@@ -1,9 +1,7 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[codz]
+*.py[cod]
 *$py.class
-
-# C extensions
 *.so
 
 # Distribution / packaging
@@ -148,22 +146,47 @@ venv.bak/
 .spyderproject
 .spyproject
 
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
 # Rope project settings
 .ropeproject
 
+# Checkpoints
+checkpoints/
+*.ckpt
+
 # mkdocs documentation
 /site
+# Logs
+logs/
+*.log
 
 # mypy
 .mypy_cache/
 .dmypy.json
 dmypy.json
 
+# Ray
+ray_results/
+
 # Pyre type checker
 .pyre/
 
+# Jupyter
+.ipynb_checkpoints/
+
 # pytype static type analyzer
 .pytype/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Cython debug symbols
 cython_debug/
@@ -205,3 +228,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# OS
+.DS_Store
+Thumbs.db
