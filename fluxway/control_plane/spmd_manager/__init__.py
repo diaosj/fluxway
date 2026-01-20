@@ -1,3 +1,3 @@
 """SPMD Manager module for SPMD lifecycle management."""
 
-from .manager import SPMDManager
+from .manager import SPMDManager, SPMDHandle
