@@ -1,5 +1,5 @@
 1. 概述
-Fluxway 是一个面向大规模分布式训练的深度学习框架，采用直接 SPMD-to-SPMD 数据传输机制，避免了传统的 "SPMD-to-One + One-to-SPMD" 中间聚合步骤，从而提升训练效率。框架采用分层架构设计，支持异步执行、灵活的资源调度和动态任务编排。其中异步流水线有限状态机（Asynchronous Pipeline Finite State Machine）、双平面传播协议（Dual-Plane Propagation Protocol）和双流汇聚机制（Dual-Stream Convergence）是框架的特色。
+Fluxway 是一个面向大规模分布式训练的深度学习框架，采用直接 SPMD-to-SPMD 数据传输机制，避免了传统的 "SPMD-to-One + One-to-SPMD" 中间聚合步骤，从而提升训练效率。框架采用分层架构设计，支持异步执行、灵活的资源调度和动态任务编排。其中 DAG 数据驱动编排（DAG-based Data-Driven Orchestration）、双平面传播协议（Dual-Plane Propagation Protocol）和双流汇聚机制（Dual-Stream Convergence）是框架的特色。
 
 1.1 核心特性
 **双平面传播协议**：将 SPMD 间的数据传输分为 Data Plane（数据平面）和 Control Plane（控制平面）两条路径，根据数据类型自动选择最优传输策略
@@ -8,7 +8,7 @@ Fluxway 是一个面向大规模分布式训练的深度学习框架，采用直
 
 **异步执行**：前向和反向传播支持异步执行，Data Plane 数据流水线化，提升计算资源利用率
 
-**有限状态机编排**：基于有限状态机（FSM）的任务编排，支持多子节点分叉和条件触发，实现动态执行路径选择
+**DAG 编排**：基于有向无环图（DAG）的任务编排，节点在所有上游依赖完成后自动执行，实现数据驱动的执行模型
 
 **智能资源管理**：基于 Ray Placement Group 的资源调度机制，支持条件分支共享资源、抢占和驱逐，优化资源利用率
 
@@ -28,53 +28,47 @@ Fluxway 是一个面向大规模分布式训练的深度学习框架，采用直
 控制平面是整个训练框架的核心协调层，负责全局视图管理、资源调度和状态监控。
 2.1 主控层 (Main Orchestrator)
 主控层是框架的最顶层，负责整体训练流程的编排和管理。
-2.1.1 有限状态机解析器 (FSM Parser)
+2.1.1 DAG 解析器 (DAG Parser)
 职责：
-解析用户定义的有限状态机（Finite State Machine）任务编排
-构建状态转换图和触发条件
+解析用户定义的有向无环图（DAG）任务编排
+构建节点依赖关系和数据流
 识别 SPMD 层级和连接关系
-支持多子节点分叉和条件触发
-验证 FSM 的有效性（状态可达性、无死锁检查）
+计算拓扑排序和执行层级
+验证 DAG 的有效性（无环检验、可达性检查）
 核心能力：
-多子节点分叉：支持一个节点根据触发条件分叉到多个子节点
-触发条件配置：支持基于数据、状态、时间等条件的触发
-动态路径选择：运行时根据触发条件动态选择执行路径
-状态管理：维护当前状态和状态转换历史
+数据驱动执行：节点在所有上游依赖完成后自动执行
+拓扑排序：计算有效的执行顺序，确保依赖关系正确
+并行层级：识别可并行执行的节点层级
+Source/Sink 识别：自动识别入口节点（无上游）和出口节点（无下游）
 输入：
-用户定义的 FSM 配置文件（JSON/YAML）或 Python API
-FSM 节点定义（SPMD 配置、输入输出规格、触发条件）
+用户定义的 DAG 配置文件（JSON/YAML）或 Python API
+DAG 节点定义（SPMD 配置、上下游依赖）
 输出：
 内部任务视图（Task View）
-SPMD 层级拓扑图（包含条件分支）
-状态转换表
-触发条件映射
-备注：
-可以使用python transitions库？
+SPMD 层级拓扑图
+拓扑排序结果
+执行层级划分
 数据结构：
-class TaskNode:
-    spmd_id: str
+class DAGNode:
+    node_id: str
     spmd_config: SPMDConfig  # worker数量、资源需求等
-    inputs: List[str]  # 前置SPMD ID列表
-    outputs: List[str]  # 后置SPMD ID列表（可能包含条件分支）
+    upstream_nodes: List[str]  # 上游依赖节点 ID 列表
+    downstream_nodes: List[str]  # 下游被依赖节点 ID 列表
     user_forward_fn: Callable
     user_backward_fn: Callable
-    trigger_conditions: Dict[str, Callable]  # 条件名 -> 条件函数
-class ConditionalEdge:
-    from_node: str
-    to_node: str
-    condition: Callable  # 触发条件函数
-    condition_name: str  # 条件名称
-class TaskFSM:
-    nodes: Dict[str, TaskNode]
-    edges: List[ConditionalEdge]  # 条件边
-    initial_state: str  # 初始状态
-    final_states: List[str]  # 终止状态列表
-    state_transitions: Dict[str, List[ConditionalEdge]]  # 状态 -> 可能的转换
-触发条件类型：
-数据条件：基于输入数据的值或特征触发
-状态条件：基于当前训练状态（step、loss等）触发
-时间条件：基于时间或步数触发
-资源条件：基于资源可用性触发
+class DAGEdge:
+    source_node: str  # 上游节点
+    target_node: str  # 下游节点
+    is_gradient_edge: bool  # 是否为梯度传递边
+class TaskDAG:
+    nodes: Dict[str, DAGNode]
+    edges: List[DAGEdge]
+    source_nodes: List[str]  # 入口节点（无上游依赖）
+    sink_nodes: List[str]  # 出口节点（无下游依赖）
+执行模型：
+当节点的所有 upstream_nodes 完成执行后，该节点自动变为 ready 状态
+ready 状态的节点可以被调度执行
+同一执行层级的节点可以并行执行
 2.1.2 调度器 (Scheduler)
 职责：
 基于 Ray Placement Group 进行资源分配

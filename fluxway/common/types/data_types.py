@@ -11,64 +11,31 @@ from pydantic import BaseModel, Field, ConfigDict
 
 
 # =============================================================================
-# FSM Related Types (Section 2.1.1)
+# Graph Related Types (Section 2.1.1)
 # =============================================================================
 
+from enum import Enum
+
+
+class PartitionType(str, Enum):
+    """Partition type for sharding specification."""
+    
+    DP = "dp"  # Data Parallelism
+    TP = "tp"  # Tensor Parallelism
+
+
 class SPMDConfig(BaseModel):
-    """SPMD configuration including worker count and resource requirements."""
+    """SPMD configuration including worker count, resource requirements and execution params."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
     
     worker_count: int = 1
-    # TODO: Add GPU/CPU/memory resource specifications
-    # TODO: Add sharding strategy configuration
-    # TODO: Add placement constraints
-
-
-class TaskNode(BaseModel):
-    """
-    Represents a node in the task FSM.
-    
-    Each node corresponds to an SPMD execution unit with its configuration,
-    inputs/outputs, and trigger conditions.
-    """
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    spmd_id: str
-    spmd_config: SPMDConfig
-    inputs: List[str] = Field(default_factory=list)  # Predecessor SPMD IDs
-    outputs: List[str] = Field(default_factory=list)  # Successor SPMD IDs
+    mesh: Optional[Dict[PartitionType, int]] = None  # Mesh topology specification
+    input_sharding: Optional[Dict[PartitionType, int]] = None  # Input sharding specification
+    output_sharding: Optional[Dict[PartitionType, int]] = None  # Output sharding specification
     user_forward_fn: Optional[Callable] = None
     user_backward_fn: Optional[Callable] = None
-    trigger_conditions: Dict[str, Callable] = Field(default_factory=dict)  # condition_name -> condition_fn
-
-
-class ConditionalEdge(BaseModel):
-    """
-    Represents a conditional edge between FSM nodes.
-    
-    Edges can have trigger conditions that determine when the transition occurs.
-    """
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    from_node: str
-    to_node: str
-    condition: Optional[Callable] = None  # Trigger condition function
-    condition_name: str = ""
-
-
-class TaskFSM(BaseModel):
-    """
-    Finite State Machine for task orchestration.
-    
-    Manages the complete task graph including nodes, edges, and state transitions.
-    """
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-    
-    nodes: Dict[str, TaskNode] = Field(default_factory=dict)
-    edges: List[ConditionalEdge] = Field(default_factory=list)
-    initial_state: str = ""
-    final_states: List[str] = Field(default_factory=list)
-    state_transitions: Dict[str, List[ConditionalEdge]] = Field(default_factory=dict)
+    max_async_steps: int = 1  # Maximum async steps between workers in the same SPMD
+    params_update_steps: int = 1  # Sync barrier every N steps for parameter updates
 
 
 # =============================================================================
@@ -90,6 +57,69 @@ class PlacementPlan(BaseModel):
     # TODO: Define node affinity rules
     # TODO: Define resource allocation mapping
     pass
+
+
+# =============================================================================
+# Graph Builder Types (Based on graph_example.py)
+# =============================================================================
+
+class Edge(BaseModel):
+    """
+    Represents an edge in the task graph.
+    
+    Edges connect nodes and can have conditional functions to determine
+    when data flows through them.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    source_node: str
+    target_node: str
+    condition_fn: Optional[Callable[..., bool]] = None
+
+
+class Node(BaseModel):
+    """
+    Represents a node in the task graph.
+    
+    Each node corresponds to an SPMD execution unit with resource requirements
+    and connections to other nodes.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    name: str
+    description: str = ""
+    resource: Optional[ResourceSpec] = None
+    spmd_config: SPMDConfig = Field(default_factory=SPMDConfig)
+    forward_edges: List[Edge] = Field(default_factory=list)
+    backward_edges: List[Edge] = Field(default_factory=list)
+
+
+class Graph(BaseModel):
+    """
+    Complete task graph with nodes and edges.
+    
+    Built using the Builder class for programmatic construction.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    
+    name: str = ""
+    nodes: Dict[str, Node] = Field(default_factory=dict)
+    edges: List[Edge] = Field(default_factory=list)
+    source_nodes: List[str] = Field(default_factory=list)  # Entry nodes (no upstream)
+    sink_nodes: List[str] = Field(default_factory=list)  # Exit nodes (no downstream)
+
+
+class GraphValidationResult(BaseModel):
+    """
+    Result of graph validation.
+    
+    Contains validation status and any errors/warnings found.
+    """
+    is_valid: bool = True
+    is_acyclic: bool = True
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+    unreachable_nodes: List[str] = Field(default_factory=list)
 
 
 # =============================================================================

@@ -13,7 +13,7 @@ Responsibilities:
 
 from typing import List, Optional, Any
 
-from ...common.types import TaskFSM, ResourceSpec, PlacementPlan
+from ...common.types import Graph, ResourceSpec, PlacementPlan
 
 
 class Scheduler:
@@ -31,17 +31,17 @@ class Scheduler:
         self._placement_groups: dict = {}
         self._node_priorities: dict = {}
     
-    def schedule(self, task_fsm: TaskFSM) -> PlacementPlan:
+    def schedule(self, graph: Graph) -> PlacementPlan:
         """
-        Generate resource allocation plan based on FSM.
+        Generate resource allocation plan based on Graph.
         
         Args:
-            task_fsm: The task FSM to schedule
+            graph: The task graph to schedule
             
         Returns:
             Placement plan for all SPMDs
             
-        TODO: Analyze FSM resource requirements
+        TODO: Analyze graph resource requirements
         TODO: Generate placement group configurations
         TODO: Handle conditional branch resource sharing
         """
