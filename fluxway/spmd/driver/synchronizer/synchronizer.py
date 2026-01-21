@@ -1,5 +1,5 @@
 """
-SPMD Sub FSM: Internal state machine for SPMD sub-loops.
+SPMD Synchronizer: Synchronization manager for SPMD sub-loops.
 
 Based on ARCHITECTURE.md Section 3.1.1
 
@@ -17,9 +17,9 @@ Use cases:
 from typing import Callable, Optional
 
 
-class SPMDSubFSM:
+class SPMDSynchronizer:
     """
-    SPMD Sub FSM (Internal State Machine).
+    SPMD Synchronizer (Internal State Machine).
     
     Manages the internal training loop within an SPMD.
     Statefully executes SPMD via StatefulExecutor.

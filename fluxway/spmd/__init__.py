@@ -1,8 +1,8 @@
-"""SPMD layer: Execution layer with SPMD sub-orchestrator and workers."""
+"""SPMD layer: Execution layer with SPMD driver and workers."""
 
-from .sub_orchestrator import (
-    SPMDSubOrchestrator,
-    SPMDSubFSM,
+from .driver import (
+    SPMDDriver,
+    SPMDSynchronizer,
     StatefulExecutor,
     SPMDMonitor,
     WorkerRegistrar,
