@@ -1,3 +1,3 @@
-"""SPMD Sub Monitor module."""
+"""SPMD Monitor module."""
 
 from .monitor import SPMDMonitor

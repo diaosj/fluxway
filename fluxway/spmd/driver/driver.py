@@ -1,5 +1,5 @@
 """
-SPMD Sub Orchestrator: Master controller for an SPMD instance.
+SPMD Driver: Master controller for an SPMD instance.
 
 Based on ARCHITECTURE.md Section 3.1
 
@@ -9,24 +9,24 @@ manages state synchronization and distributed locking.
 
 from typing import Any, Dict, List, Optional
 
-from .sub_fsm import SPMDSubFSM
+from .synchronizer import SPMDSynchronizer
 from .stateful_executor import StatefulExecutor
-from .sub_monitor import SPMDMonitor
+from .monitor import SPMDMonitor
 from .worker_registrar import WorkerRegistrar
 from .function_signatures import FunctionSignatures
 from .partition_manager import PartitionManager
 
 
-class SPMDSubOrchestrator:
+class SPMDDriver:
     """
-    SPMD Sub Orchestrator (Master).
+    SPMD Driver (Master).
     
     Coordinates workers within a single SPMD instance.
     """
     
     def __init__(self, spmd_id: str):
         self.spmd_id = spmd_id
-        self.sub_fsm = SPMDSubFSM(spmd_id)
+        self.synchronizer = SPMDSynchronizer(spmd_id)
         self.executor = StatefulExecutor(spmd_id)
         self.monitor = SPMDMonitor(spmd_id)
         self.registrar = WorkerRegistrar(spmd_id)
