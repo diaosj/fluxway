@@ -19,6 +19,7 @@ from typing import (
 )
 import functools
 import inspect
+import importlib
 from contextlib import contextmanager
 import threading
 import logging
@@ -38,6 +39,31 @@ class PicklableThreadLocal(threading.local):
         pass
 
 
+class _PicklableLock:
+    """A threading.Lock wrapper that survives pickle (Ray serialization).
+
+    On deserialization a fresh lock is created in the new process.
+    This is correct because _instance_storage is per-process, so each
+    process needs its own lock — not a shared one.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self._lock.release()
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, state):
+        self._lock = threading.Lock()
+
+
 # Thread-local storage for operator execution context (per-call, must be thread-isolated)
 _operator_context = PicklableThreadLocal()
 
@@ -46,8 +72,22 @@ _operator_context = PicklableThreadLocal()
 # async thread pool starts) and then read-only shared across threads. Using a plain
 # dict here is intentional: threading.local would hide the pre-instantiated entries
 # from the asyncio.to_thread() worker threads.
-_instance_storage_lock = threading.Lock()
+_instance_storage_lock = _PicklableLock()
 _instance_storage: Dict[int, Any] = {}
+
+
+def get_instance_storage() -> Tuple[Dict[int, Any], Any]:
+    import fluxway.common.decorators as fd
+
+    return fd._instance_storage, fd._instance_storage_lock
+
+
+def _resolve_owner_class(module_name: str, class_qualname: str) -> Type:
+    module = importlib.import_module(module_name)
+    cls = module
+    for part in class_qualname.split("."):
+        cls = getattr(cls, part)
+    return cls
 
 
 @contextmanager
@@ -290,6 +330,8 @@ def _create_operator_wrapper(
                 inspect.Parameter.VAR_POSITIONAL,
                 inspect.Parameter.VAR_KEYWORD,
             ):
+                continue
+            if static_argument and p_name in static_argument:
                 continue
             raise TypeError(
                 f"Fluxway Operator Error: Argument '{p_name}' in '{func.__qualname__}' missing type annotation.\n"
@@ -557,8 +599,13 @@ def _create_operator_wrapper(
     elif output_sharding:
         output_args = {ArgumentType.DATA.value: list(output_sharding.keys())}
 
+    _is_class_method = "." in func.__qualname__
     meta = OperatorMeta(
         name=name,
+        owner_class_qualname=func.__qualname__.rsplit(".", 1)[0]
+        if _is_class_method
+        else "",
+        owner_class_module=func.__module__ if _is_class_method else "",
         is_source=is_source,
         max_inflight_steps=max_inflight_steps,
         input_arguments={
@@ -588,24 +635,14 @@ def _create_operator_wrapper(
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        # We need the class to instantiate it
-        cls = getattr(wrapper, "_flux_spmd_class", None)
-        if not cls:
-            # Fallback: try to find it from qualname
-            qualname_parts = func.__qualname__.split(".")
-            if len(qualname_parts) >= 2:
-                module = inspect.getmodule(func)
-                cls = getattr(module, qualname_parts[-2], None)
-
-        if not cls:
-            raise RuntimeError(
-                f"Fluxway Execution Error: Cannot instantiate class for operator '{name}'."
-            )
+        cls = _resolve_owner_class(meta.owner_class_module, meta.owner_class_qualname)
 
         instance_key = id(cls)  # different operators in one class share one instance.
-        if instance_key not in _instance_storage:
-            with _instance_storage_lock:
-                if instance_key not in _instance_storage:  # double-checked locking
+
+        storage, lock = get_instance_storage()
+        if instance_key not in storage:
+            with lock:
+                if instance_key not in storage:
                     ctx = get_current_context()
                     rank = getattr(ctx, "rank", 0)
                     world_size = getattr(ctx, "world_size", 1)
@@ -634,29 +671,20 @@ def _create_operator_wrapper(
                     instance.static_args = static_args
                     instance.ctx = getattr(ctx, "operator_ctx", None)
                     instance.__init__(**init_kwargs)
-                    _instance_storage[instance_key] = instance
+                    storage[instance_key] = instance
 
-        instance = _instance_storage[instance_key]
-
-        # Update runtime context on each call (step/ctx can change per invocation)
+        instance = storage[instance_key]
         ctx = get_current_context()
         instance.static_args = getattr(ctx, "static_args", {})
         instance.rank = getattr(ctx, "rank", 0)
         instance.world_size = getattr(ctx, "world_size", 1)
         instance.ctx = getattr(ctx, "operator_ctx", None)
-
         return func(instance, *args, **kwargs)
 
-    def set_spmd_class(cls):
-        wrapper._flux_spmd_class = cls
-
-    # Attach metadata to both original and wrapper
     for target in (func, wrapper):
         target._fluxway_operator_meta = meta
-        target._flux_set_spmd_class = set_spmd_class
 
-    # Only wrap in staticmethod if it's actually inside a class
-    if "." in func.__qualname__:
+    if _is_class_method:
         return staticmethod(wrapper)
     return wrapper
 
@@ -735,11 +763,6 @@ def spmd(
     def decorator(cls: Type[T]) -> Type[T]:
         cls._resource = res_spec
         cls._mesh = mesh
-
-        # Link operators
-        for attr_name in dir(cls):
-            attr = getattr(cls, attr_name, None)
-            getattr(attr, "_flux_set_spmd_class", lambda c: None)(cls)
 
         # Standard API
         cls.get_resource = classmethod(lambda c: c._resource)

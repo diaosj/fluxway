@@ -13,6 +13,7 @@ from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import AsyncStepConfig
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.controller import create_controller
+from fluxway.common.types import CheckpointConfig
 
 from fluxway.example.recommendation.reader import RecommendationReader
 from fluxway.example.recommendation.input_spmd import InputSPMD
@@ -88,22 +89,47 @@ async def run_training(args):
     task_graph = graph.compile("End-to-End_Training_Flow")
     print(f"[Fluxway] Graph compiled. Nodes: {list(task_graph.nodes.keys())}")
 
-    async_step_config = AsyncStepConfig(max_steps=args.steps)
-    controller = await create_controller(
-        task_graph, async_step_config=async_step_config, runtime_env=runtime_env
+    async_step_config = AsyncStepConfig(max_steps=args.max_steps)
+    checkpoint_config = CheckpointConfig(
+        backend="orbax",
+        ckpt_dir="/tmp/fluxway_recsys_ckpt",
+        interval_steps=args.checkpoint_interval,
     )
-    print(f"[Fluxway] Running for {args.steps} steps ...")
 
+    controller = await create_controller(
+        task_graph,
+        async_step_config=async_step_config,
+        checkpoint_config=checkpoint_config,
+        runtime_env=runtime_env,
+    )
+
+    restored_step = await controller.restore_checkpoint.remote()
+    if restored_step is not None:
+        print(f"[Fluxway] Resumed from checkpoint at step {restored_step}.")
+
+    print(f"[Fluxway] Running to reach total {args.max_steps} steps …")
     completed = await controller.wait_for_completion.remote()
+
+    await controller.stop_checkpointer.remote()
+
     if completed:
-        print(f"[Fluxway] Training completed after {args.steps} steps.")
+        print("[Fluxway] Training completed up to target steps.")
     else:
         print("[Fluxway] Training failed or timed out.")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Fluxway Recommendation Example")
-    parser.add_argument("--steps", type=int, default=5, help="Number of steps to run")
+    parser.add_argument(
+        "--max-steps", type=int, default=10, help="Max number of steps to run"
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=2,
+        dest="checkpoint_interval",
+        help="Save a checkpoint every N steps",
+    )
     asyncio.run(run_training(parser.parse_args()))
 
 

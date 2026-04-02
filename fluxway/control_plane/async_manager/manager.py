@@ -50,33 +50,26 @@ class AsyncStepManager:
         # Op lock states: (spmd_id, op_type) -> OpLockState
         self._lock_states: Dict[Tuple[str, str], OpLockState] = {}
 
+        # Cache for last issued allowed steps to optimize Controller RPCs
+        self._last_allowed_steps: Dict[Tuple[str, str], int] = {}
+
         # Lock for thread safety
         self._lock = threading.Lock()
 
-    def report_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
+    def report_op_completed(
+        self, spmd_id: str, op_name: str, completed_count: int
+    ) -> None:
         """
-        Report SPMD-level min-step completion.
-        """
-        with self._lock:
-            if spmd_id not in self._spmd_steps:
-                self._spmd_steps[spmd_id] = SPMDOpStep(spmd_id=spmd_id)
-
-            spmd_step = self._spmd_steps[spmd_id]
-            spmd_step.op_steps[op_name] = max(spmd_step.op_steps.get(op_name, 0), step)
-
-    def report_op_steps(self, spmd_id: str, op_steps: Dict[str, int]) -> None:
-        """
-        Report all op steps for an SPMD (from heartbeat).
+        Report SPMD-level min-count completion.
         """
         with self._lock:
             if spmd_id not in self._spmd_steps:
                 self._spmd_steps[spmd_id] = SPMDOpStep(spmd_id=spmd_id)
 
-            spmd_step = self._spmd_steps[spmd_id]
-            for op_name, step in op_steps.items():
-                spmd_step.op_steps[op_name] = max(
-                    spmd_step.op_steps.get(op_name, 0), step
-                )
+            spmd_progress = self._spmd_steps[spmd_id]
+            spmd_progress.completed_step_count[op_name] = max(
+                spmd_progress.completed_step_count.get(op_name, 0), completed_count
+            )
 
     def check_and_enforce_limits(self) -> List[Tuple[str, str, int]]:
         """
@@ -105,7 +98,9 @@ class AsyncStepManager:
                 # Get trailing progress of target
                 target_data = self._spmd_steps.get(target_id)
                 target_min_step = (
-                    target_data.op_steps.get(target_op, 0) if target_data else 0
+                    target_data.completed_step_count.get(target_op, 0)
+                    if target_data
+                    else 0
                 )
 
                 limit = self._config.default_max_inflight_steps
@@ -137,25 +132,15 @@ class AsyncStepManager:
                     if self._config.max_steps is not None:
                         allowed_step = min(allowed_step, self._config.max_steps)
 
-                    updates.append((node_id, op_name, allowed_step))
+                    cache_key = (node_id, op_name)
+                    if (
+                        cache_key not in self._last_allowed_steps
+                        or allowed_step > self._last_allowed_steps[cache_key]
+                    ):
+                        self._last_allowed_steps[cache_key] = allowed_step
+                        updates.append((node_id, op_name, allowed_step))
 
         return updates
-
-    def is_all_completed(self) -> bool:
-        """Check if all operators in all SPMDs have reached max_steps."""
-        if self._config.max_steps is None:
-            return False
-
-        with self._lock:
-            for spmd_id, node in self._graph.nodes.items():
-                spmd_step = self._spmd_steps.get(spmd_id)
-                if not spmd_step or not spmd_step.op_steps:
-                    return False
-
-                for op_name, step in spmd_step.op_steps.items():
-                    if step < self._config.max_steps:
-                        return False
-        return True
 
     def _is_locked(self, spmd_id: str, op_name: str) -> bool:
         """Check if an op is locked (must hold lock)."""
@@ -228,5 +213,5 @@ class AsyncStepManager:
         """Reset all step tracking and locks."""
         with self._lock:
             for spmd_step in self._spmd_steps.values():
-                spmd_step.op_steps.clear()
+                spmd_step.completed_step_count.clear()
             self._lock_states.clear()

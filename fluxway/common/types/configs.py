@@ -163,8 +163,10 @@ class SPMDConfig(FluxwayBaseSchema):
         0  # Max allowed step diff between workers in a mesh (intra-SPMD sync)
     )
     # Global step limit for the SPMD. If set, source operators will self-terminate
-    # after reaching this step count.
     max_steps: Optional[int] = None
+
+    # If true, worker will block identically at step=0 until a drain target is provided.
+    requires_drain_at_startup: bool = False
 
     @property
     def num_workers(self) -> int:
@@ -371,6 +373,8 @@ class OperatorMeta(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str
+    owner_class_qualname: str = ""
+    owner_class_module: str = ""
 
     is_source: Optional[bool] = None  # Explicitly mark as source (producer)
     # Whether this is an interleaved source.
@@ -691,6 +695,7 @@ class ControllerEvent(str, Enum):
     DRIVER_ERROR = "driver_error"  # Driver heartbeat timeout or error
     DRIVER_RECOVERED = "driver_recovered"  # Abnormal driver recovered
     ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
+    ALL_DRIVERS_DRAINED = "all_drivers_drained"  # All drivers reached DRAINED state
     RECOVERY_FAILED = "recovery_failed"  # Recovery failed
 
 
@@ -701,6 +706,9 @@ class DriverState(str, Enum):
     READY = "ready"  # Ready, waiting for Controller command
     RUNNING = "running"  # Running
     BLOCKED = "blocked"  # Blocked
+    DRAINING = "draining"  # Draining to target step
+    DRAINED = "drained"  # Reached the drain target step
+    SNAPSHOTTING = "snapshotting"  # Extracting operator states via save_state
     ERROR = "error"  # Error state
     RECOVERING = "recovering"  # Recovering
     COMPLETED = "completed"  # Completed
@@ -718,6 +726,11 @@ class DriverEvent(str, Enum):
     UNBLOCK_REQUESTED = "unblock_requested"
     ALL_WORKERS_COMPLETED = "all_workers_completed"
     COMPLETE = "complete"
+    DRAIN_REQUESTED = "drain_requested"
+    DRAIN_COMPLETE = "drain_complete"
+    SNAPSHOT_REQUESTED = "snapshot_requested"
+    SNAPSHOT_COMPLETE = "snapshot_complete"
+    SNAPSHOT_FAILED = "snapshot_failed"
 
 
 class WorkerHeartbeat(FluxwayBaseSchema):
@@ -725,7 +738,9 @@ class WorkerHeartbeat(FluxwayBaseSchema):
 
     rank: int
     timestamp: float
-    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_type.name -> step
+    completed_step_count: Dict[str, int] = Field(
+        default_factory=dict
+    )  # op_type.name -> completed count
     status: WorkerStatus = WorkerStatus.RUNNING
     error_message: Optional[str] = None
     telemetry: Optional["WorkerTelemetry"] = None
@@ -740,9 +755,9 @@ class DriverHeartbeat(FluxwayBaseSchema):
     status: DriverStatus = DriverStatus.HEALTHY
     state: DriverState = DriverState.INITIALIZING
     error_message: Optional[str] = None
-    op_steps: Dict[str, int] = Field(
+    completed_step_count: Dict[str, int] = Field(
         default_factory=dict
-    )  # op_type.name -> spmd-level step
+    )  # op_type.name -> completed step count
     num_workers: int = 0
     healthy_num_workers: int = 0
     blocked_ops: List[str] = Field(default_factory=list)
@@ -761,6 +776,15 @@ class HeartbeatConfig(FluxwayBaseSchema):
     heartbeat_interval: float = 5.0  # Heartbeat interval (seconds)
     heartbeat_timeout: float = 15.0  # Heartbeat timeout (seconds)
     max_missed_heartbeats: int = 3  # Maximum missed heartbeats before error
+
+
+class CheckpointConfig(FluxwayBaseSchema):
+    """Configuration for checkpoint manager."""
+
+    backend: str  # Validated at runtime by WorkerCheckpointBackend.create()
+    ckpt_dir: str
+    interval_steps: int
+    force_write: bool = False  # Force write even if directory already exists
 
 
 class AsyncStepConfig(FluxwayBaseSchema):
@@ -789,7 +813,9 @@ class SPMDOpStep(FluxwayBaseSchema):
     """SPMD operation step tracking."""
 
     spmd_id: str
-    op_steps: Dict[str, int] = Field(default_factory=dict)  # op_name -> step
+    completed_step_count: Dict[str, int] = Field(
+        default_factory=dict
+    )  # op_name -> completed count
 
 
 class OpLockState(FluxwayBaseSchema):

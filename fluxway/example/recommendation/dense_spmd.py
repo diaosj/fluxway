@@ -60,6 +60,15 @@ class DenseSPMD:
         )
         self._jax_initialized = True
 
+    def save_state(self) -> dict:
+        self._ensure_jax_init()
+        return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
+
+    def restore_state(self, state: dict) -> None:
+        self._ensure_jax_init()
+        nnx.update(self.model, state["model_state"])
+        self.grad_accum = state["grad_accum"]
+
     @operator(
         name="step",
         input_sharding={
@@ -82,7 +91,6 @@ class DenseSPMD:
         emb2: TransportTensor,
         inv2: TransportTensor,
         dp_data: DPFeatures,
-        **kwargs,
     ) -> dict:
         self._ensure_jax_init()
 
@@ -186,7 +194,7 @@ class DenseSPMD:
     @operator(
         name="update", input_sharding={"dense_grad": {"type": "static", "axis": []}}
     )
-    def update(self, dense_grad: TransportTensor, **kwargs) -> None:
+    def update(self, dense_grad: TransportTensor) -> None:
         step = self.ctx.step
         treedef = jtu.tree_structure(self.grad_accum)
         param_leaves = jtu.tree_leaves(nnx.state(self.model))
