@@ -113,7 +113,7 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
-    def reshape(self, x: Any, shape: Tuple[int, ...]) -> Any:
+    def reshape(self, tensor: Any, shape: Tuple[int, ...]) -> Any:
         pass
 
     @abstractmethod
@@ -294,6 +294,13 @@ class TensorBackend(ABC):
         """
         pass
 
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return False
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return tensor[offset : offset + count]
+
 
 class TorchBackend(TensorBackend):
     def __init__(self):
@@ -365,8 +372,8 @@ class TorchBackend(TensorBackend):
     def item(self, tensor: Any) -> Any:
         return tensor.item()
 
-    def reshape(self, x: Any, shape: Tuple[int, ...]) -> Any:
-        return self._torch.reshape(x, shape)
+    def reshape(self, tensor: Any, shape: Tuple[int, ...]) -> Any:
+        return self._torch.reshape(tensor, shape)
 
     def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
         try:
@@ -583,6 +590,13 @@ class TorchBackend(TensorBackend):
         x[indices] = values
         return x
 
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return True
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return tensor[offset : offset + count]
+
 
 class JaxBackend(TensorBackend):
     def __init__(self):
@@ -634,7 +648,7 @@ class JaxBackend(TensorBackend):
         return self._jnp.int32
 
     def is_tensor(self, obj: Any) -> bool:
-        return isinstance(obj, (self._jnp.ndarray, self._np.ndarray))
+        return isinstance(obj, (self._jnp.ndarray, self._np.ndarray, JAXViewWrapper))
 
     def is_scalar(self, obj: Any) -> bool:
         return self.is_tensor(obj) and obj.ndim == 0
@@ -645,6 +659,12 @@ class JaxBackend(TensorBackend):
     def shape(self, tensor: Any) -> Any:
         return tensor.shape
 
+    def reshape(self, tensor: Any, shape: Any) -> Any:
+        return self._jnp.reshape(tensor, shape)
+
+    def view(self, tensor: Any, shape: Any) -> Any:
+        return self._jnp.reshape(tensor, shape)
+
     def size(self, tensor: Any) -> int:
         return tensor.size
 
@@ -653,9 +673,6 @@ class JaxBackend(TensorBackend):
 
     def item(self, tensor: Any) -> Any:
         return tensor.item()
-
-    def reshape(self, x: Any, shape: Tuple[int, ...]) -> Any:
-        return self._jnp.reshape(x, shape)
 
     def unravel_index(self, indices: Any, shape: Tuple[int, ...]) -> Any:
         return self._jnp.unravel_index(indices, shape)
@@ -785,6 +802,8 @@ class JaxBackend(TensorBackend):
         return self._jnp.nonzero(x, size=size, fill_value=fill_value)
 
     def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
+        if isinstance(x, JAXViewWrapper):
+            x = x.arr[x.slices]
         # Ensure start/size are tuples for JAX compatibility
         ndim = x.ndim
         if isinstance(start, (int, float)) or self.is_scalar(start):
@@ -840,11 +859,45 @@ class JaxBackend(TensorBackend):
     def index_update(self, x: Any, indices: Any, values: Any) -> Any:
         return x.at[indices].set(values)
 
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return True
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return JAXViewWrapper(tensor, slice(offset, offset + count))
+
 
 class JAXViewWrapper:
     def __init__(self, arr, slices):
         self.arr = arr
         self.slices = slices  # int, slice, or tuple
+        desc = {
+            "shape": self.arr.shape,
+            "strides": None,
+            "data": (0, False),
+            "typestr": self.arr.dtype.str,
+        }
+        self._apply_slicing(desc)
+        self._shape = desc["shape"]
+        self._dtype = self.arr.dtype
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def ndim(self):
+        return len(self._shape)
+
+    @property
+    def dtype(self):
+        return self._dtype
+
+    def __getitem__(self, key):
+        return self.arr[self.slices][key]
+
+    def __jax_array__(self):
+        return self.arr[self.slices]
 
     @property
     def __cuda_array_interface__(self):
@@ -856,9 +909,17 @@ class JAXViewWrapper:
 
     @property
     def __array_interface__(self):
-        if not hasattr(self.arr, "__array_interface__"):
+        if hasattr(self.arr, "__array_interface__"):
+            desc = self.arr.__array_interface__.copy()
+        elif hasattr(self.arr, "unsafe_buffer_pointer"):
+            desc = {
+                "shape": self.arr.shape,
+                "typestr": self.arr.dtype.str,
+                "data": (self.arr.unsafe_buffer_pointer(), False),
+                "version": 3,
+            }
+        else:
             raise AttributeError
-        desc = self.arr.__array_interface__.copy()
         self._apply_slicing(desc)
         return desc
 
@@ -867,17 +928,6 @@ class JAXViewWrapper:
         if not hasattr(self, "_cached_sliced_arr"):
             self._cached_sliced_arr = self.arr[self.slices]
         return self._cached_sliced_arr
-
-    @property
-    def shape(self):
-        return self._sliced_arr.shape
-
-    @property
-    def dtype(self):
-        return self.arr.dtype
-
-    def __jax_array__(self):
-        return self._sliced_arr
 
     def __array__(self, *args, **kwargs):
         import numpy as np
@@ -968,6 +1018,17 @@ class JAXViewWrapper:
         ptr, readonly = desc["data"]
         desc["data"] = (ptr + ptr_offset, False)  # Force writeable as per previous hack
 
+
+try:
+    import jax
+
+    jax.tree_util.register_pytree_node(
+        JAXViewWrapper,
+        lambda w: ((w.arr,), w.slices),
+        lambda slices, arr_tuple: JAXViewWrapper(arr_tuple[0], slices),
+    )
+except ImportError:
+    pass
 
 _BACKEND: Optional[TensorBackend] = None
 
