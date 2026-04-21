@@ -118,6 +118,7 @@ if RAY_AVAILABLE:
             self._heartbeat_config = HeartbeatConfig()
             self._heartbeat_task: Optional[asyncio.Task] = None
             self._heartbeat_running = False
+            self._heartbeat_thread: Optional[threading.Thread] = None
 
             # Worker heartbeat tracking
             self._worker_heartbeats: Dict[int, WorkerHeartbeat] = {}
@@ -130,6 +131,7 @@ if RAY_AVAILABLE:
             # Workers ready/running state tracking
             self._workers_ready: bool = False
             self._workers_running: bool = False
+            self._stopping: bool = False
 
             # Init timeout (seconds) — if workers don't report within this time,
             # INIT_FAILED is triggered
@@ -155,7 +157,7 @@ if RAY_AVAILABLE:
         # Initialization
         # =====================================================================
 
-        def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
+        async def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
             """
             Initialize the driver and start all workers.
 
@@ -185,7 +187,7 @@ if RAY_AVAILABLE:
                 )
 
                 # Start all worker actors
-                self._start_workers()
+                await self._start_workers()
 
                 if checkpoint_id is not None:
                     raise NotImplementedError(
@@ -214,7 +216,7 @@ if RAY_AVAILABLE:
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
 
-        def _start_workers(self) -> None:
+        async def _start_workers(self) -> None:
             """Start all worker actors."""
 
             # Get self handle for registering with workers
@@ -246,12 +248,17 @@ if RAY_AVAILABLE:
                 self._recovery_attempts[rank] = 0
                 logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
 
+            # Collect each worker's node_id concurrently without blocking the
+            # event loop.  ray.get() on an async actor would freeze the actor
+            # until all RPCs return, preventing heartbeat processing and
+            # incoming RPC handling during the wait.
             node_id_refs = {
                 rank: worker.get_node_id.remote()
                 for rank, worker in self._worker_handles.items()
             }
-            node_id_values = ray.get(list(node_id_refs.values()))
-            node_ids = dict(zip(node_id_refs.keys(), node_id_values, strict=True))
+            ranks = list(node_id_refs.keys())
+            node_id_values = await asyncio.gather(*node_id_refs.values())
+            node_ids = dict(zip(ranks, node_id_values, strict=True))
             rank_info = self._compute_rank_info(node_ids)
 
             for rank, worker in self._worker_handles.items():
@@ -340,21 +347,63 @@ if RAY_AVAILABLE:
 
             logger.debug(f"Topology registration completed spmd_id={self.spmd_id}")
 
-        def stop(self, save_checkpoint: bool = True) -> None:
+        async def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
             logger.debug(f"Stopping spmd_id={self.spmd_id}")
+            self._stopping = True
 
             # Stop heartbeat
-            self._stop_heartbeat()
+            await self._stop_heartbeat()
 
             # Stop all workers
+            stop_refs: List[tuple[int, Any]] = []
             for rank, worker in self._worker_handles.items():
                 try:
-                    worker.stop.remote()
+                    stop_refs.append((rank, worker.stop.remote()))
                 except Exception as e:
                     logger.error(
                         f"Failed to stop worker rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
+
+            worker_handles = list(self._worker_handles.items())
+
+            if stop_refs:
+                results = await asyncio.gather(
+                    *(ref for _, ref in stop_refs),
+                    return_exceptions=True,
+                )
+                for (rank, _), result in zip(stop_refs, results, strict=True):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            f"Worker stop RPC failed rank={rank} error={result} "
+                            f"spmd_id={self.spmd_id}"
+                        )
+
+            detach_refs: List[tuple[int, Any]] = []
+            for rank, worker in worker_handles:
+                try:
+                    detach_refs.append((rank, worker.set_driver_handle.remote(None)))
+                except Exception as e:
+                    logger.error(
+                        f"Failed to detach worker rank={rank} error={e} "
+                        f"spmd_id={self.spmd_id}"
+                    )
+
+            if detach_refs:
+                detach_results = await asyncio.gather(
+                    *(ref for _, ref in detach_refs),
+                    return_exceptions=True,
+                )
+                for (rank, _), result in zip(
+                    detach_refs, detach_results, strict=True
+                ):
+                    if isinstance(result, Exception):
+                        logger.error(
+                            f"Worker detach RPC failed rank={rank} error={result} "
+                            f"spmd_id={self.spmd_id}"
+                        )
+
+            self._worker_handles.clear()
 
         # =====================================================================
         # Snapshot Orchestration (Drain → Snapshot → Resume)
@@ -541,6 +590,12 @@ if RAY_AVAILABLE:
                 rank: Worker rank
                 heartbeat: Worker heartbeat data
             """
+            if self._stopping:
+                logger.debug(
+                    f"Ignoring worker heartbeat during shutdown rank={rank} spmd_id={self.spmd_id}"
+                )
+                return
+
             self._worker_heartbeats[rank] = heartbeat
             self._worker_heartbeat_times[rank] = time.time()
             logger.heartbeat(
@@ -629,6 +684,13 @@ if RAY_AVAILABLE:
                 op_name: Operation name
                 step: Completed step number
             """
+            if self._stopping:
+                logger.debug(
+                    f"Ignoring worker op completion during shutdown rank={rank} "
+                    f"op={op_name} step={step} spmd_id={self.spmd_id}"
+                )
+                return
+
             self.spmd_synchronizer.report_worker_op_completed(rank, op_name, step)
 
         def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
@@ -754,6 +816,13 @@ if RAY_AVAILABLE:
                 step: Current step number
                 values: State values
             """
+            if self._stopping:
+                logger.debug(
+                    f"Ignoring control_argument routing during shutdown target_spmd_id={target_spmd_id} "
+                    f"step={step} spmd_id={self.spmd_id}"
+                )
+                return
+
             if self.controller_handle is not None:
                 try:
                     self.controller_handle.receive_control_argument.remote(
@@ -785,9 +854,33 @@ if RAY_AVAILABLE:
             )
             self._heartbeat_thread.start()
 
-        def _stop_heartbeat(self) -> None:
-            """Stop heartbeat reporting."""
+        async def _stop_heartbeat(self) -> None:
+            """Stop heartbeat reporting.
+
+            The thread join is executed via asyncio.to_thread so that the
+            driver's event loop remains responsive while waiting for the
+            heartbeat thread to finish its current sleep interval.  Without
+            this, a sequential shutdown of N drivers on the controller side
+            would accumulate up to N × (heartbeat_interval + 1 s) of blocking
+            time on the event loop.
+            """
             self._heartbeat_running = False
+            heartbeat_thread = self._heartbeat_thread
+            if (
+                heartbeat_thread is not None
+                and heartbeat_thread.is_alive()
+                and heartbeat_thread is not threading.current_thread()
+            ):
+                await asyncio.to_thread(
+                    heartbeat_thread.join,
+                    self._heartbeat_config.heartbeat_interval + 1.0,
+                )
+                if heartbeat_thread.is_alive():
+                    logger.warning(
+                        f"Heartbeat thread did not terminate within timeout "
+                        f"spmd_id={self.spmd_id}"
+                    )
+            self._heartbeat_thread = None
 
         def _heartbeat_loop(self) -> None:
             """Heartbeat reporting loop.
@@ -1099,7 +1192,7 @@ else:
             """Mock Ray remote call."""
             return cls(*args, **kwargs)
 
-        def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
+        async def initialize(self, checkpoint_id: Optional[str] = None) -> bool:
             return True
 
         def start(self) -> None:

@@ -17,7 +17,7 @@ import asyncio
 from typing import Any, Dict, List, Optional
 
 try:
-    import ray
+    import ray  # noqa: F401
 
     RAY_AVAILABLE = True
 except ImportError:
@@ -53,7 +53,7 @@ class SPMDHandle:
         """Check if the SPMD is initialized."""
         return self._is_initialized
 
-    def set_driver_handle(self, handle: Any) -> None:
+    def set_driver_handle(self, handle: Optional[Any]) -> None:
         """Set the driver actor handle."""
         self._driver_handle = handle
 
@@ -223,13 +223,22 @@ class SPMDManager:
             logger.error(f"Failed to start SPMD {spmd_id}: {e}")
             return None
 
-    async def stop_spmd(self, spmd_id: str, save_checkpoint: bool = True) -> None:
+    async def stop_spmd(
+        self,
+        spmd_id: str,
+        save_checkpoint: bool = True,
+        release_driver_handle: bool = True,
+    ) -> None:
         """
         Stop an SPMD instance.
 
         Args:
             spmd_id: ID of SPMD to stop
             save_checkpoint: Whether to save checkpoint before stopping
+            release_driver_handle: Whether to clear the controller-side driver
+                reference immediately after stop returns. Terminal cleanup keeps
+                handles until the controller reaches its terminal state so Ray
+                bookkeeping can settle before actor references are dropped.
         """
         handle = self._spmd_handles.get(spmd_id)
         if handle is None:
@@ -242,17 +251,27 @@ class SPMDManager:
 
         try:
             if RAY_AVAILABLE:
-                # Call stop on driver
+                # Stop the driver and wait for its worker shutdown path.
                 await handle.call_driver("stop", save_checkpoint)
-
-                # Kill the driver actor
-                ray.kill(handle.driver_handle)
-
+        except Exception as e:
+            logger.error(f"Error stopping SPMD {spmd_id}: {e}")
+        finally:
+            if release_driver_handle:
+                handle.set_driver_handle(None)
             handle.set_initialized(False)
             logger.info(f"Stopped SPMD {spmd_id}")
 
-        except Exception as e:
-            logger.error(f"Error stopping SPMD {spmd_id}: {e}")
+    def release_driver_handle(self, spmd_id: str) -> None:
+        """Release the controller-side handle to a stopped driver actor."""
+        handle = self._spmd_handles.get(spmd_id)
+        if handle is None:
+            return
+        handle.set_driver_handle(None)
+
+    def release_all_driver_handles(self) -> None:
+        """Release controller-side handles for all registered SPMDs."""
+        for handle in self._spmd_handles.values():
+            handle.set_driver_handle(None)
 
     def get_spmd_handle(self, spmd_id: str) -> Optional[SPMDHandle]:
         """

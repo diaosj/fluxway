@@ -817,6 +817,23 @@ if RAY_AVAILABLE:
             """
             logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
 
+            if self._heartbeat_manager is not None:
+                logger.debug(
+                    "Waiting for all drivers to report workers_ready before restore"
+                )
+                restore_timeout = int(
+                    os.environ.get("FLUXWAY_SNAPSHOT_TIMEOUT_SECS", "600")
+                )
+                ready = await self._heartbeat_manager.wait_until_all_drivers_ready(
+                    timeout=restore_timeout
+                )
+                if not ready:
+                    raise RuntimeError(
+                        f"Timed out after {restore_timeout}s waiting for drivers to "
+                        f"become restore-ready. A Driver may have failed to start. "
+                        f"Set FLUXWAY_SNAPSHOT_TIMEOUT_SECS to adjust."
+                    )
+
             # Important: update the baseline *before* waking up workers,
             # so their `report_op_completed` pulses don't trigger a nested checkpoint.
             self._last_checkpointed_step = step
@@ -881,8 +898,11 @@ if RAY_AVAILABLE:
             so this await never raises.  The upper wait bound is
             FLUXWAY_SNAPSHOT_TIMEOUT_SECS (default 600 s).
             """
-            if self._checkpoint_task is not None and not self._checkpoint_task.done():
-                await self._checkpoint_task
+            task = self._checkpoint_task
+            if task is not None and not task.done():
+                current_task = asyncio.current_task()
+                if task is not current_task:
+                    await task
             self._checkpoint_task = None
 
         # =====================================================================
@@ -1179,7 +1199,7 @@ if RAY_AVAILABLE:
             """
             Cleanup all SPMD resources.
 
-            Called when entering COMPLETED or FAILED state.
+            Called when entering COMPLETING or FAILING state.
             """
             logger.debug("Cleaning up all SPMDs")
 
@@ -1189,9 +1209,15 @@ if RAY_AVAILABLE:
             # Stop all SPMDs
             for spmd_id in self._spmd_manager.get_all_spmd_ids():
                 try:
-                    await self._spmd_manager.stop_spmd(spmd_id, save_checkpoint=False)
+                    await self._spmd_manager.stop_spmd(
+                        spmd_id,
+                        save_checkpoint=False,
+                        release_driver_handle=False,
+                    )
                 except Exception as e:
                     logger.error(f"Error stopping SPMD {spmd_id}: {e}")
+                finally:
+                    self._heartbeat_manager.unregister_spmd(spmd_id)
 
             # Release all placement groups
             for spmd_id in list(self._scheduler.pg_manager.get_all_spmd_ids()):
@@ -1199,6 +1225,10 @@ if RAY_AVAILABLE:
                     self._scheduler.release_resources(spmd_id)
                 except Exception as e:
                     logger.error(f"Error releasing resources for {spmd_id}: {e}")
+
+        def _release_stopped_spmd_handles(self) -> None:
+            """Release driver handles after terminal cleanup has fully completed."""
+            self._spmd_manager.release_all_driver_handles()
 
         # =====================================================================
         # Lifecycle Control
@@ -1222,6 +1252,7 @@ if RAY_AVAILABLE:
 
             # Cleanup
             await self._cleanup_all_spmds()
+            self._release_stopped_spmd_handles()
 
             logger.debug("Controller stopped")
 
