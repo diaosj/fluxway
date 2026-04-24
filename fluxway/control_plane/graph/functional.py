@@ -1,4 +1,6 @@
+from contextvars import ContextVar, Token
 from typing import Any, Callable, Dict, Optional, Type
+
 from fluxway.control_plane.graph.builder import Builder
 
 
@@ -209,22 +211,38 @@ class FunctionalGraph:
     operators on node proxies and passing the resulting handles.
 
     Example:
-        graph = FunctionalGraph()
+        with FunctionalGraph("RL_Task") as graph:
+            env = EnvSPMD(name="Env", mesh=mesh0)
+            actor = ActorSPMD(name="Actor", mesh=mesh1)
 
-        env = graph.node("Env", EnvSPMD, mesh=mesh0)
-        actor = graph.node("Actor", ActorSPMD, mesh=mesh1)
+            h_obs = env.step()
+            h_action = actor.rollout(h_obs)
 
-        h_obs = env.step()
-        h_action = actor.rollout(h_obs)
+            h_reward = env.compute_reward(h_action)
+            h_train = actor.train_step(h_reward)
 
-        h_reward = env.compute_reward(h_action)
-        h_train = actor.train_step(h_reward)
-
-        task_graph = graph.compile("RL_Task")
+            task_graph = graph.compile()
     """
 
-    def __init__(self):
+    _current: ContextVar[Optional["FunctionalGraph"]] = ContextVar(
+        "FunctionalGraph._current", default=None
+    )
+
+    def __init__(self, name: str = "functional_graph"):
         self._builder = Builder()
+        self.name = name
+        self._tokens: list[Token] = []
+
+    @classmethod
+    def current(cls) -> Optional["FunctionalGraph"]:
+        return cls._current.get()
+
+    def __enter__(self):
+        self._tokens.append(self._current.set(self))
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._current.reset(self._tokens.pop())
 
     def node(
         self, name: str, spmd_class: Type, description: str = "", *args, **kwargs
@@ -281,11 +299,11 @@ class FunctionalGraph:
         )
         return NodeProxy(name, self)
 
-    def compile(self, graph_name: str = "functional_graph") -> Any:
+    def compile(self, graph_name: Optional[str] = None) -> Any:
         """
         Compiles the defined functional flow into a concrete Fluxway Graph.
 
         Returns:
             The compiled Graph object ready for execution.
         """
-        return self._builder.build(name=graph_name)
+        return self._builder.build(name=graph_name or self.name)
