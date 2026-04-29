@@ -1,6 +1,6 @@
 import pytest
 
-from typing import List, Dict, Any, Optional
+from typing import Any
 
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.types.sharding import ShardingSpec, P
@@ -27,14 +27,14 @@ class VirtualRank:
         self.distributor = DataDistributor(rank)
         # Using the new unified receiver
         self.receiver = TransportReceiver(wait_for_n_slices=0)
-        self.data_store: Dict[str, Any] = {}
+        self.data_store: dict[str, Any] = {}
 
     def send(
         self,
-        target_ranks: List[int],
-        tensors: List[Any],
-        counts: List[int],
-        cluster_receivers: Dict[int, "VirtualRank"],
+        target_ranks: list[int],
+        tensors: list[Any],
+        counts: list[int],
+        cluster_receivers: dict[int, "VirtualRank"],
     ):
         """Simulates network payload transmission to target ranks via direct memory delivery."""
         for target_rank in target_ranks:
@@ -44,7 +44,7 @@ class VirtualRank:
                     self.rank, tensors, counts
                 )
 
-    def process_incoming(self) -> List[Any]:
+    def process_incoming(self) -> list[Any]:
         """Extracts and consumes the buffered payloads received over the mock network."""
         return self.receiver.get_buffered_slices()
 
@@ -298,9 +298,9 @@ def test_embedding_lookup_flow():
 
     # Verify Rank 0 (indices 0..5)
     # Zero-Copy: check the buffer directly
-    assert (
-        cluster[0].receiver.target_buffers is not None
-    ), "Rank 0 target_buffers should be registered"
+    assert cluster[0].receiver.target_buffers is not None, (
+        "Rank 0 target_buffers should be registered"
+    )
     rank0_data = cluster[0].receiver.target_buffers[0]
 
     expected_r0 = expected_global_output[:6]
@@ -329,9 +329,9 @@ def test_embedding_lookup_flow():
 
     # Verify exact match without sorting
     expected_ordered_0 = expected_global_output[:6]
-    assert bk.equal(
-        flat_emb_ordered_0, expected_ordered_0
-    ), "Rank 0 Reconstructed Tensor Mismatch"
+    assert bk.equal(flat_emb_ordered_0, expected_ordered_0), (
+        "Rank 0 Reconstructed Tensor Mismatch"
+    )
 
     # --- 7. Backward Pass: Gradients (SPMD2 -> SPMD1) ---
     # "Dispatch Gradients"
@@ -445,19 +445,19 @@ def test_embedding_lookup_flow():
         # The receiver should have written everything into target_buffers[0]
         actual_grads = cluster[r].receiver.target_buffers[0]
 
-        assert (
-            actual_grads.shape == expected_grads.shape
-        ), f"Rank {r} dense grad shape mismatch"
+        assert actual_grads.shape == expected_grads.shape, (
+            f"Rank {r} dense grad shape mismatch"
+        )
 
         # Value check: MirrorPartition + SymmetryReceipt should preserve exact order
-        assert bk.equal(
-            actual_grads, expected_grads
-        ), f"Rank {r} dense grad value/order mismatch"
+        assert bk.equal(actual_grads, expected_grads), (
+            f"Rank {r} dense grad value/order mismatch"
+        )
 
         # Confirm "Dense" expectation: local_keys length == local_grads length
-        assert len(actual_grads) == len(
-            spmd1_results[r][0]
-        ), f"Rank {r} n-to-n consistency check failed"
+        assert len(actual_grads) == len(spmd1_results[r][0]), (
+            f"Rank {r} n-to-n consistency check failed"
+        )
 
     # --- 10. Backward Return (SPMD1 -> SPMD0) ---
     # Final step: Gradients return from Embedding (SPMD1) to Input (SPMD0)
@@ -676,9 +676,9 @@ def test_colocation_dispatch():
         tuuids: list,
         tensors: list,
         counts: list,
-        global_shapes_list: Optional[list] = None,
-        meta_tensor_state_list: Optional[list] = None,
-        compact_params_list: Optional[list] = None,
+        global_shapes_list: list | None = None,
+        meta_tensor_state_list: list | None = None,
+        compact_params_list: list | None = None,
     ):
         received_payloads.append((target, tensors, counts))
         return True
@@ -718,15 +718,7 @@ def test_reconstruct_splits_from_lengths():
 
     # And the corresponding flat element buffer:
     received_data_flat = bk.tensor(
-        [
-            1.0,
-            1.0,  # seq 0
-            2.0,
-            2.0,
-            2.0,
-            2.0,  # seq 1
-            3.0,
-        ],  # seq 2
+        [1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0],  # seq 0  # seq 1  # seq 2
         dtype=bk.float32(),
     )
 
@@ -738,9 +730,9 @@ def test_reconstruct_splits_from_lengths():
 
     # Verify the reconstructed splits
     expected_splits = bk.tensor([0, 2, 6, 7], dtype=bk.int32())
-    assert bk.equal(
-        reconstructed_splits, expected_splits
-    ), "Failed to reconstruct splits!"
+    assert bk.equal(reconstructed_splits, expected_splits), (
+        "Failed to reconstruct splits!"
+    )
 
     # --- 2. Reconstruct segment_ids (for jax.ops.segment_mean, etc.) ---
     # Often, frameworks prefer segment_ids (e.g., [0, 0, 1, 1, 1, 1, 2]) over splits.
@@ -751,9 +743,9 @@ def test_reconstruct_splits_from_lengths():
     segment_ids = np.repeat(np.arange(len(lengths_np)), lengths_np)
 
     expected_segment_ids = np.array([0, 0, 1, 1, 1, 1, 2])
-    assert np.array_equal(
-        segment_ids, expected_segment_ids
-    ), "Failed to reconstruct segment_ids!"
+    assert np.array_equal(segment_ids, expected_segment_ids), (
+        "Failed to reconstruct segment_ids!"
+    )
 
     # --- 3. Example Use: jax.ops.segment_sum ---
     # Now the user can trivially do ops. We verify it with JAX.
@@ -775,9 +767,9 @@ def test_reconstruct_splits_from_lengths():
         dtype=jnp.float32,
     )
 
-    assert jnp.allclose(
-        segment_sums, expected_sums
-    ), f"Segment sum mismatch. Got {segment_sums}"
+    assert jnp.allclose(segment_sums, expected_sums), (
+        f"Segment sum mismatch. Got {segment_sums}"
+    )
 
 
 def test_large_scale_sparse_moe():
@@ -822,6 +814,6 @@ def test_large_scale_sparse_moe():
         for _, counts in slices
         if counts[0] > 0
     )
-    assert (
-        total_received == total_tokens
-    ), f"Expected {total_tokens} tokens, got {total_received}"
+    assert total_received == total_tokens, (
+        f"Expected {total_tokens} tokens, got {total_received}"
+    )

@@ -2,11 +2,26 @@ from abc import ABC, abstractmethod
 
 from fluxway.common.types.configs import OperatorMeta, OperatorContext
 
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Any
 
-class SKIPPED:
-    """Sentinel for skipped interleaved execution."""
 
-    pass
+class ExecutionStatus(Enum):
+    """Sentinels for operator execution status."""
+
+    SUCCESS = auto()
+    SKIPPED = auto()
+    STALE_AFTER_RESTORE = auto()
+    EMPTY_PROPAGATION = auto()
+
+
+@dataclass
+class ExecutionResult:
+    """Standardized result for operator execution."""
+
+    status: ExecutionStatus
+    data: Any = None
 
 
 class ExecutionDispatcher(ABC):

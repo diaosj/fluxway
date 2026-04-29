@@ -1,7 +1,6 @@
 import numpy as np
 import pytest
 import asyncio
-from typing import Dict
 from unittest.mock import AsyncMock, patch
 
 from fluxway.spmd.worker.worker import SPMDWorker
@@ -17,7 +16,7 @@ from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 from fluxway.common.mesh import DeviceMesh
 
 
-def _meta_to_topology(meta: OperatorMeta) -> Dict[str, SPMDTopology]:
+def _meta_to_topology(meta: OperatorMeta) -> dict[str, SPMDTopology]:
     """Helper for unit tests to derive topology from OperatorMeta."""
     top_dict = {}
     top = SPMDTopology()
@@ -125,9 +124,9 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
     shards_dict = processor_workers[0]._op_manager.get_expected_tensor_shards(
         "processor"
     )
-    assert (
-        shards_dict[1001] == 2
-    ), f"Target processor should expect 2 shards, got {shards_dict}"
+    assert shards_dict[1001] == 2, (
+        f"Target processor should expect 2 shards, got {shards_dict}"
+    )
 
     # 2. RUN STEP 0: Unit 0 (Ranks 0, 1) active
     with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:

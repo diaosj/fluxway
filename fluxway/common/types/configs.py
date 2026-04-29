@@ -4,23 +4,13 @@ Core data type definitions for Fluxway framework.
 Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
-from typing import (
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Any,
-    Type,
-    Annotated,
-    TypeVar,
-    Union,
-    Tuple,
-)
+from typing import Optional, Any, Annotated, TypeVar
+from collections.abc import Callable
 
 from pydantic import BaseModel, Field, ConfigDict
 
 
-from enum import Enum
+from enum import StrEnum
 
 T = TypeVar("T")
 
@@ -47,7 +37,7 @@ Control = Annotated[T, ControlFlow]
 class FluxwayBaseSchema(BaseModel):
     """Base model for all Fluxway configuration and metadata types."""
 
-    def as_dict(self, **kwargs) -> Dict[str, Any]:
+    def as_dict(self, **kwargs) -> dict[str, Any]:
         """
         Convert model to dictionary.
         Renamed from Pydantic's model_dump for better domain alignment.
@@ -65,21 +55,21 @@ class TensorProxy(FluxwayBaseSchema):
     """
 
     tuuid: int
-    name: Optional[str] = None  # Original name for debugging
-    shape: Optional[Tuple[int, ...]] = None
-    dtype: Optional[str] = None
+    name: str | None = None  # Original name for debugging
+    shape: tuple[int, ...] | None = None
+    dtype: str | None = None
 
     def __repr__(self):
         return f"TensorProxy(tuuid={self.tuuid}, name={self.name})"
 
 
-class NodeType(str, Enum):
+class NodeType(StrEnum):
     """Node type identifier."""
 
     SPMD = "spmd"  # Normal SPMD node
 
 
-class ReaderState(str, Enum):
+class ReaderState(StrEnum):
     """Reader state for data reading nodes."""
 
     INITIALIZING = "initializing"
@@ -108,14 +98,14 @@ class SPMDTopologyInfo(FluxwayBaseSchema):
     world_size: int = 1
     mesh: Any = None
     # TUUID-based sharding mapping: {tuuid: ShardingSpec}
-    tuuid_sharding: Dict[int, Any] = Field(default_factory=dict)
+    tuuid_sharding: dict[int, Any] = Field(default_factory=dict)
     # Map of local parameter/argument names to their assigned UUIDs.
     # {param_name: tuuid}
-    tuuid_map: Dict[str, int] = Field(default_factory=dict)
+    tuuid_map: dict[str, int] = Field(default_factory=dict)
     # Optional condition function for conditional edges
-    condition_fn: Optional[Callable[..., bool]] = None
+    condition_fn: Callable[..., bool] | None = None
     # Link to the symmetric edge (src_node, src_op, dst_node, dst_op)
-    symmetric_to: Optional[Tuple[str, str, str, str]] = None
+    symmetric_to: tuple[str, str, str, str] | None = None
     # Whether this remote node is an interleaved source
     is_interleaved: bool = False
     # Size of the interleaved group (if applicable)
@@ -128,9 +118,9 @@ class SPMDTopology(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     # Predecessors of this operator: {spmd_id: info}
-    predecessors: Dict[str, SPMDTopologyInfo] = Field(default_factory=dict)
+    predecessors: dict[str, SPMDTopologyInfo] = Field(default_factory=dict)
     # Successors of this operator: {spmd_id: info}
-    successors: Dict[str, SPMDTopologyInfo] = Field(default_factory=dict)
+    successors: dict[str, SPMDTopologyInfo] = Field(default_factory=dict)
 
 
 class SPMDConfig(FluxwayBaseSchema):
@@ -148,25 +138,30 @@ class SPMDConfig(FluxwayBaseSchema):
     mesh: Any = None  # DeviceMesh (use Any to avoid circular import)
 
     # Generic operator registration
-    operators: Dict[str, Callable] = Field(default_factory=dict)
+    operators: dict[str, Callable] = Field(default_factory=dict)
     # Explicit OperatorMeta storage - ensures metadata survives Ray serialization
-    operator_metas: Dict[str, "OperatorMeta"] = Field(default_factory=dict)
+    operator_metas: dict[str, "OperatorMeta"] = Field(default_factory=dict)
 
     # Topology of the graph for each operator
     # {op_name: SPMDTopology}
-    topology: Dict[str, "SPMDTopology"] = Field(default_factory=dict)
+    topology: dict[str, "SPMDTopology"] = Field(default_factory=dict)
 
     # Static arguments for operators: {arg_name: arg_value}
-    static_args: Dict[str, Any] = Field(default_factory=dict)
+    static_args: dict[str, Any] = Field(default_factory=dict)
 
     max_worker_step_skew: int = (
         0  # Max allowed step diff between workers in a mesh (intra-SPMD sync)
     )
     # Global step limit for the SPMD. If set, source operators will self-terminate
-    max_steps: Optional[int] = None
+    max_steps: int | None = None
 
     # If true, worker will block identically at step=0 until a drain target is provided.
     requires_drain_at_startup: bool = False
+
+    # Per-node Ray runtime_env for Driver/Worker actors.
+    # Passed through to .options(runtime_env=...) when creating actors.
+    # Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
+    runtime_env: dict[str, Any] | None = None
 
     @property
     def num_workers(self) -> int:
@@ -192,7 +187,7 @@ class ResourceSpec(FluxwayBaseSchema):
     # TODO: Add storage requirements
 
 
-class PlacementStrategy(str, Enum):
+class PlacementStrategy(StrEnum):
     """Placement strategy for resource allocation."""
 
     PACK = "PACK"  # Pack bundles on as few nodes as possible
@@ -201,7 +196,7 @@ class PlacementStrategy(str, Enum):
     STRICT_SPREAD = "STRICT_SPREAD"  # Strict spreading requirement
 
 
-class ResourcePriority(str, Enum):
+class ResourcePriority(StrEnum):
     """Resource priority for allocation and preemption decisions."""
 
     HIGH = "HIGH"  # High priority, less likely to be preempted
@@ -213,14 +208,14 @@ class PlacementPlan(FluxwayBaseSchema):
     """Resource placement plan generated by scheduler."""
 
     # Mapping of SPMD ID to resource requirements
-    spmd_placements: Dict[str, "ResourceSpec"] = Field(default_factory=dict)
+    spmd_placements: dict[str, "ResourceSpec"] = Field(default_factory=dict)
 
     # Mapping of SPMD ID to resource priority
-    spmd_priorities: Dict[str, ResourcePriority] = Field(default_factory=dict)
+    spmd_priorities: dict[str, ResourcePriority] = Field(default_factory=dict)
 
     # Shared placement groups for conditional branches
     # Key: shared_pg_id, Value: list of SPMD IDs sharing this PG
-    shared_pgs: Dict[str, List[str]] = Field(default_factory=dict)
+    shared_pgs: dict[str, list[str]] = Field(default_factory=dict)
 
     # Placement strategy
     strategy: PlacementStrategy = PlacementStrategy.PACK
@@ -243,13 +238,13 @@ class Edge(FluxwayBaseSchema):
 
     source_node: str
     target_node: str
-    source_op: Optional[str] = None  # Source node's op name
-    target_op: Optional[str] = None  # Target node's op name
-    condition_fn: Optional[Callable[..., bool]] = None
+    source_op: str | None = None  # Source node's op name
+    target_op: str | None = None  # Target node's op name
+    condition_fn: Callable[..., bool] | None = None
 
     # Link to the symmetric edge (for automatic mirror-sharding based routing)
     # Format: (source_node, source_op, target_node, target_op)
-    symmetric_to: Optional[Tuple[str, str, str, str]] = None
+    symmetric_to: tuple[str, str, str, str] | None = None
 
 
 class Node(FluxwayBaseSchema):
@@ -264,13 +259,13 @@ class Node(FluxwayBaseSchema):
 
     name: str
     description: str = ""
-    resource: Optional[ResourceSpec] = None
-    priority: Optional[ResourcePriority] = None  # Resource priority for allocation
+    resource: ResourceSpec | None = None
+    priority: ResourcePriority | None = None  # Resource priority for allocation
     spmd_config: SPMDConfig = Field(default_factory=SPMDConfig)
     node_type: NodeType = NodeType.SPMD  # Node type: SPMD
 
 
-class ArgumentType(str, Enum):
+class ArgumentType(StrEnum):
     """Argument type for fluxway transfer data."""
 
     CONTROL = "control"  # Control argument
@@ -286,20 +281,20 @@ class EdgeShardingInfo(FluxwayBaseSchema):
     world_size: int = 1
     mesh: Any = None
     # New TUUID-based sharding mapping: {tuuid: ShardingSpec}
-    tuuid_sharding: Dict[int, Any] = Field(default_factory=dict)
+    tuuid_sharding: dict[int, Any] = Field(default_factory=dict)
     # Map of local parameter/argument names to their assigned UUIDs.
-    tuuid_map: Dict[str, int] = Field(default_factory=dict)
+    tuuid_map: dict[str, int] = Field(default_factory=dict)
     # Condition function for conditional edges
-    condition_fn: Optional[Callable[..., bool]] = None
+    condition_fn: Callable[..., bool] | None = None
     # output_param_map: source op's output mapping (sender side)
     # input_param_map: target op's input mapping (receiver side)
-    output_param_map: Dict[str, List[str]] = Field(default_factory=dict)
-    input_param_map: Dict[str, List[str]] = Field(default_factory=dict)
+    output_param_map: dict[str, list[str]] = Field(default_factory=dict)
+    input_param_map: dict[str, list[str]] = Field(default_factory=dict)
     is_interleaved: bool = False
     interleave_unit_size: int = 1
 
 
-class BarrierType(str, Enum):
+class BarrierType(StrEnum):
     """Execution barrier types for operators."""
 
     STANDARD = "standard"  # Wait for all expected shards/states (default)
@@ -336,15 +331,15 @@ class TolerantBarrierConfig(BarrierConfig):
     """
 
     type: BarrierType = BarrierType.TOLERANT
-    tensor_staleness: Dict[int, int] = Field(default_factory=dict)
-    state_staleness: Dict[str, int] = Field(default_factory=dict)
-    debug_names: Dict[int, str] = Field(default_factory=dict, exclude=True)
+    tensor_staleness: dict[int, int] = Field(default_factory=dict)
+    state_staleness: dict[str, int] = Field(default_factory=dict)
+    debug_names: dict[int, str] = Field(default_factory=dict, exclude=True)
     retrieval_policy: str = "latest"  # "latest", "oldest", "closest"
 
     # Input field for logical paths (resolved during initialization)
-    staleness: Dict[str, int] = Field(default_factory=dict, exclude=True)
+    staleness: dict[str, int] = Field(default_factory=dict, exclude=True)
 
-    def resolve(self, resolver_fn: Callable[[str], Optional[int]]) -> None:
+    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
         """Resolve all stale paths to TUUIDs or Control States."""
         for key, val in self.staleness.items():
             tuuid = resolver_fn(key)
@@ -376,7 +371,7 @@ class OperatorMeta(FluxwayBaseSchema):
     owner_class_qualname: str = ""
     owner_class_module: str = ""
 
-    is_source: Optional[bool] = None  # Explicitly mark as source (producer)
+    is_source: bool | None = None  # Explicitly mark as source (producer)
     # Whether this is an interleaved source.
     is_interleaved: bool = False
     # Size of the interleaved group (e.g., 1 for single-worker).
@@ -388,31 +383,31 @@ class OperatorMeta(FluxwayBaseSchema):
     )
     # Keys use ArgumentType.value (i.e. "state" | "tensor" | "static") to avoid enum
     # serialization / circular import surprises across control-plane and worker.
-    input_arguments: Optional[Dict[str, List[str]]] = None
-    output_arguments: Optional[Dict[str, List[str]]] = None
-    input_sharding: Dict[Any, Any] = Field(default_factory=dict)
-    output_sharding: Dict[Any, Any] = Field(default_factory=dict)
-    output_uuids: List[int] = Field(default_factory=list)
+    input_arguments: dict[str, list[str]] | None = None
+    output_arguments: dict[str, list[str]] | None = None
+    input_sharding: dict[Any, Any] = Field(default_factory=dict)
+    output_sharding: dict[Any, Any] = Field(default_factory=dict)
+    output_uuids: list[int] = Field(default_factory=list)
 
     # Implicit parameter-to-field mappings
-    input_param_map: Dict[str, List[str]] = Field(default_factory=dict)
-    output_param_map: Dict[str, List[str]] = Field(default_factory=dict)
-    input_treedefs: Dict[str, Any] = Field(default_factory=dict)
-    output_treedef: Optional[Any] = None
+    input_param_map: dict[str, list[str]] = Field(default_factory=dict)
+    output_param_map: dict[str, list[str]] = Field(default_factory=dict)
+    input_treedefs: dict[str, Any] = Field(default_factory=dict)
+    output_treedef: Any | None = None
 
     # Linking metadata (populated by Builder)
-    input_pre_sharding: Dict[str, List[EdgeShardingInfo]] = Field(default_factory=dict)
-    output_post_sharding: Dict[str, List[EdgeShardingInfo]] = Field(
+    input_pre_sharding: dict[str, list[EdgeShardingInfo]] = Field(default_factory=dict)
+    output_post_sharding: dict[str, list[EdgeShardingInfo]] = Field(
         default_factory=dict
     )
 
     # Execution barrier configuration
-    barrier_config: Union[
-        StandardBarrierConfig, PeriodicBarrierConfig, TolerantBarrierConfig
-    ] = Field(default_factory=StandardBarrierConfig)
+    barrier_config: (
+        StandardBarrierConfig | PeriodicBarrierConfig | TolerantBarrierConfig
+    ) = Field(default_factory=StandardBarrierConfig)
 
     def resolve_sharding_topology(
-        self, resolver_fn: Callable[[str], Optional[int]]
+        self, resolver_fn: Callable[[str], int | None]
     ) -> None:
         for sharding in [self.input_sharding, self.output_sharding]:
             for spec in sharding.values():
@@ -420,13 +415,11 @@ class OperatorMeta(FluxwayBaseSchema):
                 if hasattr(spec, "routing") and hasattr(spec.routing, "resolve"):
                     spec.routing.resolve(resolver_fn)
 
-    def resolve_async_strategy(
-        self, resolver_fn: Callable[[str], Optional[int]]
-    ) -> None:
+    def resolve_async_strategy(self, resolver_fn: Callable[[str], int | None]) -> None:
         if hasattr(self.barrier_config, "resolve"):
             self.barrier_config.resolve(resolver_fn)
 
-    def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> List[str]:
+    def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> list[str]:
         args_map = self.output_arguments if is_output else self.input_arguments
 
         if args_map and arg_type.value in args_map:
@@ -442,14 +435,14 @@ class OperatorMeta(FluxwayBaseSchema):
     # Compare / validate helpers (used by control-plane graph builder)
     # ---------------------------------------------------------------------
 
-    def state_names(self, is_output: bool) -> List[str]:
+    def state_names(self, is_output: bool) -> list[str]:
         """Get state argument names from input/output arguments."""
         return self.get_arguments(is_output=is_output, arg_type=ArgumentType.CONTROL)
 
     def validate_and_update_state_output_match_dest_input(
         self,
         dst_meta: "OperatorMeta",
-        src_spmd_class: Type,
+        src_spmd_class: type,
         src_method_name: str,
         ctx: str,
     ) -> None:
@@ -505,10 +498,10 @@ class Graph(FluxwayBaseSchema):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     name: str = ""
-    nodes: Dict[str, Node] = Field(default_factory=dict)
-    edges: List[Edge] = Field(default_factory=list)
-    source_nodes: List[str] = Field(default_factory=list)  # Entry nodes (no upstream)
-    sink_nodes: List[str] = Field(default_factory=list)  # Exit nodes (no downstream)
+    nodes: dict[str, Node] = Field(default_factory=dict)
+    edges: list[Edge] = Field(default_factory=list)
+    source_nodes: list[str] = Field(default_factory=list)  # Entry nodes (no upstream)
+    sink_nodes: list[str] = Field(default_factory=list)  # Exit nodes (no downstream)
 
 
 class GraphValidationResult(FluxwayBaseSchema):
@@ -520,9 +513,9 @@ class GraphValidationResult(FluxwayBaseSchema):
 
     is_valid: bool = True
     is_acyclic: bool = True
-    errors: List[str] = Field(default_factory=list)
-    warnings: List[str] = Field(default_factory=list)
-    unreachable_nodes: List[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    unreachable_nodes: list[str] = Field(default_factory=list)
 
 
 # =============================================================================
@@ -601,20 +594,20 @@ class NodeView(FluxwayBaseSchema):
 
     current_spmd_id: str = ""
     current_worker_id: str = ""
-    predecessor_logical_handles: Dict[str, List[LogicalHandle]] = Field(
+    predecessor_logical_handles: dict[str, list[LogicalHandle]] = Field(
         default_factory=dict
     )
-    successor_logical_handles: Dict[str, List[LogicalHandle]] = Field(
+    successor_logical_handles: dict[str, list[LogicalHandle]] = Field(
         default_factory=dict
     )
-    handle_mapping: Dict[str, ActualHandle] = Field(default_factory=dict)
+    handle_mapping: dict[str, ActualHandle] = Field(default_factory=dict)
 
-    def get_predecessor_handles(self, spmd_id: str) -> List[LogicalHandle]:
+    def get_predecessor_handles(self, spmd_id: str) -> list[LogicalHandle]:
         """Get all logical handles for a predecessor SPMD."""
         # TODO: Implement handle lookup
         return self.predecessor_logical_handles.get(spmd_id, [])
 
-    def get_successor_handles(self, spmd_id: str) -> List[LogicalHandle]:
+    def get_successor_handles(self, spmd_id: str) -> list[LogicalHandle]:
         """Get all logical handles for a successor SPMD."""
         # TODO: Implement handle lookup
         return self.successor_logical_handles.get(spmd_id, [])
@@ -645,7 +638,7 @@ class NodeView(FluxwayBaseSchema):
 # =============================================================================
 
 
-class DriverStatus(str, Enum):
+class DriverStatus(StrEnum):
     """Driver health status."""
 
     HEALTHY = "healthy"
@@ -654,7 +647,7 @@ class DriverStatus(str, Enum):
     TIMEOUT = "timeout"
 
 
-class WorkerStatus(str, Enum):
+class WorkerStatus(StrEnum):
     """Worker operational status."""
 
     INITIALIZING = "initializing"
@@ -663,7 +656,7 @@ class WorkerStatus(str, Enum):
     ERROR = "error"
 
 
-class ControllerState(str, Enum):
+class ControllerState(StrEnum):
     """Controller state machine states.
 
     Lifecycle:
@@ -688,7 +681,7 @@ class ControllerState(str, Enum):
     FAILED = "failed"  # Task failed
 
 
-class ControllerEvent(str, Enum):
+class ControllerEvent(StrEnum):
     """Events that trigger controller state transitions."""
 
     INIT_COMPLETE = "init_complete"  # Resources allocated, SPMDs started
@@ -704,7 +697,7 @@ class ControllerEvent(str, Enum):
     CLEANUP_FINISHED = "cleanup_finished"  # Terminal cleanup completed
 
 
-class DriverState(str, Enum):
+class DriverState(StrEnum):
     """SPMD Driver state machine states."""
 
     INITIALIZING = "initializing"  # Initializing workers
@@ -719,7 +712,7 @@ class DriverState(str, Enum):
     COMPLETED = "completed"  # Completed
 
 
-class DriverEvent(str, Enum):
+class DriverEvent(StrEnum):
     """Events that trigger driver state transitions."""
 
     INIT_COMPLETE = "init_complete"
@@ -743,13 +736,13 @@ class WorkerHeartbeat(FluxwayBaseSchema):
 
     rank: int
     timestamp: float
-    completed_step_count: Dict[str, int] = Field(
+    completed_step_count: dict[str, int] = Field(
         default_factory=dict
     )  # op_type.name -> completed count
     status: WorkerStatus = WorkerStatus.RUNNING
-    error_message: Optional[str] = None
+    error_message: str | None = None
     telemetry: Optional["WorkerTelemetry"] = None
-    mailbox_status: Optional[MailboxStatus] = None  # Mailbox status for backpressure
+    mailbox_status: MailboxStatus | None = None  # Mailbox status for backpressure
 
 
 class DriverHeartbeat(FluxwayBaseSchema):
@@ -759,19 +752,19 @@ class DriverHeartbeat(FluxwayBaseSchema):
     timestamp: float
     status: DriverStatus = DriverStatus.HEALTHY
     state: DriverState = DriverState.INITIALIZING
-    error_message: Optional[str] = None
-    completed_step_count: Dict[str, int] = Field(
+    error_message: str | None = None
+    completed_step_count: dict[str, int] = Field(
         default_factory=dict
     )  # op_type.name -> completed step count
     num_workers: int = 0
     healthy_num_workers: int = 0
-    blocked_ops: List[str] = Field(default_factory=list)
+    blocked_ops: list[str] = Field(default_factory=list)
     workers_ready: bool = False  # All workers have reported heartbeat
     workers_running: bool = False  # All workers are running main loop
     is_downstream_busy: bool = (
         False  # Whether downstream SPMDs are busy (for backpressure)
     )
-    source_state: Optional[ReaderState] = None  # Generic source state
+    source_state: ReaderState | None = None  # Generic source state
     busy_worker_ratio: float = 0.0  # Ratio of workers with full mailbox
 
 
@@ -795,8 +788,8 @@ class CheckpointConfig(FluxwayBaseSchema):
 class AsyncStepConfig(FluxwayBaseSchema):
     """Configuration for async step difference control."""
 
-    max_steps: Optional[int] = None  # Maximum steps to run (global limit)
-    node_max_steps: Dict[str, int] = Field(
+    max_steps: int | None = None  # Maximum steps to run (global limit)
+    node_max_steps: dict[str, int] = Field(
         default_factory=dict
     )  # Per-node step overrides
     default_max_inflight_steps: int = (
@@ -818,7 +811,7 @@ class SPMDOpStep(FluxwayBaseSchema):
     """SPMD operation step tracking."""
 
     spmd_id: str
-    completed_step_count: Dict[str, int] = Field(
+    completed_step_count: dict[str, int] = Field(
         default_factory=dict
     )  # op_name -> completed count
 

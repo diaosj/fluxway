@@ -290,9 +290,9 @@ def test_transport_receiver_zero_copy_dlpack_and_no_concat():
     #  so we only check identity for non-JAX backends.)
     if backend.name() != "jax":
         ptr_after = receiver.target_buffers[0].__array_interface__["data"][0]
-        assert (
-            ptr_after == ptr_before
-        ), f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
+        assert ptr_after == ptr_before, (
+            f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
+        )
 
     # --- Property 2: No concat needed — read directly from the single buffer ---
     buf = receiver.target_buffers[0]  # single contiguous pre-allocated array
@@ -1191,7 +1191,13 @@ async def test_send_output_none_mesh():
 
     worker._successor_handlers = {"succ": {0: DataPlaneCallable(handler)}}
 
+    from fluxway.spmd.worker.operator_manager.dispatcher import (
+        ExecutionStatus,
+        ExecutionResult,
+    )
+
     data = [np.array([1, 2, 3])]
-    await worker._send_output("compute", data, exec_step=0)
+    result = ExecutionResult(status=ExecutionStatus.SUCCESS, data=data)
+    await worker._send_output("compute", result, exec_step=0)
 
     assert handler.receive_shards.remote.called

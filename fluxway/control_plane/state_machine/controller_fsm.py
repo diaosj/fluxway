@@ -16,7 +16,7 @@ Supports async callbacks for Ray Actor Controller.
 """
 
 import asyncio
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING
 
 from fluxway.common.types import ControllerState, ControllerEvent
 from fluxway.common.utils.logging import get_logger
@@ -116,7 +116,7 @@ class ControllerStateMachine:
         self._lock = asyncio.Lock()
 
         # Track error information
-        self._error_spmds: Dict[str, str] = {}  # spmd_id -> error_message
+        self._error_spmds: dict[str, str] = {}  # spmd_id -> error_message
         self._restarting_spmds: set = set()
 
     @property
@@ -211,7 +211,7 @@ class ControllerStateMachine:
         """Check if controller has completed."""
         return self.state in (ControllerState.COMPLETED, ControllerState.FAILED)
 
-    def get_error_spmds(self) -> Dict[str, str]:
+    def get_error_spmds(self) -> dict[str, str]:
         """Get SPMDs currently in error state."""
         return dict(self._error_spmds)
 
@@ -267,13 +267,26 @@ class ControllerStateMachine:
                 f"Failed to start heartbeat monitoring or issue initial drain: {e}"
             )
 
-        # Prevent discarded events: Check if operations were already completed during restoration (PENDING state).
-        # We perform this check upon entering RUNNING state to safely trigger completion.
+        # Prevent discarded events: Check if operations were already completed
+        # during restoration (PENDING state).  However, when a drain strategy is
+        # active, the drain→checkpoint→resume pipeline will detect max_steps and
+        # trigger ALL_DRIVERS_COMPLETED itself after the final checkpoint is
+        # persisted.  Firing the event here would race with that pipeline —
+        # cleanup would release placement groups while saves are in-flight.
         if self._controller._async_step_manager.is_all_completed():
-            logger.debug(
-                "wait_for_completion detected all operators completed upon entering RUNNING, transitioning"
-            )
-            await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
+            has_drain = self._controller._drain_strategy is not None
+            if has_drain:
+                logger.debug(
+                    "All operators completed upon entering RUNNING, but drain "
+                    "strategy is active — deferring completion to the "
+                    "drain→checkpoint→resume pipeline"
+                )
+            else:
+                logger.debug(
+                    "wait_for_completion detected all operators completed "
+                    "upon entering RUNNING, transitioning"
+                )
+                await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
 
     async def _on_enter_blocked(self) -> None:
         """
