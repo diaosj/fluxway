@@ -59,8 +59,9 @@ Homepage = "https://github.com/fluxway/fluxway"
 Documentation = "https://github.com/fluxway/fluxway#readme"
 Repository = "https://github.com/fluxway/fluxway"
 
-[tool.setuptools]
-packages = ["fluxway"]
+[tool.setuptools.packages.find]
+include = ["fluxway*"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 fluxway = ["py.typed"]
