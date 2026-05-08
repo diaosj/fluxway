@@ -33,9 +33,9 @@ import ray
 from fluxway.common.backend import get_backend
 from fluxway.common.decorators import (
     operator_context,
-    get_current_context,
     get_instance_storage,
     _resolve_owner_class,
+    _inject_context_properties,
 )
 from fluxway.common.execution import compile
 from fluxway.common.types import (
@@ -317,7 +317,6 @@ class SPMDWorker:
             node_rank=0 if node_rank is None else node_rank,
             num_nodes=1 if num_nodes is None else num_nodes,
         ):
-            ctx = get_current_context()
             storage, lock = get_instance_storage()
             for op_meta in (config.operator_metas or {}).values():
                 if not op_meta.owner_class_qualname:
@@ -347,24 +346,11 @@ class SPMDWorker:
                     init_kwargs = {}
 
                 instance = cls.__new__(cls)
-                instance.rank = rank
-                instance.world_size = world_size
-                instance.local_rank = local_rank
-                instance.local_world_size = local_world_size
-                instance.node_rank = 0 if node_rank is None else node_rank
-                instance.num_nodes = 1 if num_nodes is None else num_nodes
-                instance.static_args = static_args
-                instance.ctx = getattr(ctx, "operator_ctx", None)
+                _inject_context_properties(cls)
                 logger.debug(
-                    "operator_init_begin owner_class=%s rank=%s world_size=%s "
-                    "local_rank=%s local_world_size=%s node_rank=%s num_nodes=%s",
+                    "operator_init_begin owner_class=%s rank=%s",
                     cls.__qualname__,
                     rank,
-                    world_size,
-                    local_rank,
-                    local_world_size,
-                    0 if node_rank is None else node_rank,
-                    1 if num_nodes is None else num_nodes,
                 )
                 try:
                     instance.__init__(**init_kwargs)
@@ -1227,14 +1213,13 @@ class SPMDWorker:
                 )
                 raise e
 
-            # Execute operator in a thread to avoid blocking the worker event loop
             if isinstance(input_data, dict):
-                op_result = await asyncio.to_thread(
-                    self._op_manager.execute, op_name, step, **input_data
+                op_result = await self._op_manager.execute_async(
+                    op_name, step, **input_data
                 )
             else:
-                op_result = await asyncio.to_thread(
-                    self._op_manager.execute, op_name, step, input_data
+                op_result = await self._op_manager.execute_async(
+                    op_name, step, input_data
                 )
             logger.debug(
                 f"Execution finished op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
