@@ -67,6 +67,7 @@ if RAY_AVAILABLE:
             controller_handle: Any | None,
             graph_topology: dict[str, Any],
             checkpoint_backend: Any | None = None,
+            worker_resource: Any | None = None,
         ):
             """
             Initialize SPMD Driver.
@@ -91,6 +92,7 @@ if RAY_AVAILABLE:
             self.graph_topology = graph_topology
             self._checkpoint_backend = checkpoint_backend
             self._runtime_env = config.runtime_env
+            self.worker_resource = worker_resource
 
             # State machine
             self.state_machine = DriverStateMachine(self)
@@ -225,6 +227,12 @@ if RAY_AVAILABLE:
                 opts["placement_group_bundle_index"] = bundle_idx
             if self._runtime_env:
                 opts["runtime_env"] = self._runtime_env
+
+            if self.worker_resource is not None:
+                if getattr(self.worker_resource, "num_cpus", 0) > 0:
+                    opts["num_cpus"] = self.worker_resource.num_cpus
+                if getattr(self.worker_resource, "num_gpus", 0) > 0:
+                    opts["num_gpus"] = self.worker_resource.num_gpus
             return opts
 
         async def _start_workers(self) -> None:
@@ -262,8 +270,40 @@ if RAY_AVAILABLE:
             node_ids = dict(zip(ranks, node_id_values, strict=True))
             rank_info = self._compute_rank_info(node_ids)
 
+            # Gather IP of rank 0 to act as rendezvous address
+            if 0 in self._worker_handles:
+                rank0_ip = await self._worker_handles[0].get_node_ip.remote()
+                max_retries = 5
+                for attempt in range(max_retries):
+                    rank0_port = await self._worker_handles[0].find_free_port.remote()
+                    rank0_address = f"{rank0_ip}:{rank0_port}"
+                    try:
+                        # Initialize Rank 0 first to lock the port and avoid TOCTOU
+                        await self._worker_handles[0].setup_and_start.remote(
+                            **rank_info[0],
+                            rank0_address=rank0_address,
+                        )
+                        break
+                    except Exception as e:
+                        if (
+                            "already in use" in str(e).lower()
+                            or "address already in use" in str(e).lower()
+                            or "eaddrinuse" in str(e).lower()
+                        ):
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(0.1 * (2**attempt))
+                                continue
+                        raise
+            else:
+                rank0_address = None
+
             for rank, worker in self._worker_handles.items():
-                worker.setup_and_start.remote(**rank_info[rank])
+                if rank == 0:
+                    continue  # Already started
+                worker.setup_and_start.remote(
+                    **rank_info[rank],
+                    rank0_address=rank0_address,
+                )
 
             logger.debug(
                 f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"
@@ -485,17 +525,12 @@ if RAY_AVAILABLE:
                 self._clear_drain_and_fail()
                 return
 
-            metadata_futures = {
+            save_futures: dict[int, Any] = {
                 rank: worker.save_state_to_disk.remote(
                     self._pending_ckpt_dir, self._pending_target_step_count
                 )
                 for rank, worker in self._worker_handles.items()
             }
-            # Submit snapshot metadata to controller.
-            # This is a fire-and-forget remote call. In Ray, `.remote()` does not block
-            # and will not raise network/actor-dead errors synchronously.
-            # Synchronous exceptions here only indicate local programmatic bugs (e.g. TypeError)
-            # and should fail-fast directly rather than being swallowed by generic exception handlers.
             if self.controller_handle is None:
                 logger.error(
                     f"controller_handle is None, cannot report snapshot metadata "
@@ -505,7 +540,7 @@ if RAY_AVAILABLE:
                 return
 
             self.controller_handle.receive_snapshot_metadata.remote(
-                self.spmd_id, self._pending_snapshot_id, metadata_futures
+                self.spmd_id, self._pending_snapshot_id, save_futures
             )
 
         def _clear_drain_and_fail(self) -> None:
@@ -551,27 +586,29 @@ if RAY_AVAILABLE:
             self.state_machine.trigger(DriverEvent.SNAPSHOT_COMPLETE)
 
         async def restore_from_disk(
-            self, rank_metadata_map: dict[int, dict[str, Any]]
+            self,
+            spmd_state: dict[str, Any],
+            rank_storage: dict[int, dict[str, Any]],
         ) -> None:
             """
             Fan out checkpoint restore to all workers in parallel.
 
-            Each Worker reads its own tensors directly from the shared filesystem.
+            Every worker in ``_worker_handles`` receives a ``load_state_from_disk``
+            call.  Workers whose rank is absent from ``rank_storage`` (e.g. newly
+            added data-parallel ranks) receive ``rank_storage=None`` and will inherit
+            the logical progress from ``spmd_state`` without loading on-disk tensors.
 
             Args:
-                rank_metadata_map: {rank: metadata_dict} where metadata_dict contains
-                                   ``backend`` and backend-specific path fields.
+                spmd_state:   SPMD-level logical state (``completed_step_count``,
+                              ``static_args``) shared by all ranks.
+                rank_storage: Per-rank physical storage paths keyed by integer rank.
             """
-            self.spmd_synchronizer.load_step_counts(rank_metadata_map)
+            self.spmd_synchronizer.load_spmd_state(spmd_state)
 
-            tasks = []
-            for rank, metadata in rank_metadata_map.items():
-                worker = self._worker_handles.get(rank)
-                if worker is None:
-                    raise RuntimeError(
-                        f"Worker rank {rank} not found spmd_id={self.spmd_id}"
-                    )
-                tasks.append(worker.load_state_from_disk.remote(metadata))
+            tasks = [
+                worker.load_state_from_disk.remote(spmd_state, rank_storage.get(rank))
+                for rank, worker in self._worker_handles.items()
+            ]
             await asyncio.gather(*tasks)
 
         # =====================================================================

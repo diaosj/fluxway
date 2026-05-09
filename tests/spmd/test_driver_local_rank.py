@@ -54,9 +54,19 @@ class _FakeAsyncRemoteCall:
         self.remote = remote
 
 
+class _DummyFuture:
+    def __await__(self):
+        yield
+        return None
+
+
 class _FakeSyncRemoteCall:
     def __init__(self, func):
-        self.remote = func
+        def wrapper(*args, **kwargs):
+            func(*args, **kwargs)
+            return _DummyFuture()
+
+        self.remote = wrapper
 
 
 class FakeWorker:
@@ -64,6 +74,8 @@ class FakeWorker:
         self.node_id = node_id
         self.setup_calls = []
         self.get_node_id = _FakeAsyncRemoteCall(lambda: node_id)
+        self.get_node_ip = _FakeAsyncRemoteCall(lambda: "127.0.0.1")
+        self.find_free_port = _FakeAsyncRemoteCall(lambda: 29500)
         self.setup_and_start = _FakeSyncRemoteCall(
             lambda **kwargs: self.setup_calls.append(kwargs)
         )
@@ -96,11 +108,29 @@ async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
     await driver._start_workers()
 
     assert fake_workers[0].setup_calls == [
-        {"local_rank": 0, "local_world_size": 2, "node_rank": 0, "num_nodes": 2}
+        {
+            "local_rank": 0,
+            "local_world_size": 2,
+            "node_rank": 0,
+            "num_nodes": 2,
+            "rank0_address": "127.0.0.1:29500",
+        }
     ]
     assert fake_workers[1].setup_calls == [
-        {"local_rank": 1, "local_world_size": 2, "node_rank": 0, "num_nodes": 2}
+        {
+            "local_rank": 1,
+            "local_world_size": 2,
+            "node_rank": 0,
+            "num_nodes": 2,
+            "rank0_address": "127.0.0.1:29500",
+        }
     ]
     assert fake_workers[2].setup_calls == [
-        {"local_rank": 0, "local_world_size": 1, "node_rank": 1, "num_nodes": 2}
+        {
+            "local_rank": 0,
+            "local_world_size": 1,
+            "node_rank": 1,
+            "num_nodes": 2,
+            "rank0_address": "127.0.0.1:29500",
+        }
     ]
