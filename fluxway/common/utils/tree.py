@@ -41,33 +41,50 @@ def tree_flatten(
 
         # Template-guided flattening for data_type
         if _is_fluxway_data_type(type(v)):
-            if template and template[0] != "data_type":
-                raise ValueError(
-                    f"Type mismatch at runtime: expected {template[0]}, but "
-                    f"operator returned data_type {type(v).__name__}."
-                )
-            from typing import get_type_hints
-
-            # If template matches this node, use its predefined key order
-            if template and template[1] is type(v):
-                public_keys = template[2]
-                child_templates = template[3]
-            else:
-                try:
-                    hints = get_type_hints(type(v))
-                    public_keys = [k for k in hints.keys() if not k.startswith("_")]
-                except Exception:
-                    data_map = v.as_dict() if hasattr(v, "as_dict") else v.__dict__
-                    public_keys = sorted(
-                        [k for k in data_map.keys() if not k.startswith("_")]
+            if template and template[0] == "dict":
+                # Convert the data_type to a dict and let it fall through to the dict branch below
+                if not hasattr(v, "as_dict"):
+                    raise TypeError(
+                        f"Fluxway Data Error: data_type {type(v).__name__} lacks 'as_dict'."
                     )
-                child_templates = [None] * len(public_keys)
+                v = v.as_dict()
+            else:
+                if template and template[0] != "data_type":
+                    raise ValueError(
+                        f"Type mismatch at runtime: expected {template[0]}, but "
+                        f"operator returned data_type {type(v).__name__}."
+                    )
+                from typing import get_type_hints
 
-            data_map = v.as_dict() if hasattr(v, "as_dict") else v.__dict__
-            children = []
-            for k, child_template in zip(public_keys, child_templates, strict=True):
-                children.append(_flatten(data_map[k], child_template))
-            return ("data_type", type(v), public_keys, children)
+                # If template matches this node, use its predefined key order
+                if template and template[1] is type(v):
+                    public_keys = template[2]
+                    child_templates = template[3]
+                else:
+                    try:
+                        hints = get_type_hints(type(v))
+                        public_keys = [k for k in hints.keys() if not k.startswith("_")]
+                    except Exception as err:
+                        if not hasattr(v, "as_dict"):
+                            raise TypeError(
+                                f"Fluxway Data Error: data_type {type(v).__name__} lacks 'as_dict'."
+                            ) from err
+                        data_map = v.as_dict()
+                        public_keys = sorted(
+                            [k for k in data_map.keys() if not k.startswith("_")]
+                        )
+                    child_templates = [None] * len(public_keys)
+
+                if not hasattr(v, "as_dict"):
+                    raise TypeError(
+                        f"Fluxway Data Error: data_type {type(v).__name__} lacks 'as_dict'."
+                    )
+                data_map = v.as_dict()
+
+                children = []
+                for k, child_template in zip(public_keys, child_templates, strict=True):
+                    children.append(_flatten(data_map[k], child_template))
+                return ("data_type", type(v), public_keys, children)
 
         # Template-guided flattening for dict
         if isinstance(v, dict):
