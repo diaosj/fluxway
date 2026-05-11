@@ -477,7 +477,7 @@ if RAY_AVAILABLE:
             self._pending_snapshot_id = snapshot_id
             self._pending_target_step_count = target_count
             self._pending_ckpt_dir = ckpt_dir
-            self._persist_worker_states()
+            await self._persist_worker_states()
 
         def _on_drain_complete(self) -> None:
             if self.state_machine.state != DriverState.DRAINING:
@@ -489,7 +489,7 @@ if RAY_AVAILABLE:
             if self.controller_handle is not None:
                 self.controller_handle.report_driver_drained.remote(self.spmd_id)
 
-        def _persist_worker_states(self) -> None:
+        async def _persist_worker_states(self) -> None:
             if (
                 self._pending_ckpt_dir is None
                 or self._pending_target_step_count is None
@@ -525,12 +525,6 @@ if RAY_AVAILABLE:
                 self._clear_drain_and_fail()
                 return
 
-            save_futures: dict[int, Any] = {
-                rank: worker.save_state_to_disk.remote(
-                    self._pending_ckpt_dir, self._pending_target_step_count
-                )
-                for rank, worker in self._worker_handles.items()
-            }
             if self.controller_handle is None:
                 logger.error(
                     f"controller_handle is None, cannot report snapshot metadata "
@@ -539,8 +533,45 @@ if RAY_AVAILABLE:
                 self._clear_drain_and_fail()
                 return
 
+            try:
+                if 0 in self._worker_handles:
+                    await self._worker_handles[0].trigger_snapshot_begin.remote(
+                        self._pending_ckpt_dir, self._pending_target_step_count
+                    )
+
+                ranks = list(self._worker_handles.keys())
+                results = await asyncio.gather(
+                    *(
+                        self._worker_handles[r].save_state_to_disk.remote(
+                            self._pending_ckpt_dir, self._pending_target_step_count
+                        )
+                        for r in ranks
+                    )
+                )
+
+                gathered_states: dict[str, dict[int, dict]] = defaultdict(dict)
+                for rank, (_, rank_storage) in zip(ranks, results, strict=True):
+                    for op_name, op_state in rank_storage.get(
+                        "operator_states", {}
+                    ).items():
+                        gathered_states[op_name][rank] = op_state
+
+                if 0 in self._worker_handles:
+                    await self._worker_handles[0].trigger_snapshot_commit.remote(
+                        self._pending_ckpt_dir,
+                        self._pending_target_step_count,
+                        dict(gathered_states),
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"Snapshot lifecycle error for spmd_id={self.spmd_id}: {e}"
+                )
+                self._clear_drain_and_fail()
+                return
+
             self.controller_handle.receive_snapshot_metadata.remote(
-                self.spmd_id, self._pending_snapshot_id, save_futures
+                self.spmd_id, self._pending_snapshot_id, dict(gathered_states)
             )
 
         def _clear_drain_and_fail(self) -> None:
