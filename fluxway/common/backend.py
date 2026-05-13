@@ -630,7 +630,7 @@ class JaxBackend(TensorBackend):
         # large integer IDs (e.g. hashed feature keys) which would overflow
         # int32. Falls back to a no-op if the experimental API is absent.
         try:
-            from jax.experimental import enable_x64 as _enable_x64
+            from jax import enable_x64 as _enable_x64
 
             self._x64_cm = _enable_x64
         except ImportError:
