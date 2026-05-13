@@ -623,29 +623,52 @@ class JaxBackend(TensorBackend):
         self._jax = jax
         self._np = np
 
+        # Prefer an x64 context manager so that an explicitly requested
+        # 64-bit dtype (e.g. ``jnp.int64``) is preserved rather than being
+        # silently downcast to 32-bit when the global ``jax_enable_x64``
+        # flag is False. This is critical for transport paths that carry
+        # large integer IDs (e.g. hashed feature keys) which would overflow
+        # int32. Falls back to a no-op if the experimental API is absent.
+        try:
+            from jax.experimental import enable_x64 as _enable_x64
+
+            self._x64_cm = _enable_x64
+        except ImportError:
+            self._x64_cm = contextlib.nullcontext
+
+    def _x64_scope(self):
+        """Return a context manager that enables JAX x64 mode locally."""
+        return self._x64_cm()
+
     def name(self) -> str:
         return "jax"
 
     def tensor(self, data: Any, dtype: Any = None) -> Any:
-        return self._jnp.array(data, dtype=dtype)
+        with self._x64_scope():
+            return self._jnp.array(data, dtype=dtype)
 
     def as_tensor(self, data: Any, dtype: Any = None) -> Any:
-        return self._jnp.asarray(data, dtype=dtype)
+        with self._x64_scope():
+            return self._jnp.asarray(data, dtype=dtype)
 
     def to_numpy(self, tensor: Any) -> Any:
         return self._np.array(tensor)
 
     def zeros(self, shape: Any, dtype: Any = None) -> Any:
-        return self._jnp.zeros(shape, dtype=dtype)
+        with self._x64_scope():
+            return self._jnp.zeros(shape, dtype=dtype)
 
     def ones(self, shape: Any, dtype: Any = None) -> Any:
-        return self._jnp.ones(shape, dtype=dtype)
+        with self._x64_scope():
+            return self._jnp.ones(shape, dtype=dtype)
 
     def full(self, shape: Any, fill_value: Any, dtype: Any = None) -> Any:
-        return self._jnp.full(shape, fill_value, dtype=dtype)
+        with self._x64_scope():
+            return self._jnp.full(shape, fill_value, dtype=dtype)
 
     def arange(self, start: int, end: int, step: int = 1, dtype: Any = None) -> Any:
-        return self._jnp.arange(start, end, step, dtype=dtype)
+        with self._x64_scope():
+            return self._jnp.arange(start, end, step, dtype=dtype)
 
     def cat(self, tensors: list[Any], dim: int = 0) -> Any:
         return self._jnp.concatenate(tensors, axis=dim)
