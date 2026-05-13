@@ -862,7 +862,16 @@ class OperatorManager:
 
         Extracts all parameter types (excluding self) from each operator function
         and caches them for use in _assemble_input.
+
+        For operators that accept **kwargs, the individual tensor parameter names
+        are not present in the function signature; they are declared via the
+        operator's ``input_sharding`` and recorded in
+        ``meta.input_param_map`` by ``_resolve_input_sharding``. We expand those
+        synthetic params here so ``_assemble_input`` can collect tuuids for
+        each one and forward them as kwargs at runtime.
         """
+        from typing import Any as _Any
+
         for op_name, operator in self._operators.items():
             if operator is None:
                 continue
@@ -872,8 +881,14 @@ class OperatorManager:
                 is_source = self.is_source_operator(op_name)
 
                 params_dict = {}
+                has_var_keyword = False
                 for p_name, param in sig.parameters.items():
                     if p_name in ("self", "cls"):
+                        continue
+                    if param.kind == _inspect.Parameter.VAR_KEYWORD:
+                        has_var_keyword = True
+                        continue
+                    if param.kind == _inspect.Parameter.VAR_POSITIONAL:
                         continue
                     param_type = param.annotation
                     if param_type == _inspect.Parameter.empty:
@@ -882,6 +897,19 @@ class OperatorManager:
                         )
                         continue
                     params_dict[p_name] = param_type
+
+                # Surface **kwargs-injected tensor params declared via
+                # input_sharding so _assemble_input doesn't see an empty
+                # input_types and silently drop everything.
+                if has_var_keyword:
+                    meta = self._get_operator_metadata(op_name)
+                    if meta is not None:
+                        for k in meta.input_param_map.keys():
+                            if k in params_dict:
+                                continue
+                            if k in self._static_args:
+                                continue
+                            params_dict[k] = _Any
 
                 if not params_dict:
                     if is_source:
