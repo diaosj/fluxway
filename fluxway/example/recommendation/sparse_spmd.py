@@ -39,7 +39,7 @@ class SparseEmbeddingSPMD:
 
         self.store = se.EmbeddingStore(
             embedding_config=se.EmbeddingConfig(
-                slot_dims={0: embed_dim},
+                dims=[embed_dim],
                 num_threads=self.num_threads,
                 dtype="float32",
             ),
@@ -111,7 +111,7 @@ class SparseEmbeddingSPMD:
         ids_jax = unique_ids.flat_values.ravel().astype(jnp.int64)
 
         # Lazy-insert new keys, return embeddings for all keys in this shard.
-        vals_dlm, _, _ = self.store.lookup_or_insert(ids_jax)
+        vals_dlm, _, _ = self.store.lookup_or_insert(ids_jax, dim=self.embed_dim)
         emb_jax = jax.dlpack.from_dlpack(vals_dlm).reshape(ids_jax.size, self.embed_dim)
 
         self._forward_keys_cache[step] = ids_jax
