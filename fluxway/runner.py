@@ -87,7 +87,6 @@ def launch(
 
     sandbox_env = {
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-        "CUDA_VISIBLE_DEVICES": "",
     }
     if runtime_env is not None and "env_vars" in runtime_env:
         sandbox_env.update(runtime_env["env_vars"])
