@@ -2,7 +2,7 @@
 FROM ghcr.io/nvidia/jax:maxtext-2026-04-29
 
 # Set environment variables for logging and system configuration
-ENV FLUXWAY_LOG_LEVEL=DEBUG \
+ENV FLUXWAY_LOG_LEVEL=WARNING \
     FLUXWAY_LOG_FORCE=TRUE \
     PYTHONUNBUFFERED=1 \
     DEBIAN_FRONTEND=noninteractive
