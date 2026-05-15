@@ -2208,6 +2208,26 @@ class SPMDWorker:
                                 receipt=source_ref.receipt,
                             )
 
+                if target_spec is not None and target_spec.is_content_addressable:
+                    if (
+                        leaf_tensor.routing_indices is None
+                        and leaf_tensor.receipt is None
+                    ):
+                        tuuid_to_name = self._op_manager.get_output_tuuid_to_name(
+                            op_name
+                        )
+                        output_name = (
+                            tuuid_to_name.get(tuuid, f"TUUID:{tuuid}")
+                            if tuuid_to_name
+                            else f"TUUID:{tuuid}"
+                        )
+                        raise ValueError(
+                            f"[Fluxway Routing Error] Operator '{op_name}' output '{output_name}' "
+                            f"is destined for a dynamic routing edge, but its TransportTensor "
+                            f"lacks routing metadata (routing_indices or receipt). This violates strict routing rules. "
+                            f"If you returned a TransportTensor manually, ensure you provide explicit routing metadata."
+                        )
+
                 routing_id = (
                     id(leaf_tensor.routing_indices)
                     if leaf_tensor.routing_indices is not None

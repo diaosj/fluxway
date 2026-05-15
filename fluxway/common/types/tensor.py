@@ -126,6 +126,23 @@ class TransportTensor:
         self._nested_splits = nested_splits if nested_splits is not None else []
         self._global_shape = global_shape
 
+        if self._global_shape is not None and not self._nested_splits:
+            backend = get_backend()
+            try:
+                actual_shape = backend.shape(self._flat_values)
+                if len(actual_shape) != len(self._global_shape):
+                    raise ValueError(
+                        f"[Fluxway Validation Error] Dimensionality mismatch! "
+                        f"Actual flat_values has {len(actual_shape)} dimensions (shape: {actual_shape}), "
+                        f"but declared global_shape {self._global_shape} implies {len(self._global_shape)} dimensions. "
+                        f"Ensure you are not passing flattened data for a multi-dimensional global shape."
+                    )
+            except Exception as e:
+                if isinstance(e, ValueError) and "[Fluxway Validation Error]" in str(e):
+                    raise
+                # Fallback if shape cannot be resolved safely
+                pass
+
         self._origin_indices: IndexDescriptor | None
         if origin_indices is not None:
             if isinstance(origin_indices, IndexDescriptor):
@@ -181,6 +198,51 @@ class TransportTensor:
                 self._routing_indices = ExplicitIndex(routing_indices)
         else:
             self._routing_indices = None
+
+        if self._routing_indices is not None:
+            backend = get_backend()
+            if not self._nested_splits:
+                if isinstance(self._flat_values, list):
+                    data_len = len(self._flat_values)
+                else:
+                    try:
+                        data_len = int(backend.shape(self._flat_values)[0])
+                    except Exception:
+                        data_len = -1  # scalar or unknown
+            else:
+                if isinstance(self._nested_splits[0], list):
+                    data_len = len(self._nested_splits[0]) - 1
+                else:
+                    try:
+                        data_len = int(backend.shape(self._nested_splits[0])[0]) - 1
+                    except Exception:
+                        data_len = -1
+
+            idx_len = None
+            if isinstance(self._routing_indices, ContinuousIndex):
+                idx_len = self._routing_indices.count
+            elif isinstance(self._routing_indices, ExplicitIndex):
+                if isinstance(self._routing_indices.indices, list):
+                    idx_len = len(self._routing_indices.indices)
+                else:
+                    try:
+                        idx_len = int(backend.shape(self._routing_indices.indices)[0])
+                    except Exception:
+                        idx_len = -1
+
+            if (
+                data_len != -1
+                and idx_len is not None
+                and idx_len != -1
+                and data_len != idx_len
+            ):
+                raise ValueError(
+                    f"[Fluxway Validation Error] Data batch dimension mismatch! "
+                    f"routing_indices length is {idx_len}, but data batch_size is {data_len} "
+                    f"(shape: {backend.shape(self._flat_values)}). "
+                    f"Ensure you did not flatten a multi-dimensional array (e.g. using .ravel()), "
+                    f"which breaks row-wise alignment for routing."
+                )
 
     @classmethod
     def from_tensor(
