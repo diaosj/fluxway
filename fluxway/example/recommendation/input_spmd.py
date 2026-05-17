@@ -20,33 +20,40 @@ def hash_routing(tensor, mesh):
 async def _sparse_unique(
     tt: TransportTensor,
 ) -> tuple[TransportTensor, TransportTensor]:
-    """Uses sparse_embedding.async_unique (C++ high-perf) to deduplicate ids.
+    """Deduplicate ids via sparse_embedding.async_unique (C++ high-perf).
 
-    Returns (unique_tt, inverse_tt) with the same semantic as
-    TransportTensor.unique_with_routing() but backed by the C++ unique kernel.
+    Returns (unique_tt, inverse_tt) where:
+    - unique_tt carries deduplicated keys with global scatter positions
+    - inverse_tt maps each original element to its scatter position in the
+      Dense static assembly buffer
     """
     ids_jax = tt.flat_values
+    total_elements = tt.global_shape[0]
+
     unique_dlm, inv_dlm, first_index_dlm = await se.async_unique(
         ids_jax.ravel(), return_inverse=True, return_first_indices=True
     )
 
-    # Zero-copy DLPack transfer directly to JAX
     unique_jax = jax.dlpack.from_dlpack(unique_dlm).astype(jnp.int64)
-    inv_jax = jax.dlpack.from_dlpack(inv_dlm).astype(jnp.int32)
     first_jax = jax.dlpack.from_dlpack(first_index_dlm).astype(jnp.int32)
 
     if tt.origin_indices is not None:
-        global_first_jax = jnp.take(tt.origin_indices_materialized, first_jax)
+        global_positions = jnp.take(tt.origin_indices_materialized, first_jax)
     else:
-        global_first_jax = first_jax
+        global_positions = first_jax
+
+    inv_1d = jax.dlpack.from_dlpack(inv_dlm).astype(jnp.int32).reshape(-1)
+    adjusted_inv = global_positions[inv_1d]
 
     unique_tt = TransportTensor(
         flat_values=unique_jax,
-        routing_indices=ExplicitIndex(unique_jax),
-        origin_indices=ExplicitIndex(global_first_jax),
+        origin_indices=ExplicitIndex(global_positions),
+        global_shape=(total_elements,),
+    )
+    inv_tt = TransportTensor(
+        flat_values=adjusted_inv.reshape(ids_jax.shape),
         global_shape=tt.global_shape,
     )
-    inv_tt = TransportTensor(flat_values=inv_jax, global_shape=tt.global_shape)
     return unique_tt, inv_tt
 
 

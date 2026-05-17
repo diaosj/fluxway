@@ -1782,8 +1782,45 @@ class SPMDWorker:
             self.rank, routing_dim, data_shape=global_shape
         )
 
+        routing_extent = global_shape[routing_dim] if routing_dim < len(global_shape) else None
+        num_shards = input_layout.shard_size(routing_dim)
+        if routing_extent is not None and num_shards > 1 and routing_extent % num_shards != 0:
+            raise ValueError(
+                f"[Fluxway Assembly Error] global_shape[{routing_dim}]={routing_extent} "
+                f"is not divisible by shard_count={num_shards} "
+                f"in op '{op_name}' (TUUID {tuuid}). "
+                f"This causes partition boundary misalignment between producers and consumers. "
+                f"Ensure the upstream batch_size is divisible by the DP world_size."
+            )
+
         mask = (all_indices >= slice_start) & (all_indices < slice_end)
         local_indices = all_indices[mask] - slice_start
+
+        logical_len_early = int(backend.sum(mask))
+        buffer_capacity = local_shape[routing_dim]
+        if logical_len_early > buffer_capacity:
+            raise ValueError(
+                f"[Fluxway Assembly Error] Dynamic-to-static buffer overflow in op '{op_name}' "
+                f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
+                f"Received {logical_len_early} data elements but buffer capacity is {buffer_capacity} "
+                f"(global_shape={global_shape}, local_shape={local_shape}). "
+                f"The producer's global_shape is too small for the actual data volume. "
+                f"This typically means the upstream unique/sparse operation produced more elements "
+                f"than global_shape[0] accounts for (e.g. multi-column features after ravel+unique)."
+            )
+
+        if logical_len_early > 0:
+            unique_local = backend.unique(local_indices)
+            n_unique_slots = int(backend.shape(unique_local)[0])
+            if n_unique_slots < logical_len_early:
+                logger.warning(
+                    f"[Fluxway Assembly Warning] origin_indices collision detected in op '{op_name}' "
+                    f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
+                    f"{logical_len_early} data elements map to only {n_unique_slots} unique buffer positions. "
+                    f"{logical_len_early - n_unique_slots} elements will be silently overwritten by index_update. "
+                    f"This usually indicates the producer uses row-level origin_indices for multi-column features, "
+                    f"causing multiple unique keys from the same row to collide."
+                )
 
         if routing_dim == 0:
             local_values = all_values[mask]
@@ -2070,28 +2107,6 @@ class SPMDWorker:
         if exec_step not in self._step_tuuid_cache:
             self._step_tuuid_cache[exec_step] = {}
 
-        # TODO(He Jia): Cache function output tensor for some reason, for now disable it
-        # for i, result_leaf in enumerate(flat_results):
-        #     if i < len(output_uuids):
-        #         tuuid = output_uuids[i]
-        #         step_cache = self._step_tuuid_cache[exec_step]
-        #         if tuuid not in step_cache:
-        #             if not isinstance(result_leaf, TransportTensor):
-        #                 cached_tensor = TransportTensor.from_tensor(result_leaf)
-        #             else:
-        #                 cached_tensor = result_leaf
-        #             # --- Automatic Receipt Inheritance for Mirror Backflow ---
-        #             output_sharding = self._op_manager.get_output_sharding(op_name)
-        #             spec = output_sharding.get(tuuid)
-        #             if spec and spec.is_referential:
-        #                 source_tuuid = getattr(spec.routing, "tuuid", None)
-        #                 if source_tuuid is not None:
-        #                     source_tensor = step_cache.get(source_tuuid)
-        #                     if source_tensor and source_tensor.receipt:
-        #                         # Inherit forward receipt for backward backflow
-        #                         cached_tensor.receipt = source_tensor.receipt
-        #             step_cache[tuuid] = cached_tensor
-
         successor_ids = sorted(set(self._op_manager.get_successor_ids(op_name)))
 
         # Extract state arguments
@@ -2212,6 +2227,7 @@ class SPMDWorker:
                     if (
                         leaf_tensor.routing_indices is None
                         and leaf_tensor.receipt is None
+                        and leaf_tensor.flat_values is None
                     ):
                         tuuid_to_name = self._op_manager.get_output_tuuid_to_name(
                             op_name
@@ -2224,7 +2240,7 @@ class SPMDWorker:
                         raise ValueError(
                             f"[Fluxway Routing Error] Operator '{op_name}' output '{output_name}' "
                             f"is destined for a dynamic routing edge, but its TransportTensor "
-                            f"lacks routing metadata (routing_indices or receipt). This violates strict routing rules. "
+                            f"lacks routing metadata (routing_indices, receipt, or flat_values). "
                             f"If you returned a TransportTensor manually, ensure you provide explicit routing metadata."
                         )
 

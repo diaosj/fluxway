@@ -273,6 +273,9 @@ if RAY_AVAILABLE:
             # Gather IP of rank 0 to act as rendezvous address
             if 0 in self._worker_handles:
                 rank0_ip = await self._worker_handles[0].get_node_ip.remote()
+                if rank_info[0]["num_nodes"] == 1:
+                    rank0_ip = "127.0.0.1"
+
                 max_retries = 5
                 for attempt in range(max_retries):
                     rank0_port = await self._worker_handles[0].find_free_port.remote()

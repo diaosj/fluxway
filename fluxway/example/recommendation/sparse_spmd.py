@@ -2,6 +2,7 @@ import os
 import jax
 import jax.dlpack
 import jax.numpy as jnp
+from jax import enable_x64 as _enable_x64
 
 import sparse_embedding as se
 import sparse_embedding.checkpoint
@@ -108,7 +109,8 @@ class SparseEmbeddingSPMD:
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
         step = self.ctx.step
-        ids_jax = unique_ids.flat_values.ravel().astype(jnp.int64)
+        with _enable_x64():
+            ids_jax = unique_ids.flat_values.ravel().astype(jnp.int64)
 
         # Lazy-insert new keys, return embeddings for all keys in this shard.
         vals_dlm, _, _ = self.store.lookup_or_insert(ids_jax, dim=self.embed_dim)
