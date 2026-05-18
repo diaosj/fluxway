@@ -81,9 +81,9 @@ class DeviceMesh:
 
         self._axis_names = tuple(axis_names)
         self.axis_map = dict(
-            zip(self.axis_names, range(len(self.axis_names)), strict=False)
+            zip(self.axis_names, range(len(self.axis_names)), strict=True)
         )
-        self.size_map = dict(zip(self.axis_names, self.shape, strict=False))
+        self.size_map = dict(zip(self.axis_names, self.shape, strict=True))
 
         # Inverse map: rank -> coordinates (cached)
         self._inverse_map = {}
@@ -136,7 +136,7 @@ class DeviceMesh:
 
         # If we are in JAX, we must ensure device_ids is a JAX array to support tracer indexing.
         # jnp.asarray(numpy_array)[tracer] works correctly.
-        if backend.name() == "jax":
+        if backend.is_jax:
             return backend.as_tensor(self.device_ids)[coords]
 
         return self.device_ids[coords]
@@ -198,9 +198,9 @@ try:
 
         # Restore derived maps (static)
         obj.axis_map = dict(
-            zip(obj.axis_names, range(len(obj.axis_names)), strict=False)
+            zip(obj.axis_names, range(len(obj.axis_names)), strict=True)
         )
-        obj.size_map = dict(zip(obj.axis_names, obj.shape, strict=False))
+        obj.size_map = dict(zip(obj.axis_names, obj.shape, strict=True))
 
         # _inverse_map relies on iterating device_ids.
         # If device_ids is a Tracer, we CANNOT iterate it.

@@ -237,5 +237,6 @@ Thumbs.db
 .agent/
 .agents/
 .cursor/
+.qoder/
 
 tmp/

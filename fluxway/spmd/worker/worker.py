@@ -1782,9 +1782,15 @@ class SPMDWorker:
             self.rank, routing_dim, data_shape=global_shape
         )
 
-        routing_extent = global_shape[routing_dim] if routing_dim < len(global_shape) else None
+        routing_extent = (
+            global_shape[routing_dim] if routing_dim < len(global_shape) else None
+        )
         num_shards = input_layout.shard_size(routing_dim)
-        if routing_extent is not None and num_shards > 1 and routing_extent % num_shards != 0:
+        if (
+            routing_extent is not None
+            and num_shards > 1
+            and routing_extent % num_shards != 0
+        ):
             raise ValueError(
                 f"[Fluxway Assembly Error] global_shape[{routing_dim}]={routing_extent} "
                 f"is not divisible by shard_count={num_shards} "

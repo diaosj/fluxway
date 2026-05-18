@@ -882,7 +882,7 @@ class PhysicalLayout(FluxwayBaseSchema):
         mask = target_ranks == effective_rank
 
         # Static shape required for JIT only if provided.
-        is_jax = backend.name() == "jax"
+        is_jax = backend.is_jax
 
         if is_jax:
             nz = backend.nonzero(mask, size=dim_size, fill_value=-1)

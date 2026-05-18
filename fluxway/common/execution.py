@@ -28,9 +28,8 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         backend = get_backend()
-        backend_name = backend.name()
 
-        if backend_name == "jax":
+        if backend.is_jax:
             import jax
 
             # Safe Strategy: Always use callback mechanism.
@@ -57,7 +56,7 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
                 # Use pure_callback for return values
                 return jax.pure_callback(_host_runner, result_shape, (args, kwargs))
 
-        elif backend_name == "torch":
+        elif backend.is_torch:
             import torch
 
             # Optimization: Only use disable if we are actually compiling.
@@ -88,9 +87,8 @@ def compile(func: Callable | None = None, **kwargs):
         return functools.partial(compile, **kwargs)
 
     backend = get_backend()
-    backend_name = backend.name()
 
-    if backend_name == "jax":
+    if backend.is_jax:
         import jax
 
         # Identify JIT-specific args.
@@ -98,7 +96,7 @@ def compile(func: Callable | None = None, **kwargs):
         # We pass everything in kwargs to jax.jit
         return jax.jit(func, **kwargs)
 
-    elif backend_name == "torch":
+    elif backend.is_torch:
         import torch
 
         # JAX call sites may pass options like static_argnums; torch.compile does

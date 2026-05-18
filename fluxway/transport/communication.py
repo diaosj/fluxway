@@ -836,7 +836,9 @@ class TransportReceiver:
 
         # Actual written row counts: {source_rank: [count_per_payload_index]}
         self._written_counts: dict = {}
-        self.backend_name = get_backend().name()
+        _backend = get_backend()
+        self._is_torch = _backend.is_torch
+        self._is_jax = _backend.is_jax
 
     # ------------------------------------------------------------------
     # Zero-copy registration
@@ -901,9 +903,9 @@ class TransportReceiver:
                         raise RuntimeError(
                             f"Missing shard count for bundle element {i} from rank {source_rank}"
                         )
-                    if self.backend_name == "torch":
+                    if self._is_torch:
                         sender_bufs[i][:count] = tensor[:count]
-                    elif self.backend_name == "jax" and get_backend().is_tensor(tensor):
+                    elif self._is_jax and get_backend().is_tensor(tensor):
                         sender_bufs[i] = _jit_write_at_zero(
                             tensor, sender_bufs[i], count
                         )
@@ -936,9 +938,9 @@ class TransportReceiver:
                     except (TypeError, AttributeError):
                         pass  # opaque buffer, skip check
 
-                    if self.backend_name == "torch":
+                    if self._is_torch:
                         self.target_buffers[i][offset : offset + count] = tensor[:count]
-                    elif self.backend_name == "jax" and get_backend().is_tensor(tensor):
+                    elif self._is_jax and get_backend().is_tensor(tensor):
                         self.target_buffers[i] = _jit_write_at_offset(
                             tensor, self.target_buffers[i], count, offset
                         )

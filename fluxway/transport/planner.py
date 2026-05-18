@@ -270,7 +270,7 @@ class TransportPlanner:
             if not isinstance(unraveled, tuple):
                 unraveled = (unraveled,)
 
-            for ax_idx, coord_tensor in zip(axis_indices, unraveled, strict=False):  # type: ignore
+            for ax_idx, coord_tensor in zip(axis_indices, unraveled, strict=True):  # type: ignore
                 # When a tensor has multiple dimensions (ndim > 1) and we partition different dimensions onto different mesh axes,
                 # we need to combine these 1D coordinate transformations into a single N-D mesh coordinate system.
                 # JAX Array Broadcasting achieves this: if we reshape the coord_tensor for dimension `d` to have size `N` along
@@ -333,7 +333,7 @@ class TransportPlanner:
                 )
                 if not isinstance(rep_unraveled, tuple):
                     rep_unraveled = (rep_unraveled,)
-                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled, strict=False):  # type: ignore
+                for ax_id, r_coord in zip(rep_axis_idx, rep_unraveled, strict=True):  # type: ignore
                     expanded_coords[ax_id] = backend.reshape(r_coord, (1, num_replicas))
 
             dest_devices = mesh.coordinate_to_device(tuple(expanded_coords))

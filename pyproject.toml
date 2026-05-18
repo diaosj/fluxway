@@ -35,6 +35,8 @@ dependencies = [
     "uvloop",
     "numpy>=1.20.0",
     "ray>=2.0.0",
+    "numba>=0.60.0",
+    "cupy>=13.0.0",
 ]
 
 [project.optional-dependencies]

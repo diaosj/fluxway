@@ -229,7 +229,7 @@ def test_input_op_dedup_and_inv():
             ),
             item_stats=TransportTensor(
                 jnp.array([[0.1, 0.2], [0.3, 0.4]], dtype=jnp.float32),
-                global_shape=(2,),
+                global_shape=(2, 2),
             ),
         ),
         label=TransportTensor(jnp.array([1, 0], dtype=jnp.int32), global_shape=(2,)),
@@ -255,7 +255,7 @@ def test_input_op_dedup_repeated_ids():
                 jnp.array([3, 5, 3], dtype=jnp.int32), global_shape=(3,)
             ),
             item_stats=TransportTensor(
-                jnp.array([[0.0, 0.0]] * 3, dtype=jnp.float32), global_shape=(3,)
+                jnp.array([[0.0, 0.0]] * 3, dtype=jnp.float32), global_shape=(3, 2)
             ),
         ),
         label=TransportTensor(jnp.array([0, 0, 1], dtype=jnp.int32), global_shape=(3,)),
@@ -346,10 +346,10 @@ def test_dense_op_step_grad_shape():
     batch = 4
 
     emb1 = TransportTensor(
-        jnp.ones((n_unique_users, embed_dim)), global_shape=(n_unique_users,)
+        jnp.ones((n_unique_users, embed_dim)), global_shape=(n_unique_users, embed_dim)
     )
     emb2 = TransportTensor(
-        jnp.ones((n_unique_items, embed_dim)), global_shape=(n_unique_items,)
+        jnp.ones((n_unique_items, embed_dim)), global_shape=(n_unique_items, embed_dim)
     )
     inv1 = TransportTensor(
         jnp.array([0, 1, 0, 1], dtype=jnp.int32), global_shape=(batch,)
@@ -357,7 +357,9 @@ def test_dense_op_step_grad_shape():
     inv2 = TransportTensor(
         jnp.array([0, 1, 2, 0], dtype=jnp.int32), global_shape=(batch,)
     )
-    stats = TransportTensor(jnp.zeros((batch, stats_dim)), global_shape=(batch,))
+    stats = TransportTensor(
+        jnp.zeros((batch, stats_dim)), global_shape=(batch, stats_dim)
+    )
 
     with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=_ctx(0)):
         result = DenseOp.step(emb1=emb1, inv1=inv1, emb2=emb2, inv2=inv2, stats=stats)
@@ -373,11 +375,11 @@ def test_dense_op_step_scatter_add_correctness():
 
     # user 0 appears in sample 0 and 2 → grad accumulates twice
     # user 1 appears in sample 1 and 3 → grad accumulates twice
-    emb1 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2,))
-    emb2 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2,))
+    emb1 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2, embed_dim))
+    emb2 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2, embed_dim))
     inv1 = TransportTensor(jnp.array([0, 1, 0, 1], dtype=jnp.int32), global_shape=(4,))
     inv2 = TransportTensor(jnp.array([0, 0, 1, 1], dtype=jnp.int32), global_shape=(4,))
-    stats = TransportTensor(jnp.zeros((4, stats_dim)), global_shape=(4,))
+    stats = TransportTensor(jnp.zeros((4, stats_dim)), global_shape=(4, stats_dim))
 
     with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=_ctx(0)):
         result = DenseOp.step(emb1=emb1, inv1=inv1, emb2=emb2, inv2=inv2, stats=stats)

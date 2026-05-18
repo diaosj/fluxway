@@ -33,6 +33,19 @@ class TensorBackend(ABC):
     def name(self) -> str:
         pass
 
+    # ------------------------------------------------------------------
+    # Capability flags (used to avoid string-based backend dispatch)
+    # ------------------------------------------------------------------
+    @property
+    def is_jax(self) -> bool:
+        """True if this backend uses JAX tracing semantics (JIT, static shapes)."""
+        return False
+
+    @property
+    def is_torch(self) -> bool:
+        """True if this backend uses PyTorch (eager / torch.compile)."""
+        return False
+
     @abstractmethod
     def tensor(self, data: Any, dtype: Any = None) -> Any:
         pass
@@ -313,6 +326,10 @@ class TorchBackend(TensorBackend):
 
     def name(self) -> str:
         return "torch"
+
+    @property
+    def is_torch(self) -> bool:
+        return True
 
     def tensor(self, data: Any, dtype: Any = None) -> Any:
         return self._torch.tensor(data, dtype=dtype)
@@ -642,6 +659,10 @@ class JaxBackend(TensorBackend):
 
     def name(self) -> str:
         return "jax"
+
+    @property
+    def is_jax(self) -> bool:
+        return True
 
     def tensor(self, data: Any, dtype: Any = None) -> Any:
         with self._x64_scope():
@@ -1069,19 +1090,557 @@ try:
 except ImportError:
     pass
 
+
+# --- Numba JIT helpers (CPU acceleration) ---
+_NUMBA_AVAILABLE = False
+
+try:
+    import numba as _numba
+
+    _NUMBA_AVAILABLE = True
+
+    @_numba.jit(nopython=True, cache=True)
+    def _numba_bincount_loop(x, out):
+        """Increment out[x[i]] for each element. Caller must zero *out* first."""
+        for i in range(x.shape[0]):
+            idx = x[i]
+            if 0 <= idx < out.shape[0]:
+                out[idx] += 1
+
+    @_numba.jit(nopython=True, cache=True)
+    def _numba_bincount_weighted_loop(x, weights, out):
+        """Like _numba_bincount_loop but adds weights[i] instead of 1."""
+        for i in range(x.shape[0]):
+            idx = x[i]
+            if 0 <= idx < out.shape[0]:
+                out[idx] += weights[i]
+
+    @_numba.jit(nopython=True, cache=True)
+    def _numba_cumsum_loop(x, out):
+        """1-D prefix sum. Caller allocates *out*."""
+        if x.shape[0] == 0:
+            return
+        out[0] = x[0]
+        for i in range(1, x.shape[0]):
+            out[i] = out[i - 1] + x[i]
+
+    @_numba.jit(nopython=True, cache=True)
+    def _numba_take_loop(data, indices, out):
+        """1-D gather: out[i] = data[indices[i]]."""
+        for i in range(indices.shape[0]):
+            out[i] = data[indices[i]]
+
+except ImportError:
+    pass
+
+
+class HybridBackend(TensorBackend):
+    """Hybrid backend -- CPU: NumPy + optional Numba JIT | GPU: CuPy native.
+
+    Combines the best of both worlds:
+    - CPU mode uses NumPy arrays with optional Numba JIT acceleration
+      for hot-loop operations (bincount, cumsum, take).
+    - GPU mode uses CuPy arrays with native GPU kernels, zero roundtrip.
+    """
+
+    def __init__(self, device: str = "auto", enable_numba_jit: bool = True):
+        import numpy as np
+
+        self._np = np
+        self._cp = None
+        self._use_jit = enable_numba_jit and _NUMBA_AVAILABLE
+
+        if device == "auto":
+            try:
+                import cupy as cp
+
+                cp.cuda.runtime.getDeviceCount()  # verify CUDA available
+                self._cp = cp
+                self._device = "gpu"
+            except Exception:
+                self._device = "cpu"
+        elif device in ("gpu", "cuda"):
+            import cupy as cp
+
+            self._cp = cp
+            self._device = "gpu"
+        else:
+            self._device = "cpu"
+
+    def _is_gpu(self) -> bool:
+        return self._device == "gpu"
+
+    def _is_cpu(self) -> bool:
+        return self._device == "cpu"
+
+    # ------------------------------------------------------------------
+    # Identity
+    # ------------------------------------------------------------------
+    def name(self) -> str:
+        return "hybrid_gpu" if self._is_gpu() else "hybrid_cpu"
+
+    # ------------------------------------------------------------------
+    # Creation / conversion
+    # ------------------------------------------------------------------
+    def tensor(self, data: Any, dtype: Any = None) -> Any:
+        if self._is_gpu():
+            return self._cp.array(data, dtype=dtype)
+        return self._np.asarray(data, dtype=dtype)
+
+    def as_tensor(self, data: Any, dtype: Any = None) -> Any:
+        if self._is_gpu():
+            return self._cp.asarray(data, dtype=dtype)
+        return self._np.asarray(data, dtype=dtype)
+
+    def to_numpy(self, tensor: Any) -> Any:
+        if self._is_gpu():
+            return self._cp.asnumpy(tensor)
+        return self._np.asarray(tensor)
+
+    # ------------------------------------------------------------------
+    # Factory helpers
+    # ------------------------------------------------------------------
+    def zeros(self, shape: Any, dtype: Any = None) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.zeros(shape, dtype=dtype)
+
+    def ones(self, shape: Any, dtype: Any = None) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.ones(shape, dtype=dtype)
+
+    def full(self, shape: Any, fill_value: Any, dtype: Any = None) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.full(shape, fill_value, dtype=dtype)
+
+    def arange(self, start: int, end: int, step: int = 1, dtype: Any = None) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.arange(start, end, step, dtype=dtype)
+
+    # ------------------------------------------------------------------
+    # Shape / dtype / metadata
+    # ------------------------------------------------------------------
+    def is_tensor(self, obj: Any) -> bool:
+        if self._is_gpu():
+            return isinstance(obj, self._cp.ndarray)
+        return isinstance(obj, self._np.ndarray)
+
+    def is_scalar(self, obj: Any) -> bool:
+        if self._is_gpu():
+            return isinstance(obj, self._cp.ndarray) and obj.ndim == 0
+        return isinstance(obj, self._np.ndarray) and obj.ndim == 0
+
+    def dtype(self, tensor: Any) -> Any:
+        return tensor.dtype
+
+    def shape(self, tensor: Any) -> Any:
+        return tensor.shape
+
+    def size(self, tensor: Any) -> int:
+        return tensor.size
+
+    def cast(self, tensor: Any, dtype: Any) -> Any:
+        return tensor.astype(dtype)
+
+    def item(self, tensor: Any) -> Any:
+        return tensor.item()
+
+    def reshape(self, tensor: Any, shape: tuple[int, ...]) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.reshape(tensor, shape)
+
+    def unravel_index(self, indices: Any, shape: tuple[int, ...]) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.unravel_index(indices, shape)
+
+    def float32(self) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.float32
+
+    def int32(self) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.int32
+
+    def equal(self, x: Any, y: Any) -> bool:
+        lib = self._cp if self._is_gpu() else self._np
+        return bool(lib.array_equal(x, y))
+
+    # ------------------------------------------------------------------
+    # Concat / stack
+    # ------------------------------------------------------------------
+    def cat(self, tensors: list[Any], dim: int = 0) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.concatenate(tensors, axis=dim)
+
+    def stack(self, tensors: list[Any], dim: int = 0) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.stack(tensors, axis=dim)
+
+    # ------------------------------------------------------------------
+    # Arithmetic / element-wise
+    # ------------------------------------------------------------------
+    def floor_divide(self, x: Any, y: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.floor_divide(x, y)
+
+    def mod(self, x: Any, y: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.mod(x, y)
+
+    def where(self, condition: Any, x: Any, y: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.where(condition, x, y)
+
+    # ------------------------------------------------------------------
+    # Reduction
+    # ------------------------------------------------------------------
+    def sum(self, x: Any, dim: Any = None) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.sum(x, axis=dim)
+
+    def mean(self, x: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.mean(x)
+
+    def max(self, x: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.max(x)
+
+    def min(self, x: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.min(x)
+
+    def cumsum(self, x: Any, dim: int = 0) -> Any:
+        if self._is_gpu():
+            return self._cp.cumsum(x, axis=dim)
+        # CPU: optional Numba JIT for 1-D
+        if self._use_jit and x.ndim == 1:
+            out = self._np.empty_like(x)
+            _numba_cumsum_loop(x, out)
+            return out
+        return self._np.cumsum(x, axis=dim)
+
+    # ------------------------------------------------------------------
+    # Sorting / indexing
+    # ------------------------------------------------------------------
+    def argsort(
+        self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
+    ) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        kind = "stable" if stable else None
+        return lib.argsort(-x if descending else x, axis=dim, kind=kind)
+
+    def sort(
+        self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
+    ) -> tuple[Any, Any]:
+        lib = self._cp if self._is_gpu() else self._np
+        idx = self.argsort(x, dim, descending, stable=stable)
+        val = lib.take_along_axis(x, idx, axis=dim)
+        return val, idx
+
+    def gather(self, x: Any, dim: int, index: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        if x.shape[dim] == 0:
+            return lib.zeros(index.shape, dtype=x.dtype)
+        return lib.take_along_axis(x, index, axis=dim)
+
+    def take(self, x: Any, indices: Any) -> Any:
+        if self._is_gpu():
+            if x.shape[0] == 0:
+                indices_shape = getattr(indices, "shape", ())
+                return self._cp.zeros(indices_shape + x.shape[1:], dtype=x.dtype)
+            return x[indices]
+        # CPU path
+        if x.shape[0] == 0:
+            indices_shape = getattr(indices, "shape", ())
+            return self._np.zeros(indices_shape + x.shape[1:], dtype=x.dtype)
+        if self._use_jit and x.ndim == 1 and indices.ndim == 1:
+            flat_x = x.ravel()
+            flat_idx = indices.ravel()
+            out = self._np.empty(flat_idx.shape, dtype=flat_x.dtype)
+            _numba_take_loop(flat_x, flat_idx, out)
+            return out.reshape(indices.shape)
+        return self._np.take(x, indices, axis=0)
+
+    def select(self, x: Any, dim: int, index: int) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        if x.shape[dim] == 0:
+            new_shape = x.shape[:dim] + x.shape[dim + 1 :]
+            return lib.zeros(new_shape, dtype=x.dtype)
+        return lib.take(x, index, axis=dim)
+
+    def diff(self, x: Any, dim: int = -1) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.diff(x, axis=dim)
+
+    def bincount(self, x: Any, weights: Any | None = None, minlength: int = 0) -> Any:
+        if self._is_gpu():
+            return self._cp.bincount(x, weights=weights, minlength=minlength)
+        # CPU: optional Numba JIT
+        if self._use_jit:
+            host_x = self._np.asarray(x, dtype=self._np.intp)
+            n_out = max(int(host_x.max()) + 1 if host_x.size > 0 else 0, minlength)
+            if weights is not None:
+                w_arr = self._np.asarray(weights)
+                out = self._np.zeros(n_out, dtype=w_arr.dtype)
+                _numba_bincount_weighted_loop(host_x, w_arr, out)
+            else:
+                out = self._np.zeros(n_out, dtype=self._np.int64)
+                _numba_bincount_loop(host_x, out)
+            return out
+        return self._np.bincount(x, weights=weights, minlength=minlength)
+
+    def repeat_interleave(
+        self,
+        x: Any,
+        repeats: Any,
+        dim: int | None = None,
+        total_repeat_length: int | None = None,
+    ) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        result = lib.repeat(x, repeats, axis=dim)
+        if total_repeat_length is not None:
+            repeat_dim = dim if dim is not None else 0
+            actual_len = result.shape[repeat_dim]
+            if actual_len < total_repeat_length:
+                pad_shape = list(result.shape)
+                pad_shape[repeat_dim] = total_repeat_length - actual_len
+                padding = lib.zeros(pad_shape, dtype=result.dtype)
+                result = lib.concatenate([result, padding], axis=repeat_dim)
+            elif actual_len > total_repeat_length:
+                slices = [slice(None)] * result.ndim
+                slices[repeat_dim] = slice(0, total_repeat_length)
+                result = result[tuple(slices)]
+        return result
+
+    def nonzero(self, x: Any, *, size: Any = None, fill_value: Any = None) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        result = lib.nonzero(x)
+        if size is not None:
+            padded = []
+            for arr in result:
+                if arr.size < size:
+                    pad_len = size - arr.size
+                    pad_val = fill_value if fill_value is not None else 0
+                    pad = lib.full(pad_len, pad_val, dtype=arr.dtype)
+                    padded.append(lib.concatenate([arr, pad]))
+                else:
+                    padded.append(arr[:size])
+            result = tuple(padded)
+        return result
+
+    # ------------------------------------------------------------------
+    # Dynamic slicing
+    # ------------------------------------------------------------------
+    def dynamic_slice(self, x: Any, start: Any, size: Any) -> Any:
+        slices = []
+        for s, l in zip(start, size, strict=True):
+            if self.is_scalar(s):
+                s = int(s)
+            if self.is_scalar(l):
+                l = int(l)
+            slices.append(slice(int(s), int(s) + int(l)))
+        return x[tuple(slices)]
+
+    def dynamic_slice_in_dim(self, x: Any, start: Any, size: int, axis: int = 0) -> Any:
+        if self.is_scalar(start):
+            start = int(start)
+        slices = [slice(None)] * x.ndim
+        slices[axis] = slice(int(start), int(start) + size)
+        return x[tuple(slices)]
+
+    def dynamic_slice_update(self, x: Any, update: Any, start: Any) -> Any:
+        if isinstance(start, int):
+            x[start : start + update.shape[0]] = update
+        elif isinstance(start, list | tuple):
+            sl = [slice(s, s + update.shape[i]) for i, s in enumerate(start)]
+            x[tuple(sl)] = update
+        elif self.is_scalar(start):
+            s = int(start)
+            x[s : s + update.shape[0]] = update
+        else:
+            raise NotImplementedError(f"Unsupported start type: {type(start)}")
+        return x
+
+    # ------------------------------------------------------------------
+    # Unique
+    # ------------------------------------------------------------------
+    def unique_consecutive(
+        self, x: Any, return_inverse: bool = False, return_counts: bool = False
+    ) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        mask = lib.concatenate([lib.array([True]), x[1:] != x[:-1]])
+        uniques = x[mask]
+        if return_inverse:
+            inverse = lib.cumsum(mask) - 1
+            if return_counts:
+                indices = lib.flatnonzero(mask)
+                appended = lib.concatenate([indices, lib.array([len(x)])])
+                counts = lib.diff(appended)
+                return uniques, inverse, counts
+            return uniques, inverse
+        if return_counts:
+            indices = lib.flatnonzero(mask)
+            appended = lib.concatenate([indices, lib.array([len(x)])])
+            counts = lib.diff(appended)
+            return uniques, counts
+        return uniques
+
+    def unique(
+        self,
+        x: Any,
+        return_index: bool = False,
+        return_inverse: bool = False,
+        return_counts: bool = False,
+    ) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.unique(
+            x,
+            return_index=return_index,
+            return_inverse=return_inverse,
+            return_counts=return_counts,
+        )
+
+    # ------------------------------------------------------------------
+    # Tile / index update
+    # ------------------------------------------------------------------
+    def tile(self, x: Any, dims: tuple[int, ...]) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        return lib.tile(x, dims)
+
+    def index_update(self, x: Any, indices: Any, values: Any) -> Any:
+        x[indices] = values
+        return x
+
+    # ------------------------------------------------------------------
+    # Print
+    # ------------------------------------------------------------------
+    def print(self, fmt: str, **kwargs) -> None:
+        print(fmt.format(**kwargs))
+
+    # ------------------------------------------------------------------
+    # Functional: vmap / tree / scan
+    # ------------------------------------------------------------------
+    def vmap(self, fun: Any, in_axes: Any = 0, out_axes: Any = 0) -> Any:
+        backend = self
+
+        def vmap_fn(*args):
+            if isinstance(in_axes, int):
+                batch_size = args[0].shape[in_axes]
+            elif isinstance(in_axes, tuple):
+                for a, ax in zip(args, in_axes, strict=True):
+                    if ax is not None:
+                        batch_size = a.shape[ax]
+                        break
+                else:
+                    raise ValueError("No vmapped axis found in in_axes")
+            else:
+                batch_size = args[0].shape[0]
+
+            results = []
+            for i in range(batch_size):
+                vmapped_args = []
+                for j, arg in enumerate(args):
+                    if not backend.is_tensor(arg):
+                        vmapped_args.append(arg)
+                        continue
+                    if isinstance(in_axes, int):
+                        ax = in_axes
+                    elif isinstance(in_axes, tuple):
+                        ax = in_axes[j] if j < len(in_axes) else 0
+                    else:
+                        ax = 0
+                    if ax is None:
+                        vmapped_args.append(arg)
+                    else:
+                        idx = [slice(None)] * arg.ndim
+                        idx[ax] = i
+                        vmapped_args.append(arg[tuple(idx)])
+                results.append(fun(*vmapped_args))
+
+            out_axis = out_axes if isinstance(out_axes, int) else 0
+            return backend.stack(results, dim=out_axis)
+
+        return vmap_fn
+
+    def tree_map(self, fun: Any, tree: Any) -> Any:
+        # Pure-Python pytree map; HybridBackend does not depend on JAX.
+        if isinstance(tree, dict):
+            return {k: self.tree_map(fun, v) for k, v in tree.items()}
+        if isinstance(tree, list):
+            return [self.tree_map(fun, v) for v in tree]
+        if isinstance(tree, tuple):
+            return type(tree)(self.tree_map(fun, v) for v in tree)
+        return fun(tree)
+
+    def tree_flatten(self, tree: Any) -> tuple[list[Any], Any]:
+        # Pure-Python flatten producing a flat leaves list. The second
+        # element is a structural placeholder (top-level container type).
+        leaves: list[Any] = []
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                for v in node.values():
+                    _walk(v)
+            elif isinstance(node, list | tuple):
+                for v in node:
+                    _walk(v)
+            else:
+                leaves.append(node)
+
+        _walk(tree)
+        return leaves, type(tree)
+
+    def scan(self, f: Any, init: Any, xs: Any, length: int | None = None) -> Any:
+        carry = init
+        ys = []
+        if xs is None:
+            if length is None:
+                raise ValueError("length must be provided if xs is None")
+            xs_iter = range(length)
+        else:
+            if self.is_tensor(xs):
+                xs_iter = xs
+            else:
+                raise NotImplementedError("Tuple xs scan not fully supported yet")
+        for x_item in xs_iter:
+            carry, y = f(carry, x_item)
+            ys.append(y)
+        if not ys:
+            return carry, []
+        return carry, self.stack(ys)
+
+    # ------------------------------------------------------------------
+    # DLPack interop -- zero-copy
+    # ------------------------------------------------------------------
+    @property
+    def supports_zero_copy_view(self) -> bool:
+        return True  # Both NumPy and CuPy support zero-copy DLPack
+
+    def get_contiguous_view(self, tensor: Any, offset: int, count: int) -> Any:
+        return tensor[offset : offset + count]
+
+    def get_dlpack_slice(self, tensor: Any, cursor: Any | None = None) -> Any:
+        sliced = tensor[cursor] if cursor is not None else tensor
+        dev_type, dev_id = sliced.__dlpack_device__()
+        return DLPackObject(sliced.__dlpack__(), device=(dev_type, dev_id))
+
+    def from_dlpack(self, dlpack_capsule: Any) -> Any:
+        lib = self._cp if self._is_gpu() else self._np
+        if hasattr(dlpack_capsule, "__dlpack__"):
+            return lib.from_dlpack(dlpack_capsule)
+        return lib.from_dlpack(DLPackObject(dlpack_capsule))
+
+    def to_dlpack(self, x: Any) -> Any:
+        return x.__dlpack__()
+
+
 _BACKEND: TensorBackend | None = None
 
 
 def get_backend() -> TensorBackend:
     global _BACKEND
     if _BACKEND is None:
-        try:
-            _BACKEND = JaxBackend()
-        except ImportError:
-            try:
-                _BACKEND = TorchBackend()
-            except ImportError:
-                raise ImportError("Neither JAX nor PyTorch found.") from None
+        _BACKEND = HybridBackend(device="auto")
     return _BACKEND
 
 
@@ -1091,6 +1650,12 @@ def set_backend(name: str):
         _BACKEND = JaxBackend()
     elif name.lower() in ["torch", "pytorch"]:
         _BACKEND = TorchBackend()
+    elif name.lower() == "cupy":
+        _BACKEND = HybridBackend(device="gpu")
+    elif name.lower() in ("numba", "numba_cpu"):
+        _BACKEND = HybridBackend(device="cpu", enable_numba_jit=True)
+    elif name.lower() == "hybrid":
+        _BACKEND = HybridBackend(device="auto")
     else:
         raise ValueError(f"Unknown backend: {name}")
 

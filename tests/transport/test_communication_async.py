@@ -167,11 +167,12 @@ def test_async_distributor_multiple_mixed(setup):
     dist = AsyncDataDistributor(local_rank)
 
     idx = jnp.arange(5, dtype=jnp.int32)
+    idx_ragged = jnp.arange(2, dtype=jnp.int32)
     t1 = TransportTensor(jnp.zeros(5), global_shape=(10,))  # dense
     t2 = TransportTensor(
         jnp.ones(5),
         nested_splits=[jnp.array([0, 2, 5])],
-        routing_indices=idx,
+        routing_indices=idx_ragged,
         global_shape=(10,),
     )  # ragged+idx
     t3 = TransportTensor(
