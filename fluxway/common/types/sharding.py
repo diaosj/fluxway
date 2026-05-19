@@ -8,7 +8,7 @@ from typing import Any
 from collections.abc import Callable
 from pydantic import Field, model_validator
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.index_descriptor import (
     IndexDescriptor,

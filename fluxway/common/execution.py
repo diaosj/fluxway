@@ -4,7 +4,7 @@ from typing import Any
 from collections.abc import Callable
 import functools
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 
 
 def shield(func: Callable | None = None, *, result_shape: Any = None):

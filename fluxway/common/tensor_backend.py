@@ -1173,6 +1173,12 @@ class HybridBackend(TensorBackend):
     def _is_cpu(self) -> bool:
         return self._device == "cpu"
 
+    def _to_gpu(self, x: Any) -> Any:
+        """Ensure *x* lives on GPU (zero-copy if already a CuPy array)."""
+        if isinstance(x, self._np.ndarray):
+            return self._cp.asarray(x)
+        return x
+
     # ------------------------------------------------------------------
     # Identity
     # ------------------------------------------------------------------
@@ -1185,12 +1191,27 @@ class HybridBackend(TensorBackend):
     def tensor(self, data: Any, dtype: Any = None) -> Any:
         if self._is_gpu():
             return self._cp.array(data, dtype=dtype)
-        return self._np.asarray(data, dtype=dtype)
+        arr = self._np.asarray(data, dtype=dtype)
+        if isinstance(arr, self._np.ndarray) and not arr.flags.writeable:
+            try:
+                arr.flags.writeable = True
+            except ValueError:
+                arr = self._np.array(arr)
+        return arr
 
     def as_tensor(self, data: Any, dtype: Any = None) -> Any:
         if self._is_gpu():
             return self._cp.asarray(data, dtype=dtype)
-        return self._np.asarray(data, dtype=dtype)
+        arr = self._np.asarray(data, dtype=dtype)
+        # Ray deserialization and np.from_dlpack may produce readonly arrays.
+        # In fluxway all received arrays convey ownership, so marking writable
+        # is safe and avoids downstream BufferError on DLPack re-export.
+        if isinstance(arr, self._np.ndarray) and not arr.flags.writeable:
+            try:
+                arr.flags.writeable = True
+            except ValueError:
+                arr = self._np.array(arr)
+        return arr
 
     def to_numpy(self, tensor: Any) -> Any:
         if self._is_gpu():
@@ -1245,12 +1266,14 @@ class HybridBackend(TensorBackend):
         return tensor.item()
 
     def reshape(self, tensor: Any, shape: tuple[int, ...]) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.reshape(tensor, shape)
+        if self._is_gpu():
+            return self._cp.reshape(self._to_gpu(tensor), shape)
+        return self._np.reshape(tensor, shape)
 
     def unravel_index(self, indices: Any, shape: tuple[int, ...]) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.unravel_index(indices, shape)
+        if self._is_gpu():
+            return self._cp.unravel_index(self._to_gpu(indices), shape)
+        return self._np.unravel_index(indices, shape)
 
     def float32(self) -> Any:
         lib = self._cp if self._is_gpu() else self._np
@@ -1261,57 +1284,69 @@ class HybridBackend(TensorBackend):
         return lib.int32
 
     def equal(self, x: Any, y: Any) -> bool:
-        lib = self._cp if self._is_gpu() else self._np
-        return bool(lib.array_equal(x, y))
+        if self._is_gpu():
+            return bool(self._cp.array_equal(self._to_gpu(x), self._to_gpu(y)))
+        return bool(self._np.array_equal(x, y))
 
     # ------------------------------------------------------------------
     # Concat / stack
     # ------------------------------------------------------------------
     def cat(self, tensors: list[Any], dim: int = 0) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.concatenate(tensors, axis=dim)
+        if self._is_gpu():
+            return self._cp.concatenate([self._to_gpu(t) for t in tensors], axis=dim)
+        return self._np.concatenate(tensors, axis=dim)
 
     def stack(self, tensors: list[Any], dim: int = 0) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.stack(tensors, axis=dim)
+        if self._is_gpu():
+            return self._cp.stack([self._to_gpu(t) for t in tensors], axis=dim)
+        return self._np.stack(tensors, axis=dim)
 
     # ------------------------------------------------------------------
     # Arithmetic / element-wise
     # ------------------------------------------------------------------
     def floor_divide(self, x: Any, y: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.floor_divide(x, y)
+        if self._is_gpu():
+            return self._cp.floor_divide(self._to_gpu(x), self._to_gpu(y))
+        return self._np.floor_divide(x, y)
 
     def mod(self, x: Any, y: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.mod(x, y)
+        if self._is_gpu():
+            return self._cp.mod(self._to_gpu(x), self._to_gpu(y))
+        return self._np.mod(x, y)
 
     def where(self, condition: Any, x: Any, y: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.where(condition, x, y)
+        if self._is_gpu():
+            return self._cp.where(
+                self._to_gpu(condition), self._to_gpu(x), self._to_gpu(y)
+            )
+        return self._np.where(condition, x, y)
 
     # ------------------------------------------------------------------
     # Reduction
     # ------------------------------------------------------------------
     def sum(self, x: Any, dim: Any = None) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.sum(x, axis=dim)
+        if self._is_gpu():
+            return self._cp.sum(self._to_gpu(x), axis=dim)
+        return self._np.sum(x, axis=dim)
 
     def mean(self, x: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.mean(x)
+        if self._is_gpu():
+            return self._cp.mean(self._to_gpu(x))
+        return self._np.mean(x)
 
     def max(self, x: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.max(x)
+        if self._is_gpu():
+            return self._cp.max(self._to_gpu(x))
+        return self._np.max(x)
 
     def min(self, x: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.min(x)
+        if self._is_gpu():
+            return self._cp.min(self._to_gpu(x))
+        return self._np.min(x)
 
     def cumsum(self, x: Any, dim: int = 0) -> Any:
         if self._is_gpu():
-            return self._cp.cumsum(x, axis=dim)
+            return self._cp.cumsum(self._to_gpu(x), axis=dim)
         # CPU: optional Numba JIT for 1-D
         if self._use_jit and x.ndim == 1:
             out = self._np.empty_like(x)
@@ -1325,30 +1360,48 @@ class HybridBackend(TensorBackend):
     def argsort(
         self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
     ) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
         kind = "stable" if stable else None
-        return lib.argsort(-x if descending else x, axis=dim, kind=kind)
+        if self._is_gpu():
+            return self._cp.argsort(
+                -self._to_gpu(x) if descending else self._to_gpu(x),
+                axis=dim,
+                kind=kind,
+            )
+        return self._np.argsort(
+            -x if descending else x,
+            axis=dim,
+            kind=kind,
+        )
 
     def sort(
         self, x: Any, dim: int = -1, descending: bool = False, stable: bool = False
     ) -> tuple[Any, Any]:
-        lib = self._cp if self._is_gpu() else self._np
         idx = self.argsort(x, dim, descending, stable=stable)
-        val = lib.take_along_axis(x, idx, axis=dim)
-        return val, idx
+        if self._is_gpu():
+            return self._cp.take_along_axis(
+                self._to_gpu(x), self._to_gpu(idx), axis=dim
+            ), idx
+        return self._np.take_along_axis(x, idx, axis=dim), idx
 
     def gather(self, x: Any, dim: int, index: Any) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
+        if self._is_gpu():
+            gpu_x, gpu_idx = self._to_gpu(x), self._to_gpu(index)
+            if gpu_x.shape[dim] == 0:
+                return self._cp.zeros(gpu_idx.shape, dtype=gpu_x.dtype)
+            return self._cp.take_along_axis(gpu_x, gpu_idx, axis=dim)
         if x.shape[dim] == 0:
-            return lib.zeros(index.shape, dtype=x.dtype)
-        return lib.take_along_axis(x, index, axis=dim)
+            return self._np.zeros(index.shape, dtype=x.dtype)
+        return self._np.take_along_axis(x, index, axis=dim)
 
     def take(self, x: Any, indices: Any) -> Any:
         if self._is_gpu():
-            if x.shape[0] == 0:
-                indices_shape = getattr(indices, "shape", ())
-                return self._cp.zeros(indices_shape + x.shape[1:], dtype=x.dtype)
-            return x[indices]
+            gpu_x, gpu_idx = self._to_gpu(x), self._to_gpu(indices)
+            if gpu_x.shape[0] == 0:
+                indices_shape = getattr(gpu_idx, "shape", ())
+                return self._cp.zeros(
+                    indices_shape + gpu_x.shape[1:], dtype=gpu_x.dtype
+                )
+            return gpu_x[gpu_idx]
         # CPU path
         if x.shape[0] == 0:
             indices_shape = getattr(indices, "shape", ())
@@ -1362,19 +1415,28 @@ class HybridBackend(TensorBackend):
         return self._np.take(x, indices, axis=0)
 
     def select(self, x: Any, dim: int, index: int) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
+        if self._is_gpu():
+            gpu_x = self._to_gpu(x)
+            if gpu_x.shape[dim] == 0:
+                new_shape = gpu_x.shape[:dim] + gpu_x.shape[dim + 1 :]
+                return self._cp.zeros(new_shape, dtype=gpu_x.dtype)
+            return self._cp.take(gpu_x, index, axis=dim)
         if x.shape[dim] == 0:
             new_shape = x.shape[:dim] + x.shape[dim + 1 :]
-            return lib.zeros(new_shape, dtype=x.dtype)
-        return lib.take(x, index, axis=dim)
+            return self._np.zeros(new_shape, dtype=x.dtype)
+        return self._np.take(x, index, axis=dim)
 
     def diff(self, x: Any, dim: int = -1) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        return lib.diff(x, axis=dim)
+        if self._is_gpu():
+            return self._cp.diff(self._to_gpu(x), axis=dim)
+        return self._np.diff(x, axis=dim)
 
     def bincount(self, x: Any, weights: Any | None = None, minlength: int = 0) -> Any:
         if self._is_gpu():
-            return self._cp.bincount(x, weights=weights, minlength=minlength)
+            gpu_weights = self._to_gpu(weights) if weights is not None else None
+            return self._cp.bincount(
+                self._to_gpu(x), weights=gpu_weights, minlength=minlength
+            )
         # CPU: optional Numba JIT
         if self._use_jit:
             host_x = self._np.asarray(x, dtype=self._np.intp)
@@ -1396,16 +1458,30 @@ class HybridBackend(TensorBackend):
         dim: int | None = None,
         total_repeat_length: int | None = None,
     ) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        result = lib.repeat(x, repeats, axis=dim)
+        if self._is_gpu():
+            result = self._cp.repeat(self._to_gpu(x), self._to_gpu(repeats), axis=dim)
+            if total_repeat_length is not None:
+                repeat_dim = dim if dim is not None else 0
+                actual_len = result.shape[repeat_dim]
+                if actual_len < total_repeat_length:
+                    pad_shape = list(result.shape)
+                    pad_shape[repeat_dim] = total_repeat_length - actual_len
+                    padding = self._cp.zeros(pad_shape, dtype=result.dtype)
+                    result = self._cp.concatenate([result, padding], axis=repeat_dim)
+                elif actual_len > total_repeat_length:
+                    slices = [slice(None)] * result.ndim
+                    slices[repeat_dim] = slice(0, total_repeat_length)
+                    result = result[tuple(slices)]
+            return result
+        result = self._np.repeat(x, repeats, axis=dim)
         if total_repeat_length is not None:
             repeat_dim = dim if dim is not None else 0
             actual_len = result.shape[repeat_dim]
             if actual_len < total_repeat_length:
                 pad_shape = list(result.shape)
                 pad_shape[repeat_dim] = total_repeat_length - actual_len
-                padding = lib.zeros(pad_shape, dtype=result.dtype)
-                result = lib.concatenate([result, padding], axis=repeat_dim)
+                padding = self._np.zeros(pad_shape, dtype=result.dtype)
+                result = self._np.concatenate([result, padding], axis=repeat_dim)
             elif actual_len > total_repeat_length:
                 slices = [slice(None)] * result.ndim
                 slices[repeat_dim] = slice(0, total_repeat_length)
@@ -1413,16 +1489,29 @@ class HybridBackend(TensorBackend):
         return result
 
     def nonzero(self, x: Any, *, size: Any = None, fill_value: Any = None) -> Any:
-        lib = self._cp if self._is_gpu() else self._np
-        result = lib.nonzero(x)
+        if self._is_gpu():
+            result = self._cp.nonzero(self._to_gpu(x))
+            if size is not None:
+                padded = []
+                for arr in result:
+                    if arr.size < size:
+                        pad_len = size - arr.size
+                        pad_val = fill_value if fill_value is not None else 0
+                        pad = self._cp.full(pad_len, pad_val, dtype=arr.dtype)
+                        padded.append(self._cp.concatenate([arr, pad]))
+                    else:
+                        padded.append(arr[:size])
+                result = tuple(padded)
+            return result
+        result = self._np.nonzero(x)
         if size is not None:
             padded = []
             for arr in result:
                 if arr.size < size:
                     pad_len = size - arr.size
                     pad_val = fill_value if fill_value is not None else 0
-                    pad = lib.full(pad_len, pad_val, dtype=arr.dtype)
-                    padded.append(lib.concatenate([arr, pad]))
+                    pad = self._np.full(pad_len, pad_val, dtype=arr.dtype)
+                    padded.append(self._np.concatenate([arr, pad]))
                 else:
                     padded.append(arr[:size])
             result = tuple(padded)
@@ -1627,8 +1716,25 @@ class HybridBackend(TensorBackend):
     def from_dlpack(self, dlpack_capsule: Any) -> Any:
         lib = self._cp if self._is_gpu() else self._np
         if hasattr(dlpack_capsule, "__dlpack__"):
-            return lib.from_dlpack(dlpack_capsule)
-        return lib.from_dlpack(DLPackObject(dlpack_capsule))
+            arr = lib.from_dlpack(dlpack_capsule)
+        else:
+            arr = lib.from_dlpack(DLPackObject(dlpack_capsule))
+        # Ensure writable: np.from_dlpack may return readonly arrays when the
+        # DLPack source does not support signalling readonly (older protocol).
+        # In fluxway all DLPack transfers convey ownership, so marking writable
+        # is safe and avoids downstream BufferError on re-export via DLPack.
+        # When zero-copy writeable flag fails (e.g. readonly shared memory),
+        # a copy is unavoidable.
+        if (
+            self._is_cpu()
+            and isinstance(arr, self._np.ndarray)
+            and not arr.flags.writeable
+        ):
+            try:
+                arr.flags.writeable = True
+            except ValueError:
+                arr = self._np.array(arr)
+        return arr
 
     def to_dlpack(self, x: Any) -> Any:
         return x.__dlpack__()

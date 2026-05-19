@@ -177,7 +177,7 @@ print("=" * 80)
 jax_results = {}
 try:
     import jax.numpy as jnp
-    from fluxway.common.backend import JaxBackend
+    from fluxway.common.tensor_backend import JaxBackend
 
     jax_b = JaxBackend()
 
@@ -248,7 +248,7 @@ print("=" * 80)
 cupy_results = {}
 try:
     import cupy as cp
-    from fluxway.common.backend import HybridBackend
+    from fluxway.common.tensor_backend import HybridBackend
 
     cupy_b = HybridBackend(device="gpu")
 
@@ -314,7 +314,7 @@ print("=" * 80)
 
 numba_results = {}
 try:
-    from fluxway.common.backend import HybridBackend
+    from fluxway.common.tensor_backend import HybridBackend
 
     numba_b = HybridBackend(device="gpu")
 

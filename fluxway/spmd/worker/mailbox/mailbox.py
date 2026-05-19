@@ -19,7 +19,7 @@ from collections.abc import Callable
 
 import numpy as np
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.index_descriptor import ContinuousIndex
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.common.types.configs import BarrierConfig, TolerantBarrierConfig

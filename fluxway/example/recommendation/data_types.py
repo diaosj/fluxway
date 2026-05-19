@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-import jax.numpy as jnp
+from typing import Any
+
 from fluxway.common.decorators import data_type
 from fluxway.common.types.tensor import TransportTensor
 
@@ -79,7 +80,7 @@ class LookupOutput:
 class DenseOutput:
     """The result of the dense forward pass, serving as context for backward."""
 
-    prediction: jnp.ndarray
+    prediction: Any
     # Metadata for backward
     user_inv: TransportTensor
     item_inv: TransportTensor

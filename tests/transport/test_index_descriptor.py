@@ -6,7 +6,7 @@ from fluxway.common.index_descriptor import (
     IndexPattern,
     ExplicitIndex,
 )
-from fluxway.common.backend import set_backend, get_backend
+from fluxway.common.tensor_backend import set_backend, get_backend
 
 
 @pytest.fixture(autouse=True)

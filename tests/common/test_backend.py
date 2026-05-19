@@ -1,6 +1,6 @@
 import pytest
 import numpy as np
-from fluxway.common.backend import get_backend, use_backend
+from fluxway.common.tensor_backend import get_backend, use_backend
 
 
 def test_jax_dlpack_slice_multidim():
@@ -10,7 +10,7 @@ def test_jax_dlpack_slice_multidim():
     except ImportError:
         pytest.skip("JAX not available")
 
-    from fluxway.common.backend import JAXViewWrapper
+    from fluxway.common.tensor_backend import JAXViewWrapper
 
     with use_backend("jax"):
         backend = get_backend()
@@ -131,7 +131,7 @@ def test_contiguous_view_jax_returns_wrapper():
     """JaxBackend.get_contiguous_view returns a JAXViewWrapper with the
     original array reference and the correct slice (zero-copy guarantee)."""
     try:
-        from fluxway.common.backend import JaxBackend, JAXViewWrapper
+        from fluxway.common.tensor_backend import JaxBackend, JAXViewWrapper
         import jax.numpy as jnp
     except ImportError:
         pytest.skip("JAX not available")
@@ -152,7 +152,7 @@ def test_contiguous_view_jax_returns_wrapper():
 def test_contiguous_view_jax_wrapper_array_interface():
     """JAXViewWrapper.__array_interface__ exposes the correct shape and dtype."""
     try:
-        from fluxway.common.backend import JAXViewWrapper
+        from fluxway.common.tensor_backend import JAXViewWrapper
     except ImportError:
         pytest.skip("JAX not available")
 

@@ -8,7 +8,7 @@ from fluxway.transport.communication import SyncDataDistributor, AsyncDataDistri
 from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.backend import set_backend
+from fluxway.common.tensor_backend import set_backend
 
 
 @pytest.fixture(autouse=True)

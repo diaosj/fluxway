@@ -18,6 +18,7 @@ from typing import Any
 
 try:
     import ray  # noqa: F401
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
     RAY_AVAILABLE = True
 except ImportError:
@@ -185,8 +186,10 @@ class SPMDManager:
             driver_name = f"spmd_driver_{spmd_id}"
             driver_opts: dict[str, Any] = {"name": driver_name}
             if placement_group is not None:
-                driver_opts["placement_group"] = placement_group
-                driver_opts["placement_group_bundle_index"] = driver_bundle_index
+                driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=driver_bundle_index,
+                )
             if config.runtime_env:
                 driver_opts["runtime_env"] = config.runtime_env
 

@@ -142,7 +142,8 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
 async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release(
     controller,
 ):
-    controller._heartbeat_manager = AsyncMock()
+    controller._heartbeat_manager = MagicMock()
+    controller._heartbeat_manager.stop_monitoring_async = AsyncMock()
     controller._spmd_manager.stop_spmd = AsyncMock()
     controller._scheduler = MagicMock()
     controller._scheduler.pg_manager.get_all_spmd_ids.return_value = []

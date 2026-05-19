@@ -5,7 +5,7 @@ from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.types.sharding import ShardingConfig
 from fluxway.common.mesh import DeviceMesh
 from fluxway.transport.communication import DataDistributor, TransportReceiver
-from fluxway.common.backend import set_backend
+from fluxway.common.tensor_backend import set_backend
 
 
 @pytest.fixture(autouse=True)

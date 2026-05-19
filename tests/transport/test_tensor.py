@@ -2,7 +2,7 @@ import pytest
 import pickle
 import jax.numpy as jnp
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.backend import set_backend, get_backend
+from fluxway.common.tensor_backend import set_backend, get_backend
 from fluxway.common.index_descriptor import ContinuousIndex
 
 

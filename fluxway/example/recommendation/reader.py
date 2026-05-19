@@ -1,6 +1,6 @@
 import json
 import pathlib
-import jax.numpy as jnp
+import numpy as np
 from typing import Any
 
 from fluxway.common.decorators import spmd_source, operator
@@ -84,34 +84,38 @@ class RecommendationReader(GrainReader):
         g_shape = (global_batch_size,)
         origins = ContinuousIndex.chunk(0, global_batch_size)
 
+        # Determine feature dimensions from first sample
+        stats_dim = len(samples[0]["target_item_stats"])
+        g_shape_stats = (global_batch_size, stats_dim)
+
         active = ActiveFeatures(
             user_id=TransportTensor.from_lists(
-                [s["user_id"] for s in samples],
-                dtype=jnp.int64,
+                [s["user_id"][0] for s in samples],
+                dtype=np.int64,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
             user_age_level=TransportTensor.from_lists(
-                [s["user_age_level"] for s in samples],
-                dtype=jnp.int32,
+                [s["user_age_level"][0] for s in samples],
+                dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
             request_hour=TransportTensor.from_lists(
-                [s["request_hour"] for s in samples],
-                dtype=jnp.int32,
+                [s["request_hour"][0] for s in samples],
+                dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
             hist_click_item_seq=TransportTensor.from_lists(
                 [s["hist_click_item_seq"] for s in samples],
-                dtype=jnp.int32,
+                dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
             hist_seq_length=TransportTensor.from_lists(
-                [[s["hist_seq_length"]] for s in samples],
-                dtype=jnp.int32,
+                [s["hist_seq_length"] for s in samples],
+                dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
@@ -119,29 +123,29 @@ class RecommendationReader(GrainReader):
 
         passive = PassiveFeatures(
             target_item_id=TransportTensor.from_lists(
-                [s["target_item_id"] for s in samples],
-                dtype=jnp.int64,
+                [s["target_item_id"][0] for s in samples],
+                dtype=np.int64,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
             target_item_category=TransportTensor.from_lists(
-                [s["target_item_category"] for s in samples],
-                dtype=jnp.int32,
+                [s["target_item_category"][0] for s in samples],
+                dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
             target_item_stats=TransportTensor.from_lists(
                 [s["target_item_stats"] for s in samples],
-                dtype=jnp.float32,
-                global_shape=g_shape,
+                dtype=np.float32,
+                global_shape=g_shape_stats,
                 origin_indices=origins,
             ),
         )
 
         labels = LabelFeatures(
             is_click=TransportTensor.from_lists(
-                [s["is_click"] for s in samples],
-                dtype=jnp.int32,
+                [s["is_click"][0] for s in samples],
+                dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             )

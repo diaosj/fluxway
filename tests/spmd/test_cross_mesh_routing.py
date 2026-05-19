@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 import jax.numpy as jnp
 import numpy as np
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 

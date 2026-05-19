@@ -1,12 +1,10 @@
 import os
-import jax
-import jax.dlpack
-import jax.numpy as jnp
-from jax import enable_x64 as _enable_x64
 
+import numpy as np
 import sparse_embedding as se
 import sparse_embedding.checkpoint
 
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
@@ -47,7 +45,7 @@ class SparseEmbeddingSPMD:
             initializer_config=se.Uniform(min_val=-0.01, max_val=0.01),
             optimizer_config=se.Adam(lr=0.01),
         )
-        self._forward_keys_cache: dict[int, jnp.ndarray] = {}
+        self._forward_keys_cache: dict[int, np.ndarray] = {}
 
         logger.debug(
             "SparseEmbeddingSPMD_init rank=%s world_size=%s vocab_size=%s embed_dim=%s",
@@ -109,28 +107,35 @@ class SparseEmbeddingSPMD:
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
         step = self.ctx.step
-        with _enable_x64():
-            ids_jax = unique_ids.flat_values.ravel().astype(jnp.int64)
+        ids_np = unique_ids.flat_values.ravel().astype(np.int64)
 
         # Lazy-insert new keys, return embeddings for all keys in this shard.
-        vals_dlm, _, _ = self.store.lookup_or_insert(ids_jax, dim=self.embed_dim)
-        emb_jax = jax.dlpack.from_dlpack(vals_dlm).reshape(ids_jax.size, self.embed_dim)
+        vals_dlm, _, _ = self.store.lookup_or_insert(ids_np, dim=self.embed_dim)
+        backend = get_backend()
+        emb_np = backend.from_dlpack(vals_dlm).reshape(ids_np.size, self.embed_dim)
 
-        self._forward_keys_cache[step] = ids_jax
+        self._forward_keys_cache[step] = ids_np
+
+        # -- 数值正确性验证: lookup keys 与 received unique_ids 一致 --
+        np.testing.assert_array_equal(
+            ids_np,
+            unique_ids.flat_values.ravel().astype(np.int64),
+            err_msg=f"[SparseSPMD] rank={self.rank} lookup keys 与 unique_ids 不匹配",
+        )
 
         g_shape = None
         if unique_ids.global_shape and len(unique_ids.global_shape) >= 1:
             g_shape = (unique_ids.global_shape[0], self.embed_dim)
 
         output = TransportTensor(
-            emb_jax,
+            emb_np,
             origin_indices=unique_ids.origin_indices,
             global_shape=g_shape,
             receipt=unique_ids.receipt,
         )
         print(
             f"[SparseEmbeddingSPMD.lookup] rank={self.rank} step={step} "
-            f"keys={ids_jax} emb_norm={float(jnp.linalg.norm(emb_jax)):.4f}"
+            f"keys={ids_np} emb_norm={float(np.linalg.norm(emb_np)):.4f}"
         )
         return LookupOutput(sparse_features=output)
 
@@ -147,22 +152,28 @@ class SparseEmbeddingSPMD:
     )
     def update(self, grads: TransportTensor) -> None:
         step = self.ctx.step
-        keys_jax = self._forward_keys_cache.pop(step, None)
+        keys_np = self._forward_keys_cache.pop(step, None)
 
-        if keys_jax is None:
+        if keys_np is None:
             raise ValueError(
                 f"SparseEmbeddingSPMD rank={self.rank}: "
                 f"missing forward cache for step {step}"
             )
 
-        grads_jax = grads.flat_values.reshape(keys_jax.size, self.embed_dim)
+        grads_np = grads.flat_values.reshape(keys_np.size, self.embed_dim)
 
-        self.store.accumulate_gradients(keys_jax, grads_jax)
+        # -- 数值正确性验证: 梯度维度与 keys 一致 --
+        assert grads_np.shape == (keys_np.size, self.embed_dim), (
+            f"[SparseSPMD] update grads shape {grads_np.shape} "
+            f"!= expected ({keys_np.size}, {self.embed_dim})"
+        )
+
+        self.store.accumulate_gradients(keys_np, grads_np)
         self.store.optimizer_step()
 
         print(
             f"[SparseEmbeddingSPMD.update] rank={self.rank} step={step} "
-            f"grad_norm={float(jnp.linalg.norm(grads_jax)):.4f}"
+            f"grad_norm={float(np.linalg.norm(grads_np)):.4f}"
         )
 
 
@@ -173,4 +184,4 @@ def hash_routing(tensor, mesh):
         val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
     partitioner = se.ModuloPartitioner(num_shards=mesh.size)
     shard_ids_dlm = partitioner.partition(val)
-    return jnp.array(jax.dlpack.from_dlpack(shard_ids_dlm))
+    return get_backend().from_dlpack(shard_ids_dlm)

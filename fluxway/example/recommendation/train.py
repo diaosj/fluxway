@@ -39,14 +39,7 @@ async def run_training(args):
     cpu_runtime_env = {
         "env_vars": {
             "CUDA_VISIBLE_DEVICES": "",
-            "JAX_PLATFORMS": "cpu",
             "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-        }
-    }
-    sparse_runtime_env = {
-        "env_vars": {
-            **cpu_runtime_env["env_vars"],
-            "JAX_ENABLE_X64": "1",
         }
     }
     gpu_runtime_env = {"env_vars": {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}}
@@ -83,7 +76,7 @@ async def run_training(args):
             vocab_size=2000,
             embed_dim=16,
             num_threads=args.num_threads,
-            runtime_env=sparse_runtime_env,
+            runtime_env=cpu_runtime_env,
         )
         table2 = SparseEmbeddingSPMD(
             name="EmbeddingTable2",
@@ -91,7 +84,7 @@ async def run_training(args):
             vocab_size=2000,
             embed_dim=16,
             num_threads=args.num_threads,
-            runtime_env=sparse_runtime_env,
+            runtime_env=cpu_runtime_env,
         )
         dense = DenseSPMD(
             name="DenseLayers",

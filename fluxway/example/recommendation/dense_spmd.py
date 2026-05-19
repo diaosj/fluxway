@@ -1,12 +1,34 @@
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
+import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
 from .data_types import DPFeatures
+
+# Select array backend for JIT-external operations based on GPU availability.
+# When JAX uses GPU, CuPy provides zero-copy DLPack interop with JAX.
+# When JAX falls back to CPU, NumPy is the natural choice.
+_GPU_AVAILABLE = False
+try:
+    import cupy as cp
+
+    # Verify CUDA is actually usable (cupy may be installed without a GPU)
+    try:
+        _cc = cp.cuda.Device(0).compute_capability
+        _GPU_AVAILABLE = True
+    except Exception:
+        _GPU_AVAILABLE = False
+except ImportError:
+    _GPU_AVAILABLE = False
+
+
+def _xp():
+    """Return CuPy if GPU is available, otherwise NumPy."""
+    return cp if _GPU_AVAILABLE else np
 
 
 @spmd(
@@ -27,37 +49,53 @@ class DenseSPMD:
         self.grad_accum_steps = grad_accum_steps
         self._jax_initialized = False
 
-        print(
-            f"[DenseSPMD] init jax.distributed rank={self.rank} world_size={self.world_size} coordinator={self.rank0_address}",
-            flush=True,
-        )
-        try:
-            jax.distributed.initialize(
-                coordinator_address=self.rank0_address,
-                num_processes=self.world_size,
-                process_id=self.rank,
-            )
+        # JAX distributed coordination is only meaningful with accelerators.
+        # On CPU-only hosts the coordination service aborts (SIGABRT), so we
+        # skip initialization entirely and rely on the default CPU device.
+        if _GPU_AVAILABLE:
             print(
-                f"[DenseSPMD] init jax.distributed success rank={self.rank}", flush=True
-            )
-        except Exception as e:
-            print(
-                f"[DenseSPMD] init jax.distributed failed rank={self.rank} error={e}",
+                f"[DenseSPMD] init jax.distributed rank={self.rank} world_size={self.world_size} coordinator={self.rank0_address}",
                 flush=True,
             )
-            raise
+            try:
+                jax.distributed.initialize(
+                    coordinator_address=self.rank0_address,
+                    num_processes=self.world_size,
+                    process_id=self.rank,
+                )
+                print(
+                    f"[DenseSPMD] init jax.distributed success rank={self.rank}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[DenseSPMD] init jax.distributed failed rank={self.rank} error={e}",
+                    flush=True,
+                )
+                raise
+        else:
+            print(
+                f"[DenseSPMD] CPU-only mode, skipping jax.distributed init rank={self.rank}",
+                flush=True,
+            )
 
     def _ensure_jax_init(self):
         if self._jax_initialized:
             return
 
-        n_global = len(jax.devices())
-        print(
-            f"[DenseSPMD._ensure_jax_init] rank={self.rank} "
-            f"global_devices={n_global} local_devices={len(jax.local_devices())}"
-        )
-
-        self.mesh = Mesh(jax.devices(), ("dp",))
+        if _GPU_AVAILABLE:
+            n_global = len(jax.devices())
+            print(
+                f"[DenseSPMD._ensure_jax_init] rank={self.rank} "
+                f"global_devices={n_global} local_devices={len(jax.local_devices())}"
+            )
+            self.mesh = Mesh(jax.devices(), ("dp",))
+        else:
+            # CPU-only: single default device, no distributed mesh
+            print(
+                f"[DenseSPMD._ensure_jax_init] CPU-only rank={self.rank} devices=[cpu]"
+            )
+            self.mesh = Mesh(jax.local_devices(), ("dp",))
 
         input_dim = self.embed_dim * 2 + self.dense_stats_dim
 
@@ -108,47 +146,75 @@ class DenseSPMD:
     ) -> dict:
         self._ensure_jax_init()
 
-        emb1_2d = emb1.flat_values.reshape(-1, emb1.flat_values.shape[-1])
-        emb2_2d = emb2.flat_values.reshape(-1, emb2.flat_values.shape[-1])
-        inv1_1d = inv1.flat_values.reshape(-1)
-        inv2_1d = inv2.flat_values.reshape(-1)
+        # -- JIT 外: GPU(CuPy) / CPU(NumPy) 操作 --
+        xp = _xp()
+        emb1_2d = xp.asarray(emb1.flat_values).reshape(-1, emb1.flat_values.shape[-1])
+        emb2_2d = xp.asarray(emb2.flat_values).reshape(-1, emb2.flat_values.shape[-1])
+        inv1_1d = xp.asarray(inv1.flat_values).reshape(-1)
+        inv2_1d = xp.asarray(inv2.flat_values).reshape(-1)
+
+        # -- 数值正确性验证: inv 索引范围 --
+        assert inv1_1d.min() >= 0 and inv1_1d.max() < emb1_2d.shape[0], (
+            f"[DenseSPMD] inv1 越界: max={inv1_1d.max()}, emb1_unique_count={emb1_2d.shape[0]}"
+        )
+        assert inv2_1d.min() >= 0 and inv2_1d.max() < emb2_2d.shape[0], (
+            f"[DenseSPMD] inv2 越界: max={inv2_1d.max()}, emb2_unique_count={emb2_2d.shape[0]}"
+        )
 
         f1_rec = emb1_2d[inv1_1d]
         f2_rec = emb2_2d[inv2_1d]
-        dense_stats = dp_data.dense_stats.flat_values.reshape(
+        dense_stats = xp.asarray(dp_data.dense_stats.flat_values).reshape(
             -1, dp_data.dense_stats.flat_values.shape[-1]
         )
-        labels_local = dp_data.labels.is_click.flat_values.reshape(-1).astype(
-            jnp.float32
+        labels_local = (
+            xp.asarray(dp_data.labels.is_click.flat_values)
+            .reshape(-1)
+            .astype(xp.float32)
+        )
+
+        # -- 数值正确性验证: inv 还原 --
+        # f1_rec[i] == emb1_2d[inv1_1d[i]], 即 lookup 还原后每个样本的 embedding 正确
+        assert f1_rec.shape[0] == inv1_1d.shape[0], (
+            f"[DenseSPMD] f1_rec batch size {f1_rec.shape[0]} != inv1 size {inv1_1d.shape[0]}"
+        )
+        assert f2_rec.shape[0] == inv2_1d.shape[0], (
+            f"[DenseSPMD] f2_rec batch size {f2_rec.shape[0]} != inv2 size {inv2_1d.shape[0]}"
         )
 
         dp_sharding = NamedSharding(self.mesh, P("dp"))
         replicated = NamedSharding(self.mesh, P())
         local_batch = f1_rec.shape[0]
 
+        # -- JIT 入口桥接: CuPy → JAX (DLPack zero-copy) --
+        f1_jax = jnp.asarray(f1_rec)
+        f2_jax = jnp.asarray(f2_rec)
+        stats_jax = jnp.asarray(dense_stats)
+        labels_jax = jnp.asarray(labels_local)
+
         # Build global sharded arrays from per-rank local slices.
         # All 6 dp ranks collectively form the global batch of world_size * local_batch rows.
         global_f1 = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch, f1_rec.shape[1]),
+            shape=(self.world_size * local_batch, f1_jax.shape[1]),
             sharding=dp_sharding,
-            arrays=[f1_rec],
+            arrays=[f1_jax],
         )
         global_f2 = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch, f2_rec.shape[1]),
+            shape=(self.world_size * local_batch, f2_jax.shape[1]),
             sharding=dp_sharding,
-            arrays=[f2_rec],
+            arrays=[f2_jax],
         )
         global_stats = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch, dense_stats.shape[1]),
+            shape=(self.world_size * local_batch, stats_jax.shape[1]),
             sharding=dp_sharding,
-            arrays=[dense_stats],
+            arrays=[stats_jax],
         )
         global_labels = jax.make_array_from_single_device_arrays(
             shape=(self.world_size * local_batch,),
             sharding=dp_sharding,
-            arrays=[labels_local],
+            arrays=[labels_jax],
         )
 
+        # -- JIT 内: JAX 训练核心 --
         @nnx.jit(
             in_shardings=(None, dp_sharding, dp_sharding, dp_sharding, dp_sharding),
             out_shardings=(None, dp_sharding, dp_sharding, replicated),
@@ -179,22 +245,57 @@ class DenseSPMD:
             self.model, global_f1, global_f2, global_stats, global_labels
         )
 
-        # Extract this rank's local slice of the sharded x_grad using addressable_shards
-        grad_f1_local = grad_f1_global.addressable_shards[0].data
-        grad_f2_local = grad_f2_global.addressable_shards[0].data
+        # -- JIT 输出后处理: JAX → xp --
+        grad_f1_local = xp.asarray(grad_f1_global.addressable_shards[0].data)
+        grad_f2_local = xp.asarray(grad_f2_global.addressable_shards[0].data)
 
         # scatter-add: (local_batch, emb_dim) → (K_u, emb_dim)
-        g1_unique = jnp.zeros_like(emb1_2d).at[inv1_1d].add(grad_f1_local)
-        g2_unique = jnp.zeros_like(emb2_2d).at[inv2_1d].add(grad_f2_local)
+        g1_unique = xp.zeros_like(emb1_2d)
+        if _GPU_AVAILABLE:
+            cp.scatter_add(
+                g1_unique,
+                cp.broadcast_to(inv1_1d[:, None], grad_f1_local.shape),
+                grad_f1_local,
+            )
+        else:
+            np.add.at(g1_unique, inv1_1d, grad_f1_local)
+        g2_unique = xp.zeros_like(emb2_2d)
+        if _GPU_AVAILABLE:
+            cp.scatter_add(
+                g2_unique,
+                cp.broadcast_to(inv2_1d[:, None], grad_f2_local.shape),
+                grad_f2_local,
+            )
+        else:
+            np.add.at(g2_unique, inv2_1d, grad_f2_local)
+
+        # -- 数值正确性验证: scatter-add 梯度 --
+        # scatter-add 后 g1_unique 的非零行数不应超过 unique_keys 数量
+        if _GPU_AVAILABLE:
+            g1_nonzero_rows = int(cp.count_nonzero(cp.any(g1_unique != 0, axis=1)))
+            g2_nonzero_rows = int(cp.count_nonzero(cp.any(g2_unique != 0, axis=1)))
+        else:
+            g1_nonzero_rows = int(np.count_nonzero(np.any(g1_unique != 0, axis=1)))
+            g2_nonzero_rows = int(np.count_nonzero(np.any(g2_unique != 0, axis=1)))
+        assert g1_nonzero_rows <= emb1_2d.shape[0], (
+            f"[DenseSPMD] grad1 scatter-add 非零行数 {g1_nonzero_rows} "
+            f"超过 unique keys 数量 {emb1_2d.shape[0]}"
+        )
+        assert g2_nonzero_rows <= emb2_2d.shape[0], (
+            f"[DenseSPMD] grad2 scatter-add 非零行数 {g2_nonzero_rows} "
+            f"超过 unique keys 数量 {emb2_2d.shape[0]}"
+        )
 
         dense_grad_leaves = jtu.tree_leaves(dense_param_grads)
-        dense_grad_flat = jnp.concatenate([g.ravel() for g in dense_grad_leaves])
+        dense_grad_flat = xp.concatenate(
+            [xp.asarray(g).ravel() for g in dense_grad_leaves]
+        )
 
         print(
             f"[DenseSPMD.step] rank={self.rank} "
             f"f1_rec={f1_rec.shape} f2_rec={f2_rec.shape} "
             f"loss={float(loss_val):.4f} "
-            f"dense_grad_norms={[float(jnp.linalg.norm(g)) for g in dense_grad_leaves]}"
+            f"dense_grad_norms={[float(xp.linalg.norm(xp.asarray(g))) for g in dense_grad_leaves]}"
         )
 
         return {
@@ -212,7 +313,7 @@ class DenseSPMD:
         step = self.ctx.step
         treedef = jtu.tree_structure(self.grad_accum)
         param_leaves = jtu.tree_leaves(nnx.state(self.model))
-        flat = dense_grad.flat_values
+        flat = jnp.asarray(dense_grad.flat_values)
         cursor = 0
         split_leaves = []
         for leaf in param_leaves:

@@ -265,7 +265,7 @@ def test_transport_receiver_zero_copy_dlpack_and_no_concat():
     slice via index assignment, which already avoids any final concat.
     """
     shared = np.zeros((6, 4), dtype=np.float32)
-    from fluxway.common.backend import get_backend
+    from fluxway.common.tensor_backend import get_backend
 
     backend = get_backend()
 

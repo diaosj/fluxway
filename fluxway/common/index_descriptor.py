@@ -5,7 +5,7 @@ from typing import Any, Optional
 from collections.abc import Callable
 
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 
 
 class IndexMorphology(enum.Enum):

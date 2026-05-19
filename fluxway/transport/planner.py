@@ -9,7 +9,7 @@ import logging
 
 import numpy as np
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.types.sharding import PhysicalLayout
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,8 @@ class TransportPlan:
 
     @property
     def send_offsets(self) -> Any:
-        counts = np.array(self.send_counts)
+        backend = get_backend()
+        counts = backend.to_numpy(self.send_counts)
         cs = np.cumsum(counts)
         return np.concatenate([[0], cs[:-1]]).astype(np.int32)
 
@@ -45,9 +46,8 @@ class TransportPlan:
 
     def iter_device_slices(self):
         """Iterate by device: (device_id, offset, count)."""
-        import numpy as np
-
-        counts = np.array(self.send_counts)
+        backend = get_backend()
+        counts = backend.to_numpy(self.send_counts)
         offset = 0
         for device_id in range(self.target_num_workers):
             count = int(counts[device_id])

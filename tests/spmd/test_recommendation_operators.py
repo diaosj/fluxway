@@ -13,7 +13,7 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import pytest
 
-from fluxway.common.backend import set_backend
+from fluxway.common.tensor_backend import set_backend
 from fluxway.common.decorators import data_type, operator, operator_context, spmd
 from fluxway.common.types.tensor import TransportTensor
 

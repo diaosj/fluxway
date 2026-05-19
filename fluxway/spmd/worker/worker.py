@@ -32,7 +32,7 @@ import numpy as np
 
 import ray
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import (
     operator_context,
     get_current_context,
@@ -1412,7 +1412,16 @@ class SPMDWorker:
 
         # Fast Path: Single tensor is already the result (Zero-copy)
         if count == 1:
-            return tensor_list[0]
+            t = tensor_list[0]
+            # Ray deserialization may produce readonly NumPy arrays.
+            # Ensure writable so downstream DLPack re-export works.
+            if (
+                hasattr(t, "flags")
+                and hasattr(t.flags, "writeable")
+                and not t.flags.writeable
+            ):
+                t.flags.writeable = True
+            return t
 
         # Find the archetype (first non-empty tensor with proper rank)
         prototype = None

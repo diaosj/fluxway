@@ -40,7 +40,7 @@ class DeviceMesh:
 
         # Determine device_ids and shape
         if device_ids is not None:
-            self.device_ids = np.array(device_ids)
+            self.device_ids = np.array(device_ids, dtype=np.int32)
             if device_shape is None:
                 # Infer shape from device_ids
                 if self.device_ids.ndim == 1:
@@ -70,7 +70,9 @@ class DeviceMesh:
             expected_size = 1
             for s in self._shape:
                 expected_size *= s
-            self.device_ids = np.arange(expected_size).reshape(self._shape)
+            self.device_ids = np.arange(expected_size, dtype=np.int32).reshape(
+                self._shape
+            )
         else:
             raise ValueError("Either device_shape or device_ids must be provided.")
 
@@ -130,20 +132,24 @@ class DeviceMesh:
 
     def coordinate_to_device(self, coords: tuple[Any, ...]) -> Any:
         """Vectorized get_rank. coords elements can be tensors or numpy arrays."""
-        from fluxway.common.backend import get_backend
+        from fluxway.common.tensor_backend import get_backend
 
         backend = get_backend()
 
-        # If we are in JAX, we must ensure device_ids is a JAX array to support tracer indexing.
-        # jnp.asarray(numpy_array)[tracer] works correctly.
+        # JAX tracers require device_ids as a JAX array for indexed access.
         if backend.is_jax:
             return backend.as_tensor(self.device_ids)[coords]
 
-        return self.device_ids[coords]
+        # device_ids is a small NumPy lookup table — always index on CPU,
+        # then transfer result to device if the backend is on GPU.
+        np_coords = tuple(
+            backend.to_numpy(c) if hasattr(c, "shape") else c for c in coords
+        )
+        return backend.tensor(self.device_ids[np_coords])
 
     def unravel_index(self, ranks: Any) -> tuple[Any, ...]:
         """Convert physical ranks to multi-dimensional logical coordinates."""
-        from fluxway.common.backend import get_backend
+        from fluxway.common.tensor_backend import get_backend
 
         try:
             backend = get_backend()
@@ -154,7 +160,7 @@ class DeviceMesh:
 
     def flatten(self) -> list[int]:
         """Return a flattened list of physical device IDs."""
-        from fluxway.common.backend import get_backend
+        from fluxway.common.tensor_backend import get_backend
 
         try:
             backend = get_backend()

@@ -21,6 +21,7 @@ from typing import Any
 
 try:
     import ray
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
     RAY_AVAILABLE = True
 except ImportError:
@@ -223,8 +224,10 @@ if RAY_AVAILABLE:
             """Build .options() kwargs for a worker actor."""
             opts: dict[str, Any] = {"name": name}
             if self.placement_group is not None:
-                opts["placement_group"] = self.placement_group
-                opts["placement_group_bundle_index"] = bundle_idx
+                opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                    placement_group=self.placement_group,
+                    placement_group_bundle_index=bundle_idx,
+                )
             if self._runtime_env:
                 opts["runtime_env"] = self._runtime_env
 

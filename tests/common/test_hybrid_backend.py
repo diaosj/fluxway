@@ -10,7 +10,7 @@ These tests simulate real communication layer workloads:
 import numpy as np
 import pytest
 
-from fluxway.common.backend import HybridBackend
+from fluxway.common.tensor_backend import HybridBackend
 
 # ============================================================
 # Fixtures

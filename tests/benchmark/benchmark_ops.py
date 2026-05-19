@@ -6,7 +6,7 @@ repeat_interleave, cumsum, and their pipeline composition — on every available
 backend (JAX CPU/GPU, NumPy, Numba CPU, CuPy, Numba CUDA).
 
 Results guide the per-operation backend dispatch table in
-``fluxway.common.backend``.
+``fluxway.common.tensor_backend``.
 
 Usage:
     python -m tests.benchmark.benchmark_ops [options]

@@ -1,9 +1,9 @@
 import asyncio
 
-import jax
-import jax.numpy as jnp
+import numpy as np
 import sparse_embedding as se
 
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.index_descriptor import ExplicitIndex
@@ -14,7 +14,7 @@ def hash_routing(tensor, mesh):
     val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
     if len(val.shape) > 1:
         val = val[:, 0]
-    return jnp.mod(val, mesh.size)
+    return np.mod(val, mesh.size)
 
 
 async def _sparse_unique(
@@ -27,31 +27,41 @@ async def _sparse_unique(
     - inverse_tt maps each original element to its scatter position in the
       Dense static assembly buffer
     """
-    ids_jax = tt.flat_values
+    ids_np = tt.flat_values
     total_elements = tt.global_shape[0]
 
     unique_dlm, inv_dlm, first_index_dlm = await se.async_unique(
-        ids_jax.ravel(), return_inverse=True, return_first_indices=True
+        ids_np.ravel(), return_inverse=True, return_first_indices=True
     )
 
-    unique_jax = jax.dlpack.from_dlpack(unique_dlm).astype(jnp.int64)
-    first_jax = jax.dlpack.from_dlpack(first_index_dlm).astype(jnp.int32)
+    backend = get_backend()
+    unique_np = backend.from_dlpack(unique_dlm).astype(np.int64)
+    first_np = backend.from_dlpack(first_index_dlm).astype(np.int32)
 
     if tt.origin_indices is not None:
-        global_positions = jnp.take(tt.origin_indices_materialized, first_jax)
+        global_positions = np.take(tt.origin_indices_materialized, first_np)
     else:
-        global_positions = first_jax
+        global_positions = first_np
 
-    inv_1d = jax.dlpack.from_dlpack(inv_dlm).astype(jnp.int32).reshape(-1)
+    inv_1d = backend.from_dlpack(inv_dlm).astype(np.int32).reshape(-1)
     adjusted_inv = global_positions[inv_1d]
 
+    # -- 数值正确性验证: unique + inv 还原 --
+    # 还原: original_ids[i] == unique_ids[inv[i]] 对所有 i 成立
+    original_ids = ids_np.ravel()
+    np.testing.assert_array_equal(
+        unique_np[inv_1d],
+        original_ids,
+        err_msg="[InputSPMD] unique+inv 还原失败: unique[inv] != original",
+    )
+
     unique_tt = TransportTensor(
-        flat_values=unique_jax,
+        flat_values=unique_np,
         origin_indices=ExplicitIndex(global_positions),
         global_shape=(total_elements,),
     )
     inv_tt = TransportTensor(
-        flat_values=adjusted_inv.reshape(ids_jax.shape),
+        flat_values=adjusted_inv.reshape(ids_np.shape),
         global_shape=tt.global_shape,
     )
     return unique_tt, inv_tt

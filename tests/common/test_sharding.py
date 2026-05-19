@@ -3,7 +3,7 @@
 import pytest
 import jax.numpy as jnp
 
-from fluxway.common.backend import set_backend
+from fluxway.common.tensor_backend import set_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.sharding import ShardingSpec, P
 from fluxway.common.index_descriptor import RaggedIndex, ExplicitIndex, FunctionalIndex

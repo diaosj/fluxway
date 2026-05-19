@@ -9,7 +9,7 @@ import logging
 import asyncio
 import numpy as np
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.transport.planner import TransportPlanner
 from fluxway.common.types.sharding import PhysicalLayout
 from fluxway.common.types.tensor import TransportTensor
@@ -85,8 +85,8 @@ class BaseDataDistributor:
                 sender_rank_tags, payloads, mirror_target_world_size
             )
 
-        counts_np = np.array(tensors_size)
-        offsets_np = np.array(tensor_offsets)
+        counts_np = backend.to_numpy(tensors_size)
+        offsets_np = backend.to_numpy(tensor_offsets)
 
         for i in range(mirror_target_world_size):
             count = int(counts_np[i])
@@ -449,10 +449,15 @@ class BaseDataDistributor:
         # Materialise per-device send counts/offsets on the host once.  These are the
         # minimal scalars needed to slice the flat buffers; the heavy tensor data stays
         # on-device until the Python slice below.
-        counts_host = np.array(send_counts).flatten()
-        offsets_host = np.array(send_offsets).flatten()
-        counts_per_payload_host = [np.array(c).flatten() for c in counts_per_payload]
-        offsets_per_payload_host = [np.array(o).flatten() for o in offsets_per_payload]
+        _backend = get_backend()
+        counts_host = _backend.to_numpy(send_counts).flatten()
+        offsets_host = _backend.to_numpy(send_offsets).flatten()
+        counts_per_payload_host = [
+            _backend.to_numpy(c).flatten() for c in counts_per_payload
+        ]
+        offsets_per_payload_host = [
+            _backend.to_numpy(o).flatten() for o in offsets_per_payload
+        ]
 
         def _get_slice_compact_desc_params(device_id):
             slice_compact_desc_params: list[list[int] | None] = []
@@ -522,7 +527,7 @@ class BaseDataDistributor:
 
         if is_replicated:
             # Fan-out
-            sorted_dest_host = np.array(dest_devices)
+            sorted_dest_host = _backend.to_numpy(dest_devices)
 
             for device_id, count in enumerate(counts_host):
                 targets = sorted_dest_host[device_id].flatten().tolist()
