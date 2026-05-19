@@ -1,6 +1,88 @@
 from abc import ABC, abstractmethod
 from typing import Any
 import contextlib
+import numpy as np
+
+
+def force_writable(arr: Any) -> Any:
+    """Make a readonly array writable **without copying**.
+
+    DLPack / Ray shared-memory imports produce arrays whose data buffer is
+    genuinely mutable (the C++ allocator always uses writable memory), but
+    NumPy / CuPy conservatively marks them readonly because they cannot
+    verify ownership.
+
+    This function patches ``__array_interface__`` (CPU) or
+    ``__cuda_array_interface__`` (GPU) to clear the readonly flag and
+    reconstructs a new view that shares the **same underlying memory**:
+
+    * zero-copy  – no data duplication
+    * writable   – downstream code can modify in-place
+    * safe       – the source array is kept alive via ``_source`` to
+      prevent premature DLPack deallocation
+
+    Only call this when you *know* the backing memory is writable (which is
+    always the case for DLPack tensors produced by sparse_embedding or
+    Fluxway transport).
+    """
+    # Fast path: already writable or not an ndarray type we handle
+    if not hasattr(arr, "flags") or not hasattr(arr.flags, "writeable"):
+        return arr
+
+    if isinstance(arr, np.ndarray):
+        if arr.flags.writeable:
+            return arr
+        try:
+            arr.flags.writeable = True
+            return arr
+        except ValueError:
+            pass
+
+        # CPU path: patch __array_interface__
+        class _WritableCPUView:
+            __slots__ = ("__array_interface__", "_source")
+
+            def __init__(self, source: np.ndarray):
+                iface = source.__array_interface__
+                ptr, _ = iface["data"]
+                new_iface = dict(iface)
+                new_iface["data"] = (ptr, False)
+                self.__array_interface__ = new_iface
+                self._source = source  # prevent GC → prevents DLPack free
+
+        return np.asarray(_WritableCPUView(arr))
+
+    # GPU path: CuPy arrays
+    try:
+        import cupy as cp
+
+        if isinstance(arr, cp.ndarray):
+            if arr.flags.writeable:
+                return arr
+            try:
+                arr.flags.writeable = True
+                return arr
+            except ValueError:
+                pass
+
+            # Patch __cuda_array_interface__
+            class _WritableGPUView:
+                __slots__ = ("__cuda_array_interface__", "_source")
+
+                def __init__(self, source: cp.ndarray):
+                    iface = source.__cuda_array_interface__
+                    ptr, _ = iface["data"]
+                    new_iface = dict(iface)
+                    new_iface["data"] = (ptr, False)
+                    self.__cuda_array_interface__ = new_iface
+                    self._source = source  # prevent GC
+
+            return cp.asarray(_WritableGPUView(arr))
+    except ImportError:
+        pass
+
+    # Fallback: non-ndarray types (JAX, Torch, etc.) — return as-is
+    return arr
 
 
 class DLPackObject:
@@ -1191,27 +1273,12 @@ class HybridBackend(TensorBackend):
     def tensor(self, data: Any, dtype: Any = None) -> Any:
         if self._is_gpu():
             return self._cp.array(data, dtype=dtype)
-        arr = self._np.asarray(data, dtype=dtype)
-        if isinstance(arr, self._np.ndarray) and not arr.flags.writeable:
-            try:
-                arr.flags.writeable = True
-            except ValueError:
-                arr = self._np.array(arr)
-        return arr
+        return force_writable(self._np.asarray(data, dtype=dtype))
 
     def as_tensor(self, data: Any, dtype: Any = None) -> Any:
         if self._is_gpu():
             return self._cp.asarray(data, dtype=dtype)
-        arr = self._np.asarray(data, dtype=dtype)
-        # Ray deserialization and np.from_dlpack may produce readonly arrays.
-        # In fluxway all received arrays convey ownership, so marking writable
-        # is safe and avoids downstream BufferError on DLPack re-export.
-        if isinstance(arr, self._np.ndarray) and not arr.flags.writeable:
-            try:
-                arr.flags.writeable = True
-            except ValueError:
-                arr = self._np.array(arr)
-        return arr
+        return force_writable(self._np.asarray(data, dtype=dtype))
 
     def to_numpy(self, tensor: Any) -> Any:
         if self._is_gpu():
@@ -1719,22 +1786,11 @@ class HybridBackend(TensorBackend):
             arr = lib.from_dlpack(dlpack_capsule)
         else:
             arr = lib.from_dlpack(DLPackObject(dlpack_capsule))
-        # Ensure writable: np.from_dlpack may return readonly arrays when the
-        # DLPack source does not support signalling readonly (older protocol).
-        # In fluxway all DLPack transfers convey ownership, so marking writable
-        # is safe and avoids downstream BufferError on re-export via DLPack.
-        # When zero-copy writeable flag fails (e.g. readonly shared memory),
-        # a copy is unavoidable.
-        if (
-            self._is_cpu()
-            and isinstance(arr, self._np.ndarray)
-            and not arr.flags.writeable
-        ):
-            try:
-                arr.flags.writeable = True
-            except ValueError:
-                arr = self._np.array(arr)
-        return arr
+        # DLPack imports produce arrays backed by genuinely writable memory,
+        # but NumPy/CuPy conservatively mark them readonly.  force_writable
+        # patches __array_interface__ / __cuda_array_interface__ to grant
+        # write access without copying.
+        return force_writable(arr)
 
     def to_dlpack(self, x: Any) -> Any:
         return x.__dlpack__()

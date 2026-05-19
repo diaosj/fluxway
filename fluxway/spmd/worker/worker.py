@@ -32,7 +32,7 @@ import numpy as np
 
 import ray
 
-from fluxway.common.tensor_backend import get_backend
+from fluxway.common.tensor_backend import get_backend, force_writable
 from fluxway.common.decorators import (
     operator_context,
     get_current_context,
@@ -1414,14 +1414,9 @@ class SPMDWorker:
         if count == 1:
             t = tensor_list[0]
             # Ray deserialization may produce readonly NumPy arrays.
-            # Ensure writable so downstream DLPack re-export works.
-            if (
-                hasattr(t, "flags")
-                and hasattr(t.flags, "writeable")
-                and not t.flags.writeable
-            ):
-                t.flags.writeable = True
-            return t
+            # force_writable patches __array_interface__ / __cuda_array_interface__
+            # to grant write access without copying.
+            return force_writable(t)
 
         # Find the archetype (first non-empty tensor with proper rank)
         prototype = None
@@ -1813,29 +1808,37 @@ class SPMDWorker:
 
         logical_len_early = int(backend.sum(mask))
         buffer_capacity = local_shape[routing_dim]
-        if logical_len_early > buffer_capacity:
+
+        # When origin_indices have collisions (multiple source rows map to the
+        # same target slot via scatter-add), logical_len_early can exceed
+        # buffer_capacity even though the actual number of unique target slots
+        # fits.  Compute unique slots first and validate against those.
+        n_unique_slots = logical_len_early  # default: 1:1 mapping
+        if logical_len_early > buffer_capacity and logical_len_early > 0:
+            unique_local = backend.unique(local_indices)
+            n_unique_slots = int(backend.shape(unique_local)[0])
+
+        if n_unique_slots > buffer_capacity:
             raise ValueError(
                 f"[Fluxway Assembly Error] Dynamic-to-static buffer overflow in op '{op_name}' "
                 f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
-                f"Received {logical_len_early} data elements but buffer capacity is {buffer_capacity} "
+                f"Received {logical_len_early} data elements mapping to {n_unique_slots} unique "
+                f"buffer positions, but buffer capacity is {buffer_capacity} "
                 f"(global_shape={global_shape}, local_shape={local_shape}). "
                 f"The producer's global_shape is too small for the actual data volume. "
                 f"This typically means the upstream unique/sparse operation produced more elements "
                 f"than global_shape[0] accounts for (e.g. multi-column features after ravel+unique)."
             )
 
-        if logical_len_early > 0:
-            unique_local = backend.unique(local_indices)
-            n_unique_slots = int(backend.shape(unique_local)[0])
-            if n_unique_slots < logical_len_early:
-                logger.warning(
-                    f"[Fluxway Assembly Warning] origin_indices collision detected in op '{op_name}' "
-                    f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
-                    f"{logical_len_early} data elements map to only {n_unique_slots} unique buffer positions. "
-                    f"{logical_len_early - n_unique_slots} elements will be silently overwritten by index_update. "
-                    f"This usually indicates the producer uses row-level origin_indices for multi-column features, "
-                    f"causing multiple unique keys from the same row to collide."
-                )
+        if logical_len_early > 0 and n_unique_slots < logical_len_early:
+            logger.warning(
+                f"[Fluxway Assembly Warning] origin_indices collision detected in op '{op_name}' "
+                f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
+                f"{logical_len_early} data elements map to only {n_unique_slots} unique buffer positions. "
+                f"{logical_len_early - n_unique_slots} elements will be silently overwritten by index_update. "
+                f"This usually indicates the producer uses row-level origin_indices for multi-column features, "
+                f"causing multiple unique keys from the same row to collide."
+            )
 
         if routing_dim == 0:
             local_values = all_values[mask]

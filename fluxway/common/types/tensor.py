@@ -2,7 +2,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from fluxway.common.tensor_backend import get_backend
+from fluxway.common.tensor_backend import get_backend, force_writable
 from fluxway.common.index_descriptor import (
     ContinuousIndex,
     IndexDescriptor,
@@ -125,28 +125,14 @@ class TransportTensor:
         self._flat_values = flat_values
 
         # Ensure writable: transport deserialization (Ray RPC, pickle) may produce
-        # readonly NumPy arrays.  In fluxway all received arrays convey ownership,
-        # so marking writable is safe and avoids downstream BufferError on DLPack
-        # re-export.  This is zero-copy when possible — no data is duplicated.
-        if (
-            isinstance(self._flat_values, np.ndarray)
-            and not self._flat_values.flags.writeable
-        ):
-            try:
-                self._flat_values.flags.writeable = True
-            except ValueError:
-                # Array is backed by genuinely readonly memory (e.g. Ray shared
-                # memory mapping).  A copy is unavoidable here.
-                self._flat_values = np.array(self._flat_values)
+        # readonly NumPy arrays.  force_writable patches __array_interface__ to
+        # grant write access without copying.
+        self._flat_values = force_writable(self._flat_values)
 
         self._nested_splits = nested_splits if nested_splits is not None else []
-        # Same writable guarantee for nested_splits (used in cumsum, slice arithmetic)
+        # Same writable guarantee for nested_splits
         for i, s in enumerate(self._nested_splits):
-            if isinstance(s, np.ndarray) and not s.flags.writeable:
-                try:
-                    s.flags.writeable = True
-                except ValueError:
-                    self._nested_splits[i] = np.array(s)
+            self._nested_splits[i] = force_writable(s)
 
         self._global_shape = global_shape
 
