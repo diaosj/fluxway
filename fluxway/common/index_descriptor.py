@@ -181,7 +181,7 @@ class ContinuousIndex(IndexDescriptor):
         backend = get_backend()
         if self.pattern == IndexPattern.CONTIGUOUS:
             return backend.arange(
-                self.start, self.start + self.count, dtype=backend.int32()
+                self.start, self.start + self.count, dtype=backend.int32(), device="cpu"
             )
         elif self.pattern == IndexPattern.STRIDED:
             return backend.arange(
@@ -189,6 +189,7 @@ class ContinuousIndex(IndexDescriptor):
                 self.start + self.step * self.count,
                 self.step,
                 dtype=backend.int32(),
+                device="cpu",
             )
         raise ValueError(f"Cannot materialize pattern={self.pattern}")
 
@@ -297,7 +298,7 @@ class ExplicitIndex(IndexDescriptor):
             return ExplicitIndex(self.indices[s:e])
 
         # Tensor path: Avoid JAX tracer concretization errors
-        idx_range = backend.arange(start, end, dtype=backend.int32())
+        idx_range = backend.arange(start, end, dtype=backend.int32(), device="cpu")
         sliced_indices = backend.take(self.indices, idx_range)
         return ExplicitIndex(sliced_indices)
 

@@ -205,7 +205,7 @@ class TransportPlanner:
         ndim = len(global_shape)
 
         mesh_coords: list[Any | None] = [None] * len(dst_mesh.shape) if dst_mesh else []
-        combined_valid_mask = backend.ones((1,), dtype=backend.int32())
+        combined_valid_mask = backend.ones((1,), dtype=backend.int32(), device="cpu")
 
         from fluxway.common.types.sharding import ChunkPartition
 
@@ -238,7 +238,9 @@ class TransportPlanner:
                     )
                 else:
                     # Fallback for anonymous shards (1:1 mapping)
-                    input_for_routing = backend.arange(0, src_data_shape[d])
+                    input_for_routing = backend.arange(
+                        0, src_data_shape[d], device="cpu"
+                    )
 
             # Identify sub-mesh assigned to this tensor dimension
             axes = dst_partitions[d]
@@ -289,12 +291,14 @@ class TransportPlanner:
 
         for i in range(len(mesh_coords)):
             if mesh_coords[i] is None:
-                mesh_coords[i] = backend.zeros((1,), dtype=backend.int32())
+                mesh_coords[i] = backend.zeros(
+                    (1,), dtype=backend.int32(), device="cpu"
+                )
 
         if dst_mesh:
             primary_dest = dst_mesh.coordinate_to_device(tuple(mesh_coords))
         else:
-            primary_dest = backend.zeros((1,), dtype=backend.int32())
+            primary_dest = backend.zeros((1,), dtype=backend.int32(), device="cpu")
 
         dest_devices = primary_dest
 
@@ -321,7 +325,9 @@ class TransportPlanner:
             rep_axis_idx = [mesh.axis_names.index(ax) for ax in dst_replica_axes]
             rep_shape = [mesh.shape[idx] for idx in rep_axis_idx]
 
-            rep_flat_indices = backend.arange(0, num_replicas, dtype=backend.int32())
+            rep_flat_indices = backend.arange(
+                0, num_replicas, dtype=backend.int32(), device="cpu"
+            )
 
             if len(dst_replica_axes) == 1:
                 expanded_coords[rep_axis_idx[0]] = backend.reshape(

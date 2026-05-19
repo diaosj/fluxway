@@ -1025,14 +1025,14 @@ def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
         or len(backend.shape(prime_rank_tags)) == 0
     ):
         target_rank = int(prime_rank_tags)
-        counts = backend.zeros((world_size,), dtype=backend.int32())
+        counts = backend.zeros((world_size,), dtype=backend.int32(), device="cpu")
 
         if target_rank >= 0 and target_rank < world_size:
             first_tensor = backend.tree_flatten(slave_tensors)[0][0]
             rows = backend.shape(first_tensor)[0]
             counts = backend.index_update(counts, (target_rank,), rows)
 
-        offsets = backend.zeros((world_size,), dtype=backend.int32())
+        offsets = backend.zeros((world_size,), dtype=backend.int32(), device="cpu")
         return slave_tensors, counts, offsets
 
     # Sentinel Protocol:
@@ -1103,7 +1103,7 @@ def _jit_plan_and_pack(
     )
 
     cs = backend.cumsum(send_counts, dim=0)
-    zero = backend.zeros((1,), dtype=backend.int32())
+    zero = backend.zeros((1,), dtype=backend.int32(), device="cpu")
     send_offsets = backend.cat([zero, cs[:-1]], dim=0)
 
     # 2. Reorder data per payload — O(N) flat reorder, no vmap padding
@@ -1140,12 +1140,12 @@ def _jit_plan_and_pack(
 
             num_items = backend.shape(reordered_item_lengths)[0]
             item_ids = backend.repeat_interleave(
-                backend.arange(0, num_items, dtype=backend.int32()),
+                backend.arange(0, num_items, dtype=backend.int32(), device="cpu"),
                 reordered_item_lengths,
                 total_repeat_length=flat_cap,
             )
 
-            iota = backend.arange(0, flat_cap, dtype=backend.int32())
+            iota = backend.arange(0, flat_cap, dtype=backend.int32(), device="cpu")
             reordered_flat_starts = backend.take(reordered_flat_offsets, item_ids)
             inner_offsets = iota - reordered_flat_starts
 

@@ -145,7 +145,7 @@ class DeviceMesh:
         np_coords = tuple(
             backend.to_numpy(c) if hasattr(c, "shape") else c for c in coords
         )
-        return backend.tensor(self.device_ids[np_coords])
+        return backend.tensor(self.device_ids[np_coords], device="cpu")
 
     def unravel_index(self, ranks: Any) -> tuple[Any, ...]:
         """Convert physical ranks to multi-dimensional logical coordinates."""

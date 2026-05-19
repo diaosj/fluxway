@@ -19,22 +19,21 @@ from fluxway.common.tensor_backend import HybridBackend
 
 @pytest.fixture
 def cpu_backend():
-    """CPU backend with Numba JIT enabled — must NOT fallback to pure NumPy."""
-    b = HybridBackend(device="cpu", enable_numba_jit=True)
+    """Backend with CPU as default device and Numba JIT enabled."""
+    b = HybridBackend(default_device="cpu", enable_numba_jit=True)
     assert b._use_jit is True, "Numba JIT must be available, no fallback allowed"
-    assert b._is_cpu()
+    assert b._default_device == "cpu"
     return b
 
 
 @pytest.fixture
 def gpu_backend():
-    """GPU backend using CuPy native — must NOT fallback to CPU."""
+    """Backend with GPU as default device — must NOT fallback to CPU."""
     try:
-        b = HybridBackend(device="gpu")
+        b = HybridBackend(default_device="gpu")
     except Exception:
         pytest.skip("CuPy/CUDA not available")
-    assert b._is_gpu(), "GPU mode must be active, no fallback to CPU"
-    assert b._cp is not None
+    assert b._cp is not None, "GPU mode must be active, no fallback to CPU"
     return b
 
 
@@ -238,14 +237,14 @@ class TestGPUCuPyNative:
         world_size = 8
         num_cols = 4
         destinations = rng.integers(0, world_size, n, dtype=np.int32)
-        x = gpu_backend.tensor(destinations)
+        x = gpu_backend.tensor(destinations, device="gpu")
         sort_idx = gpu_backend.argsort(x, stable=True)
         assert isinstance(sort_idx, cp.ndarray)
         counts = gpu_backend.bincount(x, minlength=world_size)
         assert isinstance(counts, cp.ndarray)
         offsets = gpu_backend.cumsum(counts, dim=0)
         assert isinstance(offsets, cp.ndarray)
-        positions = gpu_backend.arange(0, n, dtype=gpu_backend.int32())
+        positions = gpu_backend.arange(0, n, dtype=gpu_backend.int32(), device="gpu")
         rows = gpu_backend.floor_divide(positions, num_cols)
         cols = gpu_backend.mod(positions, num_cols)
         assert isinstance(rows, cp.ndarray)
@@ -271,20 +270,24 @@ class TestGPUCuPyNative:
             np.testing.assert_array_equal(gpu_backend.to_numpy(offsets), expected)
 
     def test_gpu_tensor_is_cupy(self, gpu_backend):
-        """Sanity: all factory methods return CuPy arrays on GPU backend."""
+        """Sanity: factory methods return CuPy arrays when device='gpu'."""
         import cupy as cp
 
         assert isinstance(
-            gpu_backend.zeros((4,), dtype=gpu_backend.float32()), cp.ndarray
+            gpu_backend.zeros((4,), dtype=gpu_backend.float32(), device="gpu"),
+            cp.ndarray,
         )
         assert isinstance(
-            gpu_backend.ones((4,), dtype=gpu_backend.float32()), cp.ndarray
+            gpu_backend.ones((4,), dtype=gpu_backend.float32(), device="gpu"),
+            cp.ndarray,
         )
         assert isinstance(
-            gpu_backend.arange(0, 10, dtype=gpu_backend.int32()), cp.ndarray
+            gpu_backend.arange(0, 10, dtype=gpu_backend.int32(), device="gpu"),
+            cp.ndarray,
         )
         assert isinstance(
-            gpu_backend.full((4,), 7, dtype=gpu_backend.int32()), cp.ndarray
+            gpu_backend.full((4,), 7, dtype=gpu_backend.int32(), device="gpu"),
+            cp.ndarray,
         )
 
     def test_full_routing_pipeline_gpu(self, gpu_backend):
