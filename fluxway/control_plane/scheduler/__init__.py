@@ -3,4 +3,4 @@
 from .scheduler import Scheduler
 from .pg_manager import PGManager
 
-__all__ = [PGManager, Scheduler]
+__all__ = ["PGManager", "Scheduler"]

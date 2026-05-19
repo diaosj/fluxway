@@ -77,7 +77,7 @@ class TransportPlanner:
         dst_spec: PhysicalLayout,
         src_index_desc: Any | None = None,
         dst_index_desc: Any | None = None,
-        src_routing_shard_resolver: Callable[[int, int], Any] | None = None,
+        src_routing_shard_resolver: Callable[..., Any] | None = None,
         src_routing_indices: Any | None = None,
         src_routing_based_values: Any | None = None,
     ) -> TransportPlan:
@@ -144,7 +144,7 @@ class TransportPlanner:
         src_routing_based_values: Any | None,
         dst_index_desc: Any,
         dst_routing_dim: int | tuple[int, ...] | None,
-        dst_strategy: Callable | None,
+        dst_strategy: Any | None,
         dst_mesh: Any | None,
         dst_partitions: dict | None,
         dst_replica_axes: Any | None,
@@ -162,6 +162,7 @@ class TransportPlanner:
 
         dst_is_content_addressable = (
             getattr(dst_strategy, "routing_paradigm", None) is not None
+            and dst_strategy is not None
             and dst_strategy.routing_paradigm.name == "DYNAMIC"
         )
 

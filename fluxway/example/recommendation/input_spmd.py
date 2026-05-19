@@ -1,7 +1,8 @@
+from typing import Any
 import asyncio
 
 import numpy as np
-import sparse_embedding as se
+import sparse_embedding as se  # type: ignore
 
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator
@@ -28,7 +29,7 @@ async def _sparse_unique(
       Dense static assembly buffer
     """
     ids_np = tt.flat_values
-    total_elements = tt.global_shape[0]
+    total_elements = tt.global_shape[0]  # type: ignore
 
     unique_dlm, inv_dlm, first_index_dlm = await se.async_unique(
         ids_np.ravel(), return_inverse=True, return_first_indices=True
@@ -39,12 +40,19 @@ async def _sparse_unique(
     first_np = backend.from_dlpack(first_index_dlm).astype(np.int32)
 
     if tt.origin_indices is not None:
-        global_positions = np.take(tt.origin_indices_materialized, first_np)
+        origin = tt.origin_indices_materialized
+        if origin is None:
+            raise ValueError("origin_indices_materialized is None")
+        global_positions = np.take(origin, first_np)
     else:
         global_positions = first_np
 
     inv_1d = backend.from_dlpack(inv_dlm).astype(np.int32).reshape(-1)
-    adjusted_inv = global_positions[inv_1d]
+    # inv_1d is already a local 0-based index into unique_np for this rank.
+    # global_positions encodes where each unique embedding lands in the global
+    # assembly buffer — that belongs on unique_tt.origin_indices only.
+    # DenseSPMD uses inv to index into the local emb shard, so keep it local.
+    adjusted_inv = inv_1d
 
     # -- 数值正确性验证: unique + inv 还原 --
     # 还原: original_ids[i] == unique_ids[inv[i]] 对所有 i 成立
@@ -72,7 +80,20 @@ async def _sparse_unique(
     mesh_axis_names=("dp",),
 )
 class InputSPMD:
+    rank: int
+    world_size: int
+    ctx: "Any"
     """Deduplicates features via sparse_embedding.async_unique and routes to embedding tables."""
+
+    def __init__(
+        self,
+        name: str = "",
+        mesh: "Any" = None,
+        runtime_env: "Any" = None,
+        resource: "Any" = None,
+        **kwargs: "Any",
+    ):
+        pass
 
     @operator(
         name="process",

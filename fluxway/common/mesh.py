@@ -91,7 +91,7 @@ class DeviceMesh:
         self._inverse_map = {}
         it = np.nditer(self.device_ids, flags=["multi_index", "refs_ok"])
         for x in it:
-            rank = int(x)
+            rank = int(x)  # type: ignore
             self._inverse_map[rank] = it.multi_index
 
     @property

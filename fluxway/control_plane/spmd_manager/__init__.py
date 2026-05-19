@@ -2,4 +2,4 @@
 
 from .manager import SPMDManager, SPMDHandle
 
-__all__ = [SPMDHandle, SPMDManager]
+__all__ = ["SPMDHandle", "SPMDManager"]

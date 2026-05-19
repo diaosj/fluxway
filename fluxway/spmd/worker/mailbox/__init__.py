@@ -2,4 +2,4 @@
 
 from .mailbox import WorkerMailbox
 
-__all__ = [WorkerMailbox]
+__all__ = ["WorkerMailbox"]

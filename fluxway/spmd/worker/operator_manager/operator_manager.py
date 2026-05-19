@@ -10,7 +10,7 @@ Responsibilities:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, cast
 from collections.abc import Callable
 from fluxway.common.utils.logging import get_logger
 import asyncio
@@ -123,7 +123,7 @@ class OperatorManager:
 
         # Resolve operator callables from operator_metas (owner class + method name).
         # config.operators only provides the op_name → method_name mapping.
-        self._operators: dict[str, Callable] = {}
+        self._operators: dict[str, Any] = {}
         for op_name, meta in (config.operator_metas or {}).items():
             method_name = config.operators.get(op_name, op_name)
             if meta.owner_class_qualname:
@@ -191,7 +191,7 @@ class OperatorManager:
         # (op_name, tuuid, pre_spmd_id, rank, step_mod) -> List[int]
         self._producer_cache: dict[tuple[str, int, str, int, int], list[int]] = {}
         # (tuuid, pre_spmd_id) -> PhysicalLayout (projected)
-        self._effective_layout_cache: dict[tuple[int, str], PhysicalLayout] = {}
+        self._effective_layout_cache: dict[tuple[int, str], PhysicalLayout | None] = {}
 
         # Parse topology from OperatorMeta
         self._parse_operator_metadata()
@@ -223,14 +223,17 @@ class OperatorManager:
             return None
 
         if routing.is_referential:
-            if routing.routing.tuuid is None:
+            if getattr(routing.routing, "tuuid", None) is None:
                 raise ValueError(
                     f"[Fluxway Topology Resolution Error] Incomplete referential routing for input '{tuuid}' in operator '{op_name}'. "
-                    f"The logical path '{routing.routing.path}' failed to resolve to a concrete TUUID. "
+                    f"The logical path '{getattr(routing.routing, 'path', '')}' failed to resolve to a concrete TUUID. "
                     "This usually happens when the path points to an operator or field that is not defined in the graph as a predecessor."
                 )
             # Resolve the producer's logical routing first
-            producer_routing = self._resolve_producer_spec(routing.routing.tuuid)
+            tuuid_val = getattr(routing.routing, "tuuid", None)
+            if tuuid_val is None:
+                raise ValueError("TUUID missing")
+            producer_routing = self._resolve_producer_spec(tuuid_val)
             if producer_routing:
                 # bind to PhysicalLayout on current mesh
                 layout = producer_routing.bind(self._mesh)
@@ -261,7 +264,7 @@ class OperatorManager:
             return None
 
         if spec.is_referential:
-            if spec.routing.tuuid is None:
+            if getattr(spec.routing, "tuuid", None) is None:
                 raise ValueError(f"Incomplete producer ref for TUUID {tuuid}")
 
             current_trace = _trace or set()
@@ -270,7 +273,7 @@ class OperatorManager:
             current_trace.add(tuuid)
 
             resolved = self._resolve_producer_spec(
-                spec.routing.tuuid, _trace=current_trace
+                cast(int, getattr(spec.routing, "tuuid", None)), _trace=current_trace
             )
             if resolved and provider_map is None:
                 self._resolved_producer_cache[tuuid] = resolved
@@ -659,7 +662,7 @@ class OperatorManager:
         """Helper to resolve referential paths to TUUIDs in a specific map."""
         for spec in sharding_map.values():
             if spec.is_referential:
-                spec.routing.resolve(resolver_fn)
+                getattr(spec.routing, "resolve", lambda x: None)(resolver_fn)
 
     def _register_all_algebraic_specs(
         self, sharding_map: dict[int, "ShardingSpec"]
@@ -679,7 +682,7 @@ class OperatorManager:
 
         for _, spec in sharding_map.items():
             if isinstance(spec, ShardingSpec) and spec.is_referential:
-                mirror_tuuid = spec.routing.tuuid
+                mirror_tuuid = getattr(spec.routing, "tuuid", None)
                 if mirror_tuuid is None:
                     continue
 
@@ -690,7 +693,9 @@ class OperatorManager:
                         continue
 
                     # Inject the ultimate algebraic truth into our referential spec
-                    spec.routing.resolve_sharding(truth_spec.routing)
+                    getattr(spec.routing, "resolve_sharding", lambda x: None)(
+                        truth_spec.routing
+                    )
 
     def resolve_path(self, op_name: str, path: str) -> int:
         """
@@ -1148,7 +1153,7 @@ class OperatorManager:
 
         # Fallback for Eager mode or dynamic inputs: check input_sharding mesh
         spec = self._input_sharding.get(op_name, {}).get(tuuid)
-        if spec and spec.mesh:
+        if spec and getattr(spec, "mesh", None):
             return spec.mesh.size
 
         raise ValueError(

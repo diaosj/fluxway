@@ -50,7 +50,7 @@ class IndexDescriptor:
             all_merged = True
 
             for next_d in descriptors[1:]:
-                merged_candidate = merged._try_merge(next_d)
+                merged_candidate = merged._try_merge(next_d)  # type: ignore
                 if merged_candidate is None:
                     all_merged = False
                     break
@@ -341,11 +341,13 @@ except ImportError:
     _JAX_AVAILABLE = False
 
 if _JAX_AVAILABLE:
+    import jax
+
     jax.tree_util.register_pytree_node(
         ContinuousIndex,
-        lambda x: ((x.start, x.step, x.count), {"pattern": x.pattern}),
+        lambda x: ((x.start, x.step, x.count), {"pattern": x.pattern}),  # type: ignore
         lambda aux, children: ContinuousIndex(
-            pattern=aux["pattern"],
+            pattern=aux["pattern"],  # type: ignore
             start=children[0],
             step=children[1],
             count=children[2],

@@ -67,7 +67,7 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionResult,
 )
 from fluxway.transport.communication import AsyncDataDistributor
-from typing import Any, Optional, get_type_hints
+from typing import Any, Optional, get_type_hints, cast
 
 
 @compile(static_argnums=())
@@ -129,6 +129,23 @@ class SPMDWorker:
     Ray will automatically detect this as an async actor due to async method definitions.
     """
 
+    _step_tuuid_cache: dict[int, dict[int, Any]]
+    _completed_step_count: dict[str, int]
+    _pending_future_steps: dict[str, list[int]]
+    _successor_handlers: dict[str, dict[int, Any]]
+    _send_semaphore: "asyncio.Semaphore"
+    _heartbeat_interval: float
+    _last_error: str | None
+    _op_runnable: dict[str, "asyncio.Event"]
+    _mailbox: WorkerMailbox
+    _drain_cond: "asyncio.Condition"
+
+    @property
+    def op_manager(self) -> OperatorManager:
+        if self._op_manager is None:
+            raise RuntimeError("OperatorManager is not initialized yet.")
+        return self._op_manager
+
     def __init__(
         self,
         config: SPMDConfig,
@@ -184,7 +201,7 @@ class SPMDWorker:
         )
 
         # Op-level blocking: asyncio.Event (set=runnable, clear=blocked)
-        self._op_runnable: dict[str, asyncio.Event] = {
+        self._op_runnable = {
             op_name: asyncio.Event()
             for op_name in (self.config.operators if self.config else {})
         }
@@ -221,7 +238,7 @@ class SPMDWorker:
         # Handler storage (Data Plane - wrapped in DataPlaneCallable)
         # {spmd_id: {rank: DataPlaneCallable}}
         self._predecessor_handlers: dict[str, dict[int, DataPlaneCallable]] = {}
-        self._successor_handlers: dict[str, dict[int, DataPlaneCallable]] = {}
+        self._successor_handlers = {}
 
         # Heartbeat configuration
         self._heartbeat_interval: float = 5.0
@@ -263,7 +280,7 @@ class SPMDWorker:
 
         # Metadata for "Mirror Sharding" (Symmetry Routing)
         # Structure: {step_id: {op_name.tuuid: TransportTensor}}
-        self._step_tuuid_cache: dict[int, dict[int, TransportTensor]] = {}
+        self._step_tuuid_cache = {}
 
         # Tracks which (op_name, step) barriers have been registered to avoid double-declaring.
         self._barriers_declared: dict[tuple[str, int], bool] = {}
@@ -351,7 +368,7 @@ class SPMDWorker:
                 except (ValueError, TypeError):
                     init_kwargs = {}
 
-                instance = cls.__new__(cls)
+                instance = object.__new__(cls)
                 _inject_context_properties(cls)
                 ctx = get_current_context()
                 for _attr in _STATIC_CONTEXT_ATTR_NAMES:
@@ -472,7 +489,7 @@ class SPMDWorker:
             self._source_pause_events = {
                 op_name: asyncio.Event()
                 for op_name in (self.config.operators if self.config else {})
-                if self._op_manager.is_source_operator(op_name)
+                if self.op_manager.is_source_operator(op_name)
             }
             for event in self._source_pause_events.values():
                 event.set()
@@ -655,7 +672,7 @@ class SPMDWorker:
         """
         Trigger initial steps for source operators (those with 0 input tensors).
         """
-        source_ops = self._op_manager.get_source_operators()
+        source_ops = self.op_manager.get_source_operators()
         logger.debug(
             f"Source operators identified ops={source_ops} spmd_id={self.spmd_id} rank={self.rank}"
         )
@@ -715,7 +732,7 @@ class SPMDWorker:
         Called by the Driver BEFORE the task is triggered on all workers.
         """
         if self._op_manager:
-            self._op_manager.register_eager_inputs(
+            self.op_manager.register_eager_inputs(
                 op_name, tuuid_sharding, expected_counts
             )
 
@@ -749,7 +766,7 @@ class SPMDWorker:
         # Drop stale data (data for steps already executed)
         # Note: periodic ops don't have stale steps as they use virtual sequence
         is_periodic = (
-            self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
+            self.op_manager.is_periodic_trigger(op_name) if self._op_manager else False
         )
         if not is_periodic and step < completed_step_count:
             logger.warning(
@@ -802,7 +819,16 @@ class SPMDWorker:
         meta_tensor_state_list = (
             meta_tensor_state_list if meta_tensor_state_list is not None else [0] * num
         )
-        global_shapes = global_shapes if global_shapes is not None else [None] * num
+        global_shapes = (
+            global_shapes
+            if global_shapes is not None
+            else cast(list[tuple[int, ...] | None], [None] * num)
+        )
+        _slice_compact = (
+            slice_compact_desc_params
+            if slice_compact_desc_params is not None
+            else [None] * num
+        )
 
         op_bundles: dict[str, dict[str, list[Any]]] = {}
         cursor = 0
@@ -820,7 +846,7 @@ class SPMDWorker:
             tuuid_counts = counts[cursor : cursor + n_elements]
             cursor += n_elements
 
-            ops = self._op_manager.get_operators_for_tuuid(u)
+            ops = self.op_manager.get_operators_for_tuuid(u)
             for op_name in ops:
                 if op_name not in op_bundles:
                     op_bundles[op_name] = {
@@ -837,9 +863,7 @@ class SPMDWorker:
                 bundle["counts"].extend(tuuid_counts)
                 bundle["shapes"].append(global_shapes[i])
                 bundle["meta"].append(meta_state)
-                bundle["compact"].append(
-                    slice_compact_desc_params[i] if slice_compact_desc_params else None
-                )
+                bundle["compact"].append(_slice_compact[i])
 
         watermark = 0
         for op_name, bundle in op_bundles.items():
@@ -851,7 +875,7 @@ class SPMDWorker:
             sub_compact = bundle["compact"]
             self._ensure_step_declared(op_name, step)
 
-            sender_world_size = self._op_manager.get_sender_world_size(
+            sender_world_size = self.op_manager.get_sender_world_size(
                 op_name, sender_id, sub_uuids[0]
             )
             if sender_world_size is None:
@@ -890,19 +914,17 @@ class SPMDWorker:
             return  # Already declared
 
         expected_tensors = (
-            self._op_manager.get_expected_tensor_shards(op_name)
+            self.op_manager.get_expected_tensor_shards(op_name)
             if self._op_manager
             else {}
         )
         expected_states = (
-            self._op_manager.get_expected_control_arg_names(op_name)
+            self.op_manager.get_expected_control_arg_names(op_name)
             if self._op_manager
             else []
         )
         meta = (
-            self._op_manager.get_operator_metadata(op_name)
-            if self._op_manager
-            else None
+            self.op_manager.get_operator_metadata(op_name) if self._op_manager else None
         )
         self._mailbox.declare_step(
             op_name,
@@ -947,7 +969,7 @@ class SPMDWorker:
         logger.debug(
             f"Enqueue called op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
-        meta = self._op_manager._get_operator_metadata(op_name)
+        meta = self.op_manager._get_operator_metadata(op_name)
         priority = meta.priority if isinstance(meta, OperatorMeta) else 0
         await self._execution_queue.put((-priority, step, op_name))
         logger.debug(
@@ -1018,7 +1040,7 @@ class SPMDWorker:
                 )
                 # Check if this op is in periodic_trigger mode
                 is_periodic = (
-                    self._op_manager.is_periodic_trigger(op_name)
+                    self.op_manager.is_periodic_trigger(op_name)
                     if self._op_manager
                     else False
                 )
@@ -1091,7 +1113,7 @@ class SPMDWorker:
 
     async def _check_all_empty(self, op_name: str, step: int) -> bool:
         """Check if all received shards for a step are empty packets."""
-        expected_tuuids = self._op_manager.get_expected_tuuids(op_name)
+        expected_tuuids = self.op_manager.get_expected_tuuids(op_name)
         if not expected_tuuids:
             return False
 
@@ -1116,7 +1138,7 @@ class SPMDWorker:
         if self._op_manager is None:
             return
 
-        successor_ids = self._op_manager.get_successor_ids(op_name)
+        successor_ids = self.op_manager.get_successor_ids(op_name)
         if not successor_ids:
             return
 
@@ -1126,7 +1148,7 @@ class SPMDWorker:
         )
 
         for spmd_id in successor_ids:
-            succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
+            succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
             if not succ_info:
                 continue
 
@@ -1136,19 +1158,19 @@ class SPMDWorker:
                 # target_spec = succ_info.tuuid_sharding.get(tuuid)
                 # # Note: For empty packets, we might not have a source_spec if we skipped execution.
                 # # However, the OperatorManager's output_sharding contains it.
-                # output_sharding = self._op_manager.get_output_sharding(op_name)
+                # output_sharding = self.op_manager.get_output_sharding(op_name)
                 # # Find the source spec for this TUUID (searching reverse mapping isn't great but works here)
                 # # Actually, OperatorManager should have a get_output_sharding_by_uuid.
                 # # For now, let's just find it.
                 # source_spec = None
-                # for uuid_val in self._op_manager.get_output_tuuids(op_name):
+                # for uuid_val in self.op_manager.get_output_tuuids(op_name):
                 #     if uuid_val == tuuid:
                 #         source_spec = output_sharding.get(uuid_val)
                 #         break
 
                 # if source_spec and target_spec:
                 #     effective_rank = self.rank
-                #     dispatcher = self._op_manager.get_dispatcher(op_name)
+                #     dispatcher = self.op_manager.get_dispatcher(op_name)
                 #     if getattr(dispatcher, "interleave_unit_size", None) is not None:
                 #         effective_rank = self.rank % dispatcher.interleave_unit_size
 
@@ -1221,7 +1243,7 @@ class SPMDWorker:
                 return ExecutionResult(status=ExecutionStatus.STALE_AFTER_RESTORE)
 
             # --- Dispatcher Check: Should this rank execute this step? ---
-            dispatcher = self._op_manager.get_dispatcher(op_name)
+            dispatcher = self.op_manager.get_dispatcher(op_name)
             if not dispatcher.should_execute(self.rank, self._world_size, step):
                 logger.debug(
                     f"Dispatcher skipped execution op={op_name} step={step} "
@@ -1254,11 +1276,11 @@ class SPMDWorker:
                 raise e
 
             if isinstance(input_data, dict):
-                op_result = await self._op_manager.execute_async(
+                op_result = await self.op_manager.execute_async(
                     op_name, step, **input_data
                 )
             else:
-                op_result = await self._op_manager.execute_async(
+                op_result = await self.op_manager.execute_async(
                     op_name, step, input_data
                 )
             logger.debug(
@@ -1297,8 +1319,8 @@ class SPMDWorker:
             raise
 
     async def _assemble_input(self, op_name: str, step: int) -> Any:
-        static_args = self._op_manager.get_static_args()
-        expected_state_names = self._op_manager.get_expected_control_arg_names(op_name)
+        static_args = self.op_manager.get_static_args()
+        expected_state_names = self.op_manager.get_expected_control_arg_names(op_name)
         all_states = await self._mailbox.get_all_control_arguments(op_name, step)
         state_args = {
             name: all_states[name]
@@ -1306,9 +1328,9 @@ class SPMDWorker:
             if name in all_states
         }
 
-        meta = self._op_manager.get_operator_metadata(op_name)
-        input_types = self._op_manager.get_operator_input_types(op_name)
-        pre_topo = self._op_manager.get_predecessor_topology(op_name)
+        meta = self.op_manager.get_operator_metadata(op_name)
+        input_types = self.op_manager.get_operator_input_types(op_name)
+        pre_topo = self.op_manager.get_predecessor_topology(op_name)
 
         all_tuuids = []
         p_to_tuuids = {}
@@ -1556,8 +1578,8 @@ class SPMDWorker:
     ) -> "TransportTensor":
         """Assemble tensor shards into a complete TransportTensor."""
         # Note: Input layout is now retrieved as a PhysicalLayout bound to current mesh
-        input_layout = self._op_manager._resolve_input_spec(op_name, tuuid)
-        predecessor_topology = self._op_manager.get_predecessor_topology(op_name)
+        input_layout = self.op_manager._resolve_input_spec(op_name, tuuid)
+        predecessor_topology = self.op_manager.get_predecessor_topology(op_name)
 
         if input_layout is None or input_layout.is_content_addressable:
             # Fallback or dynamic: merge all shards
@@ -1599,7 +1621,7 @@ class SPMDWorker:
                 continue
 
             # Unified resolution (handles interleave, etc.)
-            producer_ranks = self._op_manager.resolve_tensor_producers(
+            producer_ranks = self.op_manager.resolve_tensor_producers(
                 op_name, tuuid, pre_spmd_id, self.rank, step=step
             )
 
@@ -1696,7 +1718,7 @@ class SPMDWorker:
 
         stacked = backend.stack(all_values)
         op = (
-            input_layout.reduce_op.value
+            cast(Any, input_layout.reduce_op).value
             if hasattr(input_layout.reduce_op, "value")
             else str(input_layout.reduce_op)
         )
@@ -2029,7 +2051,7 @@ class SPMDWorker:
         next_step_index = completed_step_count
 
         # If it's a source operator, automatically trigger the next step
-        if self._op_manager.is_source_operator(op_name):
+        if self.op_manager.is_source_operator(op_name):
             # Check for global step limit (max_steps)
             max_steps = self.config.max_steps
             if max_steps is not None and completed_step_count >= max_steps:
@@ -2058,7 +2080,7 @@ class SPMDWorker:
 
         # Check if this op is in periodic_trigger mode
         is_periodic = (
-            self._op_manager.is_periodic_trigger(op_name) if self._op_manager else False
+            self.op_manager.is_periodic_trigger(op_name) if self._op_manager else False
         )
 
         if not is_periodic:
@@ -2115,9 +2137,9 @@ class SPMDWorker:
             await self._propagate_empty_packets(op_name, exec_step)
             return
 
-        output_uuids = self._op_manager.get_output_tuuids(op_name)
+        output_uuids = self.op_manager.get_output_tuuids(op_name)
         # Flatten the result using guided tree_flatten
-        meta = self._op_manager.get_operator_metadata(op_name)
+        meta = self.op_manager.get_operator_metadata(op_name)
         flat_results, treedef = tree_flatten(
             result.data, treedef_template=meta.output_treedef if meta else None
         )
@@ -2125,11 +2147,11 @@ class SPMDWorker:
         if exec_step not in self._step_tuuid_cache:
             self._step_tuuid_cache[exec_step] = {}
 
-        successor_ids = sorted(set(self._op_manager.get_successor_ids(op_name)))
+        successor_ids = sorted(set(self.op_manager.get_successor_ids(op_name)))
 
         # Extract state arguments
         state_data = {}
-        expected_state_names = self._op_manager.get_output_state_names(op_name)
+        expected_state_names = self.op_manager.get_output_state_names(op_name)
         if expected_state_names:
             # Use tree_unflatten to reconstruct the original structure for state extraction
             # This is a temporary measure until state is properly integrated into the graph
@@ -2140,7 +2162,7 @@ class SPMDWorker:
                     state_data[name] = val
 
         for spmd_id in successor_ids:
-            succ_info = self._op_manager.get_successor_info(op_name, spmd_id)
+            succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
             if succ_info is None:
                 continue
 
@@ -2161,9 +2183,7 @@ class SPMDWorker:
                 if not isinstance(leaf_tensor, TransportTensor):
                     leaf_tensor = TransportTensor.from_tensor(leaf_tensor)
 
-                source_logical = self._op_manager.get_output_sharding(op_name).get(
-                    tuuid
-                )
+                source_logical = self.op_manager.get_output_sharding(op_name).get(tuuid)
                 target_logical = succ_info.tuuid_sharding.get(tuuid)
 
                 if source_logical is None or target_logical is None:
@@ -2172,7 +2192,7 @@ class SPMDWorker:
                 source_spec = source_logical.bind(self._mesh)
                 target_spec = target_logical.bind(succ_info.mesh or self._mesh)
 
-                dispatcher = self._op_manager.get_dispatcher(op_name)
+                dispatcher = self.op_manager.get_dispatcher(op_name)
                 unit_size = getattr(dispatcher, "interleave_unit_size", None)
                 if isinstance(unit_size, int):
                     unit_idx = self.rank // unit_size
@@ -2210,7 +2230,7 @@ class SPMDWorker:
                     if mirror_tuuid is not None:
                         source_ref = self._step_tuuid_cache[exec_step].get(mirror_tuuid)
                         if source_ref is None:
-                            tuuid_to_name = self._op_manager.get_output_tuuid_to_name(
+                            tuuid_to_name = self.op_manager.get_output_tuuid_to_name(
                                 op_name
                             )
                             output_name = (
@@ -2247,7 +2267,7 @@ class SPMDWorker:
                         and leaf_tensor.receipt is None
                         and leaf_tensor.flat_values is None
                     ):
-                        tuuid_to_name = self._op_manager.get_output_tuuid_to_name(
+                        tuuid_to_name = self.op_manager.get_output_tuuid_to_name(
                             op_name
                         )
                         output_name = (
@@ -2282,7 +2302,7 @@ class SPMDWorker:
             distributor = AsyncDataDistributor(effective_rank)
 
             # Build TUUID -> Name mapping for debugging and reporting (cached in OpManager)
-            tuuid_to_name = self._op_manager.get_output_tuuid_to_name(op_name)
+            tuuid_to_name = self.op_manager.get_output_tuuid_to_name(op_name)
 
             for (source_spec, target_spec, _), batch in batches.items():
                 batch_target_uuids = [t[0] for t in batch]
@@ -2444,11 +2464,11 @@ class SPMDWorker:
 
     def set_static_arg(self, name: str, value: Any) -> None:
         """Set a static argument value."""
-        self._op_manager.set_static_arg(name, value)
+        self.op_manager.set_static_arg(name, value)
 
     def get_static_arg(self, name: str) -> Any | None:
         """Get a static argument value."""
-        return self._op_manager.get_static_arg(name)
+        return self.op_manager.get_static_arg(name)
 
     # =========================================================================
     # State Argument Handling
@@ -2629,7 +2649,7 @@ class SPMDWorker:
         """
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         if self._op_manager:
-            for op in self._op_manager._operators.values():
+            for op in self.op_manager._operators.values():
                 if hasattr(op, "on_snapshot_begin"):
                     op.on_snapshot_begin(spmd_dir)
 
@@ -2642,7 +2662,7 @@ class SPMDWorker:
         """
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         if self._op_manager:
-            for op_name, op in self._op_manager._operators.items():
+            for op_name, op in self.op_manager._operators.items():
                 if hasattr(op, "on_snapshot_commit"):
                     op_states = gathered_states.get(op_name, {})
                     op.on_snapshot_commit(spmd_dir, op_states)
@@ -2665,7 +2685,7 @@ class SPMDWorker:
               tensors.
         """
         completed_step_count_snapshot = dict(self._completed_step_count)
-        static_args_snapshot = self._op_manager.get_static_args()
+        static_args_snapshot = self.op_manager.get_static_args()
 
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         operator_states = self._call_operator_save_state(spmd_dir)
@@ -2717,7 +2737,7 @@ class SPMDWorker:
             )
         for op_name, count in spmd_state["completed_step_count"].items():
             self._completed_step_count[op_name] = count
-            if self._op_manager.is_source_operator(op_name):
+            if self.op_manager.is_source_operator(op_name):
                 max_steps = self.config.max_steps
                 if max_steps is None or count < max_steps:
                     logger.info(
@@ -2736,7 +2756,7 @@ class SPMDWorker:
                 f"for spmd_id={self.spmd_id} rank={self.rank}."
             )
         for name, value in spmd_state["static_args"].items():
-            self._op_manager.set_static_arg(name, value)
+            self.op_manager.set_static_arg(name, value)
 
         if rank_storage is None:
             logger.debug(
@@ -2748,7 +2768,7 @@ class SPMDWorker:
 
         target_state = {
             "completed_step_count": self._completed_step_count,
-            "static_args": self._op_manager.get_all_static_args(),
+            "static_args": self.op_manager.get_static_args(),
             "operator_states": self._call_operator_save_state(""),
         }
         state = await self._checkpoint_backend.load(

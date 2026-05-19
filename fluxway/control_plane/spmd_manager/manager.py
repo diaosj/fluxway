@@ -23,6 +23,7 @@ try:
     RAY_AVAILABLE = True
 except ImportError:
     RAY_AVAILABLE = False
+    PlacementGroupSchedulingStrategy = None
 
 from fluxway.common.types import SPMDConfig
 from fluxway.common.utils.logging import get_logger
@@ -84,7 +85,7 @@ class SPMDHandle:
         return method_fn.remote(*args, **kwargs)
 
 
-class SPMDManager:
+class SPMDManager:  # pyright: ignore[reportRedeclaration]
     """
     Global SPMD Manager (Orchestrator).
 
@@ -186,14 +187,14 @@ class SPMDManager:
             driver_name = f"spmd_driver_{spmd_id}"
             driver_opts: dict[str, Any] = {"name": driver_name}
             if placement_group is not None:
-                driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(  # type: ignore
                     placement_group=placement_group,
                     placement_group_bundle_index=driver_bundle_index,
                 )
             if config.runtime_env:
                 driver_opts["runtime_env"] = config.runtime_env
 
-            driver = spmd_driver_cls.options(**driver_opts).remote(
+            driver = spmd_driver_cls.options(**driver_opts).remote(  # type: ignore
                 spmd_id=spmd_id,
                 config=config,
                 placement_group=placement_group,

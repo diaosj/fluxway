@@ -50,8 +50,8 @@ logger = get_logger(__name__)
 
 if RAY_AVAILABLE:
 
-    @ray.remote
-    class SPMDDriver:
+    @ray.remote  # type: ignore[reportPossiblyUnboundVariable]
+    class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         """
         SPMD Driver (Ray Actor).
 
@@ -224,7 +224,7 @@ if RAY_AVAILABLE:
             """Build .options() kwargs for a worker actor."""
             opts: dict[str, Any] = {"name": name}
             if self.placement_group is not None:
-                opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(  # type: ignore[reportPossiblyUnboundVariable]
                     placement_group=self.placement_group,
                     placement_group_bundle_index=bundle_idx,
                 )
@@ -242,13 +242,13 @@ if RAY_AVAILABLE:
             """Start all worker actors."""
 
             # Get self handle for registering with workers
-            self_handle = ray.get_runtime_context().current_actor
+            self_handle = ray.get_runtime_context().current_actor  # type: ignore
 
             for rank, bundle_idx in enumerate(self.worker_bundle_indices):
                 opts = self._build_worker_opts(
                     bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}"
                 )
-                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
+                worker = SPMDWorker.options(**opts).remote(
                     config=self.config,
                     rank=rank,
                     spmd_id=self.spmd_id,
@@ -261,7 +261,7 @@ if RAY_AVAILABLE:
                 logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
 
             # Collect each worker's node_id concurrently without blocking the
-            # event loop.  ray.get() on an async actor would freeze the actor
+            # event loop.  ray.get(  # type: ignore[reportPossiblyUnboundVariable]) on an async actor would freeze the actor
             # until all RPCs return, preventing heartbeat processing and
             # incoming RPC handling during the wait.
             node_id_refs = {
@@ -308,7 +308,7 @@ if RAY_AVAILABLE:
                     continue  # Already started
                 worker.setup_and_start.remote(
                     **rank_info[rank],
-                    rank0_address=rank0_address,
+                    rank0_address=rank0_address,  # type: ignore
                 )
 
             logger.debug(
@@ -737,7 +737,7 @@ if RAY_AVAILABLE:
                 )
             else:
                 # Too many attempts, report to controller
-                self._report_error(
+                self._report_error(  # type: ignore
                     f"Worker {rank} recovery failed after {attempts} attempts: {error}"
                 )
 
@@ -1075,17 +1075,17 @@ if RAY_AVAILABLE:
                 old_worker = self._worker_handles.get(rank)
                 if old_worker is not None:
                     try:
-                        ray.kill(old_worker)
+                        ray.kill(old_worker)  # type: ignore
                     except Exception:
                         pass
 
                 # Start new worker
                 bundle_idx = self.worker_bundle_indices[rank]
-                self_handle = ray.get_runtime_context().current_actor
+                self_handle = ray.get_runtime_context().current_actor  # type: ignore
                 opts = self._build_worker_opts(
                     bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}_recovered"
                 )
-                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
+                worker = SPMDWorker.options(**opts).remote(
                     config=self.config,
                     rank=rank,
                     spmd_id=self.spmd_id,
@@ -1097,7 +1097,7 @@ if RAY_AVAILABLE:
 
                 # Start worker execution if we're in RUNNING state
                 if self.state_machine.is_running():
-                    worker.start.remote()
+                    worker._auto_start.remote()  # type: ignore[attr-defined]
 
                 logger.debug(
                     f"Worker recovery successful rank={rank} spmd_id={self.spmd_id}"
@@ -1233,7 +1233,7 @@ if RAY_AVAILABLE:
 
 else:
     # Mock class when Ray is not available
-    class SPMDDriver:
+    class SPMDDriver:  # type: ignore[reportRedeclaration]
         """Mock SPMD Driver for testing without Ray."""
 
         def __init__(self, spmd_id: str, **kwargs):

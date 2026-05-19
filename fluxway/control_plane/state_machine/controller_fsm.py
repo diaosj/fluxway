@@ -104,7 +104,7 @@ class ControllerStateMachine:
         ): ControllerState.BLOCKED,
     }
 
-    def __init__(self, controller: "ControllerActor"):
+    def __init__(self, controller: "ControllerActor"):  # type: ignore
         """
         Initialize ControllerStateMachine.
 

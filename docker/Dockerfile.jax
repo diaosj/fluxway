@@ -36,7 +36,6 @@ RUN pip install -i ${PIP_MIRROR} --no-cache-dir \
     minio \
     "ray[all]==2.49.0" \
     numba \
-    cupy \
     grain \
     orjson \
     psutil \

@@ -76,6 +76,9 @@ from .sharding import (
 # Unified tensor wrapper
 from .tensor import TransportTensor
 
+# Operator interfaces
+from .operator import StatefulOperatorProtocol
+
 __all__ = [
     "SPMDConfig",
     "Edge",
@@ -133,4 +136,5 @@ __all__ = [
     "ShardingSpec",
     "PhysicalLayout",
     "TransportTensor",
+    "StatefulOperatorProtocol",
 ]

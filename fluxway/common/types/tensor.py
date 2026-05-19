@@ -116,9 +116,9 @@ class TransportTensor:
     def __init__(
         self,
         flat_values: Any,
-        nested_splits: list[np.ndarray] | None = None,  # type: ignore
-        origin_indices: IndexDescriptor | None = None,
-        routing_indices: IndexDescriptor | None = None,
+        nested_splits: list[Any] | None = None,
+        origin_indices: Any | None = None,
+        routing_indices: Any | None = None,
         global_shape: tuple[int, ...] | None = None,
         receipt: SymmetryReceipt | None = None,
     ):
@@ -1184,6 +1184,7 @@ except ImportError:
     _JAX_AVAILABLE = False
 
 if _JAX_AVAILABLE:
+    import jax
 
     def _tt_flatten(v):
         children = (

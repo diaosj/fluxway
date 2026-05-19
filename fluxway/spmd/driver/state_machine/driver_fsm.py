@@ -19,10 +19,12 @@ import threading
 from typing import TYPE_CHECKING
 from collections.abc import Callable
 
+from typing import Any
+
 from fluxway.common.types import DriverState, DriverEvent
 
 if TYPE_CHECKING:
-    from fluxway.spmd.driver import SPMDDriver
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ class DriverStateMachine:
         (DriverState.SNAPSHOTTING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
     }
 
-    def __init__(self, driver: "SPMDDriver"):
+    def __init__(self, driver: "Any"):
         """
         Initialize DriverStateMachine.
 

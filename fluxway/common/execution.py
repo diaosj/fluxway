@@ -57,7 +57,7 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
                 return jax.pure_callback(_host_runner, result_shape, (args, kwargs))
 
         elif backend.is_torch:
-            import torch
+            import torch  # type: ignore
 
             # Optimization: Only use disable if we are actually compiling.
             # Avoids overhead in eager mode.
@@ -97,7 +97,7 @@ def compile(func: Callable | None = None, **kwargs):
         return jax.jit(func, **kwargs)
 
     elif backend.is_torch:
-        import torch
+        import torch  # type: ignore
 
         # JAX call sites may pass options like static_argnums; torch.compile does
         # not accept those, so keep only parameters from torch.compile's API.

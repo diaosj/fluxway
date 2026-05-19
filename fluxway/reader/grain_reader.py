@@ -143,7 +143,7 @@ class GrainReader(BaseReader):
         without modification.
         """
         if hasattr(self._iterator, "get_state"):
-            raw: bytes = self._iterator.get_state()
+            raw: bytes = self._iterator.get_state()  # type: ignore
             return {self._GRAIN_STATE_KEY: base64.b64encode(raw).decode()}
         return {}
 
@@ -164,4 +164,4 @@ class GrainReader(BaseReader):
                 f"Override set_state() in your subclass to handle this iterator type."
             )
         raw = base64.b64decode(state[self._GRAIN_STATE_KEY].encode())
-        self._iterator.set_state(raw)
+        self._iterator.set_state(raw)  # type: ignore

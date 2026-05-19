@@ -1,3 +1,4 @@
+from typing import Any
 import jax
 import jax.numpy as jnp
 import jax.tree_util as jtu
@@ -24,6 +25,7 @@ try:
         _GPU_AVAILABLE = False
 except ImportError:
     _GPU_AVAILABLE = False
+    cp = None
 
 
 def _xp():
@@ -36,6 +38,10 @@ def _xp():
     mesh_axis_names=("dp",),
 )
 class DenseSPMD:
+    rank: int
+    world_size: int
+    ctx: "Any"
+    rank0_address: str
     """Final computation node: forward pass, loss, and dense/embedding gradient computation."""
 
     def __init__(
@@ -43,59 +49,44 @@ class DenseSPMD:
         embed_dim: int = 3,
         dense_stats_dim: int = 2,
         grad_accum_steps: int = 2,
+        name: str = "",
+        mesh: "Any" = None,
+        runtime_env: "Any" = None,
+        resource: "Any" = None,
+        **kwargs: "Any",
     ):
         self.embed_dim = embed_dim
         self.dense_stats_dim = dense_stats_dim
         self.grad_accum_steps = grad_accum_steps
         self._jax_initialized = False
 
-        # JAX distributed coordination is only meaningful with accelerators.
-        # On CPU-only hosts the coordination service aborts (SIGABRT), so we
-        # skip initialization entirely and rely on the default CPU device.
-        if _GPU_AVAILABLE:
-            print(
-                f"[DenseSPMD] init jax.distributed rank={self.rank} world_size={self.world_size} coordinator={self.rank0_address}",
-                flush=True,
-            )
-            try:
-                jax.distributed.initialize(
-                    coordinator_address=self.rank0_address,
-                    num_processes=self.world_size,
-                    process_id=self.rank,
-                )
-                print(
-                    f"[DenseSPMD] init jax.distributed success rank={self.rank}",
-                    flush=True,
-                )
-            except Exception as e:
-                print(
-                    f"[DenseSPMD] init jax.distributed failed rank={self.rank} error={e}",
-                    flush=True,
-                )
-                raise
-        else:
-            print(
-                f"[DenseSPMD] CPU-only mode, skipping jax.distributed init rank={self.rank}",
-                flush=True,
-            )
-
     def _ensure_jax_init(self):
         if self._jax_initialized:
             return
 
-        if _GPU_AVAILABLE:
-            n_global = len(jax.devices())
-            print(
-                f"[DenseSPMD._ensure_jax_init] rank={self.rank} "
-                f"global_devices={n_global} local_devices={len(jax.local_devices())}"
-            )
-            self.mesh = Mesh(jax.devices(), ("dp",))
-        else:
-            # CPU-only: single default device, no distributed mesh
-            print(
-                f"[DenseSPMD._ensure_jax_init] CPU-only rank={self.rank} devices=[cpu]"
-            )
-            self.mesh = Mesh(jax.local_devices(), ("dp",))
+        # jax.distributed.initialize() is called here (lazily on first operator
+        # invocation) rather than in __init__.  All Ray actors must finish __init__
+        # before any operator executes, so by this point every rank's actor is
+        # alive and can connect to the coordinator simultaneously — avoiding the
+        # deadlock that occurs when __init__ blocks waiting for a peer that Ray
+        # hasn't created yet.
+        print(
+            f"[DenseSPMD] init jax.distributed rank={self.rank} "
+            f"world_size={self.world_size} coordinator={self.rank0_address}",
+            flush=True,
+        )
+        jax.distributed.initialize(
+            coordinator_address=self.rank0_address,
+            num_processes=self.world_size,
+            process_id=self.rank,
+        )
+
+        n_global = len(jax.devices())
+        print(
+            f"[DenseSPMD] jax.distributed ok rank={self.rank} "
+            f"global_devices={n_global} local_devices={len(jax.local_devices())}"
+        )
+        self.mesh = Mesh(jax.devices(), ("dp",))
 
         input_dim = self.embed_dim * 2 + self.dense_stats_dim
 
@@ -148,10 +139,10 @@ class DenseSPMD:
 
         # -- JIT 外: GPU(CuPy) / CPU(NumPy) 操作 --
         xp = _xp()
-        emb1_2d = xp.asarray(emb1.flat_values).reshape(-1, emb1.flat_values.shape[-1])
-        emb2_2d = xp.asarray(emb2.flat_values).reshape(-1, emb2.flat_values.shape[-1])
-        inv1_1d = xp.asarray(inv1.flat_values).reshape(-1)
-        inv2_1d = xp.asarray(inv2.flat_values).reshape(-1)
+        emb1_2d = xp.asarray(emb1.flat_values).reshape(-1, emb1.flat_values.shape[-1])  # type: ignore
+        emb2_2d = xp.asarray(emb2.flat_values).reshape(-1, emb2.flat_values.shape[-1])  # type: ignore
+        inv1_1d = xp.asarray(inv1.flat_values).reshape(-1)  # type: ignore
+        inv2_1d = xp.asarray(inv2.flat_values).reshape(-1)  # type: ignore
 
         # -- 数值正确性验证: inv 索引范围 --
         assert inv1_1d.min() >= 0 and inv1_1d.max() < emb1_2d.shape[0], (
@@ -163,13 +154,13 @@ class DenseSPMD:
 
         f1_rec = emb1_2d[inv1_1d]
         f2_rec = emb2_2d[inv2_1d]
-        dense_stats = xp.asarray(dp_data.dense_stats.flat_values).reshape(
+        dense_stats = xp.asarray(dp_data.dense_stats.flat_values).reshape(  # type: ignore
             -1, dp_data.dense_stats.flat_values.shape[-1]
         )
         labels_local = (
-            xp.asarray(dp_data.labels.is_click.flat_values)
+            xp.asarray(dp_data.labels.is_click.flat_values)  # type: ignore
             .reshape(-1)
-            .astype(xp.float32)
+            .astype(xp.float32)  # type: ignore
         )
 
         # -- 数值正确性验证: inv 还原 --
@@ -191,25 +182,28 @@ class DenseSPMD:
         stats_jax = jnp.asarray(dense_stats)
         labels_jax = jnp.asarray(labels_local)
 
-        # Build global sharded arrays from per-rank local slices.
-        # All 6 dp ranks collectively form the global batch of world_size * local_batch rows.
+        # All world_size JAX workers form one distributed session (via
+        # jax.distributed.initialize in __init__), so the global shape is
+        # world_size * local_batch regardless of CPU or GPU backend.
+        jax_world_size = self.world_size
+
         global_f1 = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch, f1_jax.shape[1]),
+            shape=(jax_world_size * local_batch, f1_jax.shape[1]),
             sharding=dp_sharding,
             arrays=[f1_jax],
         )
         global_f2 = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch, f2_jax.shape[1]),
+            shape=(jax_world_size * local_batch, f2_jax.shape[1]),
             sharding=dp_sharding,
             arrays=[f2_jax],
         )
         global_stats = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch, stats_jax.shape[1]),
+            shape=(jax_world_size * local_batch, stats_jax.shape[1]),
             sharding=dp_sharding,
             arrays=[stats_jax],
         )
         global_labels = jax.make_array_from_single_device_arrays(
-            shape=(self.world_size * local_batch,),
+            shape=(jax_world_size * local_batch,),
             sharding=dp_sharding,
             arrays=[labels_jax],
         )
@@ -246,24 +240,24 @@ class DenseSPMD:
         )
 
         # -- JIT 输出后处理: JAX → xp --
-        grad_f1_local = xp.asarray(grad_f1_global.addressable_shards[0].data)
-        grad_f2_local = xp.asarray(grad_f2_global.addressable_shards[0].data)
+        grad_f1_local = xp.asarray(grad_f1_global.addressable_shards[0].data)  # type: ignore
+        grad_f2_local = xp.asarray(grad_f2_global.addressable_shards[0].data)  # type: ignore
 
         # scatter-add: (local_batch, emb_dim) → (K_u, emb_dim)
-        g1_unique = xp.zeros_like(emb1_2d)
+        g1_unique = xp.zeros_like(emb1_2d)  # type: ignore
         if _GPU_AVAILABLE:
-            cp.scatter_add(
+            cp.scatter_add(  # type: ignore
                 g1_unique,
-                cp.broadcast_to(inv1_1d[:, None], grad_f1_local.shape),
+                cp.broadcast_to(inv1_1d[:, None], grad_f1_local.shape),  # type: ignore
                 grad_f1_local,
             )
         else:
             np.add.at(g1_unique, inv1_1d, grad_f1_local)
-        g2_unique = xp.zeros_like(emb2_2d)
+        g2_unique = xp.zeros_like(emb2_2d)  # type: ignore
         if _GPU_AVAILABLE:
-            cp.scatter_add(
+            cp.scatter_add(  # type: ignore
                 g2_unique,
-                cp.broadcast_to(inv2_1d[:, None], grad_f2_local.shape),
+                cp.broadcast_to(inv2_1d[:, None], grad_f2_local.shape),  # type: ignore
                 grad_f2_local,
             )
         else:
@@ -272,8 +266,8 @@ class DenseSPMD:
         # -- 数值正确性验证: scatter-add 梯度 --
         # scatter-add 后 g1_unique 的非零行数不应超过 unique_keys 数量
         if _GPU_AVAILABLE:
-            g1_nonzero_rows = int(cp.count_nonzero(cp.any(g1_unique != 0, axis=1)))
-            g2_nonzero_rows = int(cp.count_nonzero(cp.any(g2_unique != 0, axis=1)))
+            g1_nonzero_rows = int(cp.count_nonzero(cp.any(g1_unique != 0, axis=1)))  # type: ignore
+            g2_nonzero_rows = int(cp.count_nonzero(cp.any(g2_unique != 0, axis=1)))  # type: ignore
         else:
             g1_nonzero_rows = int(np.count_nonzero(np.any(g1_unique != 0, axis=1)))
             g2_nonzero_rows = int(np.count_nonzero(np.any(g2_unique != 0, axis=1)))
@@ -287,15 +281,15 @@ class DenseSPMD:
         )
 
         dense_grad_leaves = jtu.tree_leaves(dense_param_grads)
-        dense_grad_flat = xp.concatenate(
-            [xp.asarray(g).ravel() for g in dense_grad_leaves]
+        dense_grad_flat = xp.concatenate(  # type: ignore
+            [xp.asarray(g).ravel() for g in dense_grad_leaves]  # type: ignore
         )
 
         print(
             f"[DenseSPMD.step] rank={self.rank} "
             f"f1_rec={f1_rec.shape} f2_rec={f2_rec.shape} "
             f"loss={float(loss_val):.4f} "
-            f"dense_grad_norms={[float(xp.linalg.norm(xp.asarray(g))) for g in dense_grad_leaves]}"
+            f"dense_grad_norms={[float(xp.linalg.norm(xp.asarray(g))) for g in dense_grad_leaves]}"  # type: ignore
         )
 
         return {

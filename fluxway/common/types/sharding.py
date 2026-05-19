@@ -158,9 +158,9 @@ class PartitionSpec(FluxwayBaseSchema):
 
     def __init__(self, *specs: str | tuple[str, ...] | None):
         if len(specs) == 1 and isinstance(specs[0], list | tuple) and not specs[0]:
-            super().__init__(specs=())
+            super().__init__(specs=())  # type: ignore
         else:
-            super().__init__(specs=specs)
+            super().__init__(specs=specs)  # type: ignore
 
     @property
     def partitions(self) -> dict[int, tuple[str, ...]]:
@@ -494,7 +494,7 @@ class ShardingSpec(FluxwayBaseSchema):
     routing: AlgebraicRouting | ReferentialRouting
 
     def __init__(self, routing: AlgebraicRouting | ReferentialRouting, **kwargs):
-        super().__init__(routing=routing, **kwargs)
+        super().__init__(routing=routing, **kwargs)  # type: ignore
 
     @property
     def strategy(self) -> PartitionStrategy:
@@ -568,12 +568,12 @@ class ShardingSpec(FluxwayBaseSchema):
     def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
         """Resolve the logical path to a physical TUUID."""
         if hasattr(self.routing, "resolve"):
-            self.routing.resolve(resolver_fn)
+            self.routing.resolve(resolver_fn)  # type: ignore
 
     def resolve_sharding(self, routing: AlgebraicRouting) -> None:
         """Inject the physical routing strategy once resolved."""
         if hasattr(self.routing, "resolve_sharding"):
-            self.routing.resolve_sharding(routing)
+            self.routing.resolve_sharding(routing)  # type: ignore
 
     # ---- Factory Methods ----
 
@@ -664,6 +664,9 @@ class PhysicalLayout(FluxwayBaseSchema):
     replica_axes: tuple[str, ...] | None = Field(default=None)
     replica_size: int = Field(default=1)
 
+    global_shape: tuple[int, ...] | None = Field(default=None)
+    reduce_op: Any | None = Field(default=None)
+
     @property
     def partitions(self) -> dict[int, tuple[str, ...]]:
         return self.spec.partitions
@@ -697,7 +700,7 @@ class PhysicalLayout(FluxwayBaseSchema):
         return self.spec.index_descriptor
 
     def __init__(self, spec: ShardingSpec, mesh: DeviceMesh, **kwargs):
-        super().__init__(spec=spec, mesh=mesh, **kwargs)
+        super().__init__(spec=spec, mesh=mesh, **kwargs)  # type: ignore
 
     @model_validator(mode="after")
     def _compute_replica_info(self) -> PhysicalLayout:

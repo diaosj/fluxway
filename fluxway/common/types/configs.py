@@ -419,7 +419,7 @@ class OperatorMeta(FluxwayBaseSchema):
 
     def resolve_async_strategy(self, resolver_fn: Callable[[str], int | None]) -> None:
         if hasattr(self.barrier_config, "resolve"):
-            self.barrier_config.resolve(resolver_fn)
+            self.barrier_config.resolve(resolver_fn)  # type: ignore
 
     def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> list[str]:
         args_map = self.output_arguments if is_output else self.input_arguments

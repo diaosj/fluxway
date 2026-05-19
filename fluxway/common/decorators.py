@@ -11,11 +11,10 @@ import importlib
 import inspect
 import logging
 import threading
-from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Annotated, Any, TypeVar, Union, get_type_hints
-
+from collections.abc import Callable
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
 
 logger = logging.getLogger(__name__)
@@ -80,7 +79,7 @@ def _resolve_owner_class(module_name: str, class_qualname: str) -> type:
     cls = module
     for part in class_qualname.split("."):
         cls = getattr(cls, part)
-    return cls
+    return cls  # type: ignore
 
 
 @contextmanager
@@ -410,7 +409,7 @@ def _resolve_output_sharding(
         if "type" in output_sharding and "axis" in output_sharding:
             resolved = dict.fromkeys(out_data_fields, output_sharding)
         else:
-            return_type_name = return_tp.__name__.lower()
+            return_type_name = return_tp.__name__.lower()  # type: ignore
             remaining: dict = {}
             for k, v in output_sharding.items():
                 if k.lower() in ("return", return_type_name):
@@ -552,14 +551,14 @@ class _OperatorWrapper:
             async def async_bound_method(*args, **kwargs):
                 return await self.func(_get_or_create_instance(), *args, **kwargs)
 
-            async_bound_method._fluxway_operator_meta = self._fluxway_operator_meta
+            async_bound_method._fluxway_operator_meta = self._fluxway_operator_meta  # type: ignore
             return async_bound_method
 
         @functools.wraps(self.func)
         def bound_method(*args, **kwargs):
             return self.func(_get_or_create_instance(), *args, **kwargs)
 
-        bound_method._fluxway_operator_meta = self._fluxway_operator_meta
+        bound_method._fluxway_operator_meta = self._fluxway_operator_meta  # type: ignore
         return bound_method
 
     def __call__(self, *args, **kwargs):
@@ -580,7 +579,7 @@ def operator(
     max_inflight_steps: int = 0,
     is_source: bool | None = None,
     barrier_config: Any | None = None,
-):
+) -> "Any":
     """
     Mark a function as a Fluxway operator with automatic metadata inference.
     """
@@ -788,14 +787,14 @@ def data_type():
                     f"Fix: Use a @data_type decorated dataclass instead of a dictionary."
                 )
 
-        cls.is_fluxway_data = classmethod(lambda c: True)
+        cls.is_fluxway_data = classmethod(lambda c: True)  # type: ignore
 
         if not hasattr(cls, "as_dict"):
 
             def as_dict(self):
                 return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
 
-            cls.as_dict = as_dict
+            cls.as_dict = as_dict  # type: ignore
 
         return cls
 
@@ -836,15 +835,15 @@ def spmd(
         mesh = DeviceMesh(axis_names=mesh_axis_names, device_shape=mesh_axis_shapes)
 
     def decorator(cls: type[T]) -> type[T]:
-        cls._resource = res_spec
-        cls._mesh = mesh
-        cls._runtime_env = runtime_env
+        cls._resource = res_spec  # type: ignore
+        cls._mesh = mesh  # type: ignore
+        cls._runtime_env = runtime_env  # type: ignore
 
-        cls.get_resource = classmethod(lambda c: c._resource)
-        cls.get_mesh = classmethod(lambda c: c._mesh)
-        cls.get_runtime_env = classmethod(lambda c: c._runtime_env)
-        cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)
-        cls.is_fluxway_spmd = classmethod(lambda c: True)
+        cls.get_resource = classmethod(lambda c: c._resource)  # type: ignore
+        cls.get_mesh = classmethod(lambda c: c._mesh)  # type: ignore
+        cls.get_runtime_env = classmethod(lambda c: c._runtime_env)  # type: ignore
+        cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)  # type: ignore
+        cls.is_fluxway_spmd = classmethod(lambda c: True)  # type: ignore
 
         original_new = cls.__new__
 
@@ -861,7 +860,7 @@ def spmd(
                 return original_new(cls_obj)
             return original_new(cls_obj, *args, **kwargs)
 
-        cls.__new__ = __new__
+        cls.__new__ = __new__  # type: ignore
 
         def get_spmd_config(c) -> "SPMDConfig":
             from fluxway.common.types import SPMDConfig, OperatorMeta
@@ -898,7 +897,7 @@ def spmd(
                 runtime_env=c._runtime_env,
             )
 
-        cls.get_spmd_config = classmethod(get_spmd_config)
+        cls.get_spmd_config = classmethod(get_spmd_config)  # type: ignore
         return cls
 
     return decorator

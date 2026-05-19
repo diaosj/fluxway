@@ -929,8 +929,8 @@ class Builder:
                 condition_fn=condition_fn,
                 tuuid_sharding=tuuid_src_out,
                 tuuid_map=tuuid_map,
-                target_op=target_op,
-                tensor_map=tensor_map,
+                target_op=target_op,  # type: ignore
+                tensor_map=tensor_map,  # type: ignore
                 input_param_map=dst_meta.input_param_map,
                 output_param_map=src_meta.output_param_map,
                 is_interleaved=is_interleaved,
@@ -942,8 +942,8 @@ class Builder:
                 condition_fn=condition_fn,
                 tuuid_sharding=tuuid_dst_in,
                 tuuid_map=tuuid_map,
-                target_op=target_op,
-                tensor_map=tensor_map,
+                target_op=target_op,  # type: ignore
+                tensor_map=tensor_map,  # type: ignore
                 input_param_map=dst_meta.input_param_map,
                 output_param_map=src_meta.output_param_map,
                 is_interleaved=is_interleaved,

@@ -3,7 +3,7 @@ from .backend import WorkerCheckpointBackend
 from .safetensors import SafeTensorsBackend
 
 try:
-    from .orbax import OrbaxBackend
+    from .orbax import OrbaxBackend  # type: ignore
 except ModuleNotFoundError as exc:
     _ORBAX_IMPORT_ERROR = exc
 

@@ -2,4 +2,4 @@
 
 from .executor import StatefulExecutor
 
-__all__ = [StatefulExecutor]
+__all__ = ["StatefulExecutor"]

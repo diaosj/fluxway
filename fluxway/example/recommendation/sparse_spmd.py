@@ -1,8 +1,9 @@
+from typing import Any
 import os
 
 import numpy as np
-import sparse_embedding as se
-import sparse_embedding.checkpoint
+import sparse_embedding as se  # type: ignore
+import sparse_embedding.checkpoint  # type: ignore
 
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator
@@ -18,6 +19,9 @@ logger = get_logger(__name__)
     mesh_axis_names=("shard",),
 )
 class SparseEmbeddingSPMD:
+    rank: int
+    world_size: int
+    ctx: "Any"
     """Sharded embedding table backed by sparse_embedding.EmbeddingStore.
 
     Each shard owns the embeddings for keys hash-routed to it.  Forward lookup
@@ -31,6 +35,11 @@ class SparseEmbeddingSPMD:
         vocab_size: int = 1000,
         embed_dim: int = 3,
         num_threads: int | None = None,
+        name: str = "",
+        mesh: "Any" = None,
+        runtime_env: "Any" = None,
+        resource: "Any" = None,
+        **kwargs: "Any",
     ):
         self.embed_dim = embed_dim
         self.vocab_size = vocab_size

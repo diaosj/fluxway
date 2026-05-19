@@ -30,7 +30,7 @@ class GraphParser:
     def __init__(self):
         self._graph: Graph | None = None
 
-    def parse_file(self, config_path: str | Path) -> Graph:
+    def parse_file(self, config_path: str | Path) -> Graph:  # type: ignore
         """
         Parse Graph configuration from a file (JSON/YAML).
 
@@ -46,7 +46,7 @@ class GraphParser:
         """
         pass
 
-    def parse_dict(self, config: dict[str, Any]) -> Graph:
+    def parse_dict(self, config: dict[str, Any]) -> Graph:  # type: ignore
         """
         Parse Graph configuration from a dictionary.
 
@@ -69,7 +69,7 @@ class GraphParser:
         config: SPMDConfig,
         upstream_nodes: list[str] | None = None,
         downstream_nodes: list[str] | None = None,
-    ) -> Node:
+    ) -> Node:  # type: ignore
         """
         Build a Node programmatically.
 
@@ -93,7 +93,7 @@ class GraphParser:
         target_node: str,
         edge_name: str = "",
         is_gradient_edge: bool = False,
-    ) -> Edge:
+    ) -> Edge:  # type: ignore
         """
         Add a directed edge to the Graph.
 

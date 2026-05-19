@@ -124,8 +124,8 @@ class BaseDataDistributor:
     def _plan_single_tensor_group(
         self,
         local_data: TransportTensor | list[TransportTensor],
-        source: PhysicalLayout,
-        target: PhysicalLayout,
+        source: PhysicalLayout | None,
+        target: PhysicalLayout | None,
         capacity: int | list[int] | None = None,
         tuuid: int | list[int] | None = None,
         tuuid_to_name: dict[int, str] | None = None,
@@ -403,10 +403,12 @@ class BaseDataDistributor:
         payloads_tuple = tuple(payloads)
 
         dst_partitions_tuple = (
-            tuple(sorted(target.partitions.items())) if target.partitions else None
+            tuple(sorted(target.partitions.items()))
+            if target and target.partitions
+            else None
         )
 
-        target_routing_dim = target.routing_dim
+        target_routing_dim = target.routing_dim if target else 0
 
         # Prepare static shapes for JIT padding
         # static_shapes: (item_cap, payload0_flat_cap, payload1_flat_cap, ...)
@@ -434,13 +436,13 @@ class BaseDataDistributor:
             src_data_shape=src_shape,
             src_routing_indices=src_geometry_indices,
             src_routing_based_values=dst_content_routing_values,
-            dst_index_desc=target.index_descriptor,
+            dst_index_desc=target.index_descriptor if target else None,
             dst_routing_dim=target_routing_dim,
-            dst_strategy=target.strategy,
-            dst_mesh=target.mesh,
+            dst_strategy=target.strategy if target else None,
+            dst_mesh=target.mesh if target else None,
             dst_partitions=dst_partitions_tuple,
-            dst_replica_axes=target.replica_axes,
-            dst_replica_size=target.replica_size,
+            dst_replica_axes=target.replica_axes if target else None,
+            dst_replica_size=target.replica_size if target else 1,
             static_shapes=static_shapes_tuple,
             src_spec=source,
             src_index_desc=primary.topology,
@@ -470,6 +472,7 @@ class BaseDataDistributor:
                     # TODO(He Jia): Support Cyclic
                     offset = int(offsets_host[device_id])
                     count = int(counts_host[device_id])
+                    assert isinstance(desc_obj, ContinuousIndex)
                     slice_compact_desc_params.append(
                         desc_obj.slice(offset, offset + count).to_compact_params()
                     )
@@ -1065,10 +1068,10 @@ def _jit_plan_and_pack(
     src_routing_based_values: Any,
     dst_index_desc: Any,
     dst_routing_dim: int | tuple[int, ...] | None,
-    dst_strategy: Callable,
-    dst_mesh: Any,
-    dst_partitions: Any,
-    dst_replica_axes: Any,
+    dst_strategy: Callable | None,
+    dst_mesh: Any | None,
+    dst_partitions: Any | None,
+    dst_replica_axes: Any | None,
     dst_replica_size: int,
     static_shapes: tuple[int, ...],
     src_spec: Any | None = None,

@@ -32,6 +32,7 @@ class StatefulExecutor:
         self._metrics: dict[str, Any] = {}
 
     def execute_on_all_workers(self, method: str, *args, **kwargs) -> list[Any]:
+        return []
         """
         Execute a method on all workers.
 
@@ -47,7 +48,12 @@ class StatefulExecutor:
         """
         pass
 
+    def get_operator_state(self, op_name: str) -> dict[str, Any]:
+        """Get state for a specific operator."""
+        return {}
+
     def save_worker_states(self) -> dict[str, Any]:
+        return {}
         """
         Save all worker states.
 
@@ -80,7 +86,7 @@ class StatefulExecutor:
         """
         pass
 
-    def collect_metrics(self) -> dict[str, Any]:
+    def collect_metrics(self) -> dict[str, Any]:  # type: ignore
         """
         Collect metrics from all workers.
 

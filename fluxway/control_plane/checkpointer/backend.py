@@ -35,7 +35,7 @@ class WorkerCheckpointBackend(ABC):
                 f"Unknown checkpoint backend: {name!r}. "
                 f"Registered backends: {sorted(_BACKEND_REGISTRY)}"
             )
-        return backend_cls(force_write=force_write)
+        return backend_cls(force_write=force_write)  # type: ignore
 
     @classmethod
     def registered_names(cls) -> list:

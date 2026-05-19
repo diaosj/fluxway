@@ -98,20 +98,24 @@ async def run_training(args):
         h_raw = reader.read()
         h_proc = input_node.process(h_raw)
 
-        h_emb1 = table1.lookup(unique_ids=h_proc.unique_user_ids).sparse_features
-        h_emb2 = table2.lookup(unique_ids=h_proc.unique_item_ids).sparse_features
+        h_emb1 = table1.lookup(
+            unique_ids=h_proc.unique_user_ids  # type: ignore
+        ).sparse_features
+        h_emb2 = table2.lookup(
+            unique_ids=h_proc.unique_item_ids  # type: ignore
+        ).sparse_features
 
         h_step = dense.step(
             emb1=h_emb1,
-            inv1=h_proc.user_inv,
+            inv1=h_proc.user_inv,  # type: ignore
             emb2=h_emb2,
-            inv2=h_proc.item_inv,
-            dp_data=h_proc.dp_data,
+            inv2=h_proc.item_inv,  # type: ignore
+            dp_data=h_proc.dp_data,  # type: ignore
         )
 
-        table1.update(grads=h_step.grad1)
-        table2.update(grads=h_step.grad2)
-        dense.update(dense_grad=h_step.dense_grad)
+        table1.update(grads=h_step.grad1)  # type: ignore
+        table2.update(grads=h_step.grad2)  # type: ignore
+        dense.update(dense_grad=h_step.dense_grad)  # type: ignore
 
         task_graph = graph.compile()
 

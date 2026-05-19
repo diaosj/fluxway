@@ -16,9 +16,9 @@ def force_writable(arr: Any) -> Any:
     ``__cuda_array_interface__`` (GPU) to clear the readonly flag and
     reconstructs a new view that shares the **same underlying memory**:
 
-    * zero-copy  – no data duplication
-    * writable   – downstream code can modify in-place
-    * safe       – the source array is kept alive via ``_source`` to
+    * zero-copy  - no data duplication
+    * writable   - downstream code can modify in-place
+    * safe       - the source array is kept alive via ``_source`` to
       prevent premature DLPack deallocation
 
     Only call this when you *know* the backing memory is writable (which is
@@ -113,6 +113,16 @@ class TensorBackend(ABC):
 
     @abstractmethod
     def name(self) -> str:
+        pass
+
+    @abstractmethod
+    def from_dlpack(self, dlpack_capsule: Any) -> Any:
+        """Create a tensor from a DLPack capsule."""
+        pass
+
+    @abstractmethod
+    def to_dlpack(self, x: Any) -> Any:
+        """Create a DLPack capsule from a tensor."""
         pass
 
     # ------------------------------------------------------------------
@@ -411,7 +421,7 @@ class TensorBackend(ABC):
 
 class TorchBackend(TensorBackend):
     def __init__(self):
-        import torch
+        import torch  # type: ignore
 
         self._torch = torch
 
@@ -641,7 +651,7 @@ class TorchBackend(TensorBackend):
 
     def tree_map(self, fun: Any, tree: Any) -> Any:
         try:
-            import torch.utils._pytree as pytree
+            import torch.utils._pytree as pytree  # type: ignore
 
             return pytree.tree_map(fun, tree)
         except ImportError:
@@ -652,7 +662,7 @@ class TorchBackend(TensorBackend):
 
     def tree_flatten(self, tree: Any) -> tuple[list[Any], Any]:
         try:
-            import torch.utils._pytree as pytree
+            import torch.utils._pytree as pytree  # type: ignore
 
             return pytree.tree_flatten(tree)
         except ImportError:
@@ -692,7 +702,7 @@ class TorchBackend(TensorBackend):
         return carry, self.stack(ys)
 
     def get_dlpack_slice(self, tensor: Any, cursor: Any | None = None) -> Any:
-        from torch.utils.dlpack import to_dlpack
+        from torch.utils.dlpack import to_dlpack  # type: ignore
 
         sliced_tensor = tensor
         if cursor is not None:
@@ -717,6 +727,21 @@ class TorchBackend(TensorBackend):
             )
 
         return DLPackObject(to_dlpack(sliced_tensor), device=device_tuple)
+
+    def from_dlpack(self, dlpack_capsule: Any) -> Any:
+        from torch.utils.dlpack import from_dlpack  # type: ignore
+
+        capsule_obj = (
+            dlpack_capsule
+            if hasattr(dlpack_capsule, "__dlpack__")
+            else DLPackObject(dlpack_capsule)
+        )
+        return from_dlpack(capsule_obj)
+
+    def to_dlpack(self, x: Any) -> Any:
+        from torch.utils.dlpack import to_dlpack  # type: ignore
+
+        return to_dlpack(x)
 
     def index_update(self, x: Any, indices: Any, values: Any) -> Any:
         x[indices] = values
@@ -807,7 +832,7 @@ class JaxBackend(TensorBackend):
         return self._jnp.stack(tensors, axis=dim)
 
     def equal(self, x: Any, y: Any) -> bool:
-        return self._jnp.array_equal(x, y)
+        return self._jnp.array_equal(x, y)  # type: ignore
 
     def float32(self) -> Any:
         return self._jnp.float32
@@ -980,7 +1005,7 @@ class JaxBackend(TensorBackend):
         if (isinstance(size, int | float) or self.is_scalar(size)) and ndim == 1:
             size = (size,)
 
-        return self._jax.lax.dynamic_slice(x, start, size)
+        return self._jax.lax.dynamic_slice(x, start, size)  # type: ignore
 
     def dynamic_slice_in_dim(self, x: Any, start: Any, size: int, axis: int = 0) -> Any:
         ndim = x.ndim
@@ -1024,6 +1049,19 @@ class JaxBackend(TensorBackend):
     def get_dlpack_slice(self, tensor: Any, cursor: Any | None = None) -> Any:
         # returns a zero-copy wrapper for JAX
         return JAXViewWrapper(tensor, cursor) if cursor is not None else tensor
+
+    def from_dlpack(self, dlpack_capsule: Any) -> Any:
+        import jax  # type: ignore
+
+        capsule_obj = (
+            dlpack_capsule
+            if hasattr(dlpack_capsule, "__dlpack__")
+            else DLPackObject(dlpack_capsule)
+        )
+        return jax.dlpack.from_dlpack(capsule_obj)
+
+    def to_dlpack(self, x: Any) -> Any:
+        return x.__dlpack__()
 
     def index_update(self, x: Any, indices: Any, values: Any) -> Any:
         return x.at[indices].set(values)

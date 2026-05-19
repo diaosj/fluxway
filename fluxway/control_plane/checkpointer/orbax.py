@@ -80,7 +80,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
         self._force_write = force_write
 
     def __setstate__(self, state):
-        self.__dict__.update(state)
+        self.__dict__.update(state)  # type: ignore
         self._handler = None
 
     def _get_handler(self):

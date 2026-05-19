@@ -11,7 +11,7 @@ try:
     RAY_AVAILABLE = True
 except ImportError:
     RAY_AVAILABLE = False
-    ray = None  # type: ignore
+    ray: Any = None
 
 logger = logging.getLogger(__name__)
 

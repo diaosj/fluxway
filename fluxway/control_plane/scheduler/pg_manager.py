@@ -24,7 +24,18 @@ try:
     RAY_AVAILABLE = True
 except ImportError:
     RAY_AVAILABLE = False
+    pass
+
+    def _placement_group_mock(*args: Any, **kwargs: Any) -> Any:
+        return None
+
+    def _remove_placement_group_mock(pg: Any) -> None:
+        pass
+
     PlacementGroup = Any  # type: ignore
+    placement_group = _placement_group_mock
+    remove_placement_group = _remove_placement_group_mock
+
 
 from fluxway.common.types import (
     ResourceSpec,

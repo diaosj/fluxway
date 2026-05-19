@@ -17,6 +17,8 @@ from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeature
     interleave_unit_size=1,
 )
 class RecommendationReader(GrainReader):
+    rank: int
+    world_size: int
     """
     Produces batches of UserBatch in col-store layout (Active / Passive / Label).
     When no data_source is provided, generates a 1000-sample synthetic dataset.
@@ -54,6 +56,9 @@ class RecommendationReader(GrainReader):
             static_args, rank, world_size, shard_index, shard_count
         )
         self._completed_steps = 0
+
+    def __init__(self):
+        super().__init__()
 
     @operator(
         "read",
@@ -153,7 +158,7 @@ class RecommendationReader(GrainReader):
 
         return UserBatch(active=active, passive=passive, labels=labels)
 
-    def save_state(self, ckpt_dir: str) -> dict[str, Any]:
+    def save_state(self, ckpt_dir: str) -> dict[str, Any]:  # type: ignore
         shard_count = getattr(self, "world_size", 1)
         static_args = getattr(self, "static_args", {})
         path = pathlib.Path(ckpt_dir) / f"reader_rank_{self.rank}_of_{shard_count}.json"
@@ -167,7 +172,7 @@ class RecommendationReader(GrainReader):
             )
         return {}
 
-    def restore_state(self, state: dict[str, Any], ckpt_dir: str) -> None:
+    def restore_state(self, state: dict[str, Any], ckpt_dir: str) -> None:  # type: ignore
         # completed_steps is identical across all ranks, so take the max.
         # Pair it with the saved batch_size to get the exact items-per-rank to skip,
         # regardless of the new world_size or batch_size.

@@ -18,6 +18,7 @@ import logging
 try:
     import ray
 
+    _ = ray
     RAY_AVAILABLE = True
 except ImportError:
     RAY_AVAILABLE = False
@@ -415,6 +416,8 @@ class Scheduler:
             return True
 
         try:
+            import ray
+
             available = ray.available_resources()
 
             if resources.num_gpus > 0:
