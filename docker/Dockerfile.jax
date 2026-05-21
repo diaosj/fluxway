@@ -51,7 +51,7 @@ COPY . /workspace/
 
 # Install the project in editable mode
 RUN cd /workspace && \
-    pip install -i ${PIP_MIRROR} --no-cache-dir -e .
+    pip install -i ${PIP_MIRROR} --no-cache-dir --no-deps -e .
 
 # Default command
 CMD ["/bin/bash"]

@@ -1,0 +1,45 @@
+# Exclude Git configuration
+.git
+.gitignore
+
+# Exclude local Python virtual environments and dependency caches
+.venv
+venv
+ENV
+env
+.pip
+*.egg-info
+build/
+dist/
+
+# Exclude bytecode and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Exclude local large-scale training datasets and Lance format files (Crucial to prevent build context bloat)
+dataset/data/*
+data/
+*.lance*
+*.log*
+
+# Exclude debugging and temporary artifacts
+/tmp/
+/backup/
+/out/
+/xla/
+/profiler/
+.DS_Store
+*.swp
+*~
+
+# Exclude IDE configuration files and AI Agent runtime paths
+.vscode/
+.idea/
+.claude/
+.gemini/
+.agents/
+.qoder/
