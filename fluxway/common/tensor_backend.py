@@ -1116,6 +1116,10 @@ class JAXViewWrapper:
 
     @property
     def __array_interface__(self):
+        if hasattr(self.arr, "devices") and any(
+            d.platform != "cpu" for d in self.arr.devices()
+        ):
+            raise AttributeError
         if hasattr(self.arr, "__array_interface__"):
             desc = self.arr.__array_interface__.copy()
         elif hasattr(self.arr, "unsafe_buffer_pointer"):

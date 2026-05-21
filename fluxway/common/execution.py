@@ -86,33 +86,42 @@ def compile(func: Callable | None = None, **kwargs):
     if func is None:
         return functools.partial(compile, **kwargs)
 
-    backend = get_backend()
+    cache = {}
 
-    if backend.is_jax:
-        import jax
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs_call):
+        backend = get_backend()
+        backend_name = backend.name()
+        if backend_name not in cache:
+            if backend.is_jax:
+                import jax
 
-        # Identify JIT-specific args.
-        # jax.jit(fun, static_argnums=None, device=None, backend=None, donate_argnums=None, inline=False, keep_unused=False, abstracted_axes=None)
-        # We pass everything in kwargs to jax.jit
-        return jax.jit(func, **kwargs)
+                # Identify JIT-specific args.
+                # jax.jit(fun, static_argnums=None, device=None, backend=None, donate_argnums=None, inline=False, keep_unused=False, abstracted_axes=None)
+                # We pass everything in kwargs to jax.jit
+                cache[backend_name] = jax.jit(func, **kwargs)
 
-    elif backend.is_torch:
-        import torch  # type: ignore
+            elif backend.is_torch:
+                import torch  # type: ignore
 
-        # JAX call sites may pass options like static_argnums; torch.compile does
-        # not accept those, so keep only parameters from torch.compile's API.
-        torch_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key in {"backend", "disable", "dynamic", "fullgraph", "mode", "options"}
-        }
+                # JAX call sites may pass options like static_argnums; torch.compile does
+                # not accept those, so keep only parameters from torch.compile's API.
+                torch_kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key
+                    in {"backend", "disable", "dynamic", "fullgraph", "mode", "options"}
+                }
 
-        # Set default mode to reduce-overhead if not provided, per user request
-        if "mode" not in torch_kwargs:
-            torch_kwargs["mode"] = "reduce-overhead"
+                # Set default mode to reduce-overhead if not provided, per user request
+                if "mode" not in torch_kwargs:
+                    torch_kwargs["mode"] = "reduce-overhead"
 
-        return torch.compile(func, **torch_kwargs)
+                cache[backend_name] = torch.compile(func, **torch_kwargs)
 
-    else:
-        # No-op for other backends (e.g. numpy?)
-        return func
+            else:
+                # No-op for other backends (e.g. numpy?)
+                cache[backend_name] = func
+        return cache[backend_name](*args, **kwargs_call)
+
+    return wrapper

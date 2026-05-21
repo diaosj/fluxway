@@ -350,7 +350,16 @@ class BaseDataDistributor:
                 selected_capacity = actual_req
             capacity = selected_capacity
         elif capacity is None:
-            capacity = actual_req
+            backend = get_backend()
+            if backend.name() == "jax":
+                if actual_req == 0:
+                    capacity = 0
+                elif actual_req <= 1024:
+                    capacity = 1 << (actual_req - 1).bit_length()
+                else:
+                    capacity = ((actual_req + 1023) // 1024) * 1024
+            else:
+                capacity = actual_req
 
         global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
 
@@ -400,7 +409,93 @@ class BaseDataDistributor:
             )
             return
 
-        payloads_tuple = tuple(payloads)
+        # Pad payloads and lengths to capacity bucket shape to avoid JAX JIT recompilation
+        backend = get_backend()
+        padded_payloads = []
+        padded_nested_length_list = []
+        static_shapes = [capacity]
+
+        for p, p_len in zip(payloads, nested_length_list, strict=True):
+            if p_len is not None:
+                # Ragged payload
+                pad_len_size = capacity - actual_req
+                if pad_len_size > 0:
+                    len_padding = backend.zeros(
+                        (pad_len_size,), dtype=backend.dtype(p_len)
+                    )
+                    padded_len = backend.cat([p_len, len_padding], dim=0)
+                else:
+                    padded_len = p_len
+                padded_nested_length_list.append(padded_len)
+
+                flat_req = p.shape[0]
+                if backend.name() == "jax" and capacity != actual_req:
+                    # Pad flat ragged values using same bucketing
+                    if flat_req == 0:
+                        flat_capacity = 0
+                    elif flat_req <= 1024:
+                        flat_capacity = 1 << (flat_req - 1).bit_length()
+                    else:
+                        flat_capacity = ((flat_req + 1023) // 1024) * 1024
+                else:
+                    flat_capacity = flat_req
+
+                static_shapes.append(flat_capacity)
+                pad_flat_size = flat_capacity - flat_req
+                if pad_flat_size > 0:
+                    flat_pad_shape = (pad_flat_size,) + backend.shape(p)[1:]
+                    flat_padding = backend.zeros(flat_pad_shape, dtype=backend.dtype(p))
+                    padded_p = backend.cat([p, flat_padding], dim=0)
+                else:
+                    padded_p = p
+                padded_payloads.append(padded_p)
+            else:
+                # Dense payload
+                padded_nested_length_list.append(None)
+                static_shapes.append(capacity)
+
+                pad_size = capacity - actual_req
+                if pad_size > 0:
+                    pad_shape = (pad_size,) + backend.shape(p)[1:]
+                    padding = backend.zeros(pad_shape, dtype=backend.dtype(p))
+                    padded_p = backend.cat([p, padding], dim=0)
+                else:
+                    padded_p = p
+                padded_payloads.append(padded_p)
+
+        # Pad routing indices and routing values to capacity bucket shape with -1
+        if src_geometry_indices is not None:
+            src_geometry_indices = backend.as_tensor(
+                src_geometry_indices, dtype=backend.int32()
+            )
+            pad_size = capacity - actual_req
+            if pad_size > 0:
+                padding = backend.full((pad_size,), -1, dtype=backend.int32())
+                src_geometry_indices = backend.cat(
+                    [src_geometry_indices, padding], dim=0
+                )
+
+        if dst_content_routing_values is not None:
+            dst_content_routing_values = backend.as_tensor(
+                dst_content_routing_values, dtype=backend.int32()
+            )
+            pad_size = capacity - actual_req
+            if pad_size > 0:
+                padding = backend.full((pad_size,), -1, dtype=backend.int32())
+                dst_content_routing_values = backend.cat(
+                    [dst_content_routing_values, padding], dim=0
+                )
+
+        # Adjust src_shape for capacity representation
+        source_is_static = source.is_static if source else False
+        source_shard_size = source.shard_size(0) if (source and source_is_static) else 1
+        global_capacity = capacity * source_shard_size
+        if primary.global_shape is not None:
+            src_shape = (global_capacity,) + primary.global_shape[1:]
+        else:
+            src_shape = (global_capacity,) + local_shape[1:]
+
+        payloads_tuple = tuple(padded_payloads)
 
         dst_partitions_tuple = (
             tuple(sorted(target.partitions.items()))
@@ -409,15 +504,6 @@ class BaseDataDistributor:
         )
 
         target_routing_dim = target.routing_dim if target else 0
-
-        # Prepare static shapes for JIT padding
-        # static_shapes: (item_cap, payload0_flat_cap, payload1_flat_cap, ...)
-        static_shapes = [capacity]
-        for p_data, p_len in zip(payloads, nested_length_list, strict=True):  # type: ignore
-            if p_len is not None:
-                static_shapes.append(int(p_data.shape[0]))
-            else:
-                static_shapes.append(capacity)
         static_shapes_tuple = tuple(static_shapes)
 
         (
@@ -431,7 +517,7 @@ class BaseDataDistributor:
             sort_indices,
         ) = _jit_plan_and_pack(
             payloads_tuple=payloads_tuple,
-            nested_length_list=tuple(nested_length_list),
+            nested_length_list=tuple(padded_nested_length_list),
             src_local_rank=self.local_rank,
             src_data_shape=src_shape,
             src_routing_indices=src_geometry_indices,
@@ -447,6 +533,11 @@ class BaseDataDistributor:
             src_spec=source,
             src_index_desc=primary.topology,
         )
+
+        if sort_indices is not None and capacity > actual_req:
+            # Filter sort_indices to only keep indices < actual_req
+            mask = sort_indices < actual_req
+            sort_indices = sort_indices[mask]
 
         # Materialise per-device send counts/offsets on the host once.  These are the
         # minimal scalars needed to slice the flat buffers; the heavy tensor data stays
@@ -1085,6 +1176,51 @@ def _jit_plan_and_pack(
     produced.
     """
     backend = get_backend()
+    print("[TRACE] _jit_plan_and_pack trace details:", flush=True)
+    print(
+        f"  payloads_tuple: {[(backend.shape(p), backend.dtype(p)) for p in payloads_tuple]}",
+        flush=True,
+    )
+    print(f"  nested_length_list: {nested_length_list}", flush=True)
+    print(
+        f"  src_local_rank: {src_local_rank} (type={type(src_local_rank)})", flush=True
+    )
+    print(
+        f"  src_data_shape: {src_data_shape} (type={type(src_data_shape)})", flush=True
+    )
+    print(
+        f"  src_routing_indices: {src_routing_indices is None} {None if src_routing_indices is None else backend.shape(src_routing_indices)}",
+        flush=True,
+    )
+    print(
+        f"  src_routing_based_values: {src_routing_based_values is None} {None if src_routing_based_values is None else backend.shape(src_routing_based_values)}",
+        flush=True,
+    )
+    print(
+        f"  dst_index_desc: {dst_index_desc} (type={type(dst_index_desc)})", flush=True
+    )
+    print(
+        f"  dst_routing_dim: {dst_routing_dim} (type={type(dst_routing_dim)})",
+        flush=True,
+    )
+    print(f"  dst_strategy: {dst_strategy} (type={type(dst_strategy)})", flush=True)
+    print(f"  dst_mesh: {dst_mesh} (type={type(dst_mesh)})", flush=True)
+    print(
+        f"  dst_partitions: {dst_partitions} (type={type(dst_partitions)})", flush=True
+    )
+    print(
+        f"  dst_replica_axes: {dst_replica_axes} (type={type(dst_replica_axes)})",
+        flush=True,
+    )
+    print(
+        f"  dst_replica_size: {dst_replica_size} (type={type(dst_replica_size)})",
+        flush=True,
+    )
+    print(f"  static_shapes: {static_shapes} (type={type(static_shapes)})", flush=True)
+    print(f"  src_spec: {src_spec} (type={type(src_spec)})", flush=True)
+    print(
+        f"  src_index_desc: {src_index_desc} (type={type(src_index_desc)})", flush=True
+    )
 
     # 1. Compute Plan
     sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (

@@ -243,6 +243,11 @@ class TransportPlanner:
                         0, src_data_shape[d], device="cpu"
                     )
 
+            # Pre-truncate sentinel values (-1) to safe index 0 for strategy & unravel calculations
+            input_for_routing_safe = backend.where(
+                input_for_routing >= 0, input_for_routing, 0
+            )
+
             # Identify sub-mesh assigned to this tensor dimension
             axes = dst_partitions[d]
             axis_indices = [dst_mesh.axis_names.index(ax) for ax in axes]
@@ -252,7 +257,7 @@ class TransportPlanner:
                 sub_num_workers *= s
 
             logical_ranks_d = strategy(
-                input_for_routing,
+                input_for_routing_safe,
                 dim_size=global_shape[d],
                 num_workers=sub_num_workers,
                 index_desc=dst_index_desc if is_dynamic_dim else None,
@@ -354,11 +359,18 @@ class TransportPlanner:
             else backend.reshape(backend.select(dest_devices, dim=1, index=0), (-1,))
         )
 
-        sort_indices = backend.argsort(primary_dest_flat, dim=0, stable=True)
+        valid_mask_flat = backend.reshape(combined_valid_mask, (-1,))
+
+        # Map sentinel elements (where valid_mask_flat is 0) to dst_num_workers (garbage bin)
+        # to ensure they sort to the very end and do not corrupt valid rank offsets.
+        primary_dest_flat_for_sort = backend.where(
+            valid_mask_flat > 0, primary_dest_flat, dst_num_workers
+        )
+
+        sort_indices = backend.argsort(primary_dest_flat_for_sort, dim=0, stable=True)
 
         # Step 5: Compute send counts
         # Filter out sentinels (-1) from padded JIT operations
-        valid_mask_flat = backend.reshape(combined_valid_mask, (-1,))
 
         # We ensure primary_dest_flat is safe for bincount (no -1)
         # and use weights to count only valid entries.

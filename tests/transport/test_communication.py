@@ -77,3 +77,51 @@ def test_distributor_receiver_integration():
     assert counts1[0] == 1
     assert payload_data1.shape[0] >= 1
     assert jnp.array_equal(payload_data1[0:1], values[1:2])
+
+
+def test_jax_compilation_storm_protection():
+    import time
+    from fluxway.common.tensor_backend import get_backend
+
+    backend = get_backend()
+
+    src_mesh = DeviceMesh(
+        axis_names=("x",), device_shape=(1,), device_ids=np.array([0])
+    )
+    dst_mesh = DeviceMesh(
+        axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1])
+    )
+
+    source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    target_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
+
+    distributor = DataDistributor(local_rank=0)
+
+    times = []
+    sizes = [100, 120, 100, 120]
+
+    def dummy_send(target, tuuids, tensors, counts, *args, **kwargs):
+        return True
+
+    # Warmup to compile/initialize JAX/XLA first for all sizes in the test
+    for size in sizes:
+        val = backend.zeros((size, 4), dtype=backend.float32())
+        data = TransportTensor(val, global_shape=(size, 4))
+        distributor.distribute(
+            local_data=data, source=source_spec, target=target_spec, send_fn=dummy_send
+        )
+
+    for size in sizes:
+        val = backend.zeros((size, 4), dtype=backend.float32())
+        data = TransportTensor(val, global_shape=(size, 4))
+        t0 = time.time()
+        distributor.distribute(
+            local_data=data, source=source_spec, target=target_spec, send_fn=dummy_send
+        )
+        times.append(time.time() - t0)
+
+    # All steps should be cached and extremely fast now!
+    for i, t in enumerate(times):
+        assert t < 0.1, (
+            f"Step {i + 1} was slow: {t:.6f}s (recompilation storm or latency detected)"
+        )
