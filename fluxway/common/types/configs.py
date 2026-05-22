@@ -165,6 +165,7 @@ class SPMDConfig(FluxwayBaseSchema):
     # Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
     runtime_env: dict[str, Any] | None = None
 
+    # If true, worker will fail immediately upon error instead of attempting recovery.
     fail_fast: bool = True
 
     @property
@@ -770,6 +771,17 @@ class DriverHeartbeat(FluxwayBaseSchema):
     )
     source_state: ReaderState | None = None  # Generic source state
     busy_worker_ratio: float = 0.0  # Ratio of workers with full mailbox
+
+
+class ErrorPolicy(FluxwayBaseSchema):
+    """Error handling policy for Controller-level error classification.
+
+    Decision priority:
+      1. recoverable_patterns match → recoverable (attempt restart)
+      2. No match → fall back to SPMDConfig.fail_fast
+    """
+
+    recoverable_patterns: list[str] = Field(default_factory=list)
 
 
 class HeartbeatConfig(FluxwayBaseSchema):

@@ -16,9 +16,11 @@ Supports async callbacks for Ray Actor Controller.
 """
 
 import asyncio
+import re
 from typing import TYPE_CHECKING
 
 from fluxway.common.types import ControllerState, ControllerEvent
+from fluxway.common.types.configs import ErrorPolicy
 from fluxway.common.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -108,6 +110,7 @@ class ControllerStateMachine:
         self,
         controller: "ControllerActor",
         blocked_timeout: float = 300.0,
+        error_policy: ErrorPolicy | None = None,
     ):  # type: ignore
         """
         Initialize ControllerStateMachine.
@@ -115,6 +118,7 @@ class ControllerStateMachine:
         Args:
             controller: Reference to the Controller instance
             blocked_timeout: Max seconds to stay in BLOCKED before auto-failing
+            error_policy: Error classification policy for fail-fast decisions
         """
         self._controller = controller
         self._state = ControllerState.INITIALIZING
@@ -126,6 +130,7 @@ class ControllerStateMachine:
 
         self._blocked_timeout_secs = blocked_timeout
         self._blocked_timeout_task: asyncio.Task | None = None
+        self._error_policy = error_policy or ErrorPolicy()
 
     @property
     def state(self) -> ControllerState:
@@ -312,12 +317,13 @@ class ControllerStateMachine:
         except Exception as e:
             logger.error(f"Failed to block all SPMDs: {e}")
 
-        # Check if any failed node has fail_fast=True → skip recovery
-        for spmd_id in self._error_spmds:
-            node = self._controller._graph.nodes.get(spmd_id)
-            if node and node.spmd_config.fail_fast:
+        # Check if any failed node should fail-fast
+        for spmd_id, error_msg in self._error_spmds.items():
+            if self._should_fail_fast(spmd_id, error_msg):
                 logger.error(
-                    f"SPMD {spmd_id} has fail_fast=True, skipping recovery"
+                    f"SPMD {spmd_id} error is non-recoverable "
+                    f"(fail_fast or no matching recoverable_pattern), "
+                    f"skipping recovery"
                 )
                 await self.trigger_event(ControllerEvent.RECOVERY_FAILED)
                 return
@@ -333,9 +339,7 @@ class ControllerStateMachine:
             try:
                 success = await self._controller.restart_spmd(spmd_id)
                 if not success:
-                    raise RuntimeError(
-                        f"restart_spmd returned failure for {spmd_id}"
-                    )
+                    raise RuntimeError(f"restart_spmd returned failure for {spmd_id}")
             except Exception as e:
                 logger.error(f"Failed to restart SPMD {spmd_id}: {e}")
                 self._restarting_spmds.discard(spmd_id)
@@ -399,6 +403,15 @@ class ControllerStateMachine:
     async def _on_enter_failed(self) -> None:
         """Called when entering FAILED state."""
         logger.error("Controller entering FAILED state")
+
+    def _should_fail_fast(self, spmd_id: str, error_message: str) -> bool:
+        for pattern in self._error_policy.recoverable_patterns:
+            if re.search(pattern, error_message):
+                return False
+        node = self._controller._graph.nodes.get(spmd_id)
+        if node:
+            return node.spmd_config.fail_fast
+        return True
 
     def _start_blocked_timeout(self) -> None:
         self._cancel_blocked_timeout()

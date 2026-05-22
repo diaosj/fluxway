@@ -39,6 +39,7 @@ from fluxway.common.types import (
     ControllerEvent,
     ControllerState,
     DriverHeartbeat,
+    ErrorPolicy,
     Graph,
     HeartbeatConfig,
 )
@@ -204,6 +205,7 @@ if RAY_AVAILABLE:
             heartbeat_config: HeartbeatConfig | None = None,
             async_step_config: AsyncStepConfig | None = None,
             checkpoint_config: CheckpointConfig | None = None,
+            error_policy: ErrorPolicy | None = None,
         ):
             """
             Initialize Controller with configuration.
@@ -213,6 +215,7 @@ if RAY_AVAILABLE:
                 heartbeat_config: Heartbeat configuration
                 async_step_config: Async step configuration
                 checkpoint_config: Configuration for checkpointer backend
+                error_policy: Error classification policy for fail-fast decisions
             """
             # Ray actors run in separate worker processes; ensure INFO logs are not dropped.
             ensure_logging_configured()
@@ -221,6 +224,7 @@ if RAY_AVAILABLE:
             self._heartbeat_config = heartbeat_config or HeartbeatConfig()
             self._async_step_config = async_step_config or AsyncStepConfig()
             self._checkpoint_config = checkpoint_config
+            self._error_policy = error_policy or ErrorPolicy()
 
             self._monitor = Monitor()
             self._state_manager = StateManager()
@@ -228,6 +232,7 @@ if RAY_AVAILABLE:
             self._state_machine = ControllerStateMachine(
                 self,
                 blocked_timeout=self._heartbeat_config.blocked_timeout,
+                error_policy=self._error_policy,
             )
             self._async_step_manager = AsyncStepManager(graph, self._async_step_config)
             # snapshot_id → {expected, received, metadata, event}

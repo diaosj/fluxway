@@ -43,6 +43,7 @@ from .configs import (
     WorkerHeartbeat,
     DriverHeartbeat,
     HeartbeatConfig,
+    ErrorPolicy,
     ReaderState,
     MailboxStatus,
     # Step/Lock Types
@@ -114,6 +115,7 @@ __all__ = [
     "WorkerHeartbeat",
     "DriverHeartbeat",
     "HeartbeatConfig",
+    "ErrorPolicy",
     "ReaderState",
     "MailboxStatus",
     "AsyncStepConfig",
