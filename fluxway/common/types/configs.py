@@ -165,6 +165,8 @@ class SPMDConfig(FluxwayBaseSchema):
     # Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
     runtime_env: dict[str, Any] | None = None
 
+    fail_fast: bool = True
+
     @property
     def num_workers(self) -> int:
         """Derive world size (total workers) from mesh size."""
@@ -776,6 +778,7 @@ class HeartbeatConfig(FluxwayBaseSchema):
     heartbeat_interval: float = 5.0  # Heartbeat interval (seconds)
     heartbeat_timeout: float = 15.0  # Heartbeat timeout (seconds)
     max_missed_heartbeats: int = 3  # Maximum missed heartbeats before error
+    blocked_timeout: float = 300.0
 
 
 class CheckpointConfig(FluxwayBaseSchema):

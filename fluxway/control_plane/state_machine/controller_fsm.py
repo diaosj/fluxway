@@ -104,12 +104,17 @@ class ControllerStateMachine:
         ): ControllerState.BLOCKED,
     }
 
-    def __init__(self, controller: "ControllerActor"):  # type: ignore
+    def __init__(
+        self,
+        controller: "ControllerActor",
+        blocked_timeout: float = 300.0,
+    ):  # type: ignore
         """
         Initialize ControllerStateMachine.
 
         Args:
             controller: Reference to the Controller instance
+            blocked_timeout: Max seconds to stay in BLOCKED before auto-failing
         """
         self._controller = controller
         self._state = ControllerState.INITIALIZING
@@ -118,6 +123,9 @@ class ControllerStateMachine:
         # Track error information
         self._error_spmds: dict[str, str] = {}  # spmd_id -> error_message
         self._restarting_spmds: set = set()
+
+        self._blocked_timeout_secs = blocked_timeout
+        self._blocked_timeout_task: asyncio.Task | None = None
 
     @property
     def state(self) -> ControllerState:
@@ -252,6 +260,7 @@ class ControllerStateMachine:
         All workers are running after topology registration.
         Starts heartbeat timeout monitoring.
         """
+        self._cancel_blocked_timeout()
         logger.debug("Controller entering RUNNING state")
 
         # Start heartbeat timeout monitoring now that system is fully initialized
@@ -292,7 +301,8 @@ class ControllerStateMachine:
         """
         Called when entering BLOCKED state.
 
-        Blocks all SPMDs and initiates recovery for error SPMDs.
+        Blocks all SPMDs, then either initiates recovery or triggers
+        RECOVERY_FAILED based on the fail_fast config of error SPMDs.
         """
         logger.warning("Controller entering BLOCKED state")
 
@@ -302,18 +312,40 @@ class ControllerStateMachine:
         except Exception as e:
             logger.error(f"Failed to block all SPMDs: {e}")
 
+        # Check if any failed node has fail_fast=True → skip recovery
+        for spmd_id in self._error_spmds:
+            node = self._controller._graph.nodes.get(spmd_id)
+            if node and node.spmd_config.fail_fast:
+                logger.error(
+                    f"SPMD {spmd_id} has fail_fast=True, skipping recovery"
+                )
+                await self.trigger_event(ControllerEvent.RECOVERY_FAILED)
+                return
+
         # Initiate recovery for error SPMDs
         error_spmds = list(self._error_spmds.keys())
+        recovery_failed = False
 
         for spmd_id in error_spmds:
             if spmd_id in self._restarting_spmds:
                 continue
             self._restarting_spmds.add(spmd_id)
             try:
-                await self._controller.restart_spmd(spmd_id)
+                success = await self._controller.restart_spmd(spmd_id)
+                if not success:
+                    raise RuntimeError(
+                        f"restart_spmd returned failure for {spmd_id}"
+                    )
             except Exception as e:
                 logger.error(f"Failed to restart SPMD {spmd_id}: {e}")
                 self._restarting_spmds.discard(spmd_id)
+                recovery_failed = True
+
+        if recovery_failed:
+            await self.trigger_event(ControllerEvent.RECOVERY_FAILED)
+            return
+
+        self._start_blocked_timeout()
 
     async def _on_enter_completing(self) -> None:
         """
@@ -342,6 +374,7 @@ class ControllerStateMachine:
 
         Handles unrecoverable failures.
         """
+        self._cancel_blocked_timeout()
         logger.error("Controller entering FAILING state")
 
         errors = dict(self._error_spmds)
@@ -367,8 +400,32 @@ class ControllerStateMachine:
         """Called when entering FAILED state."""
         logger.error("Controller entering FAILED state")
 
+    def _start_blocked_timeout(self) -> None:
+        self._cancel_blocked_timeout()
+        self._blocked_timeout_task = asyncio.get_event_loop().create_task(
+            self._blocked_timeout_watchdog()
+        )
+
+    def _cancel_blocked_timeout(self) -> None:
+        if self._blocked_timeout_task and not self._blocked_timeout_task.done():
+            self._blocked_timeout_task.cancel()
+        self._blocked_timeout_task = None
+
+    async def _blocked_timeout_watchdog(self) -> None:
+        try:
+            await asyncio.sleep(self._blocked_timeout_secs)
+            if self._state == ControllerState.BLOCKED:
+                logger.error(
+                    f"BLOCKED state timed out after {self._blocked_timeout_secs}s, "
+                    f"triggering RECOVERY_FAILED"
+                )
+                await self.trigger_event(ControllerEvent.RECOVERY_FAILED)
+        except asyncio.CancelledError:
+            pass
+
     async def reset(self) -> None:
         """Reset state machine to initial state."""
+        self._cancel_blocked_timeout()
         async with self._lock:
             self._state = ControllerState.INITIALIZING
             self._error_spmds.clear()

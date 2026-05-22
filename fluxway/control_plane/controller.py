@@ -225,7 +225,10 @@ if RAY_AVAILABLE:
             self._monitor = Monitor()
             self._state_manager = StateManager()
             self._scheduler = Scheduler(spmd_manager=None)
-            self._state_machine = ControllerStateMachine(self)
+            self._state_machine = ControllerStateMachine(
+                self,
+                blocked_timeout=self._heartbeat_config.blocked_timeout,
+            )
             self._async_step_manager = AsyncStepManager(graph, self._async_step_config)
             # snapshot_id → {expected, received, metadata, event}
             self._pending_snapshots: dict[str, Any] = {}

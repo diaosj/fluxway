@@ -1090,6 +1090,10 @@ class SPMDWorker:
         """Stop the execution loop gracefully."""
         self._running = False
         self._driver_handle = None
+        # Wake any worker blocked on drain condition
+        async with self._drain_cond:
+            self._drain_target_count = None
+            self._drain_cond.notify_all()
         # Put a sentinel to unblock the queue
         await self._execution_queue.put((999, 0, "__stop__"))
 
