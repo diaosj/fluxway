@@ -6,6 +6,8 @@ Control plane operations (scheduling, heartbeats) still use native Ray.
 
 from typing import Any
 
+from fluxway.common.tensor_backend import ensure_cpu_serializable
+
 
 class DataPlaneCallable:
     """
@@ -31,12 +33,13 @@ class DataPlaneCallable:
         """
         Data Plane: Primary method for tensor shard transmission.
         """
+        cpu_payloads = [ensure_cpu_serializable(p) for p in payloads]
         return await self._handle.receive_shards.remote(
             tuuids=tuuids,
             step=step,
             sender_id=sender_id,
             sender_rank=sender_rank,
-            payloads=payloads,
+            payloads=cpu_payloads,
             counts=counts,
             global_shapes=global_shapes,
             meta_tensor_state_list=meta_tensor_state_list,

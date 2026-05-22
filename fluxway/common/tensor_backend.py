@@ -85,6 +85,33 @@ def force_writable(arr: Any) -> Any:
     return arr
 
 
+def ensure_cpu_serializable(arr: Any) -> Any:
+    """Move a GPU-resident array to CPU for safe pickle/Ray serialization.
+
+    CuPy arrays live in CUDA device memory.  When Ray serializes them via
+    pickle, the receiver must have a CUDA context to deserialize — which
+    fails on CPU-only workers with ``cudaErrorNoDevice``.
+
+    This function detects GPU-backed arrays via ``__cuda_array_interface__``
+    and converts them to NumPy.  CPU arrays (NumPy, plain Python) pass
+    through unchanged with zero overhead.
+
+    **Call-site guidance**: use this only on Ray (pickle-based) transport
+    boundaries.  Other transports (NCCL, UCX) handle CUDA buffers natively
+    and should NOT call this.
+    """
+    if not hasattr(arr, "__cuda_array_interface__"):
+        return arr
+    try:
+        import cupy as cp
+
+        if isinstance(arr, cp.ndarray):
+            return cp.asnumpy(arr)
+    except ImportError:
+        pass
+    return arr
+
+
 class DLPackObject:
     """Wrapper to convert a PyCapsule into a DLPack-compatible object.
 
