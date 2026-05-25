@@ -467,8 +467,6 @@ class TorchBackend(TensorBackend):
 
     def to_numpy(self, tensor: Any) -> Any:
         if isinstance(tensor, list):
-            import numpy as np
-
             return np.array(tensor)
         return tensor.detach().cpu().numpy()
 
@@ -786,11 +784,9 @@ class JaxBackend(TensorBackend):
     def __init__(self):
         import jax.numpy as jnp
         import jax
-        import numpy as np
 
         self._jnp = jnp
         self._jax = jax
-        self._np = np
 
         # Prefer an x64 context manager so that an explicitly requested
         # 64-bit dtype (e.g. ``jnp.int64``) is preserved rather than being
@@ -825,7 +821,7 @@ class JaxBackend(TensorBackend):
             return self._jnp.asarray(data, dtype=dtype)
 
     def to_numpy(self, tensor: Any) -> Any:
-        return self._np.array(tensor)
+        return np.array(tensor)
 
     def zeros(self, shape: Any, dtype: Any = None, device: str | None = None) -> Any:
         with self._x64_scope():
@@ -868,7 +864,7 @@ class JaxBackend(TensorBackend):
         return self._jnp.int32
 
     def is_tensor(self, obj: Any) -> bool:
-        return isinstance(obj, self._jnp.ndarray | self._np.ndarray | JAXViewWrapper)
+        return isinstance(obj, self._jnp.ndarray | np.ndarray | JAXViewWrapper)
 
     def is_scalar(self, obj: Any) -> bool:
         return self.is_tensor(obj) and obj.ndim == 0
@@ -1101,6 +1097,12 @@ class JaxBackend(TensorBackend):
         return JAXViewWrapper(tensor, slice(offset, offset + count))
 
 
+def _reconstruct_jax_array(np_array):
+    import jax
+
+    return jax.device_put(np_array)
+
+
 class JAXViewWrapper:
     def __init__(self, arr, slices):
         self.arr = arr
@@ -1168,8 +1170,6 @@ class JAXViewWrapper:
         return self._cached_sliced_arr
 
     def __array__(self, *args, **kwargs):
-        import numpy as np
-
         return np.asarray(self._sliced_arr, *args, **kwargs)
 
     def __dlpack__(self, stream=None):
@@ -1177,6 +1177,10 @@ class JAXViewWrapper:
 
     def __dlpack_device__(self):
         return self._sliced_arr.__dlpack_device__()
+
+    def __reduce__(self):
+        sliced_np = np.asarray(self._sliced_arr)
+        return (_reconstruct_jax_array, (sliced_np,))
 
     def _apply_slicing(self, desc):
         shape = desc["shape"]
@@ -1325,9 +1329,6 @@ class HybridBackend(TensorBackend):
     """
 
     def __init__(self, default_device: str = "cpu", enable_numba_jit: bool = True):
-        import numpy as np
-
-        self._np = np
         self._cp = None
         self._use_jit = enable_numba_jit and _NUMBA_AVAILABLE
         self._default_device = default_device
@@ -1346,13 +1347,13 @@ class HybridBackend(TensorBackend):
             if self._cp is None:
                 raise RuntimeError("GPU requested but CuPy / CUDA is not available.")
             return self._cp
-        return self._np
+        return np
 
     def _lib_for(self, x: Any):
         """Return the library matching the runtime type of *x*."""
         if self._cp is not None and isinstance(x, self._cp.ndarray):
             return self._cp
-        return self._np
+        return np
 
     # ------------------------------------------------------------------
     # Identity
@@ -1365,20 +1366,20 @@ class HybridBackend(TensorBackend):
     # ------------------------------------------------------------------
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
         lib = self._lib(device or self._default_device)
-        if lib is self._np:
-            return force_writable(self._np.asarray(data, dtype=dtype))
+        if lib is np:
+            return force_writable(np.asarray(data, dtype=dtype))
         return lib.array(data, dtype=dtype)
 
     def as_tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
         lib = self._lib(device or self._default_device)
-        if lib is self._np:
-            return force_writable(self._np.asarray(data, dtype=dtype))
+        if lib is np:
+            return force_writable(np.asarray(data, dtype=dtype))
         return lib.asarray(data, dtype=dtype)
 
     def to_numpy(self, tensor: Any) -> Any:
         if self._cp is not None and isinstance(tensor, self._cp.ndarray):
             return self._cp.asnumpy(tensor)
-        return self._np.asarray(tensor)
+        return np.asarray(tensor)
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -1414,12 +1415,12 @@ class HybridBackend(TensorBackend):
     def is_tensor(self, obj: Any) -> bool:
         if self._cp is not None and isinstance(obj, self._cp.ndarray):
             return True
-        return isinstance(obj, self._np.ndarray)
+        return isinstance(obj, np.ndarray)
 
     def is_scalar(self, obj: Any) -> bool:
         if self._cp is not None and isinstance(obj, self._cp.ndarray):
             return obj.ndim == 0
-        return isinstance(obj, self._np.ndarray) and obj.ndim == 0
+        return isinstance(obj, np.ndarray) and obj.ndim == 0
 
     def dtype(self, tensor: Any) -> Any:
         return tensor.dtype
@@ -1443,10 +1444,10 @@ class HybridBackend(TensorBackend):
         return self._lib_for(indices).unravel_index(indices, shape)
 
     def float32(self) -> Any:
-        return self._np.float32
+        return np.float32
 
     def int32(self) -> Any:
-        return self._np.int32
+        return np.int32
 
     def equal(self, x: Any, y: Any) -> bool:
         lib = self._lib_for(x)
@@ -1456,11 +1457,11 @@ class HybridBackend(TensorBackend):
     # Concat / stack
     # ------------------------------------------------------------------
     def cat(self, tensors: list[Any], dim: int = 0) -> Any:
-        lib = self._lib_for(tensors[0]) if tensors else self._np
+        lib = self._lib_for(tensors[0]) if tensors else np
         return lib.concatenate(tensors, axis=dim)
 
     def stack(self, tensors: list[Any], dim: int = 0) -> Any:
-        lib = self._lib_for(tensors[0]) if tensors else self._np
+        lib = self._lib_for(tensors[0]) if tensors else np
         return lib.stack(tensors, axis=dim)
 
     # ------------------------------------------------------------------
@@ -1495,10 +1496,10 @@ class HybridBackend(TensorBackend):
             return self._cp.cumsum(x, axis=dim)
         # CPU: optional Numba JIT for 1-D
         if self._use_jit and x.ndim == 1:
-            out = self._np.empty_like(x)
+            out = np.empty_like(x)
             _numba_cumsum_loop(x, out)
             return out
-        return self._np.cumsum(x, axis=dim)
+        return np.cumsum(x, axis=dim)
 
     # ------------------------------------------------------------------
     # Sorting / indexing
@@ -1532,14 +1533,14 @@ class HybridBackend(TensorBackend):
         # CPU path
         if x.shape[0] == 0:
             indices_shape = getattr(indices, "shape", ())
-            return self._np.zeros(indices_shape + x.shape[1:], dtype=x.dtype)
+            return np.zeros(indices_shape + x.shape[1:], dtype=x.dtype)
         if self._use_jit and x.ndim == 1 and indices.ndim == 1:
             flat_x = x.ravel()
             flat_idx = indices.ravel()
-            out = self._np.empty(flat_idx.shape, dtype=flat_x.dtype)
+            out = np.empty(flat_idx.shape, dtype=flat_x.dtype)
             _numba_take_loop(flat_x, flat_idx, out)
             return out.reshape(indices.shape)
-        return self._np.take(x, indices, axis=0)
+        return np.take(x, indices, axis=0)
 
     def select(self, x: Any, dim: int, index: int) -> Any:
         lib = self._lib_for(x)
@@ -1556,17 +1557,17 @@ class HybridBackend(TensorBackend):
             return self._cp.bincount(x, weights=weights, minlength=minlength)
         # CPU: optional Numba JIT
         if self._use_jit:
-            host_x = self._np.asarray(x, dtype=self._np.intp)
+            host_x = np.asarray(x, dtype=np.intp)
             n_out = max(int(host_x.max()) + 1 if host_x.size > 0 else 0, minlength)
             if weights is not None:
-                w_arr = self._np.asarray(weights)
-                out = self._np.zeros(n_out, dtype=w_arr.dtype)
+                w_arr = np.asarray(weights)
+                out = np.zeros(n_out, dtype=w_arr.dtype)
                 _numba_bincount_weighted_loop(host_x, w_arr, out)
             else:
-                out = self._np.zeros(n_out, dtype=self._np.int64)
+                out = np.zeros(n_out, dtype=np.int64)
                 _numba_bincount_loop(host_x, out)
             return out
-        return self._np.bincount(x, weights=weights, minlength=minlength)
+        return np.bincount(x, weights=weights, minlength=minlength)
 
     def repeat_interleave(
         self,
@@ -1807,9 +1808,9 @@ class HybridBackend(TensorBackend):
         if hasattr(dlpack_capsule, "__dlpack_device__"):
             device_type, _ = dlpack_capsule.__dlpack_device__()
             # DLDeviceType: kDLCPU=1, kDLCUDA=2
-            lib = self._cp if (self._cp is not None and device_type == 2) else self._np
+            lib = self._cp if (self._cp is not None and device_type == 2) else np
         else:
-            lib = self._np
+            lib = np
         capsule_obj = (
             dlpack_capsule
             if hasattr(dlpack_capsule, "__dlpack__")

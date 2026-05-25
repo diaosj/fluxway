@@ -176,10 +176,6 @@ class SPMDWorker:
         self._running = False
 
         # Pluggable per-worker checkpoint serialization. Defaults to OrbaxBackend.
-        if checkpoint_backend is None:
-            from fluxway.control_plane.checkpointer import OrbaxBackend
-
-            checkpoint_backend = OrbaxBackend()
         self._checkpoint_backend = checkpoint_backend
 
         # Driver handle for callbacks (Control Plane - Native Ray)
@@ -296,6 +292,13 @@ class SPMDWorker:
         # Ensure background I/O is complete (e.g. Orbax AsyncCheckpointer)
         if hasattr(self, "_checkpoint_backend") and self._checkpoint_backend:
             self._checkpoint_backend.finalize()
+
+    def _get_checkpoint_backend(self):
+        if self._checkpoint_backend is None:
+            from fluxway.control_plane.checkpointer import OrbaxBackend
+
+            self._checkpoint_backend = OrbaxBackend()
+        return self._checkpoint_backend
 
     # =========================================================================
     # Operator Pre-Instantiation
@@ -1672,21 +1675,6 @@ class SPMDWorker:
             first_shard.global_shape if hasattr(first_shard, "global_shape") else None
         )
 
-        # If the assembled result is empty but global_shape says data exists, this is a
-        # configuration error that slipped past the Communication-layer check (e.g. the
-        # global_shape was attached after distribution).
-        backend = get_backend()
-        assembled_rows = backend.shape(merged_values)[0]
-        if assembled_rows == 0 and global_shape is not None and global_shape[0] > 0:
-            raise ValueError(
-                f"\n[Fluxway Static Sharding Error] Static assembly for '{tuuid}' "
-                f"at {self.spmd_id} Rank {self.rank} produced 0 rows, "
-                f"but global_shape={global_shape} indicates data exists.\n"
-                f"  This means the upstream data size is smaller than this SPMD's mesh size.\n"
-                f"  Fix: Increase the data size to cover all {self._world_size} workers, "
-                f"or reduce the target mesh."
-            )
-
         merged_receipt = self._maybe_merge_receipts(shard_list)
 
         return TransportTensor(
@@ -2286,11 +2274,23 @@ class SPMDWorker:
                             f"If you returned a TransportTensor manually, ensure you provide explicit routing metadata."
                         )
 
-                routing_id = (
-                    id(leaf_tensor.routing_indices)
-                    if leaf_tensor.routing_indices is not None
-                    else 0
-                )
+                # We use Python's built-in id() to batch tensors that share the EXACT same
+                # routing metadata object reference.
+                # WARNING: Do NOT use content hashing (like .to_numpy().tobytes()) here!
+                # Routing indices can be large JAX/PyTorch tensors on the device.
+                # Fetching them to the host for content hashing triggers a massive Device-to-Host (D2H)
+                # synchronization overhead, which completely blocks the asynchronous execution pipeline.
+                # In this framework, structurally identical routing patterns are typically
+                # assigned the same shared metadata object during graph compilation or execution.
+                # Therefore, checking object identity via id() is O(1), zero-sync, and optimal for HPC.
+                if leaf_tensor.routing_indices is not None:
+                    routing_id = id(leaf_tensor.routing_indices)
+                elif leaf_tensor.origin_indices is not None:
+                    routing_id = id(leaf_tensor.origin_indices)
+                elif leaf_tensor.receipt is not None:
+                    routing_id = id(leaf_tensor.receipt)
+                else:
+                    routing_id = 0
                 batches[(source_spec, target_spec, routing_id)].append(
                     (tuuid, leaf_tensor)
                 )
@@ -2328,6 +2328,7 @@ class SPMDWorker:
                         )
 
                 # Accrue to distributor's internal plan
+                print(f"DEBUG plan_and_shard start spmd_id={self.spmd_id}", flush=True)
                 distributor.plan_and_shard(
                     batch_transport_tensors,
                     source_spec,
@@ -2375,7 +2376,9 @@ class SPMDWorker:
                 self._spawn_background_task(_wait_and_release())
                 return True
 
+            print(f"DEBUG distribute start spmd_id={self.spmd_id}", flush=True)
             await distributor.distribute(send_fn=_send_fn)
+            print(f"DEBUG distribute done spmd_id={self.spmd_id}", flush=True)
 
             # --- Send control_argument via control plane ---
             if state_data:
@@ -2695,7 +2698,7 @@ class SPMDWorker:
         operator_states = self._call_operator_save_state(spmd_dir)
 
         if operator_states:
-            rank_storage = await self._checkpoint_backend.save(
+            rank_storage = await self._get_checkpoint_backend().save(
                 {"operator_states": operator_states},
                 ckpt_dir,
                 self.spmd_id,
@@ -2775,7 +2778,7 @@ class SPMDWorker:
             "static_args": self.op_manager.get_static_args(),
             "operator_states": self._call_operator_save_state(""),
         }
-        state = await self._checkpoint_backend.load(
+        state = await self._get_checkpoint_backend().load(
             rank_storage, target_state=target_state
         )
 

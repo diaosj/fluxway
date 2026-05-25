@@ -99,6 +99,8 @@ class PGManager:
             Created PlacementGroup or None if failed
         """
         driver_res = driver_resource or DriverResourceSpec()
+        driver_res.num_cpus = 0.01
+        driver_res.memory_gb = 0.0
 
         if not RAY_AVAILABLE:
             logger.warning("Ray not available, returning mock placement group")

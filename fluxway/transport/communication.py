@@ -70,20 +70,49 @@ class BaseDataDistributor:
         )
         if is_scalar:
             target_rank = int(sender_rank_tags)
-            counts_np = np.zeros(mirror_target_world_size, dtype=np.int32)
-            offsets_np = np.zeros(mirror_target_world_size, dtype=np.int32)
-            if 0 <= target_rank < mirror_target_world_size:
-                flat_leaves, _ = backend.tree_flatten(payloads)
-                if flat_leaves:
-                    counts_np[target_rank] = backend.shape(flat_leaves[0])[0]
-            stitched_tensors = payloads
-            tensors_size = counts_np
-            tensor_offsets = offsets_np
-        else:
-            sender_rank_tags = backend.as_tensor(sender_rank_tags)
-            stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
-                sender_rank_tags, payloads, mirror_target_world_size
+            flat_leaves, treedef = backend.tree_flatten(payloads)
+            per_tensor_counts = (
+                [backend.shape(t)[0] for t in flat_leaves] if flat_leaves else []
             )
+
+            for i in range(mirror_target_world_size):
+                if i == target_rank and flat_leaves:
+                    rank_flat_tensors = flat_leaves
+                    rank_flat_counts = per_tensor_counts
+                else:
+                    rank_flat_tensors = (
+                        [t[:0] for t in flat_leaves] if flat_leaves else []
+                    )
+                    rank_flat_counts = [0] * len(flat_leaves) if flat_leaves else []
+
+                slice_params = []
+                for meta_state, desc_obj in zip(
+                    has_meta_tensor_state_list, compact_desc_info, strict=True
+                ):
+                    if meta_state & 4:
+                        offset = 0
+                        count = 1 if i == target_rank else 0
+                        slice_params.append(
+                            desc_obj.slice(offset, offset + count).to_compact_params()
+                        )
+                    else:
+                        slice_params.append(None)
+
+                yield (
+                    [i],
+                    rank_flat_tensors,
+                    rank_flat_counts,
+                    None,
+                    global_shapes_list,
+                    has_meta_tensor_state_list,
+                    slice_params,
+                )
+            return
+
+        sender_rank_tags = backend.as_tensor(sender_rank_tags)
+        stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
+            sender_rank_tags, payloads, mirror_target_world_size
+        )
 
         counts_np = backend.to_numpy(tensors_size)
         offsets_np = backend.to_numpy(tensor_offsets)
@@ -103,7 +132,6 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list, compact_desc_info, strict=True
             ):
                 if meta_state & 4:
-                    # TODO(He Jia): Support Cyclic mapping if needed
                     offset = int(offsets_np[i])
                     slice_params.append(
                         desc_obj.slice(offset, offset + count).to_compact_params()
@@ -418,7 +446,11 @@ class BaseDataDistributor:
         for p, p_len in zip(payloads, nested_length_list, strict=True):
             if p_len is not None:
                 # Ragged payload
-                pad_len_size = capacity - actual_req
+                if backend.name() == "jax" and capacity != actual_req:
+                    pad_len_size = capacity - actual_req
+                else:
+                    pad_len_size = 0
+
                 if pad_len_size > 0:
                     len_padding = backend.zeros(
                         (pad_len_size,), dtype=backend.dtype(p_len)
@@ -452,9 +484,21 @@ class BaseDataDistributor:
             else:
                 # Dense payload
                 padded_nested_length_list.append(None)
-                static_shapes.append(capacity)
 
-                pad_size = capacity - actual_req
+                payload_req = backend.shape(p)[0]
+                if backend.name() == "jax" and capacity != actual_req:
+                    if payload_req == 0:
+                        payload_capacity = 0
+                    elif payload_req <= 1024:
+                        payload_capacity = 1 << (payload_req - 1).bit_length()
+                    else:
+                        payload_capacity = ((payload_req + 1023) // 1024) * 1024
+                else:
+                    payload_capacity = payload_req
+
+                static_shapes.append(payload_capacity)
+
+                pad_size = payload_capacity - payload_req
                 if pad_size > 0:
                     pad_shape = (pad_size,) + backend.shape(p)[1:]
                     padding = backend.zeros(pad_shape, dtype=backend.dtype(p))
@@ -468,29 +512,34 @@ class BaseDataDistributor:
             src_geometry_indices = backend.as_tensor(
                 src_geometry_indices, dtype=backend.int32()
             )
-            pad_size = capacity - actual_req
-            if pad_size > 0:
-                padding = backend.full((pad_size,), -1, dtype=backend.int32())
-                src_geometry_indices = backend.cat(
-                    [src_geometry_indices, padding], dim=0
-                )
+            if backend.name() == "jax" and capacity != actual_req:
+                pad_size = capacity - actual_req
+                if pad_size > 0:
+                    padding = backend.full((pad_size,), -1, dtype=backend.int32())
+                    src_geometry_indices = backend.cat(
+                        [src_geometry_indices, padding], dim=0
+                    )
 
         if dst_content_routing_values is not None:
             dst_content_routing_values = backend.as_tensor(
                 dst_content_routing_values, dtype=backend.int32()
             )
-            pad_size = capacity - actual_req
-            if pad_size > 0:
-                padding = backend.full((pad_size,), -1, dtype=backend.int32())
-                dst_content_routing_values = backend.cat(
-                    [dst_content_routing_values, padding], dim=0
-                )
+            if backend.name() == "jax" and capacity != actual_req:
+                pad_size = capacity - actual_req
+                if pad_size > 0:
+                    padding = backend.full((pad_size,), -1, dtype=backend.int32())
+                    dst_content_routing_values = backend.cat(
+                        [dst_content_routing_values, padding], dim=0
+                    )
 
         # Adjust src_shape for capacity representation
         source_is_static = source.is_static if source else False
         source_shard_size = source.shard_size(0) if (source and source_is_static) else 1
         global_capacity = capacity * source_shard_size
-        if primary.global_shape is not None:
+        src_is_content_addr = source.is_content_addressable if source else False
+        if src_is_content_addr and primary.global_shape is not None:
+            src_shape = primary.global_shape
+        elif primary.global_shape is not None:
             src_shape = (global_capacity,) + primary.global_shape[1:]
         else:
             src_shape = (global_capacity,) + local_shape[1:]
@@ -997,7 +1046,7 @@ class TransportReceiver:
                         written.append(0)
                         continue
                     if i < len(counts):
-                        count = int(counts[i])
+                        count = counts[i]
                     else:
                         raise RuntimeError(
                             f"Missing shard count for bundle element {i} from rank {source_rank}"
@@ -1023,7 +1072,7 @@ class TransportReceiver:
                     if tensor is None or i >= len(self.target_buffers):
                         written.append(0)
                         continue
-                    count = int(counts[i] if i < len(counts) else counts[0])
+                    count = counts[i] if i < len(counts) else counts[0]
                     offset = int(offsets[i] if i < len(offsets) else offsets[0])
 
                     # Bounds check (host-side, before JIT dispatch)
@@ -1050,7 +1099,7 @@ class TransportReceiver:
         else:
             # Buffered mode: accumulate for later consumption.
             self._rx_buffers.append((tensors, counts))
-            written = [int(c) for c in counts]
+            written = counts
 
         if written:
             self._written_counts[source_rank] = written
@@ -1176,51 +1225,6 @@ def _jit_plan_and_pack(
     produced.
     """
     backend = get_backend()
-    print("[TRACE] _jit_plan_and_pack trace details:", flush=True)
-    print(
-        f"  payloads_tuple: {[(backend.shape(p), backend.dtype(p)) for p in payloads_tuple]}",
-        flush=True,
-    )
-    print(f"  nested_length_list: {nested_length_list}", flush=True)
-    print(
-        f"  src_local_rank: {src_local_rank} (type={type(src_local_rank)})", flush=True
-    )
-    print(
-        f"  src_data_shape: {src_data_shape} (type={type(src_data_shape)})", flush=True
-    )
-    print(
-        f"  src_routing_indices: {src_routing_indices is None} {None if src_routing_indices is None else backend.shape(src_routing_indices)}",
-        flush=True,
-    )
-    print(
-        f"  src_routing_based_values: {src_routing_based_values is None} {None if src_routing_based_values is None else backend.shape(src_routing_based_values)}",
-        flush=True,
-    )
-    print(
-        f"  dst_index_desc: {dst_index_desc} (type={type(dst_index_desc)})", flush=True
-    )
-    print(
-        f"  dst_routing_dim: {dst_routing_dim} (type={type(dst_routing_dim)})",
-        flush=True,
-    )
-    print(f"  dst_strategy: {dst_strategy} (type={type(dst_strategy)})", flush=True)
-    print(f"  dst_mesh: {dst_mesh} (type={type(dst_mesh)})", flush=True)
-    print(
-        f"  dst_partitions: {dst_partitions} (type={type(dst_partitions)})", flush=True
-    )
-    print(
-        f"  dst_replica_axes: {dst_replica_axes} (type={type(dst_replica_axes)})",
-        flush=True,
-    )
-    print(
-        f"  dst_replica_size: {dst_replica_size} (type={type(dst_replica_size)})",
-        flush=True,
-    )
-    print(f"  static_shapes: {static_shapes} (type={type(static_shapes)})", flush=True)
-    print(f"  src_spec: {src_spec} (type={type(src_spec)})", flush=True)
-    print(
-        f"  src_index_desc: {src_index_desc} (type={type(src_index_desc)})", flush=True
-    )
 
     # 1. Compute Plan
     sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (

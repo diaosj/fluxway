@@ -185,7 +185,7 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
 
             # Create driver actor with placement group
             driver_name = f"spmd_driver_{spmd_id}"
-            driver_opts: dict[str, Any] = {"name": driver_name}
+            driver_opts: dict[str, Any] = {"name": driver_name, "num_cpus": 0.01}
             if placement_group is not None:
                 driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(  # type: ignore
                     placement_group=placement_group,

@@ -1034,6 +1034,49 @@ class Builder:
                     f"Edge references non-existent target node: {edge.target_node}"
                 )
 
+        # 1. Build a global mapping of TUUID to its Algebraic/Concrete ShardingSpec
+        global_tuuid_to_spec = {}
+        for node_name, node in self._nodes.items():
+            for op_meta in node.spmd_config.operator_metas.values():
+                for name_in, spec in (op_meta.input_sharding or {}).items():
+                    u = self._resolve_path_to_tuuid(
+                        node_name, op_meta.name, "in", name_in
+                    )
+                    if u is not None:
+                        global_tuuid_to_spec[u] = spec
+                for name_out, spec in (op_meta.output_sharding or {}).items():
+                    u = self._resolve_path_to_tuuid(
+                        node_name, op_meta.name, "out", name_out
+                    )
+                    if u is not None:
+                        global_tuuid_to_spec[u] = spec
+
+        # 2. Recursively resolve referential sharding specs in all topology edges
+        def add_recursive_references(specs_dict):
+            to_add = {}
+            for u, spec in list(specs_dict.items()):
+                if hasattr(spec, "routing") and isinstance(
+                    spec.routing, ReferentialRouting
+                ):
+                    ref_tuuid = getattr(spec.routing, "tuuid", None)
+                    if ref_tuuid is not None and ref_tuuid not in specs_dict:
+                        ref_spec = global_tuuid_to_spec.get(ref_tuuid)
+                        if ref_spec is not None:
+                            to_add[ref_tuuid] = ref_spec
+            if to_add:
+                specs_dict.update(to_add)
+                add_recursive_references(specs_dict)
+
+        # 3. Apply the recursive resolution to all predecessor/successor edges in all nodes
+        for node in self._nodes.values():
+            for top in node.spmd_config.topology.values():
+                for pred in top.predecessors.values():
+                    if pred.tuuid_sharding:
+                        add_recursive_references(pred.tuuid_sharding)
+                for succ in top.successors.values():
+                    if succ.tuuid_sharding:
+                        add_recursive_references(succ.tuuid_sharding)
+
         graph = Graph(name=name, nodes=self._nodes.copy(), edges=self._edges.copy())
 
         return graph

@@ -833,7 +833,10 @@ class OperatorManager:
             pre_topology = self._predecessor_topology.get(op_name, {})
 
             for pre_id, pre_info in pre_topology.items():
+                active_tuuids = set(pre_info.tuuid_map.values())
                 for u, spec in pre_info.tuuid_sharding.items():
+                    if u not in active_tuuids:
+                        continue
                     if is_periodic:
                         # If periodic_trigger is enabled, expect N shards to trigger execution (default N=1)
                         from fluxway.common.types.configs import PeriodicBarrierConfig

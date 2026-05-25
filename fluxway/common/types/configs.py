@@ -185,7 +185,7 @@ class ResourceSpec(FluxwayBaseSchema):
     """Resource specification for SPMD scheduling."""
 
     num_gpus: int = 0
-    num_cpus: int = 1
+    num_cpus: float = 1.0
     memory_gb: float = 0.0
     count: int = 1
     # TODO: Add network bandwidth requirements
@@ -820,7 +820,7 @@ class AsyncStepConfig(FluxwayBaseSchema):
 class DriverResourceSpec(FluxwayBaseSchema):
     """Driver management resource configuration (system default)."""
 
-    num_cpus: int = 1
+    num_cpus: float = 1.0
     memory_gb: float = 1.0
 
 

@@ -236,6 +236,7 @@ if RAY_AVAILABLE:
                     opts["num_cpus"] = self.worker_resource.num_cpus
                 if getattr(self.worker_resource, "num_gpus", 0) > 0:
                     opts["num_gpus"] = self.worker_resource.num_gpus
+            logger.debug(f"Worker opts for {name}: {opts}")
             return opts
 
         async def _start_workers(self) -> None:

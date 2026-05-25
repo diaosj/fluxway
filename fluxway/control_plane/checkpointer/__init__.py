@@ -13,6 +13,15 @@ except ModuleNotFoundError as exc:
                 "OrbaxBackend requires optional jax/orbax dependencies."
             ) from _ORBAX_IMPORT_ERROR
 
+        async def save(self, *args, **kwargs):
+            pass
+
+        async def load(self, *args, **kwargs):
+            pass
+
+        def finalize(self) -> None:
+            pass
+
 
 __all__ = [
     "FluxwayCheckpointer",
