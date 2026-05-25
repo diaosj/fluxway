@@ -28,7 +28,10 @@ def test_static_to_static():
     dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
-        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(100,)
+        src_local_rank=0,
+        src_spec=src_spec,
+        dst_spec=dst_spec,
+        routing_global_shape=(100,),
     )
 
     assert plan.target_num_workers == 4
@@ -48,7 +51,10 @@ def test_static_to_static_rank1():
     dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
-        src_local_rank=1, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(100,)
+        src_local_rank=1,
+        src_spec=src_spec,
+        dst_spec=dst_spec,
+        routing_global_shape=(100,),
     )
 
     counts = plan.send_counts.tolist()
@@ -74,7 +80,7 @@ def test_static_to_dynamic_hash():
         src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        src_data_shape=(4,),
+        routing_global_shape=(4,),
         dst_index_desc=RaggedIndex(splits=splits),
     )
 
@@ -110,7 +116,7 @@ def test_dynamic_to_static():
         src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        src_data_shape=(6,),
+        routing_global_shape=(6,),
         src_index_desc=ExplicitIndex(indices=dep),
     )
 
@@ -133,7 +139,7 @@ def test_dynamic_to_dynamic():
         src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        src_data_shape=(3,),
+        routing_global_shape=(3,),
         src_index_desc=RaggedIndex(splits=splits),
         dst_index_desc=RaggedIndex(splits=splits),
     )
@@ -155,7 +161,10 @@ def test_routing_indices_dual_tensor():
     src_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
 
     plan = TransportPlanner.plan(
-        src_local_rank=0, src_spec=src_spec, dst_spec=val_spec, src_data_shape=(4,)
+        src_local_rank=0,
+        src_spec=src_spec,
+        dst_spec=val_spec,
+        routing_global_shape=(4,),
     )
 
     counts = plan.send_counts.tolist()
@@ -174,7 +183,10 @@ def test_replicate_fanout():
     dst_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
-        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(10,)
+        src_local_rank=0,
+        src_spec=src_spec,
+        dst_spec=dst_spec,
+        routing_global_shape=(10,),
     )
 
     assert plan.replication_factor == 2
@@ -201,7 +213,10 @@ def test_ragged_data_reorder():
     dst_spec = ShardingSpec.cyclic(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
-        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(4,)
+        src_local_rank=0,
+        src_spec=src_spec,
+        dst_spec=dst_spec,
+        routing_global_shape=(4,),
     )
 
     counts = plan.send_counts.tolist()
@@ -227,7 +242,10 @@ def test_iter_device_slices():
     dst_spec = ShardingSpec.cyclic(P("x")).bind(dst_mesh)
 
     plan = TransportPlanner.plan(
-        src_local_rank=0, src_spec=src_spec, dst_spec=dst_spec, src_data_shape=(6,)
+        src_local_rank=0,
+        src_spec=src_spec,
+        dst_spec=dst_spec,
+        routing_global_shape=(6,),
     )
 
     slices = list(plan.iter_device_slices())
@@ -259,7 +277,7 @@ def test_multi_axis_dynamic_routing_dims():
 
     plan = TransportPlanner.compute_plan(
         src_local_rank=0,
-        src_data_shape=(2, 2),
+        routing_global_shape=(2, 2),
         src_spec=src_spec,
         dst_spec=dst_spec,
         src_routing_indices=jnp.array([0, 1], dtype=jnp.int32),

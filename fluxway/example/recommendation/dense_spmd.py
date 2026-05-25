@@ -5,6 +5,7 @@ import jax.tree_util as jtu
 import numpy as np
 from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from numba import njit
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.types.tensor import TransportTensor
@@ -14,8 +15,10 @@ from .data_types import DPFeatures
 # When JAX uses GPU, CuPy provides zero-copy DLPack interop with JAX.
 # When JAX falls back to CPU, NumPy is the natural choice.
 _GPU_AVAILABLE = False
+cupyx = None  # type: ignore[assignment]
 try:
     import cupy as cp
+    import cupyx  # type: ignore[no-redef]
 
     # Verify CUDA is actually usable (cupy may be installed without a GPU)
     try:
@@ -31,6 +34,98 @@ except ImportError:
 def _xp():
     """Return CuPy if GPU is available, otherwise NumPy."""
     return cp if _GPU_AVAILABLE else np
+
+
+# ---------------------------------------------------------------------------
+# Numba JIT kernels for CPU acceleration
+# ---------------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _gather_2d_kernel(src, indices, out):
+    """out[i, :] = src[indices[i], :] — 2D gather by row index.
+
+    Replaces NumPy fancy indexing ``src[indices]`` with a compiled loop
+    for consistent CPU throughput on large batches.
+    """
+    for i in range(indices.shape[0]):
+        idx = indices[i]
+        for d in range(src.shape[1]):
+            out[i, d] = src[idx, d]
+
+
+@njit(cache=True)
+def _scatter_add_2d_kernel(out, idx, vals):
+    """In-place ``out[idx] += vals`` for 2D ``out``/``vals`` and 1D ``idx``.
+
+    Serial implementation to preserve np.add.at semantics under duplicate indices.
+    """
+    n = idx.shape[0]
+    d = vals.shape[1]
+    for i in range(n):
+        k = idx[i]
+        for j in range(d):
+            out[k, j] += vals[i, j]
+
+
+def _gather_sparse_input(emb_flat, inv_flat, batch_size, emb_dim, gname=""):
+    """Reconstruct batch tensor from unique embeddings via inverse indices.
+
+    Equivalent to ``emb_2d[inv_1d].reshape(batch_size, -1, emb_dim)``
+    but uses Numba on CPU and CuPy fancy indexing on GPU for zero-copy
+    data paths.
+    """
+    xp = _xp()
+
+    emb_2d = xp.asarray(emb_flat).reshape(-1, emb_dim)
+    inv_1d = xp.asarray(inv_flat).reshape(-1)
+
+    if emb_2d.shape[0] == 0:
+        raise ValueError(
+            f"Sparse embedding unique payload 'emb_flat' for group {gname} cannot be empty! "
+            f"emb_flat.shape={emb_flat.shape}, inv_flat.shape={inv_flat.shape}, "
+            f"batch_size={batch_size}, emb_dim={emb_dim}. "
+            "This indicates a bug in the fluxway routing layer."
+        )
+
+    if _GPU_AVAILABLE:
+        rec = emb_2d[inv_1d]
+    else:
+        rec = np.empty((inv_1d.shape[0], emb_dim), dtype=emb_2d.dtype)
+        _gather_2d_kernel(np.asarray(emb_2d), np.asarray(inv_1d), rec)
+    return rec.reshape(batch_size, -1, emb_dim)
+
+
+def _scatter_add_grad(emb_2d, inv_1d, grad_local):
+    """Scatter-add per-sample gradients back to unique embedding rows.
+
+    Equivalent to ``jnp.zeros(shape).at[inv].add(grad)`` but in-place.
+    Uses cupyx.scatter_add on GPU and Numba _scatter_add_2d_kernel on CPU.
+    """
+    xp = _xp()
+    if emb_2d.shape[0] == 0:
+        raise ValueError(
+            f"_scatter_add_grad received empty embedding tensor: "
+            f"emb_2d.shape={emb_2d.shape}, inv_1d.shape={inv_1d.shape}, "
+            f"grad_local.shape={grad_local.shape}. "
+            "This indicates a bug in the fluxway routing layer."
+        )
+
+    g_unique = xp.zeros_like(emb_2d)
+
+    if _GPU_AVAILABLE:
+        cupyx.scatter_add(  # type: ignore[union-attr]
+            g_unique,
+            xp.asarray(inv_1d),
+            grad_local,
+        )
+    else:
+        _scatter_add_2d_kernel(
+            np.asarray(g_unique),
+            np.asarray(inv_1d),
+            np.asarray(grad_local),
+        )
+    return g_unique
 
 
 @spmd(
@@ -59,6 +154,17 @@ class DenseSPMD:
         self.dense_stats_dim = dense_stats_dim
         self.grad_accum_steps = grad_accum_steps
         self._jax_initialized = False
+
+        # -- Invariants on configuration --
+        assert isinstance(embed_dim, int) and embed_dim > 0, (
+            f"[DenseSPMD] embed_dim must be a positive int, got {embed_dim!r}"
+        )
+        assert isinstance(dense_stats_dim, int) and dense_stats_dim > 0, (
+            f"[DenseSPMD] dense_stats_dim must be a positive int, got {dense_stats_dim!r}"
+        )
+        assert isinstance(grad_accum_steps, int) and grad_accum_steps >= 1, (
+            f"[DenseSPMD] grad_accum_steps must be >= 1, got {grad_accum_steps!r}"
+        )
 
     def _ensure_jax_init(self):
         if self._jax_initialized:
@@ -115,9 +221,9 @@ class DenseSPMD:
     @operator(
         name="step",
         input_sharding={
-            "emb1": {"type": "static", "axis": ["dp"]},
+            "emb1": {"type": "dynamic", "axis": ["dp"]},
             "inv1": {"type": "static", "axis": ["dp"]},
-            "emb2": {"type": "static", "axis": ["dp"]},
+            "emb2": {"type": "dynamic", "axis": ["dp"]},
             "inv2": {"type": "static", "axis": ["dp"]},
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
@@ -137,23 +243,94 @@ class DenseSPMD:
     ) -> dict:
         self._ensure_jax_init()
 
-        # -- JIT 外: GPU(CuPy) / CPU(NumPy) 操作 --
+        # -- Outside JIT: GPU(CuPy) / CPU(NumPy) operations --
         xp = _xp()
         emb1_2d = xp.asarray(emb1.flat_values).reshape(-1, emb1.flat_values.shape[-1])  # type: ignore
         emb2_2d = xp.asarray(emb2.flat_values).reshape(-1, emb2.flat_values.shape[-1])  # type: ignore
         inv1_1d = xp.asarray(inv1.flat_values).reshape(-1)  # type: ignore
         inv2_1d = xp.asarray(inv2.flat_values).reshape(-1)  # type: ignore
 
-        # -- 数值正确性验证: inv 索引范围 --
-        assert inv1_1d.min() >= 0 and inv1_1d.max() < emb1_2d.shape[0], (
-            f"[DenseSPMD] inv1 越界: max={inv1_1d.max()}, emb1_unique_count={emb1_2d.shape[0]}"
+        # -- Invariants on embedding dimension consistency --
+        assert emb1_2d.shape[1] == self.embed_dim, (
+            f"[DenseSPMD] emb1 last dim {emb1_2d.shape[1]} != configured embed_dim {self.embed_dim}"
         )
-        assert inv2_1d.min() >= 0 and inv2_1d.max() < emb2_2d.shape[0], (
-            f"[DenseSPMD] inv2 越界: max={inv2_1d.max()}, emb2_unique_count={emb2_2d.shape[0]}"
+        assert emb2_2d.shape[1] == self.embed_dim, (
+            f"[DenseSPMD] emb2 last dim {emb2_2d.shape[1]} != configured embed_dim {self.embed_dim}"
+        )
+        assert inv1_1d.shape[0] == inv2_1d.shape[0], (
+            f"[DenseSPMD] inv1 length {inv1_1d.shape[0]} != inv2 length {inv2_1d.shape[0]}"
         )
 
-        f1_rec = emb1_2d[inv1_1d]
-        f2_rec = emb2_2d[inv2_1d]
+        # -- Numerical correctness check: inv index range --
+        assert inv1_1d.min() >= 0 and inv1_1d.max() < emb1_2d.shape[0], (
+            f"[DenseSPMD] inv1 out of range: max={inv1_1d.max()}, emb1_unique_count={emb1_2d.shape[0]}"
+        )
+        assert inv2_1d.min() >= 0 and inv2_1d.max() < emb2_2d.shape[0], (
+            f"[DenseSPMD] inv2 out of range: max={inv2_1d.max()}, emb2_unique_count={emb2_2d.shape[0]}"
+        )
+
+        # -- Embedding routing order/count invariants --
+        # The cross-mesh router (input rank d -> dense rank d) must deliver
+        # exactly the unique embeddings referenced by this rank's local inv,
+        # in the same order as input rank d's local unique sequence. The
+        # following three checks together guarantee both row count and order:
+        #   (1) emb_rows == inv.max()+1   -> no missing or extra rows
+        #   (2) emb is numerically finite -> no transport corruption
+        #   (3) origin_indices length matches emb_rows -> per-row routing
+        #       metadata (encoding global assembly position) survived intact
+        if inv1_1d.size > 0:
+            expected_rows_1 = int(inv1_1d.max()) + 1
+            assert emb1_2d.shape[0] == expected_rows_1, (
+                f"[DenseSPMD] emb1 row count {emb1_2d.shape[0]} != "
+                f"inv1.max+1 {expected_rows_1}; cross-mesh routing delivered "
+                "the wrong number of unique embedding rows for emb1"
+            )
+        if inv2_1d.size > 0:
+            expected_rows_2 = int(inv2_1d.max()) + 1
+            assert emb2_2d.shape[0] == expected_rows_2, (
+                f"[DenseSPMD] emb2 row count {emb2_2d.shape[0]} != "
+                f"inv2.max+1 {expected_rows_2}; cross-mesh routing delivered "
+                "the wrong number of unique embedding rows for emb2"
+            )
+        assert bool(xp.all(xp.isfinite(emb1_2d))), (  # type: ignore
+            "[DenseSPMD] emb1 contains NaN/Inf -- possible cross-mesh "
+            "transport corruption between SparseEmbeddingSPMD and DenseSPMD"
+        )
+        assert bool(xp.all(xp.isfinite(emb2_2d))), (  # type: ignore
+            "[DenseSPMD] emb2 contains NaN/Inf -- possible cross-mesh "
+            "transport corruption between SparseEmbeddingSPMD and DenseSPMD"
+        )
+        if emb1.origin_indices is not None:
+            origin1 = emb1.origin_indices_materialized
+            assert origin1 is not None and origin1.shape[0] == emb1_2d.shape[0], (
+                f"[DenseSPMD] emb1 origin_indices length "
+                f"{None if origin1 is None else origin1.shape[0]} != emb1 row "
+                f"count {emb1_2d.shape[0]}; per-row routing metadata is broken "
+                "(rows may have been reordered/dropped/duplicated)"
+            )
+        if emb2.origin_indices is not None:
+            origin2 = emb2.origin_indices_materialized
+            assert origin2 is not None and origin2.shape[0] == emb2_2d.shape[0], (
+                f"[DenseSPMD] emb2 origin_indices length "
+                f"{None if origin2 is None else origin2.shape[0]} != emb2 row "
+                f"count {emb2_2d.shape[0]}; per-row routing metadata is broken "
+                "(rows may have been reordered/dropped/duplicated)"
+            )
+
+        local_batch = int(inv1_1d.shape[0])
+
+        # Without pooling, sparse embeddings are naturally (B, S, D). For now
+        # each sample carries a single id (S=1), so we reshape directly back
+        # to 2D for the jit forward. Switch to sum/mean pooling here when
+        # sequence features are introduced.
+        f1_rec_3d = _gather_sparse_input(
+            emb1.flat_values, inv1.flat_values, local_batch, self.embed_dim, "f1"
+        )
+        f2_rec_3d = _gather_sparse_input(
+            emb2.flat_values, inv2.flat_values, local_batch, self.embed_dim, "f2"
+        )
+        f1_rec = f1_rec_3d.reshape(local_batch, self.embed_dim)
+        f2_rec = f2_rec_3d.reshape(local_batch, self.embed_dim)
         dense_stats = xp.asarray(dp_data.dense_stats.flat_values).reshape(  # type: ignore
             -1, dp_data.dense_stats.flat_values.shape[-1]
         )
@@ -163,8 +340,23 @@ class DenseSPMD:
             .astype(xp.float32)  # type: ignore
         )
 
-        # -- 数值正确性验证: inv 还原 --
-        # f1_rec[i] == emb1_2d[inv1_1d[i]], 即 lookup 还原后每个样本的 embedding 正确
+        # -- Invariants on DP-aligned features --
+        assert dense_stats.shape[1] == self.dense_stats_dim, (
+            f"[DenseSPMD] dense_stats last dim {dense_stats.shape[1]} "
+            f"!= configured dense_stats_dim {self.dense_stats_dim}"
+        )
+        assert dense_stats.shape[0] == local_batch, (
+            f"[DenseSPMD] dense_stats batch {dense_stats.shape[0]} "
+            f"!= local_batch {local_batch}"
+        )
+        assert labels_local.shape[0] == local_batch, (
+            f"[DenseSPMD] labels batch {labels_local.shape[0]} "
+            f"!= local_batch {local_batch}"
+        )
+
+        # -- Numerical correctness check: gather restoration --
+        # f1_rec[i] == emb1_2d[inv1_1d[i]], i.e. reconstructed per-sample
+        # embedding aligns with the inverse mapping.
         assert f1_rec.shape[0] == inv1_1d.shape[0], (
             f"[DenseSPMD] f1_rec batch size {f1_rec.shape[0]} != inv1 size {inv1_1d.shape[0]}"
         )
@@ -174,9 +366,8 @@ class DenseSPMD:
 
         dp_sharding = NamedSharding(self.mesh, P("dp"))
         replicated = NamedSharding(self.mesh, P())
-        local_batch = f1_rec.shape[0]
 
-        # -- JIT 入口桥接: CuPy → JAX (DLPack zero-copy) --
+        # -- JIT entry bridge: CuPy -> JAX (DLPack zero-copy) --
         f1_jax = jnp.asarray(f1_rec)
         f2_jax = jnp.asarray(f2_rec)
         stats_jax = jnp.asarray(dense_stats)
@@ -208,7 +399,7 @@ class DenseSPMD:
             arrays=[labels_jax],
         )
 
-        # -- JIT 内: JAX 训练核心 --
+        # -- Inside JIT: JAX training core --
         @nnx.jit(
             in_shardings=(None, dp_sharding, dp_sharding, dp_sharding, dp_sharding),
             out_shardings=(None, dp_sharding, dp_sharding, replicated),
@@ -239,32 +430,17 @@ class DenseSPMD:
             self.model, global_f1, global_f2, global_stats, global_labels
         )
 
-        # -- JIT 输出后处理: JAX → xp --
+        # -- Post JIT: JAX -> xp --
         grad_f1_local = xp.asarray(grad_f1_global.addressable_shards[0].data)  # type: ignore
         grad_f2_local = xp.asarray(grad_f2_global.addressable_shards[0].data)  # type: ignore
 
         # scatter-add: (local_batch, emb_dim) → (K_u, emb_dim)
-        g1_unique = xp.zeros_like(emb1_2d)  # type: ignore
-        if _GPU_AVAILABLE:
-            cp.scatter_add(  # type: ignore
-                g1_unique,
-                cp.broadcast_to(inv1_1d[:, None], grad_f1_local.shape),  # type: ignore
-                grad_f1_local,
-            )
-        else:
-            np.add.at(g1_unique, inv1_1d, grad_f1_local)
-        g2_unique = xp.zeros_like(emb2_2d)  # type: ignore
-        if _GPU_AVAILABLE:
-            cp.scatter_add(  # type: ignore
-                g2_unique,
-                cp.broadcast_to(inv2_1d[:, None], grad_f2_local.shape),  # type: ignore
-                grad_f2_local,
-            )
-        else:
-            np.add.at(g2_unique, inv2_1d, grad_f2_local)
+        g1_unique = _scatter_add_grad(emb1_2d, inv1_1d, grad_f1_local)
+        g2_unique = _scatter_add_grad(emb2_2d, inv2_1d, grad_f2_local)
 
-        # -- 数值正确性验证: scatter-add 梯度 --
-        # scatter-add 后 g1_unique 的非零行数不应超过 unique_keys 数量
+        # -- Numerical correctness check: scatter-add gradients --
+        # The number of non-zero rows after scatter-add must not exceed the
+        # number of unique keys.
         if _GPU_AVAILABLE:
             g1_nonzero_rows = int(cp.count_nonzero(cp.any(g1_unique != 0, axis=1)))  # type: ignore
             g2_nonzero_rows = int(cp.count_nonzero(cp.any(g2_unique != 0, axis=1)))  # type: ignore
@@ -272,12 +448,12 @@ class DenseSPMD:
             g1_nonzero_rows = int(np.count_nonzero(np.any(g1_unique != 0, axis=1)))
             g2_nonzero_rows = int(np.count_nonzero(np.any(g2_unique != 0, axis=1)))
         assert g1_nonzero_rows <= emb1_2d.shape[0], (
-            f"[DenseSPMD] grad1 scatter-add 非零行数 {g1_nonzero_rows} "
-            f"超过 unique keys 数量 {emb1_2d.shape[0]}"
+            f"[DenseSPMD] grad1 scatter-add non-zero rows {g1_nonzero_rows} "
+            f"exceeds unique keys count {emb1_2d.shape[0]}"
         )
         assert g2_nonzero_rows <= emb2_2d.shape[0], (
-            f"[DenseSPMD] grad2 scatter-add 非零行数 {g2_nonzero_rows} "
-            f"超过 unique keys 数量 {emb2_2d.shape[0]}"
+            f"[DenseSPMD] grad2 scatter-add non-zero rows {g2_nonzero_rows} "
+            f"exceeds unique keys count {emb2_2d.shape[0]}"
         )
 
         dense_grad_leaves = jtu.tree_leaves(dense_param_grads)
@@ -308,6 +484,17 @@ class DenseSPMD:
         treedef = jtu.tree_structure(self.grad_accum)
         param_leaves = jtu.tree_leaves(nnx.state(self.model))
         flat = jnp.asarray(dense_grad.flat_values)
+
+        # -- Invariants on dense gradient flat layout --
+        expected_size = sum(int(leaf.size) for leaf in param_leaves)
+        assert int(flat.size) == expected_size, (
+            f"[DenseSPMD.update] dense_grad flat size {int(flat.size)} "
+            f"!= sum of param leaf sizes {expected_size}"
+        )
+        assert flat.ndim == 1, (
+            f"[DenseSPMD.update] dense_grad must be 1D after ravel, got shape={flat.shape}"
+        )
+
         cursor = 0
         split_leaves = []
         for leaf in param_leaves:

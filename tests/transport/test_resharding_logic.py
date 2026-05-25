@@ -51,7 +51,7 @@ def test_resharding_2_to_6_static_chunk():
         src_local_rank=0,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        src_data_shape=global_shape,
+        routing_global_shape=global_shape,
     )
     counts_0 = plan_0.send_counts.tolist()
     assert counts_0 == [4, 4, 4, 0, 0, 0]
@@ -63,7 +63,7 @@ def test_resharding_2_to_6_static_chunk():
         src_local_rank=1,
         src_spec=src_spec,
         dst_spec=dst_spec,
-        src_data_shape=global_shape,
+        routing_global_shape=global_shape,
     )
     counts_1 = plan_1.send_counts.tolist()
     assert counts_1 == [0, 0, 0, 4, 4, 4]
@@ -83,7 +83,7 @@ def test_identity_collapse_hash():
 
     plan = TransportPlanner.compute_plan(
         src_local_rank=0,
-        src_data_shape=(4,),
+        routing_global_shape=(4,),
         src_spec=src_spec,
         dst_spec=dst_spec,
         src_routing_based_values=data,  # Data determines route

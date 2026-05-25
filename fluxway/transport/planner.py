@@ -72,7 +72,7 @@ class TransportPlanner:
     @staticmethod
     def compute_plan(
         src_local_rank: int,
-        src_data_shape: tuple[int, ...],
+        routing_global_shape: tuple[int, ...],
         src_spec: PhysicalLayout,
         dst_spec: PhysicalLayout,
         src_index_desc: Any | None = None,
@@ -81,7 +81,16 @@ class TransportPlanner:
         src_routing_indices: Any | None = None,
         src_routing_based_values: Any | None = None,
     ) -> TransportPlan:
-        """Diff(L_src, L_dst) using physical layouts."""
+        """Diff(L_src, L_dst) using physical layouts.
+
+        ``routing_global_shape`` is the *true* global logical shape used by the
+        routing strategy (e.g. ``ChunkPartition`` reads ``shape[d]`` as the
+        ``dim_size`` argument).  It MUST be padding-free: any capacity
+        bucketing applied to the in-flight tensors is invisible here.  Callers
+        passing a padded shape will silently corrupt the routing math (e.g.
+        ``[3,4,8,9]`` against ``dim_size=16`` instead of ``12`` produces
+        ``[1,1,2,3]`` rather than ``[1,2,4,4]``).
+        """
         # N-D Native logic extracts the correct dimensionalities implicitly.
         # Default destination dimension 0 is passed to respect returning a legacy single
         # dimension for 1D layout serialization/inspection in tests.
@@ -102,8 +111,8 @@ class TransportPlanner:
                     rank,
                     dim,
                     dim_size=(
-                        src_data_shape[dim]
-                        if src_data_shape and dim < len(src_data_shape)
+                        routing_global_shape[dim]
+                        if routing_global_shape and dim < len(routing_global_shape)
                         else 0
                     ),
                     index_desc=src_index_desc,
@@ -113,7 +122,7 @@ class TransportPlanner:
         sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (
             TransportPlanner._compute_plan_internal(
                 src_local_rank=src_local_rank,
-                src_data_shape=src_data_shape,
+                routing_global_shape=routing_global_shape,
                 src_routing_indices=src_routing_indices,
                 src_routing_based_values=src_routing_based_values,
                 dst_index_desc=dst_index_desc,
@@ -139,7 +148,7 @@ class TransportPlanner:
     @staticmethod
     def _compute_plan_internal(
         src_local_rank: int,
-        src_data_shape: tuple[int, ...],
+        routing_global_shape: tuple[int, ...],
         src_routing_indices: Any | None,
         src_routing_based_values: Any | None,
         dst_index_desc: Any,
@@ -152,12 +161,19 @@ class TransportPlanner:
         src_spec: Any | None = None,
         src_index_desc: Any | None = None,
     ) -> tuple[Any, Any, Any, int, int]:
-        """Internal static logical core for JIT compilation."""
+        """Internal static logical core for JIT compilation.
+
+        ``routing_global_shape`` is the *padding-free* logical global shape
+        consumed by the routing strategy (``strategy(input, dim_size=shape[d])``).
+        It MUST NOT be inflated by capacity bucketing or any local-to-global
+        capacity recovery -- those concerns belong to the in-flight tensor
+        layout, not the routing math.  See ``compute_plan`` docstring.
+        """
         backend = get_backend()
 
         dst_num_workers = dst_mesh.size if dst_mesh else 1
         logger.debug(
-            f"[Planner] Compute plan: local_rank={src_local_rank}, src_indices={src_routing_indices}, dst_num_workers={dst_num_workers}, src_data_shape={src_data_shape}"
+            f"[Planner] Compute plan: local_rank={src_local_rank}, src_indices={src_routing_indices}, dst_num_workers={dst_num_workers}, routing_global_shape={routing_global_shape}"
         )
 
         dst_is_content_addressable = (
@@ -201,8 +217,10 @@ class TransportPlanner:
         # =====================================================================
 
         # The planner operates on the logical global domain.
-        # src_data_shape is provided by the distributor as the global shape.
-        global_shape = src_data_shape
+        # ``routing_global_shape`` is the padding-free global shape provided by
+        # the distributor; ``ChunkPartition`` and friends use ``global_shape[d]``
+        # as the routing ``dim_size``.
+        global_shape = routing_global_shape
         ndim = len(global_shape)
 
         mesh_coords: list[Any | None] = [None] * len(dst_mesh.shape) if dst_mesh else []
@@ -240,7 +258,7 @@ class TransportPlanner:
                 else:
                     # Fallback for anonymous shards (1:1 mapping)
                     input_for_routing = backend.arange(
-                        0, src_data_shape[d], device="cpu"
+                        0, routing_global_shape[d], device="cpu"
                     )
 
             # Pre-truncate sentinel values (-1) to safe index 0 for strategy & unravel calculations
@@ -390,14 +408,18 @@ class TransportPlanner:
         src_local_rank: int,
         src_spec: PhysicalLayout,
         dst_spec: PhysicalLayout,
-        src_data_shape: tuple[int, ...],
+        routing_global_shape: tuple[int, ...],
         src_index_desc: Any = None,
         dst_index_desc: Any = None,
     ) -> TransportPlan:
-        """High-level Diff API."""
+        """High-level Diff API.
+
+        ``routing_global_shape`` is the padding-free global shape the routing
+        strategy reasons about (see ``compute_plan``).
+        """
         return TransportPlanner.compute_plan(
             src_local_rank,
-            src_data_shape,
+            routing_global_shape,
             src_spec,
             dst_spec,
             src_index_desc=src_index_desc,

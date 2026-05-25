@@ -45,6 +45,17 @@ class SparseEmbeddingSPMD:
         self.vocab_size = vocab_size
         self.num_threads = num_threads or os.cpu_count() or 4
 
+        # -- Invariants on configuration --
+        assert isinstance(embed_dim, int) and embed_dim > 0, (
+            f"[SparseSPMD] embed_dim must be a positive int, got {embed_dim!r}"
+        )
+        assert isinstance(vocab_size, int) and vocab_size > 0, (
+            f"[SparseSPMD] vocab_size must be a positive int, got {vocab_size!r}"
+        )
+        assert self.num_threads > 0, (
+            f"[SparseSPMD] num_threads must be positive, got {self.num_threads}"
+        )
+
         self.store = se.EmbeddingStore(
             embedding_config=se.EmbeddingConfig(
                 dims=[embed_dim],
@@ -112,24 +123,44 @@ class SparseEmbeddingSPMD:
         input_sharding={
             "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
         },
-        output_sharding={"sparse_features": {"type": "dynamic", "axis": ["shard"]}},
+        output_sharding={
+            "sparse_features": {
+                "type": "mirror",
+                "reference": "lookup.unique_ids",
+                "axis": [],
+            }
+        },
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
         step = self.ctx.step
         ids_np = unique_ids.flat_values.ravel().astype(np.int64)
+
+        # -- Invariants on input ids --
+        assert ids_np.ndim == 1, (
+            f"[SparseSPMD.lookup] ids must be 1D after ravel, got shape={ids_np.shape}"
+        )
+        assert ids_np.size >= 0, (
+            f"[SparseSPMD.lookup] ids size must be non-negative, got {ids_np.size}"
+        )
 
         # Lazy-insert new keys, return embeddings for all keys in this shard.
         vals_dlm, _, _ = self.store.lookup_or_insert(ids_np, dim=self.embed_dim)
         backend = get_backend()
         emb_np = backend.from_dlpack(vals_dlm).reshape(ids_np.size, self.embed_dim)
 
+        # -- Invariants on lookup output --
+        assert emb_np.shape == (ids_np.size, self.embed_dim), (
+            f"[SparseSPMD.lookup] emb shape {emb_np.shape} "
+            f"!= expected ({ids_np.size}, {self.embed_dim})"
+        )
+
         self._forward_keys_cache[step] = ids_np
 
-        # -- 数值正确性验证: lookup keys 与 received unique_ids 一致 --
+        # -- Numerical correctness check: lookup keys match received unique_ids --
         np.testing.assert_array_equal(
             ids_np,
             unique_ids.flat_values.ravel().astype(np.int64),
-            err_msg=f"[SparseSPMD] rank={self.rank} lookup keys 与 unique_ids 不匹配",
+            err_msg=f"[SparseSPMD] rank={self.rank} lookup keys mismatch unique_ids",
         )
 
         g_shape = None
@@ -171,10 +202,13 @@ class SparseEmbeddingSPMD:
 
         grads_np = grads.flat_values.reshape(keys_np.size, self.embed_dim)
 
-        # -- 数值正确性验证: 梯度维度与 keys 一致 --
+        # -- Numerical correctness check: gradient layout matches keys --
         assert grads_np.shape == (keys_np.size, self.embed_dim), (
             f"[SparseSPMD] update grads shape {grads_np.shape} "
             f"!= expected ({keys_np.size}, {self.embed_dim})"
+        )
+        assert keys_np.ndim == 1, (
+            f"[SparseSPMD] update keys must be 1D, got shape={keys_np.shape}"
         )
 
         self.store.accumulate_gradients(keys_np, grads_np)

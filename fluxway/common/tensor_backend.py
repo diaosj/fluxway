@@ -131,6 +131,101 @@ class DLPackObject:
         return self._device
 
 
+def as_native_zerocopy(x: Any) -> Any:
+    """Zero-copy normalize any tensor (jax/torch/np/cupy/...) to native numpy or cupy.
+
+    HybridBackend supports *both* numpy (CPU) and cupy (GPU) and chooses
+    between them per-array via :py:meth:`HybridBackend._lib_for`.  When
+    upstream layers (routing/communication) feed a foreign array (JAX,
+    PyTorch, ...) into HybridBackend, every method silently re-dispatches
+    through ``__array_function__`` into ``jnp`` or hits ``BufferError``
+    in numba kernels.  This helper is the *single chokepoint* that
+    converts foreign arrays into the native domain.
+
+    Routing rule -- the target domain follows the **source device**, so
+    the converted array stays on the same device and the rest of the
+    pipeline keeps benefitting from ``HybridBackend._lib_for``:
+
+    +----------------------+--------------------+--------------------+
+    | Source               | CPU device         | CUDA/ROCM device   |
+    +======================+====================+====================+
+    | numpy.ndarray        | as-is              | n/a                |
+    | cupy.ndarray         | n/a                | as-is              |
+    | jax.Array            | np.from_dlpack     | cupy.from_dlpack   |
+    | torch.Tensor         | np.from_dlpack     | cupy.from_dlpack   |
+    | other __dlpack__     | np.from_dlpack     | cupy.from_dlpack   |
+    | exotic (no DLPack)   | np.asarray (copy)  | n/a                |
+    +----------------------+--------------------+--------------------+
+
+    Every supported (source, device) pair takes the zero-copy path when
+    DLPack is available; only the last fallback row may copy.
+    """
+    # numpy fast-path
+    if isinstance(x, np.ndarray):
+        return x
+
+    cp_mod = None
+    try:
+        import cupy as _cp  # type: ignore
+
+        cp_mod = _cp
+        if isinstance(x, _cp.ndarray):
+            return x
+    except Exception:
+        pass
+
+    # Detect torch tensors explicitly so we can read .is_cuda even on
+    # builds that don't expose __dlpack_device__ uniformly.
+    is_torch_tensor = False
+    torch_on_cuda = False
+    try:
+        import torch  # type: ignore
+
+        if isinstance(x, torch.Tensor):
+            is_torch_tensor = True
+            torch_on_cuda = bool(x.is_cuda)
+    except Exception:
+        pass
+
+    # Decide the target device by inspecting the source.  DLPack device
+    # codes: 1=CPU, 2=CUDA, 4=OpenCL, 7=Vulkan, 8=Metal, 10=ROCm, ...
+    source_on_gpu = False
+    if is_torch_tensor:
+        source_on_gpu = torch_on_cuda
+    elif hasattr(x, "__dlpack_device__"):
+        try:
+            source_on_gpu = x.__dlpack_device__()[0] in (2, 10)
+        except Exception:
+            source_on_gpu = False
+
+    # DLPack zero-copy paths -- preferred for jax / torch / others.
+    if hasattr(x, "__dlpack__"):
+        if source_on_gpu and cp_mod is not None:
+            try:
+                return cp_mod.from_dlpack(x)
+            except Exception:
+                pass
+        try:
+            # JAX arrays on CUDA without an active CuPy install fall
+            # through to here; np.from_dlpack will raise unless the
+            # source is on host, so the next fallback handles it.
+            return np.from_dlpack(x)
+        except Exception:
+            pass
+
+    # Last-resort fallback for objects without (working) DLPack support.
+    # For torch CUDA tensors prefer the explicit cuda->cupy path before
+    # an unavoidable host transfer.
+    if is_torch_tensor:
+        if torch_on_cuda and cp_mod is not None:
+            try:
+                return cp_mod.asarray(x.detach())
+            except Exception:
+                pass
+        return np.asarray(x.detach().cpu())
+    return np.asarray(x)
+
+
 class TensorBackend(ABC):
     """Abstract interface for tensor operations across different frameworks.
 
@@ -164,6 +259,31 @@ class TensorBackend(ABC):
     def is_torch(self) -> bool:
         """True if this backend uses PyTorch (eager / torch.compile)."""
         return False
+
+    def requires_static_shapes(self) -> bool:
+        """Whether downstream pipelines must produce static-shape buffers.
+
+        Backends that wrap a tracing/compilation engine (jax.jit,
+        torch.compile) need padded capacity buffers so traces are
+        reused across varying batch sizes.  Pure eager backends (numpy,
+        cupy, torch eager) can run on dynamic shapes directly and skip
+        padding entirely on both send and receive sides.
+
+        Default is False; backends override to opt-in.
+        """
+        return False
+
+    @abstractmethod
+    def adopt(self, x: Any) -> Any:
+        """Zero-copy adopt a foreign tensor into this backend's native domain.
+
+        Used at every entry point where untrusted tensors (jax / torch /
+        numpy / cupy / anything DLPack-capable) cross into a backend's
+        eager pipeline.  Implementations MUST take the zero-copy path
+        whenever possible (DLPack capsules, isinstance fast paths) and
+        never silently insert host transfers.
+        """
+        ...
 
     @abstractmethod
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
@@ -447,10 +567,15 @@ class TensorBackend(ABC):
 
 
 class TorchBackend(TensorBackend):
-    def __init__(self):
+    def __init__(self, compile: bool = False):
         import torch  # type: ignore
 
         self._torch = torch
+        # When ``compile=True`` the user has opted into ``torch.compile``
+        # (or any tracing/JIT path).  Communication will then bucket
+        # send/receive shapes to capacity so the compiled graph is
+        # reused across batches.  Default is False (pure eager).
+        self._compile_enabled = bool(compile)
 
     def name(self) -> str:
         return "torch"
@@ -458,6 +583,24 @@ class TorchBackend(TensorBackend):
     @property
     def is_torch(self) -> bool:
         return True
+
+    def requires_static_shapes(self) -> bool:
+        return self._compile_enabled
+
+    def adopt(self, x: Any) -> Any:
+        """Zero-copy adopt foreign tensor as a torch.Tensor."""
+        if isinstance(x, self._torch.Tensor):
+            return x
+        # DLPack zero-copy for jax.Array / cupy / numpy >=1.23.
+        if hasattr(x, "__dlpack__"):
+            try:
+                return self._torch.from_dlpack(x)
+            except Exception:
+                pass
+        # numpy fallback (zero-copy when contiguous CPU array).
+        if isinstance(x, np.ndarray):
+            return self._torch.from_numpy(x)
+        return self._torch.as_tensor(x)
 
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
         return self._torch.tensor(data, dtype=dtype)
@@ -811,6 +954,26 @@ class JaxBackend(TensorBackend):
     @property
     def is_jax(self) -> bool:
         return True
+
+    def requires_static_shapes(self) -> bool:
+        # JaxBackend always traces through ``jax.jit``; capacity
+        # bucketing is required to keep recompilation rate bounded.
+        return True
+
+    def adopt(self, x: Any) -> Any:
+        """Zero-copy adopt foreign tensor as a jax.Array."""
+        # Native fast path: anything already produced by jax stays put.
+        if isinstance(x, self._jax.Array):
+            return x
+        # DLPack zero-copy from torch / cupy / numpy >=1.23.
+        if hasattr(x, "__dlpack__"):
+            try:
+                return self._jax.dlpack.from_dlpack(x)
+            except Exception:
+                pass
+        # numpy / list fallback.
+        with self._x64_scope():
+            return self._jnp.asarray(x)
 
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
         with self._x64_scope():
@@ -1361,6 +1524,83 @@ class HybridBackend(TensorBackend):
     def name(self) -> str:
         return "hybrid_gpu_avail" if self._cp is not None else "hybrid_cpu_only"
 
+    def adopt(self, x: Any) -> Any:
+        """Zero-copy adopt foreign tensor into this HybridBackend's default device domain.
+
+        Why follow ``self._default_device`` instead of the source device:
+        HybridBackend dispatches per-call via ``_lib_for(x)``, but most
+        downstream operators (``where``, ``zeros``, ``cat`` ...) take
+        *multiple* arguments and only inspect the first.  If ``adopt``
+        followed the source device, a CUDA-resident jax.Array would be
+        normalized to cupy while ``backend.zeros()`` (driven by
+        ``_default_device``) keeps producing numpy, causing inevitable
+        cross-device argument mixes (cupy condition + numpy branches).
+        Forcing the *target* domain to ``_default_device`` keeps the
+        eager pipeline strictly single-domain.
+
+        Zero-copy paths:
+        - target=cpu, source on CPU (DLPack)        -> ``np.from_dlpack``
+        - target=cpu, source on GPU                  -> ``np.from_dlpack`` if it works,
+          else ``cp.asnumpy`` D2H (unavoidable cross-device transfer)
+        - target=gpu, source on GPU (DLPack)         -> ``cp.from_dlpack``
+        - target=gpu, source on CPU                  -> ``cp.asarray`` H2D
+          (unavoidable cross-device transfer)
+        """
+        target_is_gpu = self._default_device in ("gpu", "cuda") and self._cp is not None
+        cp_mod = self._cp
+
+        # Native fast paths.
+        if isinstance(x, np.ndarray):
+            if target_is_gpu:
+                return cp_mod.asarray(x)  # H2D, unavoidable
+            return x
+        if cp_mod is not None and isinstance(x, cp_mod.ndarray):
+            if target_is_gpu:
+                return x
+            # cupy -> numpy via DLPack zero-copy when possible.
+            try:
+                return np.from_dlpack(x)
+            except Exception:
+                return cp_mod.asnumpy(x)
+
+        # Identify torch tensors so we can honor .is_cuda even on builds
+        # whose __dlpack_device__ is not perfectly aligned with reality.
+        is_torch_tensor = False
+        torch_on_cuda = False
+        try:
+            import torch  # type: ignore
+
+            if isinstance(x, torch.Tensor):
+                is_torch_tensor = True
+                torch_on_cuda = bool(x.is_cuda)
+        except Exception:
+            pass
+
+        # Foreign DLPack-capable arrays (jax.Array, torch.Tensor, ...).
+        if hasattr(x, "__dlpack__"):
+            if target_is_gpu:
+                try:
+                    return cp_mod.from_dlpack(x)
+                except Exception:
+                    pass
+            else:
+                try:
+                    return np.from_dlpack(x)
+                except Exception:
+                    pass
+
+        # Last-resort device-aware fallback (zero-copy when possible).
+        if is_torch_tensor:
+            if target_is_gpu and not torch_on_cuda:
+                return cp_mod.asarray(x.detach().cpu().numpy())
+            if target_is_gpu and torch_on_cuda:
+                return cp_mod.asarray(x.detach())
+            # target=cpu
+            return np.asarray(x.detach().cpu())
+        if target_is_gpu:
+            return cp_mod.asarray(x)
+        return np.asarray(x)
+
     # ------------------------------------------------------------------
     # Creation / conversion
     # ------------------------------------------------------------------
@@ -1371,6 +1611,18 @@ class HybridBackend(TensorBackend):
         return lib.array(data, dtype=dtype)
 
     def as_tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
+        # If the input is already a native array (numpy / cupy), preserve
+        # its device domain.  HybridBackend dispatches per-array, so a
+        # cupy input must stay cupy even when ``self._default_device``
+        # is 'cpu' -- otherwise we'd hit cupy's implicit device->host
+        # conversion ban.  Only honor an *explicit* device override.
+        if device is None:
+            if isinstance(data, np.ndarray):
+                return force_writable(
+                    data if dtype is None else np.asarray(data, dtype=dtype)
+                )
+            if self._cp is not None and isinstance(data, self._cp.ndarray):
+                return data if dtype is None else self._cp.asarray(data, dtype=dtype)
         lib = self._lib(device or self._default_device)
         if lib is np:
             return force_writable(np.asarray(data, dtype=dtype))

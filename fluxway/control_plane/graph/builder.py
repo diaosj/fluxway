@@ -722,18 +722,12 @@ class Builder:
             src_is_mirror = isinstance(src_spec.routing, ReferentialRouting)
             dst_is_mirror = isinstance(dst_spec.routing, ReferentialRouting)
 
-            if src_is_mirror != dst_is_mirror:
-                mismatch_type = "Source" if src_is_mirror else "Destination"
-                other_type = "Mirror (Referential)"
-                current_type = "Algebraic (Static/Dynamic)"
-
+            if not src_is_mirror and dst_is_mirror:
                 raise ValueError(
                     f"\n[Fluxway Sharding Protocol Error] In {ctx}:\n"
-                    f"  Sharding protocol mismatch for tensor '{src_name}' -> '{dst_name}'.\n"
-                    f"  {mismatch_type} uses {other_type} routing, but the other side uses {current_type}.\n"
-                    f"  Fluxway requires both sides of a communication edge to agree on the routing protocol.\n"
-                    f"  Fix: If you are using mirror/follow routing, ensure both the producer's output_sharding "
-                    f"and the consumer's input_sharding are set to type='mirror'."
+                    f"  Invalid asymmetric routing for tensor '{src_name}' -> '{dst_name}'.\n"
+                    f"  Destination uses Mirror (Referential) routing, but Source uses Algebraic (Static/Dynamic).\n"
+                    f"  A destination cannot use Mirror routing unless the source provides a SymmetryReceipt via Mirror routing."
                 )
 
         return (

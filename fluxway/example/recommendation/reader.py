@@ -72,6 +72,11 @@ class RecommendationReader(GrainReader):
         static_args = getattr(self, "static_args", {})
         batch_size = static_args.get("batch_size", 24)
 
+        # -- Invariants on configuration --
+        assert isinstance(batch_size, int) and batch_size > 0, (
+            f"[Reader] batch_size must be a positive int, got {batch_size!r}"
+        )
+
         samples = []
         for _ in range(batch_size):
             item = self.next_item()
@@ -89,8 +94,35 @@ class RecommendationReader(GrainReader):
         g_shape = (global_batch_size,)
         origins = ContinuousIndex.chunk(0, global_batch_size)
 
+        # -- Invariants on per-sample structure --
+        required_keys = (
+            "user_id",
+            "user_age_level",
+            "request_hour",
+            "hist_click_item_seq",
+            "hist_seq_length",
+            "target_item_id",
+            "target_item_category",
+            "target_item_stats",
+            "is_click",
+        )
+        for k in required_keys:
+            assert k in samples[0], f"[Reader] sample missing required key '{k}'"
+
         # Determine feature dimensions from first sample
         stats_dim = len(samples[0]["target_item_stats"])
+        assert stats_dim > 0, (
+            f"[Reader] target_item_stats must be non-empty, got dim={stats_dim}"
+        )
+        # All samples must agree on stats dimensionality.
+        for i, s in enumerate(samples):
+            assert len(s["target_item_stats"]) == stats_dim, (
+                f"[Reader] sample {i} target_item_stats dim "
+                f"{len(s['target_item_stats'])} != expected {stats_dim}"
+            )
+            assert s["is_click"][0] in (0, 1), (
+                f"[Reader] sample {i} is_click must be 0 or 1, got {s['is_click'][0]}"
+            )
         g_shape_stats = (global_batch_size, stats_dim)
 
         active = ActiveFeatures(

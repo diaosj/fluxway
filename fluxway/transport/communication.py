@@ -176,7 +176,16 @@ class BaseDataDistributor:
         # Logical shape for routing (respecting Ragged/Padded boundaries)
         local_shape = primary.logical_shape
 
-        src_shape = (
+        # Padding-free global logical shape used by the routing strategy.
+        # This is the *single source of truth* for ``ChunkPartition`` /
+        # ``HashPartition`` ``dim_size`` arguments and MUST NOT be inflated by
+        # any capacity bucketing applied to in-flight tensors below.
+        # Mixing the two semantics produces silent routing corruption (e.g.
+        # ``[3,4,8,9]`` against ``dim_size=16`` yields ``[1,1,2,3]`` instead
+        # of ``[1,2,4,4]``).  When ``primary.global_shape`` is unavailable we
+        # fall back to ``local_shape`` -- valid only for scalar / fully
+        # replicated / single-rank cases (see Static->Static guard below).
+        routing_global_shape = (
             primary.global_shape if primary.global_shape is not None else local_shape
         )
 
@@ -196,18 +205,26 @@ class BaseDataDistributor:
             )
 
         # 2. Pack Tensors and Metadata (Required for all paths)
+        # All payloads/indices entering the eager pipeline below are
+        # normalized to the active backend's native domain via
+        # ``backend.adopt(x)`` here, so HybridBackend (which dispatches
+        # on isinstance(np|cp)) never has to inspect or convert foreign
+        # array types again.  This is the *single* chokepoint -- once
+        # payloads cross this boundary, every downstream backend.* call
+        # operates on a uniform domain.
+        backend = get_backend()
         payloads = []
         has_meta_tensor_state_list = []
         nested_length_list = []
         compact_desc_info: list[IndexDescriptor | None] = []
 
         for tt in tensors_to_pack:
-            payloads.append(tt.flat_values)
+            payloads.append(backend.adopt(tt.flat_values))
             meta_tensor_state = 0
 
             if tt.is_ragged:
                 meta_tensor_state |= 1
-                splits = tt.nested_splits[0]
+                splits = backend.adopt(tt.nested_splits[0])
                 lengths = splits[1:] - splits[:-1]
                 nested_length_list.append(lengths)
                 if is_mirror:
@@ -227,7 +244,7 @@ class BaseDataDistributor:
                         if hasattr(tt.origin_indices, "materialize")
                         else tt.origin_indices
                     )
-                    payloads.append(idx)
+                    payloads.append(backend.adopt(idx))
                     nested_length_list.append(None)
                     compact_desc_info.append(None)
             else:
@@ -257,10 +274,11 @@ class BaseDataDistributor:
             # Case A: Explicitly provided indices (e.g. from a previous OP)
             if hasattr(src_geometry_indices, "materialize"):
                 src_geometry_indices = src_geometry_indices.materialize()
+            src_geometry_indices = backend.adopt(src_geometry_indices)
             dst_content_routing_values = None
         elif source and source.is_content_addressable:
             # Case B: Content-addressable (Dynamic) routing
-            src_geometry_indices = primary.flat_values
+            src_geometry_indices = backend.adopt(primary.flat_values)
             dst_content_routing_values = None
         elif source:
             # Case C: Rank-based (Static) routing
@@ -297,9 +315,11 @@ class BaseDataDistributor:
         else:
             dst_content_routing_values = None
 
-        # For dst layout, prefer explicit global_shape, then tensor's global_shape, then src_layout.data_shape.
+        # For dst layout, prefer explicit global_shape, then tensor's global_shape, then routing_global_shape.
         dst_shape = (
-            primary.global_shape if primary.global_shape is not None else src_shape
+            primary.global_shape
+            if primary.global_shape is not None
+            else routing_global_shape
         )
 
         if (
@@ -378,8 +398,7 @@ class BaseDataDistributor:
                 selected_capacity = actual_req
             capacity = selected_capacity
         elif capacity is None:
-            backend = get_backend()
-            if backend.name() == "jax":
+            if backend.requires_static_shapes():
                 if actual_req == 0:
                     capacity = 0
                 elif actual_req <= 1024:
@@ -438,7 +457,9 @@ class BaseDataDistributor:
             return
 
         # Pad payloads and lengths to capacity bucket shape to avoid JAX JIT recompilation
-        backend = get_backend()
+        # (only when the active backend requires static shapes; for pure
+        # eager backends the capacity equals actual_req and all branches
+        # below are no-ops).
         padded_payloads = []
         padded_nested_length_list = []
         static_shapes = [capacity]
@@ -446,7 +467,7 @@ class BaseDataDistributor:
         for p, p_len in zip(payloads, nested_length_list, strict=True):
             if p_len is not None:
                 # Ragged payload
-                if backend.name() == "jax" and capacity != actual_req:
+                if backend.requires_static_shapes() and capacity != actual_req:
                     pad_len_size = capacity - actual_req
                 else:
                     pad_len_size = 0
@@ -461,7 +482,7 @@ class BaseDataDistributor:
                 padded_nested_length_list.append(padded_len)
 
                 flat_req = p.shape[0]
-                if backend.name() == "jax" and capacity != actual_req:
+                if backend.requires_static_shapes() and capacity != actual_req:
                     # Pad flat ragged values using same bucketing
                     if flat_req == 0:
                         flat_capacity = 0
@@ -486,7 +507,7 @@ class BaseDataDistributor:
                 padded_nested_length_list.append(None)
 
                 payload_req = backend.shape(p)[0]
-                if backend.name() == "jax" and capacity != actual_req:
+                if backend.requires_static_shapes() and capacity != actual_req:
                     if payload_req == 0:
                         payload_capacity = 0
                     elif payload_req <= 1024:
@@ -512,7 +533,7 @@ class BaseDataDistributor:
             src_geometry_indices = backend.as_tensor(
                 src_geometry_indices, dtype=backend.int32()
             )
-            if backend.name() == "jax" and capacity != actual_req:
+            if backend.requires_static_shapes() and capacity != actual_req:
                 pad_size = capacity - actual_req
                 if pad_size > 0:
                     padding = backend.full((pad_size,), -1, dtype=backend.int32())
@@ -524,7 +545,7 @@ class BaseDataDistributor:
             dst_content_routing_values = backend.as_tensor(
                 dst_content_routing_values, dtype=backend.int32()
             )
-            if backend.name() == "jax" and capacity != actual_req:
+            if backend.requires_static_shapes() and capacity != actual_req:
                 pad_size = capacity - actual_req
                 if pad_size > 0:
                     padding = backend.full((pad_size,), -1, dtype=backend.int32())
@@ -532,17 +553,13 @@ class BaseDataDistributor:
                         [dst_content_routing_values, padding], dim=0
                     )
 
-        # Adjust src_shape for capacity representation
-        source_is_static = source.is_static if source else False
-        source_shard_size = source.shard_size(0) if (source and source_is_static) else 1
-        global_capacity = capacity * source_shard_size
-        src_is_content_addr = source.is_content_addressable if source else False
-        if src_is_content_addr and primary.global_shape is not None:
-            src_shape = primary.global_shape
-        elif primary.global_shape is not None:
-            src_shape = (global_capacity,) + primary.global_shape[1:]
-        else:
-            src_shape = (global_capacity,) + local_shape[1:]
+        # NOTE: ``capacity`` is a per-rank *padding bucket* applied to in-flight
+        # tensors so XLA can trace stable shapes; it is intentionally decoupled
+        # from ``routing_global_shape`` (which drives the routing math).  Do
+        # *not* derive a ``global_capacity = capacity * mesh_size`` here -- such
+        # an inference is wrong whenever per-rank shard sizes are non-uniform
+        # (e.g. a sender that holds 4 items in a 12/4 ChunkPartition) and would
+        # corrupt the routing dim_size on the planner side.
 
         payloads_tuple = tuple(padded_payloads)
 
@@ -568,7 +585,7 @@ class BaseDataDistributor:
             payloads_tuple=payloads_tuple,
             nested_length_list=tuple(padded_nested_length_list),
             src_local_rank=self.local_rank,
-            src_data_shape=src_shape,
+            routing_global_shape=routing_global_shape,
             src_routing_indices=src_geometry_indices,
             src_routing_based_values=dst_content_routing_values,
             dst_index_desc=target.index_descriptor if target else None,
@@ -987,6 +1004,12 @@ class TransportReceiver:
         _backend = get_backend()
         self._is_torch = _backend.is_torch
         self._is_jax = _backend.is_jax
+        # Whether to route writes through the @compile JIT kernels
+        # (_jit_write_at_offset / _jit_write_at_zero).  Pure eager
+        # backends (numpy / cupy / torch eager) skip the JIT path and
+        # use plain slice-assignment, which avoids capacity-padded
+        # buffers entirely.
+        self._requires_static_shapes = _backend.requires_static_shapes()
 
     # ------------------------------------------------------------------
     # Zero-copy registration
@@ -1051,9 +1074,7 @@ class TransportReceiver:
                         raise RuntimeError(
                             f"Missing shard count for bundle element {i} from rank {source_rank}"
                         )
-                    if self._is_torch:
-                        sender_bufs[i][:count] = tensor[:count]
-                    elif self._is_jax and get_backend().is_tensor(tensor):
+                    if self._requires_static_shapes and get_backend().is_tensor(tensor):
                         sender_bufs[i] = _jit_write_at_zero(
                             tensor, sender_bufs[i], count
                         )
@@ -1086,9 +1107,7 @@ class TransportReceiver:
                     except (TypeError, AttributeError):
                         pass  # opaque buffer, skip check
 
-                    if self._is_torch:
-                        self.target_buffers[i][offset : offset + count] = tensor[:count]
-                    elif self._is_jax and get_backend().is_tensor(tensor):
+                    if self._requires_static_shapes and get_backend().is_tensor(tensor):
                         self.target_buffers[i] = _jit_write_at_offset(
                             tensor, self.target_buffers[i], count, offset
                         )
@@ -1203,7 +1222,7 @@ def _jit_plan_and_pack(
     payloads_tuple: tuple[Any, ...],
     nested_length_list: tuple[Any | None, ...],
     src_local_rank: int,
-    src_data_shape: tuple[int, ...],
+    routing_global_shape: tuple[int, ...],
     src_routing_indices: Any | None,
     src_routing_based_values: Any,
     dst_index_desc: Any,
@@ -1223,6 +1242,11 @@ def _jit_plan_and_pack(
     vectors.  The caller slices each device's window directly from the flat buffer,
     avoiding the O(W*N) vmap-padded intermediate that the previous implementation
     produced.
+
+    ``routing_global_shape`` is the padding-free logical global shape consumed
+    by the routing strategy; see ``TransportPlanner.compute_plan`` for the full
+    contract.  Per-payload static shapes (post-bucketing) are passed via
+    ``static_shapes`` and ``payloads_tuple``.
     """
     backend = get_backend()
 
@@ -1230,7 +1254,7 @@ def _jit_plan_and_pack(
     sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (
         TransportPlanner._compute_plan_internal(
             src_local_rank=src_local_rank,
-            src_data_shape=src_data_shape,
+            routing_global_shape=routing_global_shape,
             src_routing_indices=src_routing_indices,
             src_routing_based_values=src_routing_based_values,
             dst_index_desc=dst_index_desc,
