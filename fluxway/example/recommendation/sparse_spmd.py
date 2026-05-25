@@ -49,7 +49,7 @@ class SparseEmbeddingSPMD:
             embedding_config=se.EmbeddingConfig(
                 dims=[embed_dim],
                 num_threads=self.num_threads,
-                dtype="float32",
+                value_dtype="float32",
             ),
             initializer_config=se.Uniform(min_val=-0.01, max_val=0.01),
             optimizer_config=se.Adam(lr=0.01),
@@ -70,12 +70,12 @@ class SparseEmbeddingSPMD:
 
     def on_snapshot_begin(self, ckpt_dir: str) -> None:
         uri = f"{ckpt_dir}/sparse_lance"
-        backend = se.checkpoint.get_backend("lance")
+        backend = se.checkpoint.get_checkpointer("lance")
         backend.init_dataset(self.store, uri)
 
     def save_state(self, ckpt_dir: str) -> dict:
         uri = f"{ckpt_dir}/sparse_lance"
-        backend = se.checkpoint.get_backend("lance")
+        backend = se.checkpoint.get_checkpointer("lance")
         metas = backend.export_fragments(self.store, uri)
         return {"uri": uri, "lance_meta": metas}
 
@@ -83,7 +83,7 @@ class SparseEmbeddingSPMD:
         self, ckpt_dir: str, gathered_states: dict[int, dict]
     ) -> None:
         uri = f"{ckpt_dir}/sparse_lance"
-        backend = se.checkpoint.get_backend("lance")
+        backend = se.checkpoint.get_checkpointer("lance")
         all_metas = []
         for state in gathered_states.values():
             if "lance_meta" in state:
@@ -93,7 +93,7 @@ class SparseEmbeddingSPMD:
 
     def restore_state(self, state: dict, ckpt_dir: str) -> None:
         uri = state.get("uri", f"{ckpt_dir}/sparse_lance")
-        backend = se.checkpoint.get_backend("lance")
+        backend = se.checkpoint.get_checkpointer("lance")
         partitioner = se.ModuloPartitioner(num_shards=self.world_size)
         backend.load(
             self.store,
