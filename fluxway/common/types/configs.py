@@ -168,6 +168,9 @@ class SPMDConfig(FluxwayBaseSchema):
     # If true, worker will fail immediately upon error instead of attempting recovery.
     fail_fast: bool = True
 
+    # Transport backend for data plane RPC (e.g. "ray", "axon")
+    transport_type: str = "ray"
+
     @property
     def num_workers(self) -> int:
         """Derive world size (total workers) from mesh size."""

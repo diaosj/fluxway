@@ -1198,9 +1198,9 @@ async def test_send_output_none_mesh():
 
     # Mock successor handlers
     handler = MagicMock()
-    from fluxway.rpc.protocol import DataPlaneCallable
+    from fluxway.rpc.protocol import RayActorDataPlane
 
-    worker._successor_handlers = {"succ": {0: DataPlaneCallable(handler)}}
+    worker._successor_handlers = {"succ": {0: RayActorDataPlane(handler)}}
 
     from fluxway.spmd.worker.operator_manager.dispatcher import (
         ExecutionStatus,
@@ -1221,6 +1221,17 @@ async def test_trigger_snapshot_hooks():
     worker_cls = SPMDWorker.__ray_metadata__.modified_class
 
     config = MagicMock()
+
+    op_meta1 = MagicMock()
+    op_meta1.owner_class_qualname = "MockClass1"
+    op_meta1.owner_class_module = "mock_module"
+
+    op_meta2 = MagicMock()
+    op_meta2.owner_class_qualname = "MockClass2"
+    op_meta2.owner_class_module = "mock_module"
+
+    config.operator_metas = {"op1": op_meta1, "op2": op_meta2}
+
     worker = worker_cls(
         config=config,
         rank=0,
@@ -1238,21 +1249,38 @@ async def test_trigger_snapshot_hooks():
     del mock_op2.on_snapshot_commit
 
     worker._op_manager = MagicMock()
-    worker._op_manager._operators = {"op1": mock_op1, "op2": mock_op2}
 
-    ckpt_dir = "/tmp/ckpt"
-    step = 42
+    # We need to mock get_instance_storage and _resolve_owner_class
+    from unittest.mock import patch
+    import fluxway.spmd.worker.worker as worker_module
 
-    # Test trigger_snapshot_begin
-    await worker.trigger_snapshot_begin(ckpt_dir, step)
+    with patch.object(worker_module, "_resolve_owner_class") as mock_resolve:
+        mock_cls1 = type("MockClass1", (), {})
+        mock_cls2 = type("MockClass2", (), {})
+        mock_resolve.side_effect = (
+            lambda mod, name: mock_cls1 if name == "MockClass1" else mock_cls2
+        )
 
-    expected_spmd_dir = str(Path(ckpt_dir) / str(step) / "test_spmd")
-    mock_op1.on_snapshot_begin.assert_called_once_with(expected_spmd_dir)
+        with patch.object(worker_module, "get_instance_storage") as mock_storage:
+            storage_dict = {id(mock_cls1): mock_op1, id(mock_cls2): mock_op2}
+            mock_lock = MagicMock()
+            mock_lock.__enter__ = MagicMock(return_value=None)
+            mock_lock.__exit__ = MagicMock(return_value=None)
+            mock_storage.return_value = (storage_dict, mock_lock)
 
-    # Test trigger_snapshot_commit
-    gathered_states = {"op1": {0: {"state": 1}}, "op2": {0: {"state": 2}}}
-    await worker.trigger_snapshot_commit(ckpt_dir, step, gathered_states)
+            ckpt_dir = "/tmp/ckpt"
+            step = 42
 
-    mock_op1.on_snapshot_commit.assert_called_once_with(
-        expected_spmd_dir, {0: {"state": 1}}
-    )
+            # Test trigger_snapshot_begin
+            await worker.trigger_snapshot_begin(ckpt_dir, step)
+
+            expected_spmd_dir = str(Path(ckpt_dir) / str(step) / "test_spmd")
+            mock_op1.on_snapshot_begin.assert_called_once_with(expected_spmd_dir)
+
+            # Test trigger_snapshot_commit
+            gathered_states = {"op1": {0: {"state": 1}}, "op2": {0: {"state": 2}}}
+            await worker.trigger_snapshot_commit(ckpt_dir, step, gathered_states)
+
+            mock_op1.on_snapshot_commit.assert_called_once_with(
+                expected_spmd_dir, {0: {"state": 1}}
+            )

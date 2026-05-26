@@ -728,7 +728,7 @@ class BaseDataDistributor:
         nested_length_list = []
         compact_desc_info: list[IndexDescriptor | None] = []
 
-        for tt in tensors_to_pack:
+        for tt_idx, tt in enumerate(tensors_to_pack):
             payloads.append(backend.adopt(tt.flat_values))
             meta_tensor_state = 0
 
@@ -754,6 +754,47 @@ class BaseDataDistributor:
                         if hasattr(tt.origin_indices, "materialize")
                         else tt.origin_indices
                     )
+                    # Hard interception: origin_indices length MUST match the
+                    # primary routing axis length of flat_values. A common
+                    # mistake is copying ``unique_ids.origin_indices`` (length
+                    # K = batch x col) onto a *deduplicated* TransportTensor
+                    # whose row count is N (unique count). The two lengths
+                    # silently disagree and would later surface as an opaque
+                    # ``numpy.take`` IndexError inside ``_jit_plan_and_pack``.
+                    # Catching it here keeps the error in fluxway's concept
+                    # space.
+                    pri_axis = (tt.routing_axes or (0,))[0]
+                    pri_shape = getattr(tt.flat_values, "shape", None)
+                    pri_len = (
+                        int(pri_shape[pri_axis])
+                        if pri_shape is not None and pri_axis < len(pri_shape)
+                        else None
+                    )
+                    idx_shape = getattr(idx, "shape", None)
+                    idx_len = (
+                        int(idx_shape[0])
+                        if idx_shape is not None and len(idx_shape) >= 1
+                        else None
+                    )
+                    if (
+                        pri_len is not None
+                        and idx_len is not None
+                        and idx_len != pri_len
+                    ):
+                        raise RuntimeError(
+                            "[Fluxway TransportTensor Error] origin_indices "
+                            f"length mismatch for tuuid(s)={self._format_tuuids(tuuid, tuuid_to_name)} "
+                            f"(tt_idx={tt_idx}): "
+                            f"flat_values.shape={tuple(pri_shape) if pri_shape is not None else None}, "
+                            f"routing_axes={tt.routing_axes}, primary_axis={pri_axis}, "
+                            f"primary_axis_len={pri_len}, "
+                            f"origin_indices type={type(tt.origin_indices).__name__}, "
+                            f"origin_indices length={idx_len}. "
+                            "Did you copy origin_indices from a different-length "
+                            "TransportTensor (e.g. unique_ids -> sparse_features after dedup)? "
+                            "Use TransportTensor(values) and rely on mirror reference "
+                            "to inherit the upstream routing instead."
+                        )
                     payloads.append(backend.adopt(idx))
                     nested_length_list.append(None)
                     compact_desc_info.append(None)
@@ -763,7 +804,30 @@ class BaseDataDistributor:
             has_meta_tensor_state_list.append(meta_tensor_state)
 
         # 3. Explicit Mirror Early-Exit
-        if is_referential and primary.receipt is not None:
+        # Hard interception: when the source/target declares mirror routing
+        # (``is_referential``) we MUST have a SymmetryReceipt on the primary
+        # tensor. Previously, a missing receipt silently fell through to the
+        # algebraic branch below, which then misused ``origin_indices`` as a
+        # routing source and surfaced as an opaque ``numpy.take`` IndexError.
+        # We now fail fast with an actionable message.
+        if is_referential:
+            if primary.receipt is None:
+                raise RuntimeError(
+                    "[Fluxway Mirror Error] target/source declares mirror "
+                    f"routing but primary.receipt is None for tuuid(s)="
+                    f"{self._format_tuuids(tuuid, tuuid_to_name)}. "
+                    "This means the mirror reference upstream did not "
+                    "propagate a SymmetryReceipt onto this TransportTensor. "
+                    "Common causes: (1) the producing OP rebuilt "
+                    "TransportTensor without forwarding the upstream "
+                    "receipt; (2) the ``reference=`` path of the mirror "
+                    "output_sharding does not exist or is wrong; (3) the "
+                    "producing OP used algebraic (non-mirror) routing whose "
+                    "output cannot be mirrored. Fix the producer (forward "
+                    "the upstream TransportTensor unchanged), correct the "
+                    "reference= path, or change the target sharding to "
+                    "dynamic/static."
+                )
             global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
             yield from self._plan_mirror_group(
                 primary.receipt,
@@ -785,6 +849,49 @@ class BaseDataDistributor:
             if hasattr(src_geometry_indices, "materialize"):
                 src_geometry_indices = src_geometry_indices.materialize()
             src_geometry_indices = backend.adopt(src_geometry_indices)
+            # Hard interception: in the algebraic branch the routing source
+            # is built from ``primary.origin_indices`` (or, as a fallback,
+            # ``primary.routing_indices``). Its length defines the
+            # routing-domain size; if it disagrees with the primary's
+            # routing-axis length, ``sort_indices`` will index past the
+            # tensor's first dimension inside ``_jit_plan_and_pack``.
+            # Reject the mismatch here with a clear, fluxway-level error.
+            pri_axis_alg = (primary.routing_axes or (0,))[0]
+            pri_shape_alg = getattr(primary.flat_values, "shape", None)
+            pri_len_alg = (
+                int(pri_shape_alg[pri_axis_alg])
+                if pri_shape_alg is not None and pri_axis_alg < len(pri_shape_alg)
+                else None
+            )
+            src_shape_alg = getattr(src_geometry_indices, "shape", None)
+            src_len_alg = (
+                int(src_shape_alg[0])
+                if src_shape_alg is not None and len(src_shape_alg) >= 1
+                else None
+            )
+            if (
+                pri_len_alg is not None
+                and src_len_alg is not None
+                and src_len_alg != pri_len_alg
+            ):
+                raise RuntimeError(
+                    "[Fluxway Algebraic Routing Error] routing source "
+                    "length does not match primary.flat_values routing axis "
+                    f"for tuuid(s)={self._format_tuuids(tuuid, tuuid_to_name)}: "
+                    f"primary.flat_values.shape="
+                    f"{tuple(pri_shape_alg) if pri_shape_alg is not None else None}, "
+                    f"routing_axes={primary.routing_axes}, "
+                    f"primary_axis={pri_axis_alg}, primary_axis_len={pri_len_alg}, "
+                    f"routing_source_len={src_len_alg} "
+                    f"(from {'origin_indices' if primary.origin_indices is not None else 'routing_indices'}). "
+                    "Algebraic routing requires len(routing_source) == "
+                    "flat_values.shape[routing_axis]. Did you copy "
+                    "origin_indices from an upstream TransportTensor with a "
+                    "different row count? Either drop the stale "
+                    "origin_indices (use TransportTensor(values) and rely on "
+                    "mirror reference) or supply correctly-sized "
+                    "routing_indices."
+                )
             dst_content_routing_values = None
         elif source and source.is_content_addressable:
             # Case B: Content-addressable (Dynamic) routing

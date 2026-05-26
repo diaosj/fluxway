@@ -38,6 +38,7 @@ from fluxway.common.types import (
     WorkerHeartbeat,
 )
 from fluxway.common.utils import ensure_logging_configured
+from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.driver.state_machine import DriverStateMachine
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 from fluxway.spmd.driver.monitor import SPMDMonitor
@@ -361,9 +362,11 @@ if RAY_AVAILABLE:
         def register_topology(
             self,
             predecessor_handlers: dict[
-                str, dict[int, Any]
+                str, dict[int, "DataPlaneCallable"]
             ],  # {spmd_id: {rank: handle}}
-            successor_handlers: dict[str, dict[int, Any]],  # {spmd_id: {rank: handle}}
+            successor_handlers: dict[
+                str, dict[int, "DataPlaneCallable"]
+            ],  # {spmd_id: {rank: handle}}
             predecessor_count: int,
             successor_count: int,
         ) -> None:

@@ -100,6 +100,8 @@ def ensure_cpu_serializable(arr: Any) -> Any:
     boundaries.  Other transports (NCCL, UCX) handle CUDA buffers natively
     and should NOT call this.
     """
+    if isinstance(arr, np.ndarray) and not arr.flags.owndata:
+        return arr.copy()
     if not hasattr(arr, "__cuda_array_interface__"):
         return arr
     try:

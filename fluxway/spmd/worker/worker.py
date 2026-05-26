@@ -536,7 +536,7 @@ class SPMDWorker:
     # =========================================================================
 
     def register_predecessor_handlers(
-        self, spmd_id: str, handlers: dict[int, Any]
+        self, spmd_id: str, handlers: dict[int, DataPlaneCallable]
     ) -> None:
         """
         Register handlers for a predecessor SPMD.
@@ -546,11 +546,9 @@ class SPMDWorker:
 
         Args:
             spmd_id: Predecessor SPMD ID
-            handlers: {rank: ray.ActorHandle}
+            handlers: {rank: DataPlaneCallable}
         """
-        self._predecessor_handlers[spmd_id] = {
-            rank: DataPlaneCallable(h) for rank, h in handlers.items()
-        }
+        self._predecessor_handlers[spmd_id] = handlers
         logger.debug(
             f"Registered predecessor handlers predecessor_spmd_id={spmd_id} "
             f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
@@ -560,7 +558,7 @@ class SPMDWorker:
         self._check_and_auto_start()
 
     def register_successor_handlers(
-        self, spmd_id: str, handlers: dict[int, Any]
+        self, spmd_id: str, handlers: dict[int, DataPlaneCallable]
     ) -> None:
         """
         Register handlers for a successor SPMD.
@@ -570,11 +568,9 @@ class SPMDWorker:
 
         Args:
             spmd_id: Successor SPMD ID
-            handlers: {rank: ray.ActorHandle}
+            handlers: {rank: DataPlaneCallable}
         """
-        self._successor_handlers[spmd_id] = {
-            rank: DataPlaneCallable(h) for rank, h in handlers.items()
-        }
+        self._successor_handlers[spmd_id] = handlers
         logger.debug(
             f"Registered successor handlers successor_spmd_id={spmd_id} "
             f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"

@@ -54,6 +54,7 @@ from fluxway.control_plane.state_machine import ControllerStateMachine
 from fluxway.control_plane.async_manager import AsyncStepManager
 from fluxway.common.types import CheckpointConfig
 from fluxway.common.types.drain import DrainStrategy, GraphModeDrainStrategy
+from fluxway.rpc.protocol import DataPlaneRegistry
 
 logger = get_logger(__name__)
 
@@ -206,6 +207,7 @@ if RAY_AVAILABLE:
             async_step_config: AsyncStepConfig | None = None,
             checkpoint_config: CheckpointConfig | None = None,
             error_policy: ErrorPolicy | None = None,
+            transport_config: dict[str, str] | None = None,
         ):
             """
             Initialize Controller with configuration.
@@ -216,6 +218,7 @@ if RAY_AVAILABLE:
                 async_step_config: Async step configuration
                 checkpoint_config: Configuration for checkpointer backend
                 error_policy: Error classification policy for fail-fast decisions
+                transport_config: Data plane transport backend per SPMD (e.g. {"*": "ray"})
             """
             # Ray actors run in separate worker processes; ensure INFO logs are not dropped.
             ensure_logging_configured()
@@ -225,6 +228,7 @@ if RAY_AVAILABLE:
             self._async_step_config = async_step_config or AsyncStepConfig()
             self._checkpoint_config = checkpoint_config
             self._error_policy = error_policy or ErrorPolicy()
+            self._transport_config = transport_config or {}
 
             self._monitor = Monitor()
             self._state_manager = StateManager()
@@ -1219,7 +1223,7 @@ if RAY_AVAILABLE:
 
             This method:
             1. Collects ALL worker handles from ALL drivers upfront to avoid actor deadlock.
-            2. For each SPMD, calls register_topology with actual worker handles.
+            2. For each SPMD, wraps handles with DataPlaneCallable and calls register_topology.
             """
             all_spmd_ids = self.spmd_manager.get_all_spmd_ids()
             if not all_spmd_ids:
@@ -1255,6 +1259,26 @@ if RAY_AVAILABLE:
                     logger.error(f"Failed to collect worker handles for topology: {e}")
                     return
 
+            def _get_transport_type(target_spmd_id: str) -> str:
+                if target_spmd_id in self._transport_config:
+                    return self._transport_config[target_spmd_id]
+                if "*" in self._transport_config:
+                    return self._transport_config["*"]
+                node = self._graph.nodes.get(target_spmd_id)
+                if node and node.spmd_config:
+                    return getattr(node.spmd_config, "transport_type", "ray")
+                return "ray"
+
+            # Wrap raw handles with DataPlaneCallable
+            all_wrapped_handles: dict[str, dict[int, Any]] = {}
+            for target_spmd_id, raw_handles in all_worker_handles.items():
+                transport_type = _get_transport_type(target_spmd_id)
+                wrapped = {
+                    rank: DataPlaneRegistry.create(transport_type, h)
+                    for rank, h in raw_handles.items()
+                }
+                all_wrapped_handles[target_spmd_id] = wrapped
+
             # Initiate topology registration on each driver
             for spmd_id in all_spmd_ids:
                 driver = self.spmd_manager.get_driver_handle(spmd_id)
@@ -1270,21 +1294,21 @@ if RAY_AVAILABLE:
 
                 # Build predecessor/successor worker handle maps: {spmd_id: {rank: handle}}
                 pred_handlers = {
-                    p: all_worker_handles[p]
+                    p: all_wrapped_handles[p]
                     for p in predecessors
-                    if p in all_worker_handles
+                    if p in all_wrapped_handles
                 }
                 succ_handlers = {
-                    s: all_worker_handles[s]
+                    s: all_wrapped_handles[s]
                     for s in successors
-                    if s in all_worker_handles
+                    if s in all_wrapped_handles
                 }
 
                 logger.debug(f"  - pred_handlers keys: {list(pred_handlers.keys())}")
                 logger.debug(f"  - succ_handlers keys: {list(succ_handlers.keys())}")
 
                 try:
-                    # Now call register_topology with ACTUAL handles, bypassing the need for drivers to fetch them
+                    # Now call register_topology with ACTUAL DataPlaneCallable objects
                     driver.register_topology.remote(
                         pred_handlers, succ_handlers, len(predecessors), len(successors)
                     )
@@ -1421,6 +1445,7 @@ async def create_controller(
     async_step_config: AsyncStepConfig | None = None,
     checkpoint_config: CheckpointConfig | None = None,
     runtime_env: dict[str, Any] | None = None,
+    transport_config: dict[str, str] | None = None,
 ) -> Any:
     """
     Create and initialize a Controller actor.
@@ -1433,6 +1458,7 @@ async def create_controller(
         async_step_config: Optional async step configuration
         checkpoint_config: Optional checkpoint configuration
         runtime_env: Optional Ray runtime environment
+        transport_config: Optional data plane transport backend per SPMD (e.g. {"*": "ray"})
 
     Returns:
         Controller actor handle
@@ -1449,6 +1475,7 @@ async def create_controller(
         heartbeat_config=heartbeat_config,
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
+        transport_config=transport_config,
     )
 
     # Initialize the actor
