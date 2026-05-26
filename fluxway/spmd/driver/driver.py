@@ -280,15 +280,21 @@ if RAY_AVAILABLE:
                 if rank_info[0]["num_nodes"] == 1:
                     rank0_ip = "127.0.0.1"
 
+                # All ranks must enter `setup_and_start` (and therefore the
+                # operator `__init__` invoked by `_pre_instantiate_operators`)
                 max_retries = 5
                 for attempt in range(max_retries):
                     rank0_port = await self._worker_handles[0].find_free_port.remote()
                     rank0_address = f"{rank0_ip}:{rank0_port}"
                     try:
-                        # Initialize Rank 0 first to lock the port and avoid TOCTOU
-                        await self._worker_handles[0].setup_and_start.remote(
-                            **rank_info[0],
-                            rank0_address=rank0_address,
+                        await asyncio.gather(
+                            *[
+                                worker.setup_and_start.remote(
+                                    **rank_info[rank],
+                                    rank0_address=rank0_address,
+                                )
+                                for rank, worker in self._worker_handles.items()
+                            ]
                         )
                         break
                     except Exception as e:
@@ -303,14 +309,18 @@ if RAY_AVAILABLE:
                         raise
             else:
                 rank0_address = None
-
-            for rank, worker in self._worker_handles.items():
-                if rank == 0:
-                    continue  # Already started
-                worker.setup_and_start.remote(
-                    **rank_info[rank],
-                    rank0_address=rank0_address,  # type: ignore
-                )
+                # No rank 0 in this SPMD group (degenerate); still launch any
+                # remaining workers concurrently.
+                if self._worker_handles:
+                    await asyncio.gather(
+                        *[
+                            worker.setup_and_start.remote(
+                                **rank_info[rank],
+                                rank0_address=rank0_address,  # type: ignore
+                            )
+                            for rank, worker in self._worker_handles.items()
+                        ]
+                    )
 
             logger.debug(
                 f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"
@@ -556,11 +566,26 @@ if RAY_AVAILABLE:
                     )
                 )
 
+                # Pair every rank with its (spmd_state, rank_storage, operator_states)
+                # triple returned by save_state_to_disk.  The `spmd_state` carries
+                # the logical progress (`completed_step_count`, `static_args`) that
+                # is required during restore_from_disk; without forwarding it to the
+                # controller the persisted manifest is empty and any subsequent
+                # resume raises `'completed_step_count' missing from spmd_state`.
+                rank_metadata: dict[int, tuple[dict, dict]] = {
+                    rank: (spmd_state, rank_storage)
+                    for rank, (spmd_state, rank_storage, _) in zip(
+                        ranks, results, strict=True
+                    )
+                }
+
+                # Aggregate raw operator_states across ranks for
+                # trigger_snapshot_commit.  Operators like sparse_spmd need
+                # the gathered metadata (e.g. lance fragment metas from all
+                # shards) to finalize the committed checkpoint.
                 gathered_states: dict[str, dict[int, dict]] = defaultdict(dict)
-                for rank, (_, rank_storage) in zip(ranks, results, strict=True):
-                    for op_name, op_state in rank_storage.get(
-                        "operator_states", {}
-                    ).items():
+                for rank, (_, _, op_states) in zip(ranks, results, strict=True):
+                    for op_name, op_state in op_states.items():
                         gathered_states[op_name][rank] = op_state
 
                 if 0 in self._worker_handles:
@@ -578,7 +603,7 @@ if RAY_AVAILABLE:
                 return
 
             self.controller_handle.receive_snapshot_metadata.remote(
-                self.spmd_id, self._pending_snapshot_id, dict(gathered_states)
+                self.spmd_id, self._pending_snapshot_id, rank_metadata
             )
 
         def _clear_drain_and_fail(self) -> None:

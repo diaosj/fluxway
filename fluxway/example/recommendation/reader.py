@@ -33,20 +33,36 @@ class RecommendationReader(GrainReader):
         shard_count: int | None = None,
     ):
         if "data_source" not in static_args:
-            data = [
-                {
-                    "user_id": [1000 + i],
-                    "user_age_level": [i % 5],
-                    "request_hour": [18],
-                    "hist_click_item_seq": ([200, 201, 202] if i % 2 == 0 else [210]),
-                    "hist_seq_length": 3 if i % 2 == 0 else 1,
-                    "target_item_id": [500 + i],
-                    "target_item_category": [i % 10],
-                    "target_item_stats": [0.05, 19.9],
-                    "is_click": [1 if i % 3 == 0 else 0],
-                }
-                for i in range(1000)
-            ]
+            import numpy as np
+
+            np.random.seed(42)
+
+            vocab_size_user = 100
+            vocab_size_item = 5000
+
+            num_samples = 1000
+            user_ids = np.random.randint(0, vocab_size_user, size=num_samples)
+            target_item_ids = np.random.randint(0, vocab_size_item, size=num_samples)
+
+            data = []
+            for i in range(num_samples):
+                seq_len = np.random.randint(1, 6)
+                hist_seq = np.random.randint(0, vocab_size_item, size=seq_len).tolist()
+
+                data.append(
+                    {
+                        "user_id": [int(user_ids[i])],
+                        "user_age_level": [np.random.randint(0, 5)],
+                        "request_hour": [np.random.randint(0, 24)],
+                        "hist_click_item_seq": [int(x) for x in hist_seq],
+                        "hist_seq_length": [seq_len],
+                        "target_item_id": [int(target_item_ids[i])],
+                        "target_item_category": [np.random.randint(0, 10)],
+                        "target_item_stats": [np.random.rand(), np.random.rand() * 20],
+                        "is_click": [np.random.randint(0, 2)],
+                    }
+                )
+
             static_args["data_source"] = data
             static_args.setdefault("batch_size", 24)
             static_args.setdefault("num_epochs", 1)
@@ -151,7 +167,7 @@ class RecommendationReader(GrainReader):
                 origin_indices=origins,
             ),
             hist_seq_length=TransportTensor.from_lists(
-                [s["hist_seq_length"] for s in samples],
+                [s["hist_seq_length"][0] for s in samples],
                 dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,

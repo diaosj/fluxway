@@ -202,7 +202,6 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
     async def load(
         self, metadata: dict[str, Any], target_state: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        import jax
         import jax.tree_util as jtu
 
         handler = self._get_handler()
@@ -225,7 +224,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             def _read_global():
                 ckptr = ocp.Checkpointer(handler)
-                if target_global_dict is not None:
+                if target_global_dict is not None and target_global_dict:
                     # Pass the target_global_dict as `item` to support resharding automatically.
                     return ckptr.restore(
                         ckpt_path,
@@ -233,17 +232,26 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                             item=target_global_dict,
                         ),
                     )
-                else:
-                    # Fallback to fully replicated if no target state is given.
-                    mesh = jax.sharding.Mesh(jax.devices(), ("_",))
-                    replicated = jax.sharding.NamedSharding(
-                        mesh, jax.sharding.PartitionSpec()
+                elif target_global_dict is not None and not target_global_dict:
+                    # target_state was provided but contains no globally-sharded
+                    # leaves. This means the operator's model params are on
+                    # SingleDeviceSharding which is a design error: all model
+                    # arrays must be placed on the distributed mesh before
+                    # checkpoint restore is called.
+                    raise ValueError(
+                        "orbax restore: target_state was provided but yielded an "
+                        "empty target_global_dict (no globally-sharded JAX arrays "
+                        "found). This indicates model params are still on "
+                        "SingleDeviceSharding at restore time. Ensure model arrays "
+                        "are placed on the distributed mesh in __init__ via "
+                        "jax.device_put(param, NamedSharding(mesh, ...))."
                     )
-                    return ckptr.restore(
-                        ckpt_path,
-                        args=ocp.args.StandardRestore(
-                            fallback_sharding=replicated,
-                        ),
+                else:
+                    # No target state at all — cannot determine target sharding.
+                    raise ValueError(
+                        f"orbax restore: no target_state provided for checkpoint "
+                        f"at {ckpt_path}. Cannot restore without knowing the "
+                        f"expected pytree structure and sharding."
                     )
 
             global_dict = await asyncio.to_thread(_read_global)

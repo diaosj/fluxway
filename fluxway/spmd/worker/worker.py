@@ -1159,45 +1159,39 @@ class SPMDWorker:
             if not succ_info:
                 continue
 
-            # In empty propagation, we send for ALL UUIDs mapped to this successor
+            # In empty propagation, we send for ALL UUIDs mapped to this successor.
+            # Routing decision MUST mirror the non-empty path (see _execute_operator
+            # around L2178): bind logical ShardingSpec to its physical mesh and call
+            # the bipartite-graph primitive `PhysicalLayout.resolve_consumers`. This
+            # is the same math used by `_precompute_expected_tensor_shards` on the
+            # receiver side via `resolve_tensor_producers`, so sender's actual count
+            # and receiver's expected count are guaranteed to agree (no barrier
+            # mismatch).
+            output_sharding = self.op_manager.get_output_sharding(op_name)
             for target_name, tuuid in succ_info.tuuid_map.items():
-                # # TODO(He Jia): Find a better way to avoid send empty packets to all consumers
-                # target_spec = succ_info.tuuid_sharding.get(tuuid)
-                # # Note: For empty packets, we might not have a source_spec if we skipped execution.
-                # # However, the OperatorManager's output_sharding contains it.
-                # output_sharding = self.op_manager.get_output_sharding(op_name)
-                # # Find the source spec for this TUUID (searching reverse mapping isn't great but works here)
-                # # Actually, OperatorManager should have a get_output_sharding_by_uuid.
-                # # For now, let's just find it.
-                # source_spec = None
-                # for uuid_val in self.op_manager.get_output_tuuids(op_name):
-                #     if uuid_val == tuuid:
-                #         source_spec = output_sharding.get(uuid_val)
-                #         break
+                source_logical = output_sharding.get(tuuid)
+                target_logical = succ_info.tuuid_sharding.get(tuuid)
 
-                # if source_spec and target_spec:
-                #     effective_rank = self.rank
-                #     dispatcher = self.op_manager.get_dispatcher(op_name)
-                #     if getattr(dispatcher, "interleave_unit_size", None) is not None:
-                #         effective_rank = self.rank % dispatcher.interleave_unit_size
+                if source_logical is None or target_logical is None:
+                    raise ValueError(
+                        f"[SPMDWorker] Cannot resolve empty propagation routing for "
+                        f"TUUID {tuuid} from {op_name} to {spmd_id}: "
+                        f"source_sharding={bool(source_logical)}, "
+                        f"target_sharding={bool(target_logical)}"
+                    )
 
-                #     consumers = source_spec.resolve_consumers(
-                #         target_spec, effective_rank
-                #     )
-                # else:
-                #     # If sharding is missing, it must be replicated or non-standard.
-                #     # As per user request: explicit error if ambiguous.
-                #     if source_spec or target_spec or succ_info.is_interleaved:
-                #         raise ValueError(
-                #             f"[SPMDWorker] Ambiguous empty propagation for TUUID {tuuid} "
-                #             f"to {spmd_id}. Specs: src={bool(source_spec)}, dst={bool(target_spec)}"
-                #         )
+                source_spec = source_logical.bind(self._mesh)
+                target_spec = target_logical.bind(succ_info.mesh or self._mesh)
 
-                # TODO(He Jia): Find a better way to avoid send empty packets to all consumers
-                # To prevent deadlocks, empty packets MUST be broadcast to all potential consumers
-                # because the receiver's StepBarrier expects a fixed number of shards (mesh size)
-                # regardless of whether the static routing overlap exists.
-                consumers = range(succ_info.world_size)
+                effective_rank = self.rank
+                dispatcher = self.op_manager.get_dispatcher(op_name)
+                if getattr(dispatcher, "interleave_unit_size", None) is not None:
+                    effective_rank = self.rank % dispatcher.interleave_unit_size
+
+                # Same math as the non-empty routing path; covers static 1:1 / N->M /
+                # mirror / dynamic by dispatching through `strategy.intersects` or a
+                # full-fanout fallback inside the layout helper.
+                consumers = source_spec.resolve_consumers(target_spec, effective_rank)
 
                 for target_rank in consumers:
                     handler = self._successor_handlers.get(spmd_id, {}).get(target_rank)
@@ -2242,12 +2236,43 @@ class SPMDWorker:
                                 f"Verify that '{source_path}' is properly declared as an input to '{op_name}' in the graph configuration."
                             )
                         if source_ref.receipt:
+                            inherited_global_shape = leaf_tensor.global_shape
+                            if (
+                                inherited_global_shape is None
+                                and source_ref.global_shape is not None
+                            ):
+                                actual_shape = leaf_tensor.shape
+                                src_axes = source_ref.routing_axes
+                                dst_axes = leaf_tensor.routing_axes
+                                if len(src_axes) != len(dst_axes):
+                                    raise ValueError(
+                                        f"[Fluxway Mirror Error] Mirror shape alignment mismatch in operator '{op_name}'. "
+                                        f"Source routing axes {src_axes} (length {len(src_axes)}) does not match "
+                                        f"destination routing axes {dst_axes} (length {len(dst_axes)})."
+                                    )
+                                new_shape = list(actual_shape)
+                                for idx, out_axis in enumerate(dst_axes):
+                                    if out_axis >= len(new_shape):
+                                        raise ValueError(
+                                            f"[Fluxway Mirror Error] Destination routing axis {out_axis} "
+                                            f"is out of bounds for shape {actual_shape} in operator '{op_name}'."
+                                        )
+                                    src_axis = src_axes[idx]
+                                    if src_axis >= len(source_ref.global_shape):
+                                        raise ValueError(
+                                            f"[Fluxway Mirror Error] Source routing axis {src_axis} "
+                                            f"is out of bounds for global shape {source_ref.global_shape} in operator '{op_name}'."
+                                        )
+                                    new_shape[out_axis] = source_ref.global_shape[
+                                        src_axis
+                                    ]
+                                inherited_global_shape = tuple(new_shape)
+
                             leaf_tensor = TransportTensor(
                                 leaf_tensor.flat_values,
                                 nested_splits=leaf_tensor.nested_splits,
                                 routing_indices=leaf_tensor.routing_indices,
-                                global_shape=leaf_tensor.global_shape
-                                or source_ref.global_shape,
+                                global_shape=inherited_global_shape,
                                 origin_indices=leaf_tensor.origin_indices
                                 or source_ref.origin_indices,
                                 receipt=source_ref.receipt,
@@ -2653,9 +2678,25 @@ class SPMDWorker:
         """
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         if self._op_manager:
-            for op in self.op_manager._operators.values():
-                if hasattr(op, "on_snapshot_begin"):
-                    op.on_snapshot_begin(spmd_dir)
+            seen_cls_ids: set = set()
+            storage, lock = get_instance_storage()
+            for op_name, op_meta in (self.config.operator_metas or {}).items():
+                if not op_meta.owner_class_qualname:
+                    continue
+                cls = _resolve_owner_class(
+                    op_meta.owner_class_module, op_meta.owner_class_qualname
+                )
+                if cls is None or id(cls) in seen_cls_ids:
+                    continue
+                seen_cls_ids.add(id(cls))
+                with lock:
+                    instance = storage.get(id(cls))
+                if instance is None:
+                    continue
+                if hasattr(instance, "on_snapshot_begin") and callable(
+                    instance.on_snapshot_begin
+                ):
+                    instance.on_snapshot_begin(spmd_dir)
 
     async def trigger_snapshot_commit(
         self, ckpt_dir: str, step: int, gathered_states: dict[str, dict[int, dict]]
@@ -2666,19 +2707,35 @@ class SPMDWorker:
         """
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         if self._op_manager:
-            for op_name, op in self.op_manager._operators.items():
-                if hasattr(op, "on_snapshot_commit"):
+            seen_cls_ids: set = set()
+            storage, lock = get_instance_storage()
+            for op_name, op_meta in (self.config.operator_metas or {}).items():
+                if not op_meta.owner_class_qualname:
+                    continue
+                cls = _resolve_owner_class(
+                    op_meta.owner_class_module, op_meta.owner_class_qualname
+                )
+                if cls is None or id(cls) in seen_cls_ids:
+                    continue
+                seen_cls_ids.add(id(cls))
+                with lock:
+                    instance = storage.get(id(cls))
+                if instance is None:
+                    continue
+                if hasattr(instance, "on_snapshot_commit") and callable(
+                    instance.on_snapshot_commit
+                ):
                     op_states = gathered_states.get(op_name, {})
-                    op.on_snapshot_commit(spmd_dir, op_states)
+                    instance.on_snapshot_commit(spmd_dir, op_states)
 
     async def save_state_to_disk(
         self, ckpt_dir: str, step: int
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """
         Persist this worker's state to disk.
 
         Returns:
-            A ``(spmd_state, rank_storage)`` tuple:
+            A ``(spmd_state, rank_storage, operator_states)`` triple:
 
             - ``spmd_state``: SPMD-level logical state that is topology-independent
               (``completed_step_count``, ``static_args``).  All ranks in the same
@@ -2687,6 +2744,10 @@ class SPMDWorker:
               checkpoint backend (``ckpt_dir``, ``orbax_final_path``,
               ``local_state_dir``, …).  Empty dict when this rank has no on-disk
               tensors.
+            - ``operator_states``: raw per-operator save_state() return values.
+              The Driver aggregates these across all ranks and passes them to
+              ``trigger_snapshot_commit`` so that operators requiring cross-rank
+              coordination (e.g. lance commit_fragments) can finalize.
         """
         completed_step_count_snapshot = dict(self._completed_step_count)
         static_args_snapshot = self.op_manager.get_static_args()
@@ -2716,7 +2777,7 @@ class SPMDWorker:
             self.rank,
             step,
         )
-        return spmd_state, rank_storage
+        return spmd_state, rank_storage, operator_states
 
     async def load_state_from_disk(
         self,

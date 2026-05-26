@@ -163,16 +163,7 @@ class SparseEmbeddingSPMD:
             err_msg=f"[SparseSPMD] rank={self.rank} lookup keys mismatch unique_ids",
         )
 
-        g_shape = None
-        if unique_ids.global_shape and len(unique_ids.global_shape) >= 1:
-            g_shape = (unique_ids.global_shape[0], self.embed_dim)
-
-        output = TransportTensor(
-            emb_np,
-            origin_indices=unique_ids.origin_indices,
-            global_shape=g_shape,
-            receipt=unique_ids.receipt,
-        )
+        output = TransportTensor(emb_np)
         print(
             f"[SparseEmbeddingSPMD.lookup] rank={self.rank} step={step} "
             f"keys={ids_np} emb_norm={float(np.linalg.norm(emb_np)):.4f}"

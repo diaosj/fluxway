@@ -823,7 +823,10 @@ if RAY_AVAILABLE:
 
         @require_spmd_manager
         async def receive_snapshot_metadata(
-            self, spmd_id: str, snapshot_id: str, metadata_futures: dict[int, Any]
+            self,
+            spmd_id: str,
+            snapshot_id: str,
+            rank_metadata: dict[int, tuple[dict, dict]],
         ) -> None:
             snap_info = self._pending_snapshots.get(snapshot_id)
             if snap_info is None:
@@ -838,23 +841,19 @@ if RAY_AVAILABLE:
             if spmd_id in snap_info["reported"]:
                 logger.warning(
                     f"receive_snapshot_metadata: duplicate report from '{spmd_id}' "
-                    f"for snapshot '{snapshot_id}' — ignoring"
+                    f"for snapshot '{snapshot_id}' \u2014 ignoring"
                 )
                 return
             snap_info["reported"].add(spmd_id)
 
+            # Each entry is a (spmd_state, rank_storage) tuple already resolved
+            # by the Driver via save_state_to_disk.  spmd_state is identical
+            # across all ranks (topology-independent); we use the first
+            # rank's as the canonical value.
+            rank_storage_map: dict[int, dict] = {}
+            canonical_spmd_state: dict | None = None
             try:
-                ranks = list(metadata_futures.keys())
-                refs = list(metadata_futures.values())
-                results = await asyncio.gather(*refs)
-                # Each result is a (spmd_state, rank_storage) tuple from save_state_to_disk.
-                # spmd_state is identical across all ranks (topology-independent);
-                # we use rank 0's (or the first resolved rank's) as the canonical value.
-                rank_storage_map: dict[int, dict] = {}
-                canonical_spmd_state: dict | None = None
-                for rank, (spmd_state, rank_storage) in zip(
-                    ranks, results, strict=True
-                ):
+                for rank, (spmd_state, rank_storage) in rank_metadata.items():
                     if canonical_spmd_state is None:
                         canonical_spmd_state = spmd_state
                     if rank_storage:

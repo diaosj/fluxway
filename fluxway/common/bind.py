@@ -78,6 +78,8 @@ def bind_spmd(
     is_source: bool = False,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
+    priority: Any = None,
+    placement_strategy: Any = None,
     **operator_configs: dict[str, Any],
 ) -> type:
     dynamic_cls = type(cls.__name__, (cls,), {})
@@ -107,6 +109,8 @@ def bind_spmd(
             interleaved=interleaved,
             interleave_unit_size=interleave_unit_size,
             runtime_env=runtime_env,
+            priority=priority,
+            placement_strategy=placement_strategy,
         )
     else:
         spmd_dec = spmd(
@@ -114,6 +118,8 @@ def bind_spmd(
             mesh_axis_names=mesh_axis_names,
             mesh_axis_shapes=mesh_axis_shapes,
             runtime_env=runtime_env,
+            priority=priority,
+            placement_strategy=placement_strategy,
         )
 
     return spmd_dec(dynamic_cls)

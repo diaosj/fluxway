@@ -153,7 +153,6 @@ class DenseSPMD:
         self.embed_dim = embed_dim
         self.dense_stats_dim = dense_stats_dim
         self.grad_accum_steps = grad_accum_steps
-        self._jax_initialized = False
 
         # -- Invariants on configuration --
         assert isinstance(embed_dim, int) and embed_dim > 0, (
@@ -166,16 +165,6 @@ class DenseSPMD:
             f"[DenseSPMD] grad_accum_steps must be >= 1, got {grad_accum_steps!r}"
         )
 
-    def _ensure_jax_init(self):
-        if self._jax_initialized:
-            return
-
-        # jax.distributed.initialize() is called here (lazily on first operator
-        # invocation) rather than in __init__.  All Ray actors must finish __init__
-        # before any operator executes, so by this point every rank's actor is
-        # alive and can connect to the coordinator simultaneously — avoiding the
-        # deadlock that occurs when __init__ blocks waiting for a peer that Ray
-        # hasn't created yet.
         print(
             f"[DenseSPMD] init jax.distributed rank={self.rank} "
             f"world_size={self.world_size} coordinator={self.rank0_address}",
@@ -204,17 +193,25 @@ class DenseSPMD:
                 return self.linear(x).squeeze(-1)
 
         self.model = DenseLayer(input_dim)
-        self.grad_accum = jtu.tree_map(
-            lambda p: jnp.zeros_like(p), nnx.state(self.model)
+
+        # Model params must live on the distributed mesh from creation so that
+        # checkpoint save/restore sees a consistent pytree structure (all leaves
+        # are globally-sharded JAX arrays, never SingleDeviceSharding).
+        replicated = NamedSharding(self.mesh, P())
+        state = nnx.state(self.model)
+        nnx.update(
+            self.model,
+            jtu.tree_map(lambda p: jax.device_put(p, replicated), state),
         )
-        self._jax_initialized = True
+        self.grad_accum = jtu.tree_map(
+            lambda p: jax.device_put(jnp.zeros_like(p), replicated),
+            nnx.state(self.model),
+        )
 
     def save_state(self) -> dict:
-        self._ensure_jax_init()
         return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
 
     def restore_state(self, state: dict) -> None:
-        self._ensure_jax_init()
         nnx.update(self.model, state["model_state"])
         self.grad_accum = state["grad_accum"]
 
@@ -241,8 +238,6 @@ class DenseSPMD:
         inv2: TransportTensor,
         dp_data: DPFeatures,
     ) -> dict:
-        self._ensure_jax_init()
-
         # -- Outside JIT: GPU(CuPy) / CPU(NumPy) operations --
         xp = _xp()
         emb1_2d = xp.asarray(emb1.flat_values).reshape(-1, emb1.flat_values.shape[-1])  # type: ignore
