@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import logging
+from dataclasses import dataclass, field
 from typing import Any
 from collections.abc import Callable
 from pydantic import Field, model_validator
@@ -284,6 +285,30 @@ class PartitionStrategy(FluxwayBaseSchema):
         num_workers: int,
         index_desc: IndexDescriptor | None = None,
     ) -> Any:
+        """Map a 1-D index tensor to a 1-D rank tensor.
+
+        This is the L3 routing primitive. It is a pure function over a
+        single ``RoutingAxis`` — it never sees tensor data shape.
+
+        Contract:
+            - ``indices`` MUST be a 1-D tensor of length ``axis_size``
+              (== ``RoutingAxis.size``). Multi-dimensional inputs are a
+              category error and indicate a leak from the data layer
+              into the routing layer; subclasses are encouraged to assert
+              ``ndim == 1`` in debug builds.
+            - ``dim_size`` is the routing-domain extent along this axis
+              (NOT a tensor data dim). It bounds the legal value range of
+              ``indices`` to ``[0, dim_size)``.
+            - ``num_workers`` is the product of mesh-axis sizes consumed
+              by this routing axis (== ``RoutingAxis.num_workers``).
+            - ``index_desc`` is an optional ``IndexDescriptor`` used by
+              ragged / explicit-index strategies; static strategies
+              ignore it.
+
+        Returns:
+            A 1-D rank tensor of the same length as ``indices``, with
+            entries in ``[0, num_workers)``.
+        """
         raise NotImplementedError
 
     @property
@@ -1013,4 +1038,492 @@ class PhysicalLayout(FluxwayBaseSchema):
         """Specialized follow for derived tensors like routing_indices."""
         return ShardingSpec.follow(
             reference_path=reference_path, dim_map={target_dim: source_dim}
+        )
+
+
+# ============================================================
+# IndicesSpec — strict sum type for per-axis index descriptions
+# ============================================================
+#
+# A `RoutingAxis.indices` is ALWAYS an `IndicesSpec` instance. Under no
+# circumstances should it be `None` or a bare runtime tensor.  Three
+# concrete shapes:
+#
+#   - `LiteralIndices(values, length, valid_length=None)`: a materialised
+#     1-D tensor.  `values` is excluded from eq/hash so the spec stays
+#     usable as a jax.jit static argument — the runtime tensor flows
+#     through the dynamic leg of `(domain_static, indices_dyn)`.
+#
+#   - `RangeIndices(start, length, stride, valid_length=None)`: a closed
+#     form arithmetic progression `{start + k*stride : 0 <= k < length}`.
+#     Constructed only via the explicit factories `contiguous()` /
+#     `cyclic()` / `strided()` (no bare constructor at the call sites).
+#
+#   - `IdentityIndices(length, valid_length=None)`: equivalent to
+#     `RangeIndices.contiguous(0, length)`, but cheaper to inspect.
+#
+# `valid_length`, when not `None`, marks the first N entries as the only
+# valid ones (the rest are sentinel padding produced by L1 capacity
+# bucketing).  When `None` the entire `length` is valid.
+#
+# This sum type unifies sentinel handling between the materialised path
+# (sentinels are `-1` rows in the tensor) and the symbolic path (sentinels
+# are the tail rows beyond `valid_length`).
+
+
+@dataclass(frozen=True)
+class IndicesSpec:
+    """Abstract base for per-axis index descriptions.
+
+    Subclasses must expose a `length: int` field — the static logical
+    length of the index sequence (== `len(sort_indices)` contribution
+    along this axis).  Subclasses may carry an optional `valid_length:
+    int | None`; when set, only the first `valid_length` entries are
+    real and the rest are sentinel padding.
+    """
+
+    pass
+
+
+@dataclass(frozen=True)
+class LiteralIndices(IndicesSpec):
+    """Materialised 1-D index tensor.
+
+    `values` is the runtime tensor of shape `(length,)`.  It is excluded
+    from eq/hash so this dataclass remains hashable and usable as a
+    jax.jit static argument; the tensor flows through the dynamic leg of
+    the planner call.
+    """
+
+    length: int
+    values: Any = field(compare=False, hash=False, repr=False)
+    valid_length: int | None = None
+
+    def __post_init__(self):
+        if self.length < 0:
+            raise ValueError(f"LiteralIndices.length must be >= 0; got {self.length}")
+        if self.valid_length is not None and not (
+            0 <= self.valid_length <= self.length
+        ):
+            raise ValueError(
+                f"LiteralIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+
+@dataclass(frozen=True)
+class RangeIndices(IndicesSpec):
+    """Closed-form arithmetic progression `{start + k*stride}`.
+
+    Construct via the explicit factories below — never call the bare
+    constructor at user code sites.  Three modes are recognised:
+
+      - `contiguous(start, length)` -> `stride = 1`
+      - `cyclic(start, length, num_workers)` -> `stride = num_workers`
+      - `strided(start, length, stride)` -> generic
+    """
+
+    start: int
+    length: int
+    stride: int = 1
+    valid_length: int | None = None
+
+    def __post_init__(self):
+        if self.length < 0:
+            raise ValueError(f"RangeIndices.length must be >= 0; got {self.length}")
+        if self.stride == 0:
+            raise ValueError("RangeIndices.stride must be non-zero")
+        if self.valid_length is not None and not (
+            0 <= self.valid_length <= self.length
+        ):
+            raise ValueError(
+                f"RangeIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+    @classmethod
+    def contiguous(
+        cls, start: int, length: int, valid_length: int | None = None
+    ) -> RangeIndices:
+        """Standard chunk source: rank `r` holds `[r*chunk, r*chunk+length)`."""
+        return cls(
+            start=int(start), length=int(length), stride=1, valid_length=valid_length
+        )
+
+    @classmethod
+    def cyclic(
+        cls,
+        start: int,
+        length: int,
+        num_workers: int,
+        valid_length: int | None = None,
+    ) -> RangeIndices:
+        """Cyclic source: rank `r` holds `{r, r+W, r+2W, ...}` of `length` items."""
+        if num_workers <= 0:
+            raise ValueError(
+                f"RangeIndices.cyclic.num_workers must be > 0; got {num_workers}"
+            )
+        return cls(
+            start=int(start),
+            length=int(length),
+            stride=int(num_workers),
+            valid_length=valid_length,
+        )
+
+    @classmethod
+    def strided(
+        cls,
+        start: int,
+        length: int,
+        stride: int,
+        valid_length: int | None = None,
+    ) -> RangeIndices:
+        """Generic strided range — used by tests covering degenerate cases."""
+        return cls(
+            start=int(start),
+            length=int(length),
+            stride=int(stride),
+            valid_length=valid_length,
+        )
+
+
+@dataclass(frozen=True)
+class IdentityIndices(IndicesSpec):
+    """Anonymous identity over `[0, length)`.
+
+    Equivalent to `RangeIndices.contiguous(0, length)` but cheaper to
+    construct and pattern-match.
+    """
+
+    length: int
+    valid_length: int | None = None
+
+    def __post_init__(self):
+        if self.length < 0:
+            raise ValueError(f"IdentityIndices.length must be >= 0; got {self.length}")
+        if self.valid_length is not None and not (
+            0 <= self.valid_length <= self.length
+        ):
+            raise ValueError(
+                f"IdentityIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+
+# Patch L: ConstantIndices — degenerate single-valued axis.
+#
+# Used when src is partitioned on an *auxiliary* routed dst dim under
+# isomorphic chunk geometry: every local entity (row) on this rank shares
+# the same dim sub-rank, so the per-axis routing decision collapses to a
+# constant.  The planner pattern-matches this and avoids materialising a
+# `length`-sized array of repeated values; the `(1,)` rank tensor flows
+# through XLA broadcast naturally to align with the primary axis length.
+#
+# Construction contract:
+#   - `value`: the GLOBAL routing key (single int in `[0, dim_size)`).
+#   - `length`: the placeholder length.  When set to ``-1`` (the default
+#     produced by ``derive_src_side_view``), ``_build_routing_domain``
+#     finalises it to the primary axis length so all axes share the same
+#     zip-mode entity count before reaching the planner.
+@dataclass(frozen=True)
+class ConstantIndices(IndicesSpec):
+    """Single-valued axis: every entity holds the same routing key.
+
+    The `value` is the GLOBAL coordinate that the per-axis strategy maps
+    to a `sub_rank`.  `length` is the logical entity count along this
+    axis (== primary axis length under zip semantics).  Use
+    `length=-1` to defer length finalisation until
+    `_build_routing_domain` learns the primary axis length.
+    """
+
+    value: int
+    length: int = -1
+    valid_length: int | None = None
+
+    def __post_init__(self):
+        if self.length < -1:
+            raise ValueError(
+                f"ConstantIndices.length must be >= 0 (or -1 placeholder); "
+                f"got {self.length}"
+            )
+        if self.valid_length is not None and (
+            self.length < 0 or not (0 <= self.valid_length <= self.length)
+        ):
+            raise ValueError(
+                f"ConstantIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+
+# ============================================================
+# RoutingDomain — Decoupled Routing Abstraction (L2 contract)
+# ============================================================
+#
+# RoutingDomain is the *only* object the planner (L2) sees. It carries the
+# 1-D routing space (a Cartesian product of independent RoutingAxes) and the
+# DeviceMesh, but is structurally incapable of leaking tensor data shape
+# (e.g. embedding dim D) into the routing math. The historical bug where
+# `sort_indices.len = N × D` is eliminated at the API layer.
+#
+# Hashability rules (so RoutingDomain can be passed via jax.jit static_argnums):
+#   - RoutingAxis / ReplicaSpec / RoutingDomain are frozen dataclasses, hashable
+#     by virtue of all *static* fields being hashable.
+#   - `RoutingAxis.indices` is an `IndicesSpec` instance.  For
+#     `RangeIndices` / `IdentityIndices` the spec is fully hashable.  For
+#     `LiteralIndices` the runtime `values` tensor is excluded from eq/hash
+#     so the spec stays hashable; the tensor flows through the dynamic leg
+#     of `(domain_static, indices_dyn)` at the jit boundary.
+#   - PartitionStrategy / IndexDescriptor / DeviceMesh are already frozen and
+#     hashable in this codebase; embedding them is safe.
+
+
+@dataclass(frozen=True)
+class RoutingAxis:
+    """One independent routing dimension.
+
+    Maps a 1-D `IndicesSpec` of effective length `len(indices)` to a 1-D
+    rank tensor of the same length over `num_workers` workers (the product
+    of mesh sub-axis sizes).  The strategy is a pure function
+    `(indices, dim_size, num_workers, idx_desc) -> ranks` and never sees
+    tensor data shape.
+
+    Decoupling rule (axis.size vs len(indices)):
+        - ``size`` is the strategy's ``dim_size`` — the GLOBAL routing
+          extent (e.g. ``vocab_size`` / ``global_N``).  Used by the
+          strategy to compute chunk boundaries, hash buckets, etc.  It
+          is a property of the routing domain, NOT a per-rank shape.
+        - ``len(indices)`` is the LOCAL per-rank entity count
+          (== ``indices.length``).  ``sort_indices`` length along this
+          axis equals ``indices.length``.
+        These two quantities are orthogonal; conflating them is the
+        category error that produced the historical ``N x D`` broadcast
+        leak.
+
+    Fields:
+        size: routing-domain extent along this axis (strategy dim_size).
+        num_workers: product of mesh-axis sizes that this routing axis
+            occupies. Cached here so the planner does not need to walk the
+            mesh for every call.
+        mesh_axes: ordered tuple of mesh axis names this routing axis is
+            sharded across. Length 1 for simple DP/MP, >1 for hybrid.
+        strategy: 1-D partition function (already frozen pydantic, hashable).
+        paradigm: STATIC (rank-based) or DYNAMIC (content-based).
+        index_descriptor: optional descriptor for ragged/explicit indices.
+        indices: an `IndicesSpec` instance — REQUIRED, never `None`.
+            `IdentityIndices(length)` is the only way to express the
+            anonymous identity case; bare tensors must be wrapped in
+            `LiteralIndices(values, length)` by the caller.
+    """
+
+    size: int
+    num_workers: int
+    mesh_axes: tuple[str, ...]
+    strategy: PartitionStrategy
+    indices: IndicesSpec = field(default_factory=lambda: IdentityIndices(length=0))
+    paradigm: RoutingParadigm = RoutingParadigm.STATIC
+    index_descriptor: IndexDescriptor | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.indices, IndicesSpec):
+            raise TypeError(
+                f"RoutingAxis.indices must be an IndicesSpec instance "
+                f"(use IdentityIndices/RangeIndices/LiteralIndices); got "
+                f"{type(self.indices).__name__}"
+            )
+
+
+@dataclass(frozen=True)
+class ReplicaSpec:
+    """Replication group living on the dimensions complementary to routing.
+
+    `axes` are mesh-axis names that are *not* consumed by any RoutingAxis.
+    `size` is their product. The planner fans the primary destination out to
+    every coordinate along these axes (mirror replication).
+    """
+
+    axes: tuple[str, ...]
+    size: int
+
+
+@dataclass(frozen=True)
+class RoutingDomain:
+    """Pure routing space — independent of any tensor's data shape.
+
+    `axes` is a tuple of independent RoutingAxis whose Cartesian product
+    forms the full routing domain. `mesh` is the DeviceMesh those axes are
+    embedded in. `replica` (optional) describes mirror replication on the
+    mesh-axes not covered by any RoutingAxis.
+
+    `combine` controls how multiple axes are combined into the entity
+    domain.  "cartesian" (default) gives ``∏ axis.indices.length``
+    entities — the planner's general routing engine semantics.  "zip"
+    gives ``primary axis length`` entities — required by L1 transport's
+    row-binding (``backend.take(data, sort_indices, axes=(0,))``) so the
+    sort_indices length matches the row count rather than the inflated
+    Cartesian product.
+
+    Invariants enforced by `__post_init__`:
+        - All axes' mesh_axes are valid names in mesh.axis_names
+        - No mesh axis is consumed twice across different RoutingAxes
+        - replica.axes (if present) are disjoint from any axis.mesh_axes
+        - replica.size equals the product of replica.axes' mesh shape
+        - combine ∈ {"cartesian", "zip"}
+    """
+
+    axes: tuple[RoutingAxis, ...]
+    mesh: DeviceMesh
+    replica: ReplicaSpec | None = None
+    combine: str = "cartesian"
+
+    def __post_init__(self):
+        if self.combine not in ("cartesian", "zip"):
+            raise ValueError(
+                f"RoutingDomain.combine must be 'cartesian' or 'zip'; "
+                f"got {self.combine!r}"
+            )
+        seen: set[str] = set()
+        mesh_names = tuple(self.mesh.axis_names)
+        for ax in self.axes:
+            for name in ax.mesh_axes:
+                if name not in mesh_names:
+                    raise ValueError(
+                        f"RoutingAxis references unknown mesh axis {name!r}; "
+                        f"available: {mesh_names}"
+                    )
+                if name in seen:
+                    raise ValueError(
+                        f"Mesh axis {name!r} is consumed by more than one RoutingAxis"
+                    )
+                seen.add(name)
+            expected = 1
+            for name in ax.mesh_axes:
+                expected *= self.mesh.shape[mesh_names.index(name)]
+            if ax.num_workers != expected:
+                raise ValueError(
+                    f"RoutingAxis(num_workers={ax.num_workers}) does not match "
+                    f"product of mesh shape over {ax.mesh_axes} (={expected})"
+                )
+        if self.replica is not None:
+            for name in self.replica.axes:
+                if name not in mesh_names:
+                    raise ValueError(
+                        f"ReplicaSpec references unknown mesh axis {name!r}"
+                    )
+                if name in seen:
+                    raise ValueError(
+                        f"Mesh axis {name!r} cannot be both routed and replicated"
+                    )
+            expected_rep = 1
+            for name in self.replica.axes:
+                expected_rep *= self.mesh.shape[mesh_names.index(name)]
+            if self.replica.size != expected_rep:
+                raise ValueError(
+                    f"ReplicaSpec(size={self.replica.size}) does not match "
+                    f"product of mesh shape over {self.replica.axes} (={expected_rep})"
+                )
+
+    @property
+    def domain_size(self) -> int:
+        """Length of the flat routing domain (product over all axes' size)."""
+        n = 1
+        for ax in self.axes:
+            n *= ax.size
+        return n
+
+    @property
+    def replica_size(self) -> int:
+        return self.replica.size if self.replica is not None else 1
+
+    @staticmethod
+    def from_layout(
+        target: PhysicalLayout,
+        axis_sizes: tuple[int, ...],
+        axis_indices: tuple[IndicesSpec, ...],
+        combine: str = "cartesian",
+    ) -> RoutingDomain:
+        """Derive a RoutingDomain from a target PhysicalLayout.
+
+        This is the *single* place that reads `target.partitions` /
+        `target.replica_axes` / `target.replica_size`, sealing the
+        data-shape boundary so the planner never sees tensor dims.
+
+        Args:
+            target: destination PhysicalLayout produced by the sharding API.
+            axis_sizes: tuple of `size` per RoutingAxis, in the same order as
+                `sorted(target.partitions.keys())`.  This is the strategy's
+                ``dim_size`` (the GLOBAL routing extent), independent of
+                the per-rank `axis_indices` length.
+            axis_indices: tuple of `IndicesSpec` instances, one per
+                RoutingAxis, in the same order.  STRICT TYPING: bare
+                tensors / `None` are rejected.  Use
+                `IdentityIndices(length)` for the anonymous identity case,
+                `LiteralIndices(values=tensor, length=N)` for materialised
+                tensors, or `RangeIndices.contiguous/cyclic/strided(...)`
+                for closed-form ranges.
+
+        Returns:
+            A RoutingDomain whose Cartesian product equals the routed portion
+            of the target layout, with replica axes captured separately.
+
+        Raises:
+            TypeError: any element of `axis_indices` is not an `IndicesSpec`.
+            ValueError: target has no algebraic routing partitions, or
+                len(axis_sizes) / len(axis_indices) is inconsistent with
+                target.partitions.
+        """
+        for i, idx in enumerate(axis_indices):
+            if not isinstance(idx, IndicesSpec):
+                raise TypeError(
+                    f"RoutingDomain.from_layout: axis_indices[{i}] must be an "
+                    f"IndicesSpec instance (use IdentityIndices / RangeIndices / "
+                    f"LiteralIndices); got {type(idx).__name__}.  Bare tensors "
+                    f"and None are not accepted (strict typing contract)."
+                )
+        routing = target.routing
+        if not isinstance(routing, AlgebraicRouting):
+            raise ValueError(
+                f"RoutingDomain.from_layout requires AlgebraicRouting; got "
+                f"{type(routing).__name__}"
+            )
+        partitions = target.partitions
+        if not partitions:
+            raise ValueError(
+                "RoutingDomain.from_layout requires at least one routed dim; "
+                "target has empty partitions (full replication should not enter L2)"
+            )
+        ordered_dims = sorted(partitions.keys())
+        if len(axis_sizes) != len(ordered_dims) or len(axis_indices) != len(
+            ordered_dims
+        ):
+            raise ValueError(
+                f"axis_sizes/axis_indices length ({len(axis_sizes)}/{len(axis_indices)}) "
+                f"does not match number of routed dims ({len(ordered_dims)})"
+            )
+        mesh = target.mesh
+        mesh_names = tuple(mesh.axis_names)
+        axes_list: list[RoutingAxis] = []
+        for size, idx, dim in zip(axis_sizes, axis_indices, ordered_dims, strict=True):
+            mesh_axes = tuple(partitions[dim])
+            num_workers = 1
+            for name in mesh_axes:
+                num_workers *= mesh.shape[mesh_names.index(name)]
+            axes_list.append(
+                RoutingAxis(
+                    size=int(size),
+                    num_workers=num_workers,
+                    mesh_axes=mesh_axes,
+                    strategy=routing.strategy,
+                    paradigm=routing.strategy.routing_paradigm,
+                    index_descriptor=routing.index_descriptor,
+                    indices=idx,
+                )
+            )
+        replica: ReplicaSpec | None = None
+        if target.replica_axes:
+            replica = ReplicaSpec(
+                axes=tuple(target.replica_axes),
+                size=int(target.replica_size),
+            )
+        return RoutingDomain(
+            axes=tuple(axes_list), mesh=mesh, replica=replica, combine=combine
         )

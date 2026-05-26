@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 from collections.abc import Callable
 import logging
@@ -11,12 +12,483 @@ import numpy as np
 
 from fluxway.common.tensor_backend import get_backend
 from fluxway.transport.planner import TransportPlanner
-from fluxway.common.types.sharding import PhysicalLayout
+from fluxway.common.types.sharding import (
+    PhysicalLayout,
+    RoutingAxis,
+    RoutingDomain,
+    ConstantIndices,
+    IdentityIndices,
+    IndicesSpec,
+    LiteralIndices,
+    RangeIndices,
+)
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.execution import compile
 from fluxway.common.index_descriptor import ContinuousIndex, IndexDescriptor
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# SrcSideView — transport层 own 的 src-side derivation
+# ============================================================
+#
+# Patch K 的核心抽象：把调用栈中各处散落的 src 侧推导逻辑收敛到一个纯
+# 函数。函数完全由 src_spec + src_local_rank + dst_partitions 推导，不依赖运
+# 行时数据（除非路由本身是数据驱动）。这同时修复：
+#
+#  - F: 多 routing dim 异构切分下非 primary dim 丢失 LOCAL indices
+#  - G: src 侧 replication 发送权未去重（owner gating）
+#  - J: 接收侧 N 隐式协议（transport 未 own expected_senders 推导）
+#
+# 设计不变量：
+#  1. always-full 是正确性默认 —— expected_senders_per_dst is None 时指示
+#     调用方必须遵循 always-full SPMD（所有 src rank 都参与、含空包）。
+#  2. 静态可推导路径是优化 —— expected_senders_per_dst is tuple[int, ...]
+#     时，transport 可以跳过零 sender 的 dst 以及非 owner src rank，同时
+#     把 N 派发给接收侧 ArrivalBarrier 以消除上层隐式协议。
+#  3. eager / graph 不分叉 —— 分叉点恶是路由是否数据驱动。
+# ============================================================
+
+
+@dataclasses.dataclass(frozen=True)
+class SrcSideView:
+    """Source-side derivation consumed by ``_build_routing_domain``.
+
+    Carries everything L2 needs to know about the *sender's* geometry,
+    derived purely from ``src_spec + src_local_rank + dst_partitions``.
+    Replaces the loose ``src_geometry_indices``/``src_spec``/``src_local_rank``
+    triplet that was previously threaded through the call stack and
+    silently dropped (`del src_local_rank, src_spec, ...`) inside
+    ``_build_routing_domain``.
+
+    Attributes:
+        per_dim_indices: For every dim that is routed on the *destination*
+            side, the LOCAL ``IndicesSpec`` describing what this src rank
+            owns along that dim. Stored as a sorted tuple of
+            ``(routed_dim, IndicesSpec)`` pairs (frozen-dataclass-friendly
+            dict replacement). Empty tuple is illegal — callers must
+            short-circuit fully-replicated dst before reaching the
+            planner.
+        is_sender_active: ``False`` when this src rank lies on a
+            non-canonical coordinate of *some* mesh axis on which the src
+            layout is replicated (i.e. some other src rank holds the
+            same data and is the canonical sender). When ``False`` the
+            distributor must still participate in the SPMD round but only
+            transmits empty packets.
+        expected_senders_per_dst: For each dst rank ``d`` (indexed by
+            ``dst_world_size``), the number of src ranks that will send
+            *non-empty* payload to ``d``. ``None`` indicates the routing
+            graph contains at least one data-driven dim (Hash / Indexed),
+            so this count cannot be computed without running data
+            through the routing function — callers must fall back to
+            ``always-full SPMD`` and configure ``ArrivalBarrier`` with
+            ``N = src_world_size``.
+    """
+
+    per_dim_indices: tuple[tuple[int, IndicesSpec], ...]
+    is_sender_active: bool
+    expected_senders_per_dst: tuple[int, ...] | None
+
+    def __post_init__(self) -> None:
+        if not self.per_dim_indices:
+            raise ValueError(
+                "SrcSideView.per_dim_indices must be non-empty; fully "
+                "replicated targets should be filtered out before reaching L2."
+            )
+        seen: set[int] = set()
+        for dim, spec in self.per_dim_indices:
+            if not isinstance(dim, int) or dim < 0:
+                raise TypeError(
+                    f"per_dim_indices key must be a non-negative int dim; got {dim!r}"
+                )
+            if dim in seen:
+                raise ValueError(f"per_dim_indices contains duplicate dim={dim}")
+            seen.add(dim)
+            if not isinstance(spec, IndicesSpec):
+                raise TypeError(
+                    f"per_dim_indices[{dim}] must be IndicesSpec; got "
+                    f"{type(spec).__name__}"
+                )
+        if self.expected_senders_per_dst is not None:
+            for n in self.expected_senders_per_dst:
+                if not isinstance(n, int) or n < 0:
+                    raise TypeError(
+                        f"expected_senders_per_dst entries must be non-negative "
+                        f"int; got {n!r}"
+                    )
+
+    @property
+    def routed_dims(self) -> tuple[int, ...]:
+        """Sorted tuple of routed dim indices."""
+        return tuple(d for d, _ in self.per_dim_indices)
+
+    def indices_for(self, dim: int) -> IndicesSpec:
+        """Look up the LOCAL ``IndicesSpec`` for a routed dim."""
+        for d, spec in self.per_dim_indices:
+            if d == dim:
+                return spec
+        raise KeyError(f"dim {dim} is not routed in this SrcSideView")
+
+
+def _src_replicated_axes(src_spec: PhysicalLayout) -> tuple[str, ...]:
+    """Mesh axes on which the src layout is replicated (not in partitions).
+
+    A src rank's coord on these axes determines whether it is the
+    canonical sender for the data fragment (coord 0 → owner). Empty tuple
+    means src is fully partitioned — every rank is its own owner.
+    """
+    if src_spec is None or src_spec.mesh is None:
+        return ()
+    used: set[str] = set()
+    for axes in src_spec.partitions.values():
+        for ax in axes:
+            used.add(ax)
+    return tuple(name for name in src_spec.mesh.axis_names if name not in used)
+
+
+def _is_owner_on_replicated_axes(src_spec: PhysicalLayout, src_local_rank: int) -> bool:
+    """True iff ``src_local_rank`` has coord 0 on every src-replicated axis.
+
+    On the canonical (coord==0) rank we transmit real payload; on the
+    other replicas we still participate in the SPMD round but emit empty
+    packets. This collapses ``K`` duplicate sends to 1 without dropping
+    SPMD safety.
+    """
+    rep_axes = _src_replicated_axes(src_spec)
+    if not rep_axes:
+        return True
+    try:
+        coords = src_spec.mesh.get_coordinate(src_local_rank)
+    except (ValueError, AttributeError):
+        # Unknown / out-of-range rank: treat as owner to preserve at-least-once.
+        return True
+    axis_names = list(src_spec.mesh.axis_names)
+    for ax in rep_axes:
+        if ax in axis_names and coords[axis_names.index(ax)] != 0:
+            return False
+    return True
+
+
+def _is_data_driven_routing(target: PhysicalLayout) -> bool:
+    """True iff *any* routed dim depends on runtime data values.
+
+    When True the per-dst sender count cannot be derived statically and
+    callers must fall back to always-full SPMD with ``N = src_world_size``.
+    """
+    if target is None:
+        return False
+    return bool(target.is_content_addressable)
+
+
+def _src_local_indices_for_routed_dim(
+    src_spec: PhysicalLayout | None,
+    src_local_rank: int,
+    dim: int,
+    dst_global_dim: int,
+    target: PhysicalLayout | None = None,
+) -> IndicesSpec:
+    """Derive the LOCAL IndicesSpec held by ``src_local_rank`` along ``dim``.
+
+    Four structural cases (no runtime data inspection):
+
+    1. ``src_spec`` does not partition ``dim`` (src is replicated on this
+       dim, or src has no spec at all): the rank holds the *full* global
+       extent — ``IdentityIndices(length=dst_global_dim)``.
+    2. ``src_spec`` partitions ``dim`` AND the dst chunk geometry is
+       *isomorphic* (``src.shard_size(dim) == dst.shard_size(dim)``,
+       i.e. the chunk boundary alignment maps each src shard to exactly
+       one dst sub-rank): every local entity (row) on this rank shares
+       the same dst sub-rank along ``dim``, so the per-axis routing
+       decision degenerates to a constant.  We emit
+       ``ConstantIndices(value=shard_rank * chunk, length=-1)`` — the
+       length placeholder is finalised by ``_build_routing_domain`` to
+       the primary axis length, and the planner uses an XLA broadcast
+       fast path that never materialises a length-sized constant array.
+       This is the Patch L fix for multi-routing-dim zip semantics.
+    3. ``src_spec`` partitions ``dim`` with heterogeneous chunk geometry
+       (``src.shard_size(dim) != dst.shard_size(dim)``): each rank owns a
+       contiguous slice ``[shard_rank * chunk, (shard_rank+1) * chunk)``
+       — expressed as ``RangeIndices.contiguous(...)``.  This case is
+       only legal as the *primary* routed dim under current
+       ``axes=(0,)`` row-binding; multi-routing-dim heterogeneous splits
+       must be decomposed at the call-site (``_build_routing_domain``
+       enforces zip-length consistency for non-primary axes).
+    4. Other partition strategies (Cyclic / Hash / Indexed): we currently
+       fall back to ``IdentityIndices(length=local_chunk_size)`` because
+       the strict-typed Cyclic/Hash spec extraction is part of the K-2
+       follow-up.  The fallback is correct for chunk-style src layouts
+       and is the dominant case in the codebase.
+    """
+    if src_spec is None or dim not in src_spec.partitions:
+        return IdentityIndices(length=int(dst_global_dim))
+
+    sub_size = src_spec.shard_size(dim)
+    if sub_size <= 0:
+        return IdentityIndices(length=int(dst_global_dim))
+
+    chunk = max(1, dst_global_dim // sub_size)
+    shard_rank = src_spec.get_shard_rank(src_local_rank, dim)
+    start = shard_rank * chunk
+    # The last shard absorbs the remainder when dst_global_dim is not
+    # divisible by sub_size; conservative upper bound = dst_global_dim - start.
+    length = min(chunk, max(0, dst_global_dim - start))
+
+    # Patch L: detect isomorphic chunk geometry so the auxiliary axis
+    # collapses to a constant under zip semantics.  When ``target`` is
+    # supplied and ``target.shard_size(dim) == src.shard_size(dim)`` along
+    # this dim, every entity on this rank routes to the *same* dst
+    # sub-rank; emit ``ConstantIndices`` with the GLOBAL chunk start as
+    # the routing key (the strategy maps it to ``start // dst_chunk ==
+    # shard_rank``).  ``length=-1`` defers length finalisation to
+    # ``_build_routing_domain``.
+    if target is not None and dim in target.partitions:
+        try:
+            dst_sub_size = int(target.shard_size(dim))
+        except Exception:
+            dst_sub_size = -1
+        if dst_sub_size > 0 and dst_sub_size == int(sub_size):
+            return ConstantIndices(value=int(start), length=-1)
+
+    return RangeIndices.contiguous(start=int(start), length=int(length))
+
+
+def _expected_senders_per_dst(
+    src_spec: PhysicalLayout | None,
+    target: PhysicalLayout,
+    dst_global_shape: tuple[int, ...],
+) -> tuple[int, ...] | None:
+    """Compute static N per dst rank, or None when routing is data-driven.
+
+    Algorithm: for every owner src rank, derive its per-dim LOCAL
+    ``[start, end)`` range, intersect it with each dst sub-rank's chunk
+    boundaries to obtain the set of dst sub-ranks hit on that dim, then
+    take the Cartesian product across routed dims to get the full set
+    of dst ranks reached. Cost: O(src_world * ∏ sub_size) which is
+    bounded by the mesh size and runs only at planning time.
+
+    Returns None when any dst dim uses a data-driven strategy (Hash /
+    Indexed) so the caller falls back to always-full SPMD.
+    """
+    if _is_data_driven_routing(target):
+        return None
+    if target is None or target.mesh is None:
+        return None
+
+    dst_world = int(target.mesh.size)
+    counts = [0] * dst_world
+
+    if src_spec is None or src_spec.mesh is None:
+        return None
+
+    src_world = int(src_spec.mesh.size)
+    routed_dims = sorted(target.partitions.keys())
+    if not routed_dims:
+        return None
+
+    # Pre-compute per-dim chunk geometry for the dst layout.
+    dim_geom: dict[int, tuple[int, int, list[str]]] = {}
+    for dim in routed_dims:
+        global_dim = int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
+        sub_size = int(target.shard_size(dim))
+        if sub_size <= 0 or global_dim <= 0:
+            return None
+        chunk = max(1, global_dim // sub_size)
+        sub_axes = [ax for ax in target.partitions[dim] if ax in target.mesh.axis_names]
+        dim_geom[dim] = (chunk, sub_size, sub_axes)
+
+    mesh_axis_names = list(target.mesh.axis_names)
+
+    for src_rank in range(src_world):
+        # owner-gating: skip non-canonical replicas.
+        if not _is_owner_on_replicated_axes(src_spec, src_rank):
+            continue
+
+        # Per-dim: range -> set of dst sub-ranks intersected.
+        per_dim_subranks: list[list[int]] = []
+        feasible = True
+        for dim in routed_dims:
+            global_dim = (
+                int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
+            )
+            spec = _src_local_indices_for_routed_dim(
+                src_spec, src_rank, dim, global_dim, target=target
+            )
+            chunk, sub_size, _sub_axes = dim_geom[dim]
+            if isinstance(spec, ConstantIndices):
+                # Single-valued axis: the whole rank lives on one dst
+                # sub-rank along this dim.  ``value`` is the GLOBAL chunk
+                # start; ``value // chunk`` recovers the dst sub-rank
+                # under isomorphic geometry.
+                sub_rank = max(0, min(sub_size - 1, int(spec.value) // chunk))
+                per_dim_subranks.append([sub_rank])
+            elif isinstance(spec, RangeIndices):
+                if spec.length == 0:
+                    feasible = False
+                    break
+                lo = spec.start
+                hi = spec.start + (spec.length - 1) * spec.stride
+                lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+                first_sub = max(0, min(sub_size - 1, lo // chunk))
+                last_sub = max(0, min(sub_size - 1, hi // chunk))
+                per_dim_subranks.append(list(range(first_sub, last_sub + 1)))
+            elif isinstance(spec, IdentityIndices):
+                if spec.length == 0:
+                    feasible = False
+                    break
+                last = spec.length - 1
+                first_sub = 0
+                last_sub = max(0, min(sub_size - 1, last // chunk))
+                per_dim_subranks.append(list(range(first_sub, last_sub + 1)))
+            else:
+                # LiteralIndices — data-driven; the outer guard should have
+                # caught this. Be defensive.
+                return None
+        if not feasible:
+            continue
+
+        hit_dsts: set[int] = set()
+
+        def _walk(
+            d_idx: int,
+            mesh_coords: list[int],
+            out: set[int] = hit_dsts,
+            ranges: list[list[int]] = per_dim_subranks,
+            dims: list[int] = routed_dims,
+        ) -> None:
+            if d_idx == len(dims):
+                dst_rank = 0
+                for c, s in zip(mesh_coords, target.mesh.shape, strict=True):
+                    dst_rank = dst_rank * s + c
+                if 0 <= dst_rank < dst_world:
+                    out.add(dst_rank)
+                return
+            dim = dims[d_idx]
+            _chunk, sub_size, sub_axes = dim_geom[dim]
+            sub_sizes = [
+                target.mesh.shape[mesh_axis_names.index(ax)] for ax in sub_axes
+            ]
+            for sub_rank in ranges[d_idx]:
+                # Unravel sub_rank into mesh coords on this dim's axes.
+                rem = sub_rank
+                local_coords = [0] * len(sub_sizes)
+                for i in range(len(sub_sizes)):
+                    rest = 1
+                    for s2 in sub_sizes[i + 1 :]:
+                        rest *= s2
+                    if rest == 0:
+                        local_coords[i] = 0
+                    elif i < len(sub_sizes) - 1:
+                        local_coords[i] = rem // rest
+                        rem = rem % rest
+                    else:
+                        local_coords[i] = rem
+                next_coords = list(mesh_coords)
+                for ax, c in zip(sub_axes, local_coords, strict=True):
+                    next_coords[mesh_axis_names.index(ax)] = c
+                _walk(d_idx + 1, next_coords)
+
+        _walk(0, [0] * len(mesh_axis_names))
+        for d in hit_dsts:
+            counts[d] += 1
+
+    return tuple(counts)
+
+
+def _materialise_dst_rank(
+    target: PhysicalLayout,
+    dims: list[int],
+    coord: dict[int, int],
+    dst_global_shape: tuple[int, ...],
+) -> int | None:
+    """Closed-form dst rank for a single global entity coordinate.
+
+    Retained as a helper for future call sites; ``_expected_senders_per_dst``
+    no longer relies on point sampling.
+    """
+    if target.mesh is None:
+        return None
+    mesh_axis_names = list(target.mesh.axis_names)
+    mesh_coords: list[int] = [0] * len(mesh_axis_names)
+    for dim in dims:
+        if dim not in target.partitions:
+            continue
+        global_dim = int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
+        sub_size = target.shard_size(dim)
+        if sub_size <= 0 or global_dim <= 0:
+            return None
+        chunk = max(1, global_dim // sub_size)
+        sub_rank = min(sub_size - 1, max(0, coord[dim] // chunk))
+        sub_sizes = []
+        sub_axes = []
+        for ax in target.partitions[dim]:
+            if ax in mesh_axis_names:
+                sub_axes.append(ax)
+                sub_sizes.append(target.mesh.shape[mesh_axis_names.index(ax)])
+        if not sub_sizes:
+            continue
+        rem = sub_rank
+        sub_coords = [0] * len(sub_sizes)
+        for i, s in enumerate(sub_sizes):
+            if i < len(sub_sizes) - 1:
+                rest = 1
+                for s2 in sub_sizes[i + 1 :]:
+                    rest *= s2
+                sub_coords[i] = rem // rest
+                rem = rem % rest
+            else:
+                sub_coords[i] = rem
+        for ax, c in zip(sub_axes, sub_coords, strict=True):
+            mesh_coords[mesh_axis_names.index(ax)] = c
+    dst_rank = 0
+    for c, s in zip(mesh_coords, target.mesh.shape, strict=True):
+        dst_rank = dst_rank * s + c
+    return dst_rank
+
+
+def derive_src_side_view(
+    src_spec: PhysicalLayout | None,
+    src_local_rank: int,
+    target: PhysicalLayout,
+    dst_global_shape: tuple[int, ...],
+) -> SrcSideView:
+    """Pure derivation of ``SrcSideView`` from layout + rank.
+
+    Combines the F/G/J fixes:
+      F: every routed dst dim gets its own LOCAL ``IndicesSpec`` reflecting
+         the src rank's actual fragment along that dim.
+      G: ``is_sender_active`` is False on src ranks that share data with
+         the canonical (coord==0) replica on at least one src-replicated
+         mesh axis.
+      J: ``expected_senders_per_dst`` is computed when routing is fully
+         static (Chunk/Cyclic) and returned as ``None`` otherwise so the
+         caller falls back to always-full SPMD.
+    """
+    if target is None or not target.partitions:
+        raise ValueError(
+            "derive_src_side_view: target must be a routed PhysicalLayout "
+            "(target.partitions must be non-empty); fully replicated dst "
+            "should not reach the planner."
+        )
+    routed_dims = sorted(target.partitions.keys())
+    per_dim: list[tuple[int, IndicesSpec]] = []
+    for dim in routed_dims:
+        global_dim = int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
+        per_dim.append(
+            (
+                dim,
+                _src_local_indices_for_routed_dim(
+                    src_spec, src_local_rank, dim, global_dim, target=target
+                ),
+            )
+        )
+    return SrcSideView(
+        per_dim_indices=tuple(per_dim),
+        is_sender_active=_is_owner_on_replicated_axes(src_spec, src_local_rank),
+        expected_senders_per_dst=_expected_senders_per_dst(
+            src_spec, target, dst_global_shape
+        ),
+    )
 
 
 class BaseDataDistributor:
@@ -47,6 +519,44 @@ class BaseDataDistributor:
         self._meta_sort_indices = None
         self._current_source_spec = None
         self._current_target_spec = None
+        # Patch K-5: transport owns the src-side derivation, including the
+        # static-routing per-dst expected sender count. Upper layers must
+        # consult ``expected_n_for_dst`` (or ``last_src_view``) instead of
+        # threading their own implicit N to ``ArrivalBarrier``.
+        self._current_src_view: SrcSideView | None = None
+
+    @property
+    def last_src_view(self) -> SrcSideView | None:
+        """Return the SrcSideView of the most recent ``plan_and_shard`` call.
+
+        ``None`` until the first plan has been built. After ``distribute``
+        clears internal state the view is retained until the next plan
+        overwrites it.
+        """
+        return self._current_src_view
+
+    def expected_n_for_dst(self, dst_rank: int, src_world_size: int) -> int:
+        """Number of senders ``dst_rank`` will receive from in the next round.
+
+        Returns the static count derived from
+        ``SrcSideView.expected_senders_per_dst`` when routing is fully
+        static (Chunk/Cyclic across every routed dim). Falls back to
+        ``src_world_size`` (always-full SPMD) when:
+          - no plan has been built yet, OR
+          - the last plan contains a data-driven dim (Hash/Indexed),
+            in which case the count cannot be proven without inspecting
+            runtime tensor values.
+
+        Callers should pass the result directly to ``ArrivalBarrier``'s
+        ``wait_for_n_slices`` so the receiver does not need to encode
+        any private agreement with the distributor about empty packets.
+        """
+        view = self._current_src_view
+        if view is None or view.expected_senders_per_dst is None:
+            return int(src_world_size)
+        if 0 <= dst_rank < len(view.expected_senders_per_dst):
+            return int(view.expected_senders_per_dst[dst_rank])
+        return int(src_world_size)
 
     def _plan_mirror_group(
         self,
@@ -185,7 +695,7 @@ class BaseDataDistributor:
         # of ``[1,2,4,4]``).  When ``primary.global_shape`` is unavailable we
         # fall back to ``local_shape`` -- valid only for scalar / fully
         # replicated / single-rank cases (see Static->Static guard below).
-        routing_global_shape = (
+        primary_logical_shape = (
             primary.global_shape if primary.global_shape is not None else local_shape
         )
 
@@ -315,11 +825,11 @@ class BaseDataDistributor:
         else:
             dst_content_routing_values = None
 
-        # For dst layout, prefer explicit global_shape, then tensor's global_shape, then routing_global_shape.
+        # For dst layout, prefer explicit global_shape, then tensor's global_shape, then primary_logical_shape.
         dst_shape = (
             primary.global_shape
             if primary.global_shape is not None
-            else routing_global_shape
+            else primary_logical_shape
         )
 
         if (
@@ -379,15 +889,12 @@ class BaseDataDistributor:
                 f"local_rank={self.local_rank}, src_indices={src_geometry_indices}"
             )
 
-        routing_dim = target.routing_dim if target else 0
-        if routing_dim is None:
-            if target and target.partitions:
-                routing_dim = next(iter(target.partitions.keys()))
-            else:
-                routing_dim = 0
-
-        # Set capacity bucket
+        # Set capacity bucket. Bucketing is *only* needed when the active
+        # backend requires static shapes (jax.jit / torch.compile). Pure
+        # eager paths (HybridBackend default, TorchBackend eager) keep
+        # capacity == actual_req so all padding branches below are no-ops.
         actual_req = local_shape[0] if local_shape else 1
+        bk_static = backend.requires_static_shapes()
         if isinstance(capacity, list | tuple):
             selected_capacity = None
             for cap in sorted(capacity):
@@ -398,7 +905,7 @@ class BaseDataDistributor:
                 selected_capacity = actual_req
             capacity = selected_capacity
         elif capacity is None:
-            if backend.requires_static_shapes():
+            if bk_static:
                 if actual_req == 0:
                     capacity = 0
                 elif actual_req <= 1024:
@@ -467,7 +974,7 @@ class BaseDataDistributor:
         for p, p_len in zip(payloads, nested_length_list, strict=True):
             if p_len is not None:
                 # Ragged payload
-                if backend.requires_static_shapes() and capacity != actual_req:
+                if bk_static and capacity != actual_req:
                     pad_len_size = capacity - actual_req
                 else:
                     pad_len_size = 0
@@ -482,7 +989,7 @@ class BaseDataDistributor:
                 padded_nested_length_list.append(padded_len)
 
                 flat_req = p.shape[0]
-                if backend.requires_static_shapes() and capacity != actual_req:
+                if bk_static and capacity != actual_req:
                     # Pad flat ragged values using same bucketing
                     if flat_req == 0:
                         flat_capacity = 0
@@ -507,7 +1014,7 @@ class BaseDataDistributor:
                 padded_nested_length_list.append(None)
 
                 payload_req = backend.shape(p)[0]
-                if backend.requires_static_shapes() and capacity != actual_req:
+                if bk_static and capacity != actual_req:
                     if payload_req == 0:
                         payload_capacity = 0
                     elif payload_req <= 1024:
@@ -533,7 +1040,7 @@ class BaseDataDistributor:
             src_geometry_indices = backend.as_tensor(
                 src_geometry_indices, dtype=backend.int32()
             )
-            if backend.requires_static_shapes() and capacity != actual_req:
+            if bk_static and capacity != actual_req:
                 pad_size = capacity - actual_req
                 if pad_size > 0:
                     padding = backend.full((pad_size,), -1, dtype=backend.int32())
@@ -545,7 +1052,7 @@ class BaseDataDistributor:
             dst_content_routing_values = backend.as_tensor(
                 dst_content_routing_values, dtype=backend.int32()
             )
-            if backend.requires_static_shapes() and capacity != actual_req:
+            if bk_static and capacity != actual_req:
                 pad_size = capacity - actual_req
                 if pad_size > 0:
                     padding = backend.full((pad_size,), -1, dtype=backend.int32())
@@ -555,22 +1062,74 @@ class BaseDataDistributor:
 
         # NOTE: ``capacity`` is a per-rank *padding bucket* applied to in-flight
         # tensors so XLA can trace stable shapes; it is intentionally decoupled
-        # from ``routing_global_shape`` (which drives the routing math).  Do
-        # *not* derive a ``global_capacity = capacity * mesh_size`` here -- such
-        # an inference is wrong whenever per-rank shard sizes are non-uniform
+        # from the routing domain (which drives the routing math).  Do *not*
+        # derive a ``global_capacity = capacity * mesh_size`` here -- such an
+        # inference is wrong whenever per-rank shard sizes are non-uniform
         # (e.g. a sender that holds 4 items in a 12/4 ChunkPartition) and would
         # corrupt the routing dim_size on the planner side.
 
         payloads_tuple = tuple(padded_payloads)
+        # Each payload's binding axes (which axes of flat_values are bound to
+        # the routing domain). Default (0,) — used for nearly all
+        # DP/MP/EP/SP/CP/TP layouts. The fast-path `take(axis=0)` is taken
+        # whenever the binding is exactly (0,).
+        primary_routing_axes = primary.routing_axes
+        payload_routing_axes = tuple(primary_routing_axes for _ in padded_payloads)
+        static_shapes_tuple = tuple(static_shapes)
 
-        dst_partitions_tuple = (
-            tuple(sorted(target.partitions.items()))
-            if target and target.partitions
-            else None
+        # ---------- build RoutingDomain (the only thing the planner sees) ----------
+        # The domain is built from the *target* layout. Per-axis sizes are the
+        # routing-domain extents (== padding-free shape under eager backends;
+        # capacity-padded extents under static-shape backends).
+        #
+        # Patch K: transport now owns full src-side reasoning via SrcSideView.
+        # ``derive_src_side_view`` is the *only* legitimate constructor; it
+        # encapsulates per-dim LOCAL IndicesSpec derivation (F), owner gating
+        # on src-replicated mesh axes (G), and static expected_senders_per_dst
+        # (J). Distribution layer consumes ``src_view.is_sender_active`` and
+        # ``src_view.expected_senders_per_dst`` in K-4/K-5.
+        src_view = derive_src_side_view(
+            src_spec=source,
+            src_local_rank=self.local_rank,
+            target=target,
+            dst_global_shape=tuple(dst_shape)
+            if dst_shape is not None
+            else tuple(local_shape),
+        )
+        # K-5: persist for upper layers (e.g. ArrivalBarrier N derivation).
+        self._current_src_view = src_view
+
+        domain = _build_routing_domain(
+            target=target,
+            src_view=src_view,
+            primary_local_shape=local_shape,
+            src_geometry_indices=src_geometry_indices,
+            dst_content_routing_values=dst_content_routing_values,
+            bk_static=bk_static,
+            capacity=capacity,
+            actual_req=actual_req,
+            dst_global_shape=dst_shape,
         )
 
-        target_routing_dim = target.routing_dim if target else 0
-        static_shapes_tuple = tuple(static_shapes)
+        # Split into (static, dynamic) legs so that under jax.jit the static
+        # part is hashable and feeds static_argnums while the LiteralIndices
+        # values flow as the dynamic leg.  RangeIndices / IdentityIndices
+        # are fully hashable and remain inside ``domain_static`` untouched.
+        def _split_axis(ax: RoutingAxis) -> tuple[RoutingAxis, Any]:
+            spec = ax.indices
+            if isinstance(spec, LiteralIndices):
+                # Drop the runtime tensor from the static spec; tensor
+                # flows via indices_dyn[i].
+                static_spec = dataclasses.replace(spec, values=None)
+                return dataclasses.replace(ax, indices=static_spec), spec.values
+            return ax, None
+
+        split_pairs = [_split_axis(ax) for ax in domain.axes]
+        domain_static = dataclasses.replace(
+            domain,
+            axes=tuple(p[0] for p in split_pairs),
+        )
+        indices_dyn = tuple(p[1] for p in split_pairs)
 
         (
             flat_buffers_lists,
@@ -582,26 +1141,19 @@ class BaseDataDistributor:
             replication_factor,
             sort_indices,
         ) = _jit_plan_and_pack(
-            payloads_tuple=payloads_tuple,
-            nested_length_list=tuple(padded_nested_length_list),
-            src_local_rank=self.local_rank,
-            routing_global_shape=routing_global_shape,
-            src_routing_indices=src_geometry_indices,
-            src_routing_based_values=dst_content_routing_values,
-            dst_index_desc=target.index_descriptor if target else None,
-            dst_routing_dim=target_routing_dim,
-            dst_strategy=target.strategy if target else None,
-            dst_mesh=target.mesh if target else None,
-            dst_partitions=dst_partitions_tuple,
-            dst_replica_axes=target.replica_axes if target else None,
-            dst_replica_size=target.replica_size if target else 1,
-            static_shapes=static_shapes_tuple,
-            src_spec=source,
-            src_index_desc=primary.topology,
+            payloads_tuple,
+            tuple(padded_nested_length_list),
+            self.local_rank,
+            domain_static,
+            indices_dyn,
+            payload_routing_axes,
+            static_shapes_tuple,
         )
 
         if sort_indices is not None and capacity > actual_req:
-            # Filter sort_indices to only keep indices < actual_req
+            # Static-shape path only: trim sentinel rows that were padded into
+            # the routing domain. Eager path has capacity == actual_req so
+            # this branch is skipped.
             mask = sort_indices < actual_req
             sort_indices = sort_indices[mask]
 
@@ -685,13 +1237,42 @@ class BaseDataDistributor:
 
         is_replicated = replication_factor > 1
 
+        # Patch K-4: src_view drives SPMD-safe empty-packet emission.
+        # ``expected_senders_per_dst`` enables the static optimization of
+        # skipping a dst whose ``expected[d] == 0`` entirely (no sender
+        # contributes — safe to short-circuit). When ``None`` the routing
+        # graph contains a data-driven dim (Hash/Indexed) and we *cannot*
+        # prove any dst is unreached, so we fall back to always-full SPMD
+        # and emit empty packets to keep alltoall_v symmetric across
+        # senders.
+        # ``is_sender_active`` is False on src ranks that share data with
+        # the canonical (coord==0) replica on at least one src-replicated
+        # mesh axis; they MUST still participate in the SPMD round but
+        # transmit zero-count payloads to avoid double-counting.
+        expected_per_dst = src_view.expected_senders_per_dst
+        is_sender_active = src_view.is_sender_active
+
         if is_replicated:
             # Fan-out
             sorted_dest_host = _backend.to_numpy(dest_devices)
 
             for device_id, count in enumerate(counts_host):
+                # Static optimization: skip a dst whose expected sender
+                # count is 0 (proven unreached by the routing closed-form).
+                if (
+                    expected_per_dst is not None
+                    and device_id < len(expected_per_dst)
+                    and expected_per_dst[device_id] == 0
+                ):
+                    continue
+
                 targets = sorted_dest_host[device_id].flatten().tolist()
                 p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
+
+                # Owner gating: non-canonical replicas emit empty packets
+                # but still participate in the SPMD round.
+                if not is_sender_active:
+                    c_flat = [0] * len(c_flat)
 
                 yield (
                     targets,
@@ -705,15 +1286,22 @@ class BaseDataDistributor:
         else:
             # Scatter-send
             for device_id, count in enumerate(counts_host):
+                # Static optimization: skip a dst whose expected sender
+                # count is 0 (proven unreached by the routing closed-form).
+                if (
+                    expected_per_dst is not None
+                    and device_id < len(expected_per_dst)
+                    and expected_per_dst[device_id] == 0
+                ):
+                    continue
+
                 targets = [device_id]
                 p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
 
-                # Optimization: In Static-to-Static sharding, do not send empty bundles.
-                is_static = (source.is_static if source else False) and (
-                    target.is_static if target else False
-                )
-                if is_static and sum(c_flat) == 0:
-                    continue
+                # Owner gating: non-canonical replicas emit empty packets
+                # but still participate in the SPMD round.
+                if not is_sender_active:
+                    c_flat = [0] * len(c_flat)
 
                 yield (
                     targets,
@@ -1217,63 +1805,228 @@ def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
     return stitched_tensors, counts, offsets
 
 
-@compile(static_argnums=(2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15))
+def _build_routing_domain(
+    target: PhysicalLayout,
+    src_view: SrcSideView,
+    primary_local_shape: tuple[int, ...],
+    src_geometry_indices: Any | None,
+    dst_content_routing_values: Any | None,
+    bk_static: bool,
+    capacity: int,
+    actual_req: int,
+    dst_global_shape: tuple[int, ...] | None = None,
+) -> RoutingDomain:
+    """Build the RoutingDomain consumed by ``TransportPlanner``.
+
+    L1's *single* contract with L2: the planner sees only routing-domain
+    sizes and 1-D index tensors per axis — never tensor data shape.
+
+    Sizing rule per axis:
+      - ``axis.size`` is the strategy's ``dim_size`` (the GLOBAL routing
+        extent over which the strategy partitions). For static targets we
+        prefer ``dst_global_shape[dim]`` when available, otherwise we fall
+        back to ``primary_local_shape[dim]`` (correct for fully replicated
+        / single-rank cases).
+      - ``axis.indices`` is an ``IndicesSpec`` instance (strict typing).
+        For the *primary* (data-driving) routed dim we wrap the
+        runtime tensor in ``LiteralIndices(values, length,
+        valid_length=...)``; ``valid_length`` marks the real entries
+        when capacity padding introduces ``-1`` sentinels.
+        For *auxiliary* routed dims we consume the LOCAL
+        ``IndicesSpec`` derived by ``derive_src_side_view`` (Patch K),
+        so non-primary axes correctly reflect this src rank's actual
+        fragment along that dim instead of the previous degenerate
+        ``IdentityIndices(global_dim)`` placeholder.
+    """
+    spec = target.spec
+    partitions = getattr(spec, "partitions", None) or {}
+    ordered_dims = sorted(partitions.keys())
+    if not ordered_dims:
+        raise ValueError(
+            "_build_routing_domain requires a target with non-empty partitions; "
+            "fully replicated targets must be handled before reaching the planner."
+        )
+
+    # Strict invariant: SrcSideView.routed_dims must match target.partitions.
+    # ``derive_src_side_view`` is the only legitimate constructor and it
+    # iterates the same sorted target dims, so any mismatch points to a
+    # caller wiring bug.
+    if tuple(src_view.routed_dims) != tuple(ordered_dims):
+        raise ValueError(
+            f"SrcSideView.routed_dims={src_view.routed_dims} does not match "
+            f"target routed dims {tuple(ordered_dims)}; caller must pass the"
+            f" SrcSideView produced by derive_src_side_view(target=target)."
+        )
+
+    primary_dim = target.routing_dim
+    if isinstance(primary_dim, tuple):
+        primary_dim = primary_dim[0] if primary_dim else ordered_dims[0]
+    if primary_dim not in partitions:
+        primary_dim = ordered_dims[0]
+
+    primary_indices = (
+        dst_content_routing_values
+        if dst_content_routing_values is not None
+        else src_geometry_indices
+    )
+
+    # Encode capacity bucketing into the IndicesSpec: ``length`` is the
+    # padded buffer length; ``valid_length`` is the real entry count.
+    padded = bool(bk_static and capacity > actual_req)
+    primary_length = int(capacity if padded else actual_req)
+    primary_valid_length: int | None = int(actual_req) if padded else None
+
+    def _global_dim(d: int) -> int:
+        if dst_global_shape is not None and d < len(dst_global_shape):
+            v = dst_global_shape[d]
+            if v is not None:
+                return int(v)
+        if d < len(primary_local_shape):
+            return int(primary_local_shape[d])
+        raise ValueError(
+            f"_build_routing_domain: cannot determine global size of routing dim {d}; "
+            f"dst_global_shape={dst_global_shape}, primary_local_shape={primary_local_shape}"
+        )
+
+    axis_sizes: list[int] = []
+    axis_indices_list: list[IndicesSpec] = []
+    for dim in ordered_dims:
+        axis_sizes.append(_global_dim(dim))
+        if dim == primary_dim:
+            if primary_indices is not None:
+                axis_indices_list.append(
+                    LiteralIndices(
+                        length=primary_length,
+                        values=primary_indices,
+                        valid_length=primary_valid_length,
+                    )
+                )
+            else:
+                # No materialised indices supplied for the primary axis.
+                # Fall back to the SrcSideView-derived LOCAL spec so the
+                # planner still sees the rank's fragment correctly.
+                axis_indices_list.append(src_view.indices_for(dim))
+        else:
+            # Auxiliary routed axes: consume the LOCAL IndicesSpec from
+            # SrcSideView (Patch K — fixes Patch F: previous code hard-
+            # coded ``IdentityIndices(global_dim)`` and lost per-rank
+            # locality on heterogeneous dp×tp layouts).
+            axis_indices_list.append(src_view.indices_for(dim))
+
+    # Patch L: finalise the entity count under zip semantics.
+    #   - Primary axis defines the entity count (LiteralIndices.length
+    #     under capacity bucketing, or the SrcSideView fallback length).
+    #   - ``ConstantIndices(length=-1)`` placeholders inherit that
+    #     length so the planner's zip-mode invariant holds.
+    #   - Non-primary axes that are not ConstantIndices (RangeIndices /
+    #     IdentityIndices / LiteralIndices) are required to already
+    #     match the primary length — a mismatch surfaces in the
+    #     planner's zip-invariant check with a clear diagnostic.
+    # Choose the entity count for zip-mode finalisation.  Prefer any
+    # non-ConstantIndices length (LiteralIndices under capacity bucketing,
+    # or the SrcSideView RangeIndices/IdentityIndices fallback).  When all
+    # axes are ConstantIndices placeholders the routing domain degenerates
+    # to a single entity (one constant decision per rank).
+    primary_eff_length: int | None = None
+    for spec in axis_indices_list:
+        if not (isinstance(spec, ConstantIndices) and spec.length < 0):
+            primary_eff_length = int(spec.length)
+            break
+    if primary_eff_length is None:
+        primary_eff_length = 1
+    finalised: list[IndicesSpec] = []
+    for spec in axis_indices_list:
+        if isinstance(spec, ConstantIndices) and spec.length < 0:
+            finalised.append(
+                ConstantIndices(
+                    value=int(spec.value),
+                    length=primary_eff_length,
+                    valid_length=spec.valid_length,
+                )
+            )
+        else:
+            finalised.append(spec)
+    axis_indices_list = finalised
+
+    return RoutingDomain.from_layout(
+        target=target,
+        axis_sizes=tuple(axis_sizes),
+        axis_indices=tuple(axis_indices_list),
+        combine="zip",
+    )
+
+
+def _apply_with_binding(data: Any, sort_indices: Any, axes: tuple[int, ...]) -> Any:
+    """Reorder ``data`` along ``axes`` using a 1-D ``sort_indices``.
+
+    The fast path (``axes == (0,)``) is handled by the caller. This fallback
+    is used by exotic layouts that bind the routing domain to a non-leading
+    axis or to multiple axes simultaneously.  Implementing it across all
+    three backends would require ``transpose`` / ``moveaxis`` ops that are
+    currently not part of the common backend surface; we therefore emit a
+    clear NotImplementedError here.  The default ``TransportTensor.routing_axes
+    = (0,)`` covers every shipped layout (DP/MP/EP/SP/CP/TP), so this branch
+    is only a contract placeholder.
+    """
+    raise NotImplementedError(
+        "Non-leading routing_axes binding is not yet supported across all "
+        f"backends. Got axes={axes}; only the default (0,) is implemented."
+    )
+
+
+@compile(static_argnums=(2, 3, 5, 6))
 def _jit_plan_and_pack(
     payloads_tuple: tuple[Any, ...],
     nested_length_list: tuple[Any | None, ...],
     src_local_rank: int,
-    routing_global_shape: tuple[int, ...],
-    src_routing_indices: Any | None,
-    src_routing_based_values: Any,
-    dst_index_desc: Any,
-    dst_routing_dim: int | tuple[int, ...] | None,
-    dst_strategy: Callable | None,
-    dst_mesh: Any | None,
-    dst_partitions: Any | None,
-    dst_replica_axes: Any | None,
-    dst_replica_size: int,
+    domain_static: RoutingDomain,
+    indices_dyn: tuple[Any, ...],
+    payload_routing_axes: tuple[tuple[int, ...], ...],
     static_shapes: tuple[int, ...],
-    src_spec: Any | None = None,
-    src_index_desc: Any | None = None,
 ):
-    """JIT-compiled kernel: compute routing plan and reorder payloads.
+    """JIT-friendly kernel: compute the transport plan and reorder payloads.
 
-    Returns O(N) flat reordered arrays together with per-device (offsets, counts)
-    vectors.  The caller slices each device's window directly from the flat buffer,
-    avoiding the O(W*N) vmap-padded intermediate that the previous implementation
-    produced.
+    The kernel takes the routing description as a (static, dynamic) split:
+    ``domain_static`` carries every hashable, type-only field of the
+    ``RoutingDomain`` (and is therefore safe as a ``jax.jit`` static arg);
+    ``indices_dyn`` carries the per-axis runtime index tensors. They are
+    re-merged before invoking ``TransportPlanner.compute_plan``.
 
-    ``routing_global_shape`` is the padding-free logical global shape consumed
-    by the routing strategy; see ``TransportPlanner.compute_plan`` for the full
-    contract.  Per-payload static shapes (post-bucketing) are passed via
-    ``static_shapes`` and ``payloads_tuple``.
+    Returns O(N) flat reordered arrays together with per-device
+    ``(offsets, counts)`` vectors.  The caller slices each device's window
+    directly from the flat buffer, avoiding the O(W*N) vmap-padded
+    intermediate that the previous implementation produced.
     """
     backend = get_backend()
 
-    # 1. Compute Plan
-    sort_indices, dest_devices, send_counts, target_num_workers, replica_size = (
-        TransportPlanner._compute_plan_internal(
-            src_local_rank=src_local_rank,
-            routing_global_shape=routing_global_shape,
-            src_routing_indices=src_routing_indices,
-            src_routing_based_values=src_routing_based_values,
-            dst_index_desc=dst_index_desc,
-            dst_routing_dim=dst_routing_dim,
-            dst_strategy=dst_strategy,
-            dst_mesh=dst_mesh,
-            dst_partitions=dict(dst_partitions) if dst_partitions else None,
-            dst_replica_axes=dst_replica_axes,
-            dst_replica_size=dst_replica_size,
-            src_spec=src_spec,
-            src_index_desc=src_index_desc,
-        )
+    # Re-merge static + dynamic legs of the routing domain.  Only
+    # `LiteralIndices` axes carry a runtime tensor; the spec for those is
+    # rebuilt with `values=indices_dyn[i]`.  RangeIndices / IdentityIndices
+    # axes are pass-through (their dyn entry is None).
+    def _merge_axis(ax: RoutingAxis, dyn: Any) -> RoutingAxis:
+        spec = ax.indices
+        if isinstance(spec, LiteralIndices) and dyn is not None:
+            new_spec = dataclasses.replace(spec, values=dyn)
+            return dataclasses.replace(ax, indices=new_spec)
+        return ax
+
+    merged_axes = tuple(
+        _merge_axis(ax, dyn)
+        for ax, dyn in zip(domain_static.axes, indices_dyn, strict=True)
     )
+    domain = dataclasses.replace(domain_static, axes=merged_axes)
+
+    plan = TransportPlanner.compute_plan(src_local_rank, domain)
+    sort_indices = plan.sort_indices
+    dest_devices = plan.dest_devices
+    send_counts = plan.send_counts
+    replica_size = plan.replication_factor
 
     cs = backend.cumsum(send_counts, dim=0)
     zero = backend.zeros((1,), dtype=backend.int32(), device="cpu")
     send_offsets = backend.cat([zero, cs[:-1]], dim=0)
 
-    # 2. Reorder data per payload — O(N) flat reorder, no vmap padding
+    # Reorder data per payload — O(N) flat reorder, no vmap padding.
     flat_buffers_lists = []
     counts_per_payload = []
     offsets_per_payload = []
@@ -1282,20 +2035,22 @@ def _jit_plan_and_pack(
         data = payloads_tuple[i]
         lengths = nested_length_list[i]
         is_ragged = lengths is not None
+        axes = payload_routing_axes[i]
 
         if not is_ragged:
-            # --- Dense Path ---
-            # A single gather reorders all rows into send order.  No padding needed:
-            # the caller extracts each device's slice via [offset:offset+count].
-            reordered_data = backend.take(data, sort_indices)
+            # Dense path: one gather places all rows in send order.
+            if axes == (0,):
+                reordered_data = backend.take(data, sort_indices)
+            else:
+                reordered_data = _apply_with_binding(data, sort_indices, axes)
             flat_buffers_lists.append((reordered_data, None))
             counts_per_payload.append(send_counts)
             offsets_per_payload.append(send_offsets)
 
         else:
-            # --- Ragged Path ---
-            # flat_cap is a static upper bound on total flat elements (required by
-            # repeat_interleave so XLA knows the output size at trace time).
+            # Ragged path: routing always binds to the outermost axis (0,).
+            # ``flat_cap`` is the static upper bound on total flat elements
+            # so XLA knows the output size of repeat_interleave at trace time.
             flat_cap = static_shapes[i + 1]
             item_offsets_orig = backend.cat([zero, backend.cumsum(lengths)[:-1]], dim=0)
             reordered_item_starts = backend.take(item_offsets_orig, sort_indices)

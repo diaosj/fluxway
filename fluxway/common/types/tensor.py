@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Optional
 
 import numpy as np
@@ -8,6 +9,8 @@ from fluxway.common.index_descriptor import (
     IndexDescriptor,
     ExplicitIndex,
 )
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # TransportTensor — Unified tensor wrapper
@@ -121,7 +124,22 @@ class TransportTensor:
         routing_indices: Any | None = None,
         global_shape: tuple[int, ...] | None = None,
         receipt: SymmetryReceipt | None = None,
+        routing_axes: tuple[int, ...] = (0,),
     ):
+        # routing_axes: which axes of flat_values are bound to the routing
+        # domain (consumed by the planner). Default (0,) is correct for
+        # virtually all DP/MP/EP/SP/CP/TP layouts. Non-leading bindings are
+        # rare and worth flagging once per tensor.
+        self._routing_axes: tuple[int, ...] = tuple(int(a) for a in routing_axes)
+        if len(self._routing_axes) != len(set(self._routing_axes)):
+            raise ValueError(f"routing_axes must be unique, got {self._routing_axes}")
+        if self._routing_axes != (0,):
+            logger.warning(
+                "TransportTensor.routing_axes=%s (non-default). "
+                "Apply path will use the moveaxis+reshape fallback.",
+                self._routing_axes,
+            )
+
         self._flat_values = flat_values
 
         # Ensure writable: transport deserialization (Ray RPC, pickle) may produce
@@ -262,6 +280,7 @@ class TransportTensor:
         origin_indices: Any | None = None,
         routing_indices: Any | None = None,
         receipt: SymmetryReceipt | None = None,
+        routing_axes: tuple[int, ...] = (0,),
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
@@ -273,6 +292,10 @@ class TransportTensor:
                      ContinuousIndex, or a python `slice` object for O(1) regular patterns.
             global_shape: Optional global shape of the full tensor.
             receipt: Optional symmetry receipt for provenance tracking.
+            routing_axes: Which axes of `tensor` are bound to the routing
+                domain. Default (0,) is correct for nearly all DP/MP/EP/SP/CP/TP
+                layouts. The planner stays 1-D regardless; routing_axes only
+                affects the apply (gather) step in the L1 distributor.
         """
         if global_shape and origin_indices is None:
             from functools import reduce
@@ -288,6 +311,7 @@ class TransportTensor:
             routing_indices=routing_indices,
             global_shape=global_shape,
             receipt=receipt,
+            routing_axes=routing_axes,
         )
 
     @classmethod
@@ -299,6 +323,7 @@ class TransportTensor:
         origin_indices: Any | None = None,
         routing_indices: Any | None = None,
         receipt: SymmetryReceipt | None = None,
+        routing_axes: tuple[int, ...] = (0,),
     ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
@@ -343,6 +368,7 @@ class TransportTensor:
                 origin_indices=origin_indices,
                 routing_indices=routing_indices,
                 receipt=receipt,
+                routing_axes=routing_axes,
             )
 
         # Ragged tensor: use iterative flattening
@@ -394,6 +420,7 @@ class TransportTensor:
             origin_indices=origin_indices,
             routing_indices=routing_indices,
             receipt=receipt,
+            routing_axes=routing_axes,
         )
 
     def to_lists(self) -> list[Any]:
@@ -546,6 +573,16 @@ class TransportTensor:
         self._receipt = value
 
     @property
+    def routing_axes(self) -> tuple[int, ...]:
+        """Axes of `flat_values` bound to the routing domain.
+
+        The planner (L2) is structurally 1-D and ignores this; it is read
+        only by the L1 distributor at apply time to decide between the
+        fast `take(axis=0)` path and the moveaxis+reshape fallback.
+        """
+        return self._routing_axes
+
+    @property
     def meta_state(self) -> int:
         """
         Computed bitmask/int representing the state of the tensor metadata.
@@ -586,6 +623,7 @@ class TransportTensor:
                 self._flat_values[key],
                 global_shape=self._global_shape,
                 receipt=self._receipt[key] if self._receipt else None,
+                routing_axes=self._routing_axes,
             )
 
         raise NotImplementedError(
@@ -627,6 +665,7 @@ class TransportTensor:
             global_shape=self._global_shape,
             origin_indices=self.origin_indices,
             receipt=self.receipt,
+            routing_axes=self._routing_axes,
         )
 
     def sum(self, dim: Any = None) -> Any:
@@ -659,6 +698,7 @@ class TransportTensor:
             origin_indices=self.origin_indices,
             routing_indices=self.routing_indices,
             global_shape=self.global_shape,
+            routing_axes=self._routing_axes,
         )
 
         compacted = TransportTensor(
@@ -666,6 +706,7 @@ class TransportTensor:
             routing_indices=uniques,
             origin_indices=origin_indices,
             global_shape=self.global_shape,
+            routing_axes=self._routing_axes,
         )
 
         return compacted, inverse_tt
@@ -756,6 +797,7 @@ class TransportTensor:
                     if self._receipt
                     else None
                 ),
+                routing_axes=self._routing_axes,
             )
 
         else:
@@ -880,6 +922,7 @@ class TransportTensor:
                 routing_indices=new_indices,
                 origin_indices=new_origin_indices,
                 receipt=self._receipt[s:e] if self._receipt else None,
+                routing_axes=self._routing_axes,
             )
 
         # -------------------------------------------------------------------------
@@ -994,6 +1037,7 @@ class TransportTensor:
             routing_indices=new_indices,
             origin_indices=new_origin_indices,
             receipt=self._receipt[start:end] if self._receipt else None,
+            routing_axes=self._routing_axes,
         )
 
     def as_dlpack_slice(self, cursor: Any | None = None) -> Any:
@@ -1038,7 +1082,10 @@ class TransportTensor:
 
             new_values = backend.dynamic_slice(self._flat_values, starts, sizes)
             return TransportTensor(
-                new_values, self._nested_splits, routing_indices=self._routing_indices
+                new_values,
+                self._nested_splits,
+                routing_indices=self._routing_indices,
+                routing_axes=self._routing_axes,
             )
         return self
 
@@ -1079,6 +1126,7 @@ class TransportTensor:
                 routing_indices=new_routing_indices,
                 origin_indices=new_origin_indices,
                 receipt=self._receipt[idx_flat] if self._receipt else None,
+                routing_axes=self._routing_axes,
             )
 
         current_indices = idx_flat
@@ -1139,6 +1187,7 @@ class TransportTensor:
             new_splits,
             routing_indices=new_routing_indices,
             origin_indices=new_origin_indices,
+            routing_axes=self._routing_axes,
         )
 
     def __reduce__(self):
@@ -1151,6 +1200,7 @@ class TransportTensor:
                 self._routing_indices,
                 self._global_shape,
                 self._origin_indices,
+                self._routing_axes,
             ),
         )
 
@@ -1164,7 +1214,12 @@ class TransportTensor:
 
 
 def _reconstruct_transport_tensor(
-    flat_values, nested_splits, routing_indices, global_shape=None, origin_indices=None
+    flat_values,
+    nested_splits,
+    routing_indices,
+    global_shape=None,
+    origin_indices=None,
+    routing_axes=(0,),
 ):
     """Pickle reconstruction helper (top-level function for pickling)."""
     return TransportTensor(
@@ -1173,6 +1228,7 @@ def _reconstruct_transport_tensor(
         routing_indices=routing_indices,
         global_shape=global_shape,
         origin_indices=origin_indices,
+        routing_axes=routing_axes,
     )
 
 
@@ -1194,18 +1250,23 @@ if _JAX_AVAILABLE:
             v._global_shape,
             v._origin_indices,
         )
-        return children, None
+        # routing_axes is a static tuple of ints — keep it in aux_data so
+        # it does not get traced as a JAX leaf.
+        aux_data = v._routing_axes
+        return children, aux_data
 
     def _tt_unflatten(aux_data, children):
         flat_values, nested_splits, routing_indices, global_shape, origin_indices = (
             children
         )
+        routing_axes = aux_data if aux_data is not None else (0,)
         return TransportTensor(
             flat_values,
             nested_splits,
             routing_indices=routing_indices,
             global_shape=global_shape,
             origin_indices=origin_indices,
+            routing_axes=routing_axes,
         )
 
     jax.tree_util.register_pytree_node(TransportTensor, _tt_flatten, _tt_unflatten)

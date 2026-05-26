@@ -2328,7 +2328,6 @@ class SPMDWorker:
                         )
 
                 # Accrue to distributor's internal plan
-                print(f"DEBUG plan_and_shard start spmd_id={self.spmd_id}", flush=True)
                 distributor.plan_and_shard(
                     batch_transport_tensors,
                     source_spec,
@@ -2376,9 +2375,7 @@ class SPMDWorker:
                 self._spawn_background_task(_wait_and_release())
                 return True
 
-            print(f"DEBUG distribute start spmd_id={self.spmd_id}", flush=True)
             await distributor.distribute(send_fn=_send_fn)
-            print(f"DEBUG distribute done spmd_id={self.spmd_id}", flush=True)
 
             # --- Send control_argument via control plane ---
             if state_data:

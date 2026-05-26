@@ -13,6 +13,15 @@ from fluxway.common.types.sharding import (
     CyclicPartition,
     IndexedPartition,
     GreedyPartition,
+    # RoutingDomain abstraction (L2 contract)
+    RoutingDomain,
+    RoutingAxis,
+    ReplicaSpec,
+    # Strict-typed indices specification (L1 ↔ L2 contract)
+    IndicesSpec,
+    LiteralIndices,
+    RangeIndices,
+    IdentityIndices,
 )
 from .planner import TransportPlanner, TransportPlan
 from .communication import DataDistributor, TransportReceiver
@@ -26,6 +35,15 @@ __all__ = [
     "CyclicPartition",
     "IndexedPartition",
     "GreedyPartition",
+    # RoutingDomain abstraction
+    "RoutingDomain",
+    "RoutingAxis",
+    "ReplicaSpec",
+    # IndicesSpec hierarchy
+    "IndicesSpec",
+    "LiteralIndices",
+    "RangeIndices",
+    "IdentityIndices",
     "TransportPlanner",
     "TransportPlan",
     "DataDistributor",

@@ -118,7 +118,61 @@ Worker 并不会使用阻塞拉取来推进。相反，采用 `WorkerMailbox` �
 ## 4.2 AsyncDataDistributor
 新的双流架构引入了真正的异步发送管理器 `AsyncDataDistributor`。
 **分发工作流**：
-1. **打包填充 (Plan and Shard)**：使用 JAX `_jit_plan_and_pack` 的向量化静态指令来对即将发送的批次实现切分和数据重组提取，彻底摆脱 Python 动态层缓慢调度。
+1. **打包填充 (Plan and Shard)**：通过 backend 中立的 `_jit_plan_and_pack`（在 `JaxBackend` 下走 `jax.jit`，`HybridBackend`/`TorchBackend` eager 下退化为原函数）对即将发送的批次执行切分和数据重组。其唯一路由契约由 `RoutingDomain` 承载，**不再传入任何张量数据形状参数**（旧 `routing_global_shape` / `dst_partitions` / `dst_strategy` 等已彻底移除）。
 2. **异步发送 (Distribute)**：获取 `dest_agg` 内所有下游节点切分后的张量、长度计算块和 Global Shape 等，组成多个长程 RPC（使用 Ray Remote 调用）统一挂在 `asyncio.gather` 同时投递，达成全满带宽高传导。
 
 这种完全避免集合通信堵塞，又兼顾了极高的 Python 层扩展性（支持 Sparse 和 Dense 动态组装）。
+
+## 4.3 RoutingDomain 路由层（L1↔L2↔L3 严格分层）
+
+传输层按 SPMD-to-SPMD 通信的四阶段拆出**严格单向调用**的四个职责层；每层只看下一层暴露的契约对象，不跨层窥视：
+
+| 层 | 模块 | 知道什么 | 不知道什么 |
+|---|---|---|---|
+| L0 数据层 | `common/types/tensor.py` `TransportTensor` | flat_values 物理形状 (N, D, ...)、ragged splits、origin_indices、routing_axes | 路由策略、mesh、容量分桶 |
+| L1 分发层 | `transport/communication.py` `BaseDataDistributor`、`_plan_single_tensor_group` | TransportTensor、PhysicalLayout、容量分桶、padding | sort 数学细节、Cartesian broadcast |
+| L2 计划层 | `transport/planner.py` `TransportPlanner` | RoutingDomain、DeviceMesh、ReplicaSpec | 数据形状 (N, D)、payload 类型、容量 |
+| L3 策略层 | `common/types/sharding.py` `PartitionStrategy` 子类 | 1-D `(indices, dim_size, num_workers, index_desc) → ranks` | 任何 N-D / 张量数据形状概念 |
+
+**核心契约**：L1→L2 唯一入参是 `RoutingDomain`（不含张量数据形状）；L2→L3 唯一入参是 `RoutingAxis`（不含张量维度概念）。这样历史 BUG（"sort_indices.len = N×D"）在 API 层面被结构性消除。
+
+### 4.3.1 IndicesSpec 四态化（strict typing）
+
+`RoutingAxis.indices` 的类型为 `IndicesSpec`（**必填，禁止 `None` / 裸 tensor**），共四种实现：
+
+| Spec | 语义 | 物化需求 |
+|---|---|---|
+| `LiteralIndices(values, valid_length=None)` | 1-D 张量显式 ID（hash key、ragged value、ExplicitIndex） | 已为张量 |
+| `RangeIndices.{contiguous, cyclic, strided}` | 闭式等差/周期 ID | 可 symbolic fast-path 推导，**不展开** N 长 tensor |
+| `IdentityIndices(length)` | identity over `[0, length)` | 同上 |
+| `ConstantIndices(value, length=-1, valid_length=None)` | **单值轴**：所有 N 个实体共享同一 routing key | shape=(1,) tensor 通过 `coordinate_to_device` 的 advanced indexing 自动 broadcast，**永不展开**长 N 的常量数组 |
+
+### 4.3.2 SrcSideView 与 src 侧切分映射
+
+`_build_routing_domain` 是 **L1 唯一**从 `PhysicalLayout` 派生 `RoutingDomain` 的工厂；它按 src layout 在 routing dim 的 partition 类型，封装为对应 `IndicesSpec`：
+
+| src layout 在 routing dim 的 partition | 输出 IndicesSpec |
+|---|---|
+| `ChunkPartition`（与 dst 同切分粒度，**isomorphic chunk**） | `ConstantIndices(value=shard_rank * chunk, length=-1)` |
+| `ChunkPartition`（异构切分） | `RangeIndices.contiguous(start=r·chunk_size, length)` |
+| `CyclicPartition` | `RangeIndices.cyclic(start=r, length, num_workers=W)` |
+| Mirror / Replicated | `IdentityIndices(dim_size)` |
+| `HashPartition`（content-addressable） | `LiteralIndices(content_keys)` |
+| ExplicitIndex / RaggedIndex | `LiteralIndices(values)` |
+
+**isomorphic chunk** 的关键洞察：当 `src.shard_size(dim) == dst.shard_size(dim)` 时，本 rank 持有的整个数据 chunk 必然全属于 dst 的同一个 sub-rank；因此该轴退化为单值轴，输出 `ConstantIndices`。
+
+### 4.3.3 RoutingDomain.combine 双模式
+
+`RoutingDomain` 通过 `combine: str` 字段分发两种多轴语义：
+
+- **`combine="cartesian"`**（planner 默认）：保留通用 routing 引擎能力 —— 多个 axes 做 Cartesian broadcast，`sort_indices.len = ∏ axis.indices.length`；适用于 planner 直接被外部调用方驱动的场景。
+- **`combine="zip"`**（`_build_routing_domain` 显式声明，transport 层专用）：所有 axes 共享同一 primary length，**element-wise zip 对齐**；`sort_indices.len = N`（primary entity count），与 `backend.take(data, sort_indices, axes=(0,))` 的 row-binding 严格匹配。
+
+**zip-invariant 校验**：所有非 `ConstantIndices` 轴必须长度一致；不一致时 planner 抛 `ValueError` 阻断异构二轴误用。
+
+### 4.3.4 高性能要点
+
+- **零 materialise**：`ConstantIndices` 的 fast path 仅产 shape=(1,) tensor，长度为 N 的常量数组永不展开（依赖 `mesh.coordinate_to_device(device_ids[coords])` 的 advanced indexing 自动广播到 (N,)）
+- **Symbolic fast-path**：`ChunkPartition.routes_for_range(RangeIndices)` 可闭式推导 `send_counts`，HybridBackend 在 N_local=1e5 量级下相对全物化路径 ≥30% step 时间下降
+- **JIT-friendly invariant**：`RangeIndices` / `IdentityIndices` / `ConstantIndices` 全部 frozen dataclass + 不含 tensor，进入 `jax.jit` 的 `static_argnums`；仅 `LiteralIndices.values` 为动态 tensor 输入

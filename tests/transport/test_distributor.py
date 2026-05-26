@@ -632,8 +632,8 @@ def test_unified_compile():
     def simple_mul(x):
         return x * 2.0
 
-    res = simple_mul(bk.tensor([1.0, 2.0]))
-    assert bk.equal(res, bk.tensor([2.0, 4.0]))
+    res = simple_mul(bk.tensor([1.0, 2.0], dtype=bk.float32()))
+    assert bk.equal(res, bk.tensor([2.0, 4.0], dtype=bk.float32()))
 
     side_effects = []
 
@@ -642,7 +642,7 @@ def test_unified_compile():
         side_effects.append("tracing")
         return x + 1.0
 
-    t1 = bk.tensor([1.0])
+    t1 = bk.tensor([1.0], dtype=bk.float32())
     traced_fn(t1)
     assert len(side_effects) == 1, "Should trace once"
 
