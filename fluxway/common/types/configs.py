@@ -165,6 +165,15 @@ class SPMDConfig(FluxwayBaseSchema):
     # Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
     runtime_env: dict[str, Any] | None = None
 
+    # Dedicated runtime_env for the SPMDDriver actor.
+    # The driver is a control-plane actor and MUST NOT inherit GPU-related
+    # env_vars (CUDA_VISIBLE_DEVICES / JAX_PLATFORMS=cuda,...) from the
+    # worker side, otherwise pickle.loads of jax.Array on the driver will
+    # eagerly initialize a CUDA backend in a process that holds no GPU.
+    # When None, SPMDManager applies a safe default that explicitly hides
+    # GPUs from the driver actor.
+    driver_runtime_env: dict[str, Any] | None = None
+
     # If true, worker will fail immediately upon error instead of attempting recovery.
     fail_fast: bool = True
 

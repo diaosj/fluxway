@@ -86,31 +86,41 @@ def force_writable(arr: Any) -> Any:
 
 
 def ensure_cpu_serializable(arr: Any) -> Any:
-    """Move a GPU-resident array to CPU for safe pickle/Ray serialization.
+    """Move any device-resident tensor to host memory for safe pickle/Ray
+    serialization across processes that may not have a DL backend runtime.
 
-    CuPy arrays live in CUDA device memory.  When Ray serializes them via
-    pickle, the receiver must have a CUDA context to deserialize — which
-    fails on CPU-only workers with ``cudaErrorNoDevice``.
-
-    This function detects GPU-backed arrays via ``__cuda_array_interface__``
-    and converts them to NumPy.  CPU arrays (NumPy, plain Python) pass
-    through unchanged with zero overhead.
+    Fully duck-typed via Python array protocols -- no backend imports,
+    no registry, no isinstance chains:
+      - GPU-resident (``__cuda_array_interface__``: cupy / jax-cuda /
+        torch-cuda) -> ``cupy.asnumpy``.
+      - CPU-resident DL tensors (``__array__``: jax / torch CPU lazy
+        arrays) -> ``np.asarray`` (triggers device_get / detach via the
+        protocol).
+      - DLPack-only foreign tensors -> ``np.from_dlpack``.
+      - numpy views -> owned copy.
+      - everything else (Python scalars, dicts, None, ...) -> identity.
 
     **Call-site guidance**: use this only on Ray (pickle-based) transport
     boundaries.  Other transports (NCCL, UCX) handle CUDA buffers natively
     and should NOT call this.
     """
-    if isinstance(arr, np.ndarray) and not arr.flags.owndata:
-        return arr.copy()
-    if not hasattr(arr, "__cuda_array_interface__"):
-        return arr
-    try:
-        import cupy as cp
+    if isinstance(arr, np.ndarray):
+        return arr.copy() if not arr.flags.owndata else arr
 
-        if isinstance(arr, cp.ndarray):
-            return cp.asnumpy(arr)
-    except ImportError:
-        pass
+    if hasattr(arr, "__cuda_array_interface__"):
+        try:
+            import cupy as cp
+
+            return cp.asnumpy(cp.asarray(arr))
+        except ImportError:
+            pass
+
+    if hasattr(arr, "__array__"):
+        return np.asarray(arr)
+
+    if hasattr(arr, "__dlpack__"):
+        return np.from_dlpack(arr)
+
     return arr
 
 

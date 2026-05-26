@@ -75,6 +75,7 @@ def bind_spmd(
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
     runtime_env: dict[str, Any] | None = None,
+    driver_runtime_env: dict[str, Any] | None = None,
     is_source: bool = False,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
@@ -109,6 +110,7 @@ def bind_spmd(
             interleaved=interleaved,
             interleave_unit_size=interleave_unit_size,
             runtime_env=runtime_env,
+            driver_runtime_env=driver_runtime_env,
             priority=priority,
             placement_strategy=placement_strategy,
         )
@@ -118,6 +120,7 @@ def bind_spmd(
             mesh_axis_names=mesh_axis_names,
             mesh_axis_shapes=mesh_axis_shapes,
             runtime_env=runtime_env,
+            driver_runtime_env=driver_runtime_env,
             priority=priority,
             placement_strategy=placement_strategy,
         )

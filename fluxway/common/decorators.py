@@ -804,6 +804,7 @@ def data_type():
 def spmd(
     resource: dict[str, Any] | None = None,
     runtime_env: dict[str, Any] | None = None,
+    driver_runtime_env: dict[str, Any] | None = None,
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
     priority: Any = None,
@@ -816,6 +817,11 @@ def spmd(
         resource: Resource requirements (num_cpus, num_gpus, memory_gb).
         runtime_env: Ray runtime_env dict for Driver/Worker actors.
                      Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
+        driver_runtime_env: Dedicated Ray runtime_env for the SPMDDriver actor.
+                            When None, the framework applies a safe default that
+                            hides GPUs from the driver process.  Override this
+                            only if you intentionally want the driver to see
+                            specific resources (rare).
         mesh_axis_names: Axis names for the execution mesh.
         mesh_axis_shapes: Shape of the execution mesh.
         priority: Resource priority for scheduling (HIGH/MID/LOW).
@@ -843,12 +849,14 @@ def spmd(
         cls._resource = res_spec  # type: ignore
         cls._mesh = mesh  # type: ignore
         cls._runtime_env = runtime_env  # type: ignore
+        cls._driver_runtime_env = driver_runtime_env  # type: ignore
         cls._priority = priority  # type: ignore
         cls._placement_strategy = placement_strategy  # type: ignore
 
         cls.get_resource = classmethod(lambda c: c._resource)  # type: ignore
         cls.get_mesh = classmethod(lambda c: c._mesh)  # type: ignore
         cls.get_runtime_env = classmethod(lambda c: c._runtime_env)  # type: ignore
+        cls.get_driver_runtime_env = classmethod(lambda c: c._driver_runtime_env)  # type: ignore
         cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)  # type: ignore
         cls.is_fluxway_spmd = classmethod(lambda c: True)  # type: ignore
         cls.get_priority = classmethod(lambda c: c._priority)  # type: ignore
@@ -904,6 +912,7 @@ def spmd(
                 operators=operators,
                 operator_metas=metas,
                 runtime_env=c._runtime_env,
+                driver_runtime_env=c._driver_runtime_env,
             )
 
         cls.get_spmd_config = classmethod(get_spmd_config)  # type: ignore
@@ -919,6 +928,7 @@ def spmd_source(
     interleaved: bool = False,
     interleave_unit_size: int = 1,
     runtime_env: dict[str, Any] | None = None,
+    driver_runtime_env: dict[str, Any] | None = None,
     priority: Any = None,
     placement_strategy: Any = None,
 ):
@@ -931,6 +941,7 @@ def spmd_source(
         mesh_axis_names=mesh_axis_names,
         mesh_axis_shapes=mesh_axis_shapes,
         runtime_env=runtime_env,
+        driver_runtime_env=driver_runtime_env,
         priority=priority,
         placement_strategy=placement_strategy,
     )

@@ -191,8 +191,20 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
                     placement_group=placement_group,
                     placement_group_bundle_index=driver_bundle_index,
                 )
-            if config.runtime_env:
-                driver_opts["runtime_env"] = config.runtime_env
+            # Driver is a control-plane actor: it must NOT inherit GPU-related
+            # JAX env_vars (JAX_PLATFORMS=cuda,...) from the worker side,
+            # otherwise pickle.loads of jax.Array on the driver eagerly
+            # initializes a CUDA backend in a process that holds no GPU
+            # bundle and crashes the SPMD pipeline.  Resolution order:
+            #   1) explicit user override via config.driver_runtime_env
+            #   2) safe default that pins jax to CPU on the driver actor.
+            # Note: we deliberately do NOT clear CUDA_VISIBLE_DEVICES here
+            # because Ray uses the driver's visible accelerator list to
+            # propagate accelerator ids to child worker actors -- masking
+            # it triggers `IndexError: list index out of range` inside
+            # `ray._private.worker.get_accelerator_ids_for_accelerator_resource`.
+            if config.driver_runtime_env is not None:
+                driver_opts["runtime_env"] = config.driver_runtime_env
 
             driver = spmd_driver_cls.options(**driver_opts).remote(  # type: ignore
                 spmd_id=spmd_id,

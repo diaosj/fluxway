@@ -32,7 +32,11 @@ import numpy as np
 
 import ray
 
-from fluxway.common.tensor_backend import get_backend, force_writable
+from fluxway.common.tensor_backend import (
+    get_backend,
+    force_writable,
+    ensure_cpu_serializable,
+)
 from fluxway.common.decorators import (
     operator_context,
     get_current_context,
@@ -2417,7 +2421,10 @@ class SPMDWorker:
                     target_state_name = state_name
                     if is_leader:
                         names_to_send.append(target_state_name)
-                        values_to_send.append(state_value)
+                        # Materialize device tensors to host numpy at the
+                        # control-plane (Ray pickle) boundary so the
+                        # backend-free driver can deserialize safely.
+                        values_to_send.append(ensure_cpu_serializable(state_value))
 
                 if names_to_send:
                     logger.debug(
@@ -2550,7 +2557,11 @@ class SPMDWorker:
 
         try:
             self._driver_handle.routing_control_argument_to_controller.remote(
-                target_spmd_id, target_op_name, state_name, step, state_value
+                target_spmd_id,
+                target_op_name,
+                state_name,
+                step,
+                ensure_cpu_serializable(state_value),
             )
             logger.debug(
                 f"Sent control_argument name={state_name} target_spmd_id={target_spmd_id} "
