@@ -227,7 +227,7 @@ class TransportTensor:
         else:
             self._routing_indices = None
 
-        if self._routing_indices is not None:
+        if self._routing_indices is not None or self._origin_indices is not None:
             backend = get_backend()
             if not self._nested_splits:
                 if isinstance(self._flat_values, list):
@@ -246,31 +246,37 @@ class TransportTensor:
                     except Exception:
                         data_len = -1
 
-            idx_len = None
-            if isinstance(self._routing_indices, ContinuousIndex):
-                idx_len = self._routing_indices.count
-            elif isinstance(self._routing_indices, ExplicitIndex):
-                if isinstance(self._routing_indices.indices, list):
-                    idx_len = len(self._routing_indices.indices)
-                else:
-                    try:
-                        idx_len = int(backend.shape(self._routing_indices.indices)[0])
-                    except Exception:
-                        idx_len = -1
+            def _check_idx_len(idx_desc: IndexDescriptor | None, name: str):
+                if idx_desc is None:
+                    return
+                idx_len = None
+                if isinstance(idx_desc, ContinuousIndex):
+                    idx_len = idx_desc.count
+                elif isinstance(idx_desc, ExplicitIndex):
+                    if isinstance(idx_desc.indices, list):
+                        idx_len = len(idx_desc.indices)
+                    else:
+                        try:
+                            idx_len = int(backend.shape(idx_desc.indices)[0])
+                        except Exception:
+                            idx_len = -1
 
-            if (
-                data_len != -1
-                and idx_len is not None
-                and idx_len != -1
-                and data_len != idx_len
-            ):
-                raise ValueError(
-                    f"[Fluxway Validation Error] Data batch dimension mismatch! "
-                    f"routing_indices length is {idx_len}, but data batch_size is {data_len} "
-                    f"(shape: {backend.shape(self._flat_values)}). "
-                    f"Ensure you did not flatten a multi-dimensional array (e.g. using .ravel()), "
-                    f"which breaks row-wise alignment for routing."
-                )
+                if (
+                    data_len != -1
+                    and idx_len is not None
+                    and idx_len != -1
+                    and data_len != idx_len
+                ):
+                    raise ValueError(
+                        f"[Fluxway Validation Error] Data batch dimension mismatch! "
+                        f"{name} length is {idx_len}, but data batch_size is {data_len} "
+                        f"(shape: {backend.shape(self._flat_values)}). "
+                        f"Ensure you did not flatten a multi-dimensional array (e.g. using .ravel()), "
+                        f"which breaks row-wise alignment for metadata tracking."
+                    )
+
+            _check_idx_len(self._routing_indices, "routing_indices")
+            _check_idx_len(self._origin_indices, "origin_indices")
 
     @classmethod
     def from_tensor(

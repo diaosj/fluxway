@@ -806,6 +806,8 @@ def spmd(
     runtime_env: dict[str, Any] | None = None,
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
+    priority: Any = None,
+    placement_strategy: Any = None,
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -816,6 +818,9 @@ def spmd(
                      Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
         mesh_axis_names: Axis names for the execution mesh.
         mesh_axis_shapes: Shape of the execution mesh.
+        priority: Resource priority for scheduling (HIGH/MID/LOW).
+        placement_strategy: Per-node placement strategy for affinity scheduling
+                           (PACK/SPREAD/STRICT_PACK/STRICT_SPREAD).
     """
     from fluxway.common.types import ResourceSpec, SPMDConfig
     from fluxway.common.mesh import DeviceMesh
@@ -838,12 +843,16 @@ def spmd(
         cls._resource = res_spec  # type: ignore
         cls._mesh = mesh  # type: ignore
         cls._runtime_env = runtime_env  # type: ignore
+        cls._priority = priority  # type: ignore
+        cls._placement_strategy = placement_strategy  # type: ignore
 
         cls.get_resource = classmethod(lambda c: c._resource)  # type: ignore
         cls.get_mesh = classmethod(lambda c: c._mesh)  # type: ignore
         cls.get_runtime_env = classmethod(lambda c: c._runtime_env)  # type: ignore
         cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)  # type: ignore
         cls.is_fluxway_spmd = classmethod(lambda c: True)  # type: ignore
+        cls.get_priority = classmethod(lambda c: c._priority)  # type: ignore
+        cls.get_placement_strategy = classmethod(lambda c: c._placement_strategy)  # type: ignore
 
         original_new = cls.__new__
 
@@ -910,6 +919,8 @@ def spmd_source(
     interleaved: bool = False,
     interleave_unit_size: int = 1,
     runtime_env: dict[str, Any] | None = None,
+    priority: Any = None,
+    placement_strategy: Any = None,
 ):
     """
     Configure a class as an SPMD source.
@@ -920,6 +931,8 @@ def spmd_source(
         mesh_axis_names=mesh_axis_names,
         mesh_axis_shapes=mesh_axis_shapes,
         runtime_env=runtime_env,
+        priority=priority,
+        placement_strategy=placement_strategy,
     )
 
     def decorator(cls):

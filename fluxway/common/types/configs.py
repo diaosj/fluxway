@@ -218,11 +218,15 @@ class PlacementPlan(FluxwayBaseSchema):
     # Mapping of SPMD ID to resource priority
     spmd_priorities: dict[str, ResourcePriority] = Field(default_factory=dict)
 
+    # Mapping of SPMD ID to per-node placement strategy
+    # Overrides the global ``strategy`` when set for a specific SPMD.
+    spmd_strategies: dict[str, PlacementStrategy] = Field(default_factory=dict)
+
     # Shared placement groups for conditional branches
     # Key: shared_pg_id, Value: list of SPMD IDs sharing this PG
     shared_pgs: dict[str, list[str]] = Field(default_factory=dict)
 
-    # Placement strategy
+    # Placement strategy (global fallback when spmd_strategies is not set)
     strategy: PlacementStrategy = PlacementStrategy.PACK
 
 
@@ -266,6 +270,7 @@ class Node(FluxwayBaseSchema):
     description: str = ""
     resource: ResourceSpec | None = None
     priority: ResourcePriority | None = None  # Resource priority for allocation
+    placement_strategy: PlacementStrategy | None = None  # Per-node placement strategy
     spmd_config: SPMDConfig = Field(default_factory=SPMDConfig)
     node_type: NodeType = NodeType.SPMD  # Node type: SPMD
 

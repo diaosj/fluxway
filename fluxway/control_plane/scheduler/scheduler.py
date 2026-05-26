@@ -188,6 +188,7 @@ class Scheduler:
         """
         spmd_placements: dict[str, ResourceSpec] = {}
         spmd_priorities: dict[str, ResourcePriority] = {}
+        spmd_strategies: dict[str, PlacementStrategy] = {}
         shared_pgs: dict[str, list[str]] = {}
 
         for node_name, node in graph.nodes.items():
@@ -200,12 +201,18 @@ class Scheduler:
                 node.priority if node.priority is not None else ResourcePriority.MID
             )
 
+            # Per-node placement strategy (e.g. SPREAD for table, STRICT_PACK for GPU)
+            node_strategy = getattr(node, "placement_strategy", None)
+            if node_strategy is not None:
+                spmd_strategies[node_name] = node_strategy
+
         # TODO: Analyze conditional branches for shared PG opportunities
         # TODO: Implement affinity rules based on graph edges
 
         return PlacementPlan(
             spmd_placements=spmd_placements,
             spmd_priorities=spmd_priorities,
+            spmd_strategies=spmd_strategies,
             shared_pgs=shared_pgs,
             strategy=PlacementStrategy.PACK,
         )
@@ -241,7 +248,7 @@ class Scheduler:
                 spmd_id=spmd_id,
                 resource=resource,
                 priority=priority,
-                strategy=plan.strategy,
+                strategy=plan.spmd_strategies.get(spmd_id, plan.strategy),
                 num_workers=num_workers,
             )
 

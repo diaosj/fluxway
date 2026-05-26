@@ -48,7 +48,7 @@ async def _sparse_unique(
       Dense static assembly buffer
     """
     ids_np = tt.flat_values
-    total_elements = tt.global_shape[0]  # type: ignore
+    total_elements = np.prod(tt.global_shape)  # type: ignore
 
     # -- Invariants on input layout --
     assert ids_np is not None and ids_np.size > 0, (

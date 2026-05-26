@@ -103,6 +103,12 @@ class Builder:
         resource_override = kwargs.pop("resource", None)
         runtime_env_override = kwargs.pop("runtime_env", None)
         operator_configs = kwargs.pop("operator_configs", None)
+        priority = kwargs.pop("priority", None) or getattr(
+            spmd_class, "_priority", None
+        )
+        placement_strategy = kwargs.pop("placement_strategy", None) or getattr(
+            spmd_class, "_placement_strategy", None
+        )
 
         resource = copy.deepcopy(spmd_class.get_resource())
         spmd_config = copy.deepcopy(spmd_class.get_spmd_config())
@@ -190,6 +196,8 @@ class Builder:
             name=name,
             description=description,
             resource=resource,
+            priority=priority,
+            placement_strategy=placement_strategy,
             spmd_config=spmd_config,
         )
 
@@ -222,6 +230,8 @@ class Builder:
         mesh_axis_names: tuple[str, ...] | None = None,
         resource: dict[str, Any] | None = None,
         description: str = "",
+        priority: Any = None,
+        placement_strategy: Any = None,
         **reader_kwargs: Any,
     ) -> "Builder":
         """
@@ -260,7 +270,14 @@ class Builder:
 
         # Add as an SPMD node with the explicitly created mesh
         # This triggers the mandatory mesh check in add_node
-        self.add_node(name, reader_cls, description, mesh=reader_mesh)
+        self.add_node(
+            name,
+            reader_cls,
+            description,
+            mesh=reader_mesh,
+            priority=priority,
+            placement_strategy=placement_strategy,
+        )
 
         # Inject additional configuration
         node = self._nodes[name]
