@@ -1,5 +1,5 @@
 import itertools
-import json
+import pickle
 import logging
 import os
 import shutil
@@ -14,7 +14,7 @@ class FluxwayCheckpointer:
     """
     Controller-side checkpoint orchestrator.
 
-    Manages only the per-step manifest.json that maps each (spmd_id, rank) to
+    Manages only the per-step manifest.pkl that maps each (spmd_id, rank) to
     the path metadata returned by the Worker's WorkerCheckpointBackend.  The
     actual tensor serialization is performed by each Worker in its own process.
 
@@ -72,7 +72,7 @@ class FluxwayCheckpointer:
         return sorted(
             int(d.name)
             for d in root.iterdir()
-            if d.is_dir() and d.name.isdigit() and (d / "manifest.json").exists()
+            if d.is_dir() and d.name.isdigit() and (d / "manifest.pkl").exists()
         )
 
     def latest_step(self) -> int | None:
@@ -126,13 +126,13 @@ class FluxwayCheckpointer:
         return step
 
     # =========================================================================
-    # Internal Persistence (format-agnostic manifest JSON)
+    # Internal Persistence (format-agnostic manifest (pickle))
     # =========================================================================
 
     def _persist(self, step: int, manifest: dict[str, Any]) -> None:
         """Write the manifest that maps spmd_id to {spmd_state, rank_storage}."""
         step_dir = Path(self._ckpt_dir) / str(step)
-        manifest_path = step_dir / "manifest.json"
+        manifest_path = step_dir / "manifest.pkl"
 
         # Commit (rename) all orbax temporary directories atomically.
         renamed_paths = set()
@@ -163,21 +163,21 @@ class FluxwayCheckpointer:
                 "Set force_write=True in CheckpointConfig to overwrite."
             )
         step_dir.mkdir(parents=True, exist_ok=True)
-        tmp_man = step_dir / "manifest.json.tmp"
-        with open(tmp_man, "w") as f:
-            json.dump(manifest, f)
+        tmp_man = step_dir / "manifest.pkl.tmp"
+        with open(tmp_man, "wb") as f:
+            pickle.dump(manifest, f)
         tmp_man.rename(manifest_path)
         self._evict_old_checkpoints()
 
     def _load(self, step: int) -> dict[str, Any]:
         """Read and return the manifest dict for ``step``."""
-        manifest_path = Path(self._ckpt_dir) / str(step) / "manifest.json"
+        manifest_path = Path(self._ckpt_dir) / str(step) / "manifest.pkl"
         if not manifest_path.exists():
             raise FileNotFoundError(
                 f"FluxwayCheckpointer: manifest not found: {manifest_path}"
             )
-        with open(manifest_path) as f:
-            return json.load(f)
+        with open(manifest_path, "rb") as f:
+            return pickle.load(f)
 
     def _evict_old_checkpoints(self) -> None:
         """Remove oldest checkpoint directories exceeding max_to_keep."""
