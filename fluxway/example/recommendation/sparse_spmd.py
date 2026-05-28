@@ -163,6 +163,16 @@ class SparseEmbeddingSPMD:
             err_msg=f"[SparseSPMD] rank={self.rank} lookup keys mismatch unique_ids",
         )
 
+        # Mirror auto-inherit: the operator declares ``output_sharding`` as
+        # ``mirror reference="lookup.unique_ids"``, so the framework's worker
+        # hook (see ``Worker._apply_mirror_inheritance``) automatically copies
+        # both ``receipt`` (the SymmetryReceipt that drives mirror routing)
+        # and ``origin_indices`` from the cached ``unique_ids`` source onto
+        # this output.  Manually re-attaching ``unique_ids.origin_indices``
+        # here is therefore redundant -- and risky, since any future change
+        # in row count would silently mismatch the framework's length check
+        # in ``Distributor`` (see communication.py "origin_indices length
+        # mismatch" error).  Leave the output naked and let mirror inherit.
         output = TransportTensor(emb_np)
         print(
             f"[SparseEmbeddingSPMD.lookup] rank={self.rank} step={step} "

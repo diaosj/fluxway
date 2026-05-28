@@ -303,13 +303,12 @@ class TransportTensor:
                 layouts. The planner stays 1-D regardless; routing_axes only
                 affects the apply (gather) step in the L1 distributor.
         """
-        if global_shape and origin_indices is None:
-            from functools import reduce
-
-            origin_indices = ContinuousIndex.chunk(
-                0, reduce(lambda x, y: x * y, global_shape)
-            )
-
+        # NOTE: We intentionally do NOT auto-fill origin_indices here.
+        # `origin_indices` is per-origin-rank state ("which global rows do I hold"),
+        # and the framework has no rank/partition context at construction time, so
+        # any auto-synthesized value would be a wrong guess (e.g. all ranks claiming
+        # start=0). The caller MUST set origin_indices explicitly when it is needed,
+        # otherwise leave it as None and let the receipt/transport layer take over.
         return cls(
             flat_values=tensor,
             nested_splits=[],

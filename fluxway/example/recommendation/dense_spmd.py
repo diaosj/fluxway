@@ -265,14 +265,26 @@ class DenseSPMD:
         )
 
         # -- Embedding routing order/count invariants --
-        # The cross-mesh router (input rank d -> dense rank d) must deliver
-        # exactly the unique embeddings referenced by this rank's local inv,
-        # in the same order as input rank d's local unique sequence. The
-        # following three checks together guarantee both row count and order:
+        # The cross-mesh router (input rank d -> sparse ranks {0..S-1} ->
+        # dense rank d via Mirror back) must deliver exactly the unique
+        # embeddings referenced by this rank's local inv, in the same
+        # order as input rank d's local unique sequence. Two layers
+        # cooperate to make this true:
+        #   * input_spmd._sparse_unique stamps unique_tt with a per-row
+        #     ExplicitIndex(arange(K)) — a local position within this
+        #     rank's own unique sequence.  The label is orthogonal to
+        #     hash routing (which is value-based) and only needs to be
+        #     unique within the producer rank, because Mirror-back routes
+        #     each row back to the dense rank that originally emitted it.
+        #   * sparse_spmd.lookup propagates that origin_indices verbatim
+        #     onto the embedding output. The framework's
+        #     `_assemble_to_dynamic_tensor` then JIT-argsorts incoming
+        #     shards by origin_indices, so any out-of-order arrival from
+        #     multiple sparse ranks is stably reordered before this op
+        #     sees it.
+        # The two checks below catch any breakage of that contract:
         #   (1) emb_rows == inv.max()+1   -> no missing or extra rows
         #   (2) emb is numerically finite -> no transport corruption
-        #   (3) origin_indices length matches emb_rows -> per-row routing
-        #       metadata (encoding global assembly position) survived intact
         if inv1_1d.size > 0:
             expected_rows_1 = int(inv1_1d.max()) + 1
             assert emb1_2d.shape[0] == expected_rows_1, (
@@ -295,22 +307,6 @@ class DenseSPMD:
             "[DenseSPMD] emb2 contains NaN/Inf -- possible cross-mesh "
             "transport corruption between SparseEmbeddingSPMD and DenseSPMD"
         )
-        if emb1.origin_indices is not None:
-            origin1 = emb1.origin_indices_materialized
-            assert origin1 is not None and origin1.shape[0] == emb1_2d.shape[0], (
-                f"[DenseSPMD] emb1 origin_indices length "
-                f"{None if origin1 is None else origin1.shape[0]} != emb1 row "
-                f"count {emb1_2d.shape[0]}; per-row routing metadata is broken "
-                "(rows may have been reordered/dropped/duplicated)"
-            )
-        if emb2.origin_indices is not None:
-            origin2 = emb2.origin_indices_materialized
-            assert origin2 is not None and origin2.shape[0] == emb2_2d.shape[0], (
-                f"[DenseSPMD] emb2 origin_indices length "
-                f"{None if origin2 is None else origin2.shape[0]} != emb2 row "
-                f"count {emb2_2d.shape[0]}; per-row routing metadata is broken "
-                "(rows may have been reordered/dropped/duplicated)"
-            )
 
         local_batch = int(inv1_1d.shape[0])
 

@@ -1513,8 +1513,12 @@ class HybridBackend(TensorBackend):
 
             cp.cuda.runtime.getDeviceCount()
             self._cp = cp
-        except Exception:
-            pass
+        except Exception as exc:
+            if default_device in ("gpu", "cuda"):
+                raise RuntimeError(
+                    f"HybridBackend(default_device={default_device!r}) requested "
+                    f"but CuPy/CUDA is not available: {exc}"
+                ) from exc
 
     def _lib(self, device: str):
         """Return the array library for *device* ('cpu' or 'gpu')."""

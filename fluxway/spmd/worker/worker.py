@@ -1765,15 +1765,30 @@ class SPMDWorker:
             [self._get_values(s) for s in valid_shards], dim=routing_dim
         )
 
-        # Materialize indices (origin_indices preferred for logical ordering)
+        # Materialize indices (origin_indices preferred for logical ordering).
+        # Both origin_indices and routing_indices encode *global* per-row
+        # positions; without them we have no information-theoretic basis to
+        # decide which destination slot each row belongs to.  The previous
+        # arange(0, num) fallback silently produced sender-local positions
+        # that collide across senders (every sender claiming positions 0..N),
+        # which is wrong in any multi-sender scenario.  Fail loudly instead
+        # of generating undefined scatter behaviour.
         all_indices_list = []
         for s in valid_shards:
             idx = s.origin_indices_materialized
             if idx is None:
                 idx = self._get_routing_indices(s)
             if idx is None:
-                num = backend.shape(self._get_values(s))[0]
-                idx = backend.arange(0, num, dtype=backend.int32())
+                raise ValueError(
+                    f"[Fluxway Protocol Error] Dynamic-to-static assembly for "
+                    f"op '{op_name}' (TUUID {tuuid}) received a shard with "
+                    f"neither origin_indices nor routing_indices. The producer "
+                    f"must attach per-row global position metadata so each row "
+                    f"can be deterministically scattered into the destination "
+                    f"buffer; arange-style fallbacks would yield colliding "
+                    f"sender-local positions across multiple senders and "
+                    f"silently corrupt the result."
+                )
             all_indices_list.append(idx)
         all_indices = backend.cat(all_indices_list, dim=0)
 
@@ -1923,15 +1938,28 @@ class SPMDWorker:
         all_values_list = [self._get_values(s) for s in filtered_shards]
         merged_values = self._normalize_and_cat_shards(all_values_list, dim=0)
 
-        # Spatial Indices (global keys)
+        # Spatial Indices (global keys).  If *any* shard carries
+        # routing_indices, *every* shard must — they label per-row global
+        # positions and a partial set is meaningless (an arange-style
+        # fallback for the missing shards would silently invent sender-local
+        # positions that collide across producers).  Reject the heterogeneous
+        # case explicitly so the contract violation surfaces at the boundary.
         merged_routing_indices = None
         if any(self._get_routing_indices(s) is not None for s in filtered_shards):
             indices_list = []
             for s in filtered_shards:
                 idx = self._get_routing_indices(s)
                 if idx is None:
-                    num = backend.shape(self._get_values(s))[0]
-                    idx = backend.arange(0, num, dtype=backend.int32())
+                    raise ValueError(
+                        f"[Fluxway Protocol Error] Dynamic assembly for op "
+                        f"'{op_name}' (TUUID {tuuid}) received an inconsistent "
+                        f"set of shards: some carry routing_indices and some "
+                        f"do not.  routing_indices encode per-row *global* "
+                        f"positions; producers must agree on whether to emit "
+                        f"them.  An arange fallback would generate "
+                        f"sender-local positions that collide across senders "
+                        f"and silently corrupt downstream routing."
+                    )
                 indices_list.append(idx)
             merged_routing_indices = self._normalize_and_cat_shards(indices_list, dim=0)
 

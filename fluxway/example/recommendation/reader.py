@@ -33,33 +33,58 @@ class RecommendationReader(GrainReader):
         shard_count: int | None = None,
     ):
         if "data_source" not in static_args:
-            import numpy as np
+            # Synthesize a recommendation corpus whose item / user popularity
+            # follows a power-law (Zipf-like) distribution, mirroring real
+            # traffic where a small set of "hot" entities dominates impressions.
+            # This guarantees that different DP ranks observe overlapping sparse
+            # IDs and thereby exercise the cross-DP embedding routing path
+            # (e.g. the same item shows up on multiple input workers, gets routed to a single
+            # sparse worker, and its embedding fans out to multiple dense
+            # workers).
+            seed = static_args.get("seed", 42)
+            rng = np.random.default_rng(seed)
 
-            np.random.seed(42)
+            vocab_size_user = static_args.get("vocab_size_user", 100)
+            vocab_size_item = static_args.get("vocab_size_item", 2000)
+            num_samples = static_args.get("num_samples", 1000)
+            item_alpha = static_args.get("item_zipf_alpha", 1.2)
+            user_alpha = static_args.get("user_zipf_alpha", 1.0)
+            max_seq_len = static_args.get("max_seq_len", 5)
 
-            vocab_size_user = 100
-            vocab_size_item = 5000
+            item_probs = self._zipf_probs(vocab_size_item, item_alpha, rng)
+            user_probs = self._zipf_probs(vocab_size_user, user_alpha, rng)
 
-            num_samples = 1000
-            user_ids = np.random.randint(0, vocab_size_user, size=num_samples)
-            target_item_ids = np.random.randint(0, vocab_size_item, size=num_samples)
+            # Heavier-tailed sequence length: most users have short history,
+            # a few have longer ones.
+            seq_len_choices = np.arange(1, max_seq_len + 1)
+            seq_len_probs = 1.0 / seq_len_choices.astype(np.float64)
+            seq_len_probs /= seq_len_probs.sum()
+
+            user_ids = rng.choice(vocab_size_user, size=num_samples, p=user_probs)
+            target_item_ids = rng.choice(
+                vocab_size_item, size=num_samples, p=item_probs
+            )
+            seq_lens = rng.choice(seq_len_choices, size=num_samples, p=seq_len_probs)
 
             data = []
             for i in range(num_samples):
-                seq_len = np.random.randint(1, 6)
-                hist_seq = np.random.randint(0, vocab_size_item, size=seq_len).tolist()
+                sl = int(seq_lens[i])
+                hist_seq = rng.choice(vocab_size_item, size=sl, p=item_probs).tolist()
 
                 data.append(
                     {
                         "user_id": [int(user_ids[i])],
-                        "user_age_level": [np.random.randint(0, 5)],
-                        "request_hour": [np.random.randint(0, 24)],
+                        "user_age_level": [int(rng.integers(0, 5))],
+                        "request_hour": [int(rng.integers(0, 24))],
                         "hist_click_item_seq": [int(x) for x in hist_seq],
-                        "hist_seq_length": [seq_len],
+                        "hist_seq_length": [sl],
                         "target_item_id": [int(target_item_ids[i])],
-                        "target_item_category": [np.random.randint(0, 10)],
-                        "target_item_stats": [np.random.rand(), np.random.rand() * 20],
-                        "is_click": [np.random.randint(0, 2)],
+                        "target_item_category": [int(rng.integers(0, 10))],
+                        "target_item_stats": [
+                            float(rng.random()),
+                            float(rng.random() * 20),
+                        ],
+                        "is_click": [int(rng.integers(0, 2))],
                     }
                 )
 
@@ -72,6 +97,26 @@ class RecommendationReader(GrainReader):
             static_args, rank, world_size, shard_index, shard_count
         )
         self._completed_steps = 0
+
+    @staticmethod
+    def _zipf_probs(
+        vocab_size: int, alpha: float, rng: np.random.Generator
+    ) -> np.ndarray:
+        """Return a permuted Zipf-like probability vector over [0, vocab_size).
+
+        The raw 1 / (rank + 1) ** alpha mass is then permuted so that "hot"
+        IDs are scattered across the vocabulary instead of being clustered at
+        small numeric values.  This decouples ID popularity from ID encoding,
+        which is closer to real-world scenarios and prevents the downstream
+        ``ModuloPartitioner`` from skewing all hot IDs onto a single shard.
+        """
+        ranks = np.arange(1, vocab_size + 1, dtype=np.float64)
+        p = 1.0 / (ranks**alpha)
+        p /= p.sum()
+        perm = rng.permutation(vocab_size)
+        out = np.empty_like(p)
+        out[perm] = p
+        return out
 
     def __init__(self):
         super().__init__()
