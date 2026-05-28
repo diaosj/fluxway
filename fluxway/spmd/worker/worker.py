@@ -1254,17 +1254,23 @@ class SPMDWorker:
                 self._barriers_declared.pop((op_name, step), None)
                 return ExecutionResult(status=ExecutionStatus.SKIPPED)
 
-            # --- Early check: all received shards are empty packets ---
-            all_empty = await self._check_all_empty(op_name, step)
-            if all_empty:
-                logger.debug(
-                    f"All shards empty propagating empty packets op={op_name} step={step} "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
-                await self._propagate_empty_packets(op_name, step)
-                await self._mailbox.clear_step(op_name, step)
-                self._barriers_declared.pop((op_name, step), None)
-                return ExecutionResult(status=ExecutionStatus.EMPTY_PROPAGATION)
+            # --- Optional fastpath: all received shards are empty packets ---
+            # When enable_empty_fastpath is True, short-circuit by directly
+            # propagating empty packets to downstream and skipping user operator
+            # dispatch. When False (default), all steps — including all-empty
+            # ones — are dispatched to the user-defined operator, letting user
+            # code decide how to handle empty inputs.
+            if self.config.enable_empty_fastpath:
+                all_empty = await self._check_all_empty(op_name, step)
+                if all_empty:
+                    logger.debug(
+                        f"All shards empty propagating empty packets op={op_name} step={step} "
+                        f"spmd_id={self.spmd_id} rank={self.rank}"
+                    )
+                    await self._propagate_empty_packets(op_name, step)
+                    await self._mailbox.clear_step(op_name, step)
+                    self._barriers_declared.pop((op_name, step), None)
+                    return ExecutionResult(status=ExecutionStatus.EMPTY_PROPAGATION)
 
             # Assemble input data
             try:

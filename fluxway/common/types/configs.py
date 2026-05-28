@@ -180,6 +180,14 @@ class SPMDConfig(FluxwayBaseSchema):
     # Transport backend for data plane RPC (e.g. "ray", "axon")
     transport_type: str = "ray"
 
+    # If True, when all received shards for a step are empty packets, the worker
+    # will short-circuit: skip _assemble_input / user operator dispatch and
+    # directly propagate empty packets downstream (an "empty fastpath").
+    # If False (default), all steps — including all-empty ones — are dispatched
+    # to the user-defined operator, letting user code decide how to handle
+    # empty inputs (e.g. emit a 0-size output, or return None to propagate).
+    enable_empty_fastpath: bool = False
+
     @property
     def num_workers(self) -> int:
         """Derive world size (total workers) from mesh size."""
