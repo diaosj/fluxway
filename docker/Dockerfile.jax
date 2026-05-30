@@ -32,7 +32,7 @@ WORKDIR /workspace
 
 # Install common Python dependencies required by the project
 # pylance is not a vscode plugin, it's lance-format
-RUN pip install -i ${PIP_MIRROR} --no-cache-dir \
+RUN pip install --default-timeout=1000 --no-cache-dir \
     minio \
     "ray[all]==2.49.0" \
     numba \
@@ -44,6 +44,12 @@ RUN pip install -i ${PIP_MIRROR} --no-cache-dir \
     zstandard \
     fastparquet
 
+# Remove conflicting cupy-cuda12x installed by ray before installing RAPIDS to prevent breaking the cupy installation
+RUN pip uninstall -y cupy-cuda12x
+
+# Install RAPIDS GPU-accelerated libraries
+RUN pip install --default-timeout=1000 --no-cache-dir --extra-index-url https://pypi.nvidia.com cudf-cu13 rmm-cu13
+
 # Copy project files into the container
 # NOTE: Ensure you run `docker build` from the repository root, e.g.:
 # docker build -t fluxway -f docker/Dockerfile .
@@ -51,7 +57,7 @@ COPY . /workspace/
 
 # Install the project in editable mode
 RUN cd /workspace && \
-    pip install -i ${PIP_MIRROR} --no-cache-dir --no-deps -e .
+    pip install --default-timeout=1000 --no-cache-dir --no-deps -e .
 
 # Default command
 CMD ["/bin/bash"]
