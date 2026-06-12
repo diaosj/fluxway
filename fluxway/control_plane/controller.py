@@ -1294,6 +1294,14 @@ if RAY_AVAILABLE:
             status = await self._heartbeat_manager.get_all_driver_status()
             return {spmd_id: s.value for spmd_id, s in status.items()}
 
+        async def get_step_progress_summary(self) -> dict[str, dict[str, int]]:
+            """Return completed operator step counts by SPMD node."""
+            all_steps = self._async_step_manager.get_all_spmd_steps()
+            return {
+                spmd_id: dict(step.completed_step_count)
+                for spmd_id, step in all_steps.items()
+            }
+
         async def wait_for_completion(self, timeout: float | None = None) -> bool:
             """
             Wait for training to complete.

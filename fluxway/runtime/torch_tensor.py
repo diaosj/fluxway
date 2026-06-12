@@ -28,11 +28,25 @@ def transport_to_torch(tensor, *, device=None, dtype=None):
     return out
 
 
-def scalar_to_transport(value, *, dtype=None):
-    import torch
+def scalar_to_transport(value, *, dtype=None, global_shape=None):
+    import numpy as np
 
     from fluxway.common.types.tensor import TransportTensor
 
-    tensor = torch.tensor([value], dtype=dtype).cpu()
-    return TransportTensor.from_tensor(tensor, global_shape=tuple(tensor.shape))
+    np_dtype = None
+    if dtype is not None:
+        dtype_name = str(dtype)
+        if dtype_name.endswith("float32"):
+            np_dtype = np.float32
+        elif dtype_name.endswith("float64"):
+            np_dtype = np.float64
+        elif dtype_name.endswith("int64"):
+            np_dtype = np.int64
+        elif dtype_name.endswith("int32"):
+            np_dtype = np.int32
+
+    tensor = np.asarray([value], dtype=np_dtype)
+    return TransportTensor.from_tensor(
+        tensor, global_shape=global_shape or tuple(tensor.shape)
+    )
 
