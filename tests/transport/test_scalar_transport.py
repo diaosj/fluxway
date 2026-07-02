@@ -1,11 +1,15 @@
-import pytest
-import jax.numpy as jnp
+import asyncio
 
-from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.types.sharding import ShardingConfig
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
 from fluxway.common.mesh import DeviceMesh
-from fluxway.transport.communication import DataDistributor, TransportReceiver
 from fluxway.common.tensor_backend import set_backend
+from fluxway.common.types.sharding import ShardingConfig
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.transport.communication import AsyncDataDistributor
+from fluxway.transport.manifest import EDGE_EXPECTED_COUNT, FRAME_SENDER_SPMD_CODE
 
 
 @pytest.fixture(autouse=True)
@@ -14,63 +18,46 @@ def use_jax_backend():
     yield
 
 
-def test_scalar_replication_self_delivery():
-    """
-    For a scalar replicated across a 2-device mesh, each sender rank delivers
-    only to its own corresponding target rank — not a broadcast.
-    This reflects the current architecture where each rank holds its own replica.
-    """
+def test_scalar_replication_self_delivery_uses_frame_abi():
     mesh = DeviceMesh(axis_names=("dp",), device_shape=(2,))
     source_spec = ShardingConfig(type="static", axis=[]).to_spec().bind(mesh)
     target_spec = ShardingConfig(type="static", axis=[]).to_spec().bind(mesh)
+    scalar = TransportTensor.from_tensor(jnp.array(42.0), global_shape=())
 
-    scalar_val = jnp.array(42.0)
-    tt = TransportTensor.from_tensor(scalar_val, global_shape=())
+    async def capture_for_rank(rank):
+        captured = {}
 
-    # Rank 0: sends only to itself (rank 0)
-    receivers_0 = [TransportReceiver(), TransportReceiver()]
+        async def send_fn(
+            target_rank,
+            frame_i32,
+            edge_i32,
+            payload_i32,
+            shape_i32,
+            global_shape_i64,
+            compact_i64,
+            *payload_segments,
+        ):
+            captured[target_rank] = (frame_i32, edge_i32, payload_segments)
+            return True
 
-    def mock_send_0(
-        target_rank,
-        tuuids,
-        tensors,
-        counts,
-        global_shapes=None,
-        meta_state_list=None,
-        compact_params=None,
-    ):
-        receivers_0[target_rank].receive_slices(0, tensors, counts)
-        return True
+        await AsyncDataDistributor(rank).distribute(
+            local_data=scalar,
+            source=source_spec,
+            target=target_spec,
+            send_fn=send_fn,
+            tuuid=20,
+            step=1,
+            sender_spmd_code=9,
+            sender_world_size=mesh.size,
+        )
+        return captured
 
-    distributor_0 = DataDistributor(0)
-    distributor_0.distribute(
-        tt, source_spec, target_spec, send_fn=mock_send_0, tuuid=20
-    )
-    assert len(receivers_0[0].get_buffered_slices()) == 1
-    assert (
-        len(receivers_0[1].get_buffered_slices()) == 0
-    )  # rank 0 does NOT broadcast to rank 1
+    captured0 = asyncio.run(capture_for_rank(0))
+    captured1 = asyncio.run(capture_for_rank(1))
 
-    # Rank 1: sends only to itself (rank 1)
-    receivers_1 = [TransportReceiver(), TransportReceiver()]
-
-    def mock_send_1(
-        target_rank,
-        tuuids,
-        tensors,
-        counts,
-        global_shapes=None,
-        meta_state_list=None,
-        compact_params=None,
-    ):
-        receivers_1[target_rank].receive_slices(1, tensors, counts)
-        return True
-
-    distributor_1 = DataDistributor(1)
-    distributor_1.distribute(
-        tt, source_spec, target_spec, send_fn=mock_send_1, tuuid=20
-    )
-    assert len(receivers_1[0].get_buffered_slices()) == 0
-    assert (
-        len(receivers_1[1].get_buffered_slices()) == 1
-    )  # rank 1 sends to its own slot
+    assert set(captured0) == {0}
+    assert set(captured1) == {1}
+    assert int(captured0[0][0][FRAME_SENDER_SPMD_CODE]) == 9
+    assert int(captured1[1][0][FRAME_SENDER_SPMD_CODE]) == 9
+    assert int(captured0[0][1][0, EDGE_EXPECTED_COUNT]) == 1
+    assert np.asarray(captured0[0][2][0]).shape == ()

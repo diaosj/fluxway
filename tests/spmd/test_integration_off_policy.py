@@ -48,11 +48,11 @@ async def test_off_policy_staleness_integration():
     await deposit(TUUID_BATCH, 3, 30.0)
     assert mb.is_step_ready("compute", 3), "Step 3 should be ready via stale fallback"
 
-    shards_emb = await mb.get_tensor_shards("compute", TUUID_EMB, 3)
+    shards_emb = await mb.get_tensor_shard_views("compute", TUUID_EMB, 3)
     flat = [s for sl in shards_emb.values() for s in sl]
     np.testing.assert_array_equal(flat[0].flat_values, [0.2])
 
-    shards_batch = await mb.get_tensor_shards("compute", TUUID_BATCH, 3)
+    shards_batch = await mb.get_tensor_shard_views("compute", TUUID_BATCH, 3)
     flat_b = [s for sl in shards_batch.values() for s in sl]
     np.testing.assert_array_equal(flat_b[0].flat_values, [30.0])
 
@@ -61,7 +61,7 @@ async def test_off_policy_staleness_integration():
     await deposit(TUUID_BATCH, 4, 40.0)
     assert mb.is_step_ready("compute", 4), "Step 4 should be ready via stale fallback"
 
-    shards_emb_4 = await mb.get_tensor_shards("compute", TUUID_EMB, 4)
+    shards_emb_4 = await mb.get_tensor_shard_views("compute", TUUID_EMB, 4)
     flat4 = [s for sl in shards_emb_4.values() for s in sl]
     np.testing.assert_array_equal(flat4[0].flat_values, [0.2])
 

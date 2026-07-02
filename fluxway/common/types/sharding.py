@@ -171,7 +171,7 @@ class PartitionSpec(FluxwayBaseSchema):
                 if isinstance(s, str):
                     result[i] = (s,)
                 else:
-                    result[i] = tuple(str(x) for x in s)
+                    result[i] = tuple(x for x in s)
         return result
 
     def __repr__(self) -> str:
@@ -325,6 +325,18 @@ class PartitionStrategy(FluxwayBaseSchema):
         """Determines rank assignments for given indices."""
         return self(indices, dim_size, num_workers, index_desc)
 
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        raise NotImplementedError(
+            f"{self.name} must implement ranks_for_indices_spec for "
+            f"{type(spec).__name__}; implicit materialization is forbidden."
+        )
+
     def get_index_bounds(
         self,
         rank: int,
@@ -371,6 +383,16 @@ class ChunkPartition(PartitionStrategy):
             ranks,
         )
 
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        return _chunk_ranks_for_indices_spec(spec, dim_size, num_workers, backend)
+
     def intersects(
         self, src_rank, src_world_size, dst_rank, dst_world_size, dim_size, dst_strategy
     ) -> bool:
@@ -392,6 +414,16 @@ class CyclicPartition(PartitionStrategy):
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
         return backend.mod(indices, num_workers)
+
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        return _cyclic_ranks_for_indices_spec(spec, num_workers, backend)
 
     def intersects(
         self, src_rank, src_world_size, dst_rank, dst_world_size, dim_size, dst_strategy
@@ -433,6 +465,18 @@ class IndexedChunkPartition(PartitionStrategy):
             ranks,
         )
 
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        indices, valid = _values_for_indices_spec(spec, backend)
+        ranks = self(indices, dim_size, num_workers, index_desc=index_desc)
+        return ranks, valid
+
 
 class IndexedModuloPartition(PartitionStrategy):
     """Dynamic partitioning using modulo hashing based on index values."""
@@ -453,6 +497,18 @@ class IndexedModuloPartition(PartitionStrategy):
             values = indices
 
         return backend.mod(values, num_workers)
+
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        indices, valid = _values_for_indices_spec(spec, backend)
+        ranks = self(indices, dim_size, num_workers, index_desc=index_desc)
+        return ranks, valid
 
 
 class GreedyPartition(PartitionStrategy):
@@ -481,6 +537,105 @@ class GreedyPartition(PartitionStrategy):
             rank_loads[best] += int(length)
 
         return backend.tensor(assigned, dtype=backend.int32())
+
+
+def _values_for_indices_spec(spec: IndicesSpec, backend: Any) -> tuple[Any, Any]:
+    values, valid = _closed_form_indices_for_static_spec(spec, backend)
+    return values, valid
+
+
+def _valid_mask_for_length(spec: IndicesSpec, length: int, backend: Any) -> Any:
+    valid_length = length if spec.valid_length is None else spec.valid_length
+    iota = backend.arange(0, length, dtype=backend.int32(), device="cpu")
+    return backend.cast(iota < valid_length, backend.int32())
+
+
+def _literal_values_and_valid(spec: LiteralIndices, backend: Any) -> tuple[Any, Any]:
+    values = spec.values
+    valid = _valid_mask_for_length(spec, spec.length, backend)
+    return values, valid
+
+
+def _range_iota(length: int, backend: Any) -> Any:
+    return backend.arange(0, length, dtype=backend.int32(), device="cpu")
+
+
+def _chunk_ranks_for_indices_spec(
+    spec: IndicesSpec,
+    dim_size: int,
+    num_workers: int,
+    backend: Any,
+) -> tuple[Any, Any]:
+    length = spec.length
+    chunk_size = max((dim_size + num_workers - 1) // num_workers, 1)
+    if isinstance(spec, LiteralIndices):
+        values, valid = _literal_values_and_valid(spec, backend)
+        safe_values = backend.where(valid > 0, values, 0)
+        ranks = safe_values // chunk_size
+    elif isinstance(spec, IdentityIndices):
+        values = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = values // chunk_size
+    elif isinstance(spec, RangeIndices):
+        iota = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = (spec.start + iota * spec.stride) // chunk_size
+    else:
+        raise TypeError(f"ChunkPartition cannot route {type(spec).__name__}.")
+    return (
+        backend.where(
+            ranks >= num_workers,
+            backend.full(backend.shape(ranks), num_workers - 1, dtype=backend.int32()),
+            ranks,
+        ),
+        valid,
+    )
+
+
+def _cyclic_ranks_for_indices_spec(
+    spec: IndicesSpec,
+    num_workers: int,
+    backend: Any,
+) -> tuple[Any, Any]:
+    length = spec.length
+    if isinstance(spec, LiteralIndices):
+        values, valid = _literal_values_and_valid(spec, backend)
+        safe_values = backend.where(valid > 0, values, 0)
+        ranks = backend.mod(safe_values, num_workers)
+    elif isinstance(spec, IdentityIndices):
+        values = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = backend.mod(values, num_workers)
+    elif isinstance(spec, RangeIndices):
+        iota = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = backend.mod(spec.start + iota * spec.stride, num_workers)
+    else:
+        raise TypeError(f"CyclicPartition cannot route {type(spec).__name__}.")
+    return ranks, valid
+
+
+def _closed_form_indices_for_static_spec(
+    spec: IndicesSpec, backend: Any
+) -> tuple[Any, Any]:
+    length = spec.length
+    if isinstance(spec, LiteralIndices):
+        values = spec.values
+    elif isinstance(spec, IdentityIndices):
+        values = backend.arange(0, length, dtype=backend.int32(), device="cpu")
+    elif isinstance(spec, RangeIndices):
+        iota = backend.arange(0, length, dtype=backend.int32(), device="cpu")
+        values = spec.start + iota * spec.stride
+    elif isinstance(spec, ConstantIndices):
+        if length <= 0:
+            values = backend.zeros((0,), dtype=backend.int32(), device="cpu")
+        else:
+            values = backend.tensor([spec.value], dtype=backend.int32(), device="cpu")
+    else:
+        raise TypeError(f"Unsupported IndicesSpec type {type(spec).__name__}.")
+
+    valid = _valid_mask_for_length(spec, length, backend)
+    return values, valid
 
 
 # Singleton instances for common strategies.
@@ -1082,7 +1237,8 @@ class IndicesSpec:
     real and the rest are sentinel padding.
     """
 
-    pass
+    length: int
+    valid_length: int | None
 
 
 @dataclass(frozen=True)
@@ -1097,7 +1253,7 @@ class LiteralIndices(IndicesSpec):
 
     length: int
     values: Any = field(compare=False, hash=False, repr=False)
-    valid_length: int | None = None
+    valid_length: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.length < 0:
@@ -1126,7 +1282,7 @@ class RangeIndices(IndicesSpec):
     start: int
     length: int
     stride: int = 1
-    valid_length: int | None = None
+    valid_length: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.length < 0:
@@ -1146,9 +1302,7 @@ class RangeIndices(IndicesSpec):
         cls, start: int, length: int, valid_length: int | None = None
     ) -> RangeIndices:
         """Standard chunk source: rank `r` holds `[r*chunk, r*chunk+length)`."""
-        return cls(
-            start=int(start), length=int(length), stride=1, valid_length=valid_length
-        )
+        return cls(start=start, length=length, stride=1, valid_length=valid_length)
 
     @classmethod
     def cyclic(
@@ -1164,9 +1318,9 @@ class RangeIndices(IndicesSpec):
                 f"RangeIndices.cyclic.num_workers must be > 0; got {num_workers}"
             )
         return cls(
-            start=int(start),
-            length=int(length),
-            stride=int(num_workers),
+            start=start,
+            length=length,
+            stride=num_workers,
             valid_length=valid_length,
         )
 
@@ -1180,9 +1334,9 @@ class RangeIndices(IndicesSpec):
     ) -> RangeIndices:
         """Generic strided range — used by tests covering degenerate cases."""
         return cls(
-            start=int(start),
-            length=int(length),
-            stride=int(stride),
+            start=start,
+            length=length,
+            stride=stride,
             valid_length=valid_length,
         )
 
@@ -1196,7 +1350,7 @@ class IdentityIndices(IndicesSpec):
     """
 
     length: int
-    valid_length: int | None = None
+    valid_length: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.length < 0:
@@ -1237,8 +1391,8 @@ class ConstantIndices(IndicesSpec):
     """
 
     value: int
-    length: int = -1
-    valid_length: int | None = None
+    length: int = field(default=-1, kw_only=True)
+    valid_length: int | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.length < -1:
@@ -1509,7 +1663,7 @@ class RoutingDomain:
                 num_workers *= mesh.shape[mesh_names.index(name)]
             axes_list.append(
                 RoutingAxis(
-                    size=int(size),
+                    size=size,
                     num_workers=num_workers,
                     mesh_axes=mesh_axes,
                     strategy=routing.strategy,
@@ -1522,7 +1676,7 @@ class RoutingDomain:
         if target.replica_axes:
             replica = ReplicaSpec(
                 axes=tuple(target.replica_axes),
-                size=int(target.replica_size),
+                size=target.replica_size,
             )
         return RoutingDomain(
             axes=tuple(axes_list), mesh=mesh, replica=replica, combine=combine

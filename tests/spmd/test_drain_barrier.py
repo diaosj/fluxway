@@ -98,6 +98,21 @@ class TestDrainAckCallback:
         sync.report_worker_op_completed(1, "op_b", 3)
         assert fired.is_set()
 
+    def test_registered_op_without_prior_completion_blocks_drain(self):
+        sync = _make_sync(num_workers=1)
+        sync.register_expected_ops(["lookup", "update"])
+        sync.report_worker_op_completed(0, "lookup", 2)
+
+        fired = threading.Event()
+        sync.drain_to_step_count(target_count=2, on_drained=fired.set)
+        assert not fired.is_set()
+
+        sync.report_worker_op_completed(0, "update", 1)
+        assert not fired.is_set()
+
+        sync.report_worker_op_completed(0, "update", 2)
+        assert fired.is_set()
+
     def test_partial_worker_completion_does_not_fire_early(self):
         fired = threading.Event()
         sync = _make_sync(num_workers=3)

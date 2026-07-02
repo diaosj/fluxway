@@ -3,11 +3,21 @@ from typing import Any, Optional
 
 import numpy as np
 
-from fluxway.common.tensor_backend import get_backend, force_writable
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.index_descriptor import (
     ContinuousIndex,
     IndexDescriptor,
     ExplicitIndex,
+)
+from fluxway.common.tensor_components import (
+    TensorLayout,
+    TensorLineage,
+    TensorPayload,
+    TensorRouting,
+    normalize_index_descriptor,
+    routing_entity_count,
+    validate_dense_global_shape,
+    validate_metadata_lengths,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,157 +136,47 @@ class TransportTensor:
         receipt: SymmetryReceipt | None = None,
         routing_axes: tuple[int, ...] = (0,),
     ):
-        # routing_axes: which axes of flat_values are bound to the routing
-        # domain (consumed by the planner). Default (0,) is correct for
-        # virtually all DP/MP/EP/SP/CP/TP layouts. Non-leading bindings are
-        # rare and worth flagging once per tensor.
-        self._routing_axes: tuple[int, ...] = tuple(int(a) for a in routing_axes)
+        self._routing_axes: tuple[int, ...] = tuple(a for a in routing_axes)
         if len(self._routing_axes) != len(set(self._routing_axes)):
             raise ValueError(f"routing_axes must be unique, got {self._routing_axes}")
         if self._routing_axes != (0,):
             logger.warning(
                 "TransportTensor.routing_axes=%s (non-default). "
-                "Apply path will use the moveaxis+reshape fallback.",
+                "Apply path requires non-leading binding support.",
                 self._routing_axes,
             )
 
-        self._flat_values = flat_values
+        self._payload = TensorPayload.create(flat_values)
+        self._layout = TensorLayout.create(
+            nested_splits, global_shape, self._routing_axes
+        )
+        self._flat_values = self._payload.values
+        self._nested_splits = list(self._layout.nested_splits)
+        self._global_shape = self._layout.global_shape
+        backend = get_backend()
+        validate_dense_global_shape(self._payload, self._layout, backend)
 
-        # Ensure writable: transport deserialization (Ray RPC, pickle) may produce
-        # readonly NumPy arrays.  force_writable patches __array_interface__ to
-        # grant write access without copying.
-        self._flat_values = force_writable(self._flat_values)
+        data_len = routing_entity_count(self._payload, self._layout, backend)
+        origin_routing = TensorRouting.create(
+            normalize_index_descriptor(origin_indices, data_len)
+        )
+        self._lineage = TensorLineage(origin=origin_routing, receipt=receipt)
 
-        self._nested_splits = nested_splits if nested_splits is not None else []
-        # Same writable guarantee for nested_splits
-        for i, s in enumerate(self._nested_splits):
-            self._nested_splits[i] = force_writable(s)
-
-        self._global_shape = global_shape
-
-        if self._global_shape is not None and not self._nested_splits:
-            backend = get_backend()
-            try:
-                actual_shape = backend.shape(self._flat_values)
-                if len(actual_shape) != len(self._global_shape):
-                    raise ValueError(
-                        f"[Fluxway Validation Error] Dimensionality mismatch! "
-                        f"Actual flat_values has {len(actual_shape)} dimensions (shape: {actual_shape}), "
-                        f"but declared global_shape {self._global_shape} implies {len(self._global_shape)} dimensions. "
-                        f"Ensure you are not passing flattened data for a multi-dimensional global shape."
-                    )
-            except Exception as e:
-                if isinstance(e, ValueError) and "[Fluxway Validation Error]" in str(e):
-                    raise
-                # Fallback if shape cannot be resolved safely
-                pass
-
-        self._origin_indices: IndexDescriptor | None
-        if origin_indices is not None:
-            if isinstance(origin_indices, IndexDescriptor):
-                self._origin_indices = origin_indices
-            else:
-                self._origin_indices = ExplicitIndex(origin_indices)
-        else:
-            self._origin_indices = None
-
-        self._receipt = receipt
+        self._routing = TensorRouting.create(
+            normalize_index_descriptor(routing_indices, data_len)
+        )
         self._routing_indices_materialize_cache = None
         self._origin_indices_materialize_cache = None
-
-        self._routing_indices: IndexDescriptor | None
-        if isinstance(routing_indices, ContinuousIndex):
-            self._routing_indices = routing_indices
-        elif isinstance(routing_indices, slice):
-            backend = get_backend()
-            if not self._nested_splits:
-                if isinstance(self._flat_values, list):
-                    count = len(self._flat_values)
-                else:
-                    count = int(backend.shape(self._flat_values)[0])
-            else:
-                if isinstance(self._nested_splits[0], list):
-                    count = len(self._nested_splits[0]) - 1
-                else:
-                    count = int(backend.shape(self._nested_splits[0])[0]) - 1
-
-            start = routing_indices.start if routing_indices.start is not None else 0
-            stride = routing_indices.step if routing_indices.step is not None else 1
-            if routing_indices.stop is not None:
-                expected_count = (
-                    max(0, (routing_indices.stop - start + stride - 1) // stride)
-                    if stride > 0
-                    else max(
-                        0, (start - routing_indices.stop - stride - 1) // (-stride)
-                    )
-                )
-                if expected_count != count:
-                    raise ValueError(
-                        f"Slice implies count={expected_count}, but tensor has local count={count}"
-                    )
-
-            if stride == 1:
-                self._routing_indices = ContinuousIndex.chunk(start, count)
-            else:
-                self._routing_indices = ContinuousIndex.cyclic(start, stride, count)
-        elif routing_indices is not None:
-            if isinstance(routing_indices, IndexDescriptor):
-                self._routing_indices = routing_indices
-            else:
-                self._routing_indices = ExplicitIndex(routing_indices)
-        else:
-            self._routing_indices = None
-
-        if self._routing_indices is not None or self._origin_indices is not None:
-            backend = get_backend()
-            if not self._nested_splits:
-                if isinstance(self._flat_values, list):
-                    data_len = len(self._flat_values)
-                else:
-                    try:
-                        data_len = int(backend.shape(self._flat_values)[0])
-                    except Exception:
-                        data_len = -1  # scalar or unknown
-            else:
-                if isinstance(self._nested_splits[0], list):
-                    data_len = len(self._nested_splits[0]) - 1
-                else:
-                    try:
-                        data_len = int(backend.shape(self._nested_splits[0])[0]) - 1
-                    except Exception:
-                        data_len = -1
-
-            def _check_idx_len(idx_desc: IndexDescriptor | None, name: str):
-                if idx_desc is None:
-                    return
-                idx_len = None
-                if isinstance(idx_desc, ContinuousIndex):
-                    idx_len = idx_desc.count
-                elif isinstance(idx_desc, ExplicitIndex):
-                    if isinstance(idx_desc.indices, list):
-                        idx_len = len(idx_desc.indices)
-                    else:
-                        try:
-                            idx_len = int(backend.shape(idx_desc.indices)[0])
-                        except Exception:
-                            idx_len = -1
-
-                if (
-                    data_len != -1
-                    and idx_len is not None
-                    and idx_len != -1
-                    and data_len != idx_len
-                ):
-                    raise ValueError(
-                        f"[Fluxway Validation Error] Data batch dimension mismatch! "
-                        f"{name} length is {idx_len}, but data batch_size is {data_len} "
-                        f"(shape: {backend.shape(self._flat_values)}). "
-                        f"Ensure you did not flatten a multi-dimensional array (e.g. using .ravel()), "
-                        f"which breaks row-wise alignment for metadata tracking."
-                    )
-
-            _check_idx_len(self._routing_indices, "routing_indices")
-            _check_idx_len(self._origin_indices, "origin_indices")
+        self._routing_indices = self._routing.indices
+        self._origin_indices = self._lineage.origin.indices
+        self._receipt = self._lineage.receipt
+        validate_metadata_lengths(
+            self._payload,
+            self._layout,
+            self._routing,
+            self._lineage,
+            backend,
+        )
 
     @classmethod
     def from_tensor(
@@ -461,26 +361,42 @@ class TransportTensor:
 
     @property
     def flat_values(self) -> Any:
-        return self._flat_values
+        return self._payload.values
+
+    @property
+    def payload(self) -> TensorPayload:
+        return self._payload
+
+    @property
+    def layout(self) -> TensorLayout:
+        return self._layout
+
+    @property
+    def routing(self) -> TensorRouting:
+        return self._routing
+
+    @property
+    def lineage(self) -> TensorLineage:
+        return self._lineage
 
     @property
     def nested_splits(self) -> list[Any]:
-        return self._nested_splits
+        return list(self._layout.nested_splits)
 
     @property
     def is_dense(self) -> bool:
         """Returns True if this tensor is dense (no ragged dimensions)."""
-        return len(self._nested_splits) == 0
+        return self._layout.is_dense
 
     @property
     def is_ragged(self) -> bool:
         """Returns True if this tensor has ragged dimensions."""
-        return len(self._nested_splits) > 0
+        return self._layout.is_ragged
 
     @property
     def origin_indices(self) -> IndexDescriptor | None:
         """The underlying IndexDescriptor (metadata) for origin tracking."""
-        return self._origin_indices
+        return self._lineage.origin.indices
 
     @property
     def origin_indices_materialized(self) -> Any | None:
@@ -490,21 +406,12 @@ class TransportTensor:
         """
         if self._origin_indices is None:
             return None
-        if self._origin_indices_materialize_cache is not None:
-            return self._origin_indices_materialize_cache
-
-        if isinstance(self._origin_indices, ExplicitIndex):
-            self._origin_indices_materialize_cache = self._origin_indices.indices
-        elif isinstance(self._origin_indices, ContinuousIndex):
-            self._origin_indices_materialize_cache = self._origin_indices.materialize()
-        else:
-            self._origin_indices_materialize_cache = self._origin_indices
-        return self._origin_indices_materialize_cache
+        return self._lineage.origin.materialize()
 
     @property
     def routing_indices(self) -> IndexDescriptor | None:
         """The underlying IndexDescriptor (metadata) for spatial positioning."""
-        return self._routing_indices
+        return self._routing.indices
 
     @property
     def routing_indices_materialized(self) -> Any | None:
@@ -515,23 +422,12 @@ class TransportTensor:
         """
         if self._routing_indices is None:
             return None
-        if self._routing_indices_materialize_cache is not None:
-            return self._routing_indices_materialize_cache
-
-        if isinstance(self._routing_indices, ExplicitIndex):
-            self._routing_indices_materialize_cache = self._routing_indices.indices
-        elif isinstance(self._routing_indices, ContinuousIndex):
-            self._routing_indices_materialize_cache = (
-                self._routing_indices.materialize()
-            )
-        else:
-            self._routing_indices_materialize_cache = self._routing_indices
-        return self._routing_indices_materialize_cache
+        return self._routing.materialize()
 
     @property
     def global_shape(self) -> tuple[int, ...] | None:
         """Global shape of the full tensor across all ranks."""
-        return self._global_shape
+        return self._layout.global_shape
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -540,22 +436,19 @@ class TransportTensor:
         return backend.shape(self._flat_values)
 
     @property
-    def logical_count(self) -> int:
-        """Returns the number of logical elements in the primary dimension."""
-        backend = get_backend()
-        if self._nested_splits and len(self._nested_splits) > 0:
-            top_split = self._nested_splits[0]
-            if backend.shape(top_split)[0] > 0:
-                return int(backend.item(top_split[-1]))
-        return int(backend.shape(self._flat_values)[0])
-
-    @property
-    def logical_shape(self) -> tuple[int, ...]:
-        """Returns the logical shape, honoring ragged boundaries."""
+    def logical_shape(self) -> tuple[int | None, ...]:
+        """Returns the logical shape, honoring ragged boundaries.
+        Variable-length (ragged) dimensions are represented as `None`.
+        """
         backend = get_backend()
         p_shape = backend.shape(self._flat_values)
         if self._nested_splits and len(self._nested_splits) > 0:
-            return (self.logical_count,) + p_shape[1:]
+            top_split = self._nested_splits[0]
+            if backend.shape(top_split)[0] > 0:
+                bs = int(backend.shape(top_split)[0]) - 1
+            else:
+                bs = 0
+            return (bs, None) + p_shape[1:]
         return p_shape
 
     @property
@@ -571,10 +464,11 @@ class TransportTensor:
 
     @property
     def receipt(self) -> SymmetryReceipt | None:
-        return self._receipt
+        return self._lineage.receipt
 
     @receipt.setter
     def receipt(self, value: SymmetryReceipt | None):
+        self._lineage.receipt = value
         self._receipt = value
 
     @property

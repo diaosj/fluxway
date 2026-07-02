@@ -6,7 +6,8 @@ from unittest.mock import AsyncMock
 from fluxway.common.types.tensor import TransportTensor, SymmetryReceipt
 from fluxway.common.types.sharding import ShardingSpec
 from fluxway.common.mesh import DeviceMesh
-from fluxway.transport.communication import BaseDataDistributor
+from fluxway.transport.communication import AsyncDataDistributor
+from fluxway.transport.manifest import EDGE_EXPECTED_COUNT, PAYLOAD_VALID_COUNT
 
 
 class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
@@ -149,7 +150,7 @@ class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
         np.testing.assert_array_equal(p_groups[1][1], asmb2)
 
     def test_base_distributor_mirror_routing(self):
-        """Verify the BaseDataDistributor correctly handles mirror routing."""
+        """Verify mirror routing is encoded as a frame."""
         mesh = DeviceMesh(device_shape=(1,), axis_names=("worker",))
 
         # 1. Simulate a tensor with a receipt (e.g. received from rank 42)
@@ -164,7 +165,7 @@ class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
         # 2. Define a Mirror Sharding Spec
         spec = ShardingSpec.follow("some_op.input_tensor").bind(mesh)
 
-        distributor = BaseDataDistributor(local_rank=0)
+        distributor = AsyncDataDistributor(local_rank=0)
 
         # 3. Plan and Shard
         distributor.plan_and_shard(
@@ -173,22 +174,17 @@ class TestWorkerCommunicationLogic(unittest.IsolatedAsyncioTestCase):
             target=spec,  # target is also mirror
             tuuid=[123],
         )
-        # In Late Aggregation, we get results from the internal _dest_agg
-        # Each entry in _dest_agg[rank] is a 4-tuple: (tensors, counts, shapes, meta)
-        (
-            _tuuids,
-            payload_tensors,
-            payload_counts,
-            global_shapes_list,
-            meta_tensor_state_list,
-            _compact_params,
-        ) = distributor._dest_agg[42][0]
+        frame = distributor._build_transport_frame_for_target(
+            target_id=42,
+            groups=distributor._dest_agg[42],
+            step=1,
+            sender_spmd_code=0,
+            sender_world_size=1,
+        )
 
-        # Verification
-        self.assertEqual(len(payload_tensors), 1)
-        np.testing.assert_allclose(payload_tensors[0], data)
-        self.assertEqual(payload_counts, [3])
-        self.assertEqual(meta_tensor_state_list, [0])
+        self.assertEqual(int(frame.edge_i32[0, EDGE_EXPECTED_COUNT]), 1)
+        self.assertEqual(int(frame.payload_i32[0, PAYLOAD_VALID_COUNT]), 3)
+        np.testing.assert_allclose(frame.payload_segments[0], data)
 
 
 if __name__ == "__main__":

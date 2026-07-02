@@ -6,6 +6,7 @@ import dataclasses
 from typing import Any
 from collections.abc import Callable
 import logging
+import math
 
 import asyncio
 import numpy as np
@@ -16,7 +17,9 @@ from fluxway.common.types.sharding import (
     PhysicalLayout,
     RoutingAxis,
     RoutingDomain,
+    ChunkPartition,
     ConstantIndices,
+    CyclicPartition,
     IdentityIndices,
     IndicesSpec,
     LiteralIndices,
@@ -25,6 +28,25 @@ from fluxway.common.types.sharding import (
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.execution import compile
 from fluxway.common.index_descriptor import ContinuousIndex, IndexDescriptor
+from fluxway.common.ragged import encode_ragged_level_count, ragged_level_count
+from fluxway.common.tensor_components import (
+    index_descriptor_length,
+    index_source_to_indices_spec,
+    routing_entity_count,
+    select_destination_content_index_source,
+    select_source_geometry_index_source,
+)
+from fluxway.transport.manifest import (
+    EDGE_EMPTY_KIND,
+    EDGE_EXPECTED_COUNT,
+    EDGE_TUUID,
+    PAYLOAD_VALID_COUNT,
+    EmptyKind,
+    PayloadRole,
+    SenderEmissionMode,
+    TransportFrameBuilder,
+    TransportPlanManifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +169,9 @@ def _src_replicated_axes(src_spec: PhysicalLayout) -> tuple[str, ...]:
     return tuple(name for name in src_spec.mesh.axis_names if name not in used)
 
 
-def _is_owner_on_replicated_axes(src_spec: PhysicalLayout, src_local_rank: int) -> bool:
+def _is_owner_on_replicated_axes(
+    src_spec: PhysicalLayout | None, src_local_rank: int
+) -> bool:
     """True iff ``src_local_rank`` has coord 0 on every src-replicated axis.
 
     On the canonical (coord==0) rank we transmit real payload; on the
@@ -155,14 +179,14 @@ def _is_owner_on_replicated_axes(src_spec: PhysicalLayout, src_local_rank: int) 
     packets. This collapses ``K`` duplicate sends to 1 without dropping
     SPMD safety.
     """
+    if src_spec is None:
+        return True
+    if src_spec.mesh is None:
+        raise ValueError("src_spec.mesh is required for replicated-axis owner gating.")
     rep_axes = _src_replicated_axes(src_spec)
     if not rep_axes:
         return True
-    try:
-        coords = src_spec.mesh.get_coordinate(src_local_rank)
-    except (ValueError, AttributeError):
-        # Unknown / out-of-range rank: treat as owner to preserve at-least-once.
-        return True
+    coords = src_spec.mesh.get_coordinate(src_local_rank)
     axis_names = list(src_spec.mesh.axis_names)
     for ax in rep_axes:
         if ax in axis_names and coords[axis_names.index(ax)] != 0:
@@ -178,7 +202,7 @@ def _is_data_driven_routing(target: PhysicalLayout) -> bool:
     """
     if target is None:
         return False
-    return bool(target.is_content_addressable)
+    return target.is_content_addressable
 
 
 def _src_local_indices_for_routed_dim(
@@ -190,7 +214,7 @@ def _src_local_indices_for_routed_dim(
 ) -> IndicesSpec:
     """Derive the LOCAL IndicesSpec held by ``src_local_rank`` along ``dim``.
 
-    Four structural cases (no runtime data inspection):
+    Structural cases (no runtime data inspection):
 
     1. ``src_spec`` does not partition ``dim`` (src is replicated on this
        dim, or src has no spec at all): the rank holds the *full* global
@@ -214,24 +238,41 @@ def _src_local_indices_for_routed_dim(
        ``axes=(0,)`` row-binding; multi-routing-dim heterogeneous splits
        must be decomposed at the call-site (``_build_routing_domain``
        enforces zip-length consistency for non-primary axes).
-    4. Other partition strategies (Cyclic / Hash / Indexed): we currently
-       fall back to ``IdentityIndices(length=local_chunk_size)`` because
-       the strict-typed Cyclic/Hash spec extraction is part of the K-2
-       follow-up.  The fallback is correct for chunk-style src layouts
-       and is the dominant case in the codebase.
+    4. ``src_spec`` uses cyclic routing: each rank owns
+       ``{shard_rank + k * sub_size}``, expressed as ``RangeIndices`` with
+       ``stride=sub_size``.
     """
     if src_spec is None or dim not in src_spec.partitions:
-        return IdentityIndices(length=int(dst_global_dim))
+        return IdentityIndices(length=dst_global_dim)
+
+    if src_spec.is_content_addressable:
+        return IdentityIndices(length=dst_global_dim)
 
     sub_size = src_spec.shard_size(dim)
     if sub_size <= 0:
-        return IdentityIndices(length=int(dst_global_dim))
+        return IdentityIndices(length=dst_global_dim)
 
-    chunk = max(1, dst_global_dim // sub_size)
     shard_rank = src_spec.get_shard_rank(src_local_rank, dim)
+
+    if isinstance(src_spec.strategy, CyclicPartition):
+        if dst_global_dim <= shard_rank:
+            length = 0
+        else:
+            length = ((dst_global_dim - 1 - shard_rank) // sub_size) + 1
+        return RangeIndices.strided(
+            start=shard_rank,
+            length=length,
+            stride=sub_size,
+        )
+
+    if not isinstance(src_spec.strategy, ChunkPartition):
+        raise NotImplementedError(
+            f"Static source-side index derivation for {type(src_spec.strategy).__name__} "
+            "is not implemented. Supply explicit routing_indices for this tensor."
+        )
+
+    chunk = max(1, (dst_global_dim + sub_size - 1) // sub_size)
     start = shard_rank * chunk
-    # The last shard absorbs the remainder when dst_global_dim is not
-    # divisible by sub_size; conservative upper bound = dst_global_dim - start.
     length = min(chunk, max(0, dst_global_dim - start))
 
     # Patch L: detect isomorphic chunk geometry so the auxiliary axis
@@ -244,19 +285,21 @@ def _src_local_indices_for_routed_dim(
     # ``_build_routing_domain``.
     if target is not None and dim in target.partitions:
         try:
-            dst_sub_size = int(target.shard_size(dim))
+            dst_sub_size = target.shard_size(dim)
         except Exception:
             dst_sub_size = -1
-        if dst_sub_size > 0 and dst_sub_size == int(sub_size):
-            return ConstantIndices(value=int(start), length=-1)
+        if dst_sub_size > 0 and dst_sub_size == sub_size:
+            if length == 0:
+                return RangeIndices.contiguous(start=start, length=0)
+            return ConstantIndices(value=start, length=-1)
 
-    return RangeIndices.contiguous(start=int(start), length=int(length))
+    return RangeIndices.contiguous(start=start, length=length)
 
 
 def _expected_senders_per_dst(
     src_spec: PhysicalLayout | None,
     target: PhysicalLayout,
-    dst_global_shape: tuple[int, ...],
+    dst_global_shape: tuple[int | None, ...],
 ) -> tuple[int, ...] | None:
     """Compute static N per dst rank, or None when routing is data-driven.
 
@@ -270,136 +313,173 @@ def _expected_senders_per_dst(
     Returns None when any dst dim uses a data-driven strategy (Hash /
     Indexed) so the caller falls back to always-full SPMD.
     """
-    if _is_data_driven_routing(target):
+    if _is_data_driven_routing(target) or (
+        src_spec is not None and src_spec.is_content_addressable
+    ):
         return None
     if target is None or target.mesh is None:
         return None
 
-    dst_world = int(target.mesh.size)
+    dst_world = target.mesh.size
     counts = [0] * dst_world
 
     if src_spec is None or src_spec.mesh is None:
         return None
 
-    src_world = int(src_spec.mesh.size)
+    src_world = src_spec.mesh.size
     routed_dims = sorted(target.partitions.keys())
     if not routed_dims:
         return None
 
-    # Pre-compute per-dim chunk geometry for the dst layout.
-    dim_geom: dict[int, tuple[int, int, list[str]]] = {}
-    for dim in routed_dims:
-        global_dim = int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
-        sub_size = int(target.shard_size(dim))
-        if sub_size <= 0 or global_dim <= 0:
-            return None
-        chunk = max(1, global_dim // sub_size)
-        sub_axes = [ax for ax in target.partitions[dim] if ax in target.mesh.axis_names]
-        dim_geom[dim] = (chunk, sub_size, sub_axes)
-
     mesh_axis_names = list(target.mesh.axis_names)
 
     for src_rank in range(src_world):
-        # owner-gating: skip non-canonical replicas.
         if not _is_owner_on_replicated_axes(src_spec, src_rank):
             continue
 
-        # Per-dim: range -> set of dst sub-ranks intersected.
         per_dim_subranks: list[list[int]] = []
-        feasible = True
         for dim in routed_dims:
-            global_dim = (
-                int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
-            )
-            spec = _src_local_indices_for_routed_dim(
-                src_spec, src_rank, dim, global_dim, target=target
-            )
-            chunk, sub_size, _sub_axes = dim_geom[dim]
-            if isinstance(spec, ConstantIndices):
-                # Single-valued axis: the whole rank lives on one dst
-                # sub-rank along this dim.  ``value`` is the GLOBAL chunk
-                # start; ``value // chunk`` recovers the dst sub-rank
-                # under isomorphic geometry.
-                sub_rank = max(0, min(sub_size - 1, int(spec.value) // chunk))
-                per_dim_subranks.append([sub_rank])
-            elif isinstance(spec, RangeIndices):
-                if spec.length == 0:
-                    feasible = False
-                    break
-                lo = spec.start
-                hi = spec.start + (spec.length - 1) * spec.stride
-                lo, hi = (lo, hi) if lo <= hi else (hi, lo)
-                first_sub = max(0, min(sub_size - 1, lo // chunk))
-                last_sub = max(0, min(sub_size - 1, hi // chunk))
-                per_dim_subranks.append(list(range(first_sub, last_sub + 1)))
-            elif isinstance(spec, IdentityIndices):
-                if spec.length == 0:
-                    feasible = False
-                    break
-                last = spec.length - 1
-                first_sub = 0
-                last_sub = max(0, min(sub_size - 1, last // chunk))
-                per_dim_subranks.append(list(range(first_sub, last_sub + 1)))
-            else:
-                # LiteralIndices — data-driven; the outer guard should have
-                # caught this. Be defensive.
+            raw_dim = dst_global_shape[dim] if dim < len(dst_global_shape) else 0
+            global_dim = raw_dim if raw_dim is not None else 0
+            if global_dim <= 0:
                 return None
-        if not feasible:
+            per_dim_subranks.append(
+                _hit_dst_subranks_for_dim(src_spec, target, src_rank, dim, global_dim)
+            )
+            if not per_dim_subranks[-1]:
+                break
+        if not per_dim_subranks or any(not ranks for ranks in per_dim_subranks):
             continue
 
         hit_dsts: set[int] = set()
 
         def _walk(
-            d_idx: int,
+            dim_idx: int,
             mesh_coords: list[int],
-            out: set[int] = hit_dsts,
-            ranges: list[list[int]] = per_dim_subranks,
-            dims: list[int] = routed_dims,
+            *,
+            hit_dsts: set[int] = hit_dsts,
+            per_dim_subranks: list[list[int]] = per_dim_subranks,
         ) -> None:
-            if d_idx == len(dims):
+            if dim_idx == len(routed_dims):
                 dst_rank = 0
-                for c, s in zip(mesh_coords, target.mesh.shape, strict=True):
-                    dst_rank = dst_rank * s + c
-                if 0 <= dst_rank < dst_world:
-                    out.add(dst_rank)
+                for coord, size in zip(mesh_coords, target.mesh.shape, strict=True):
+                    dst_rank = dst_rank * size + coord
+                hit_dsts.add(dst_rank)
                 return
-            dim = dims[d_idx]
-            _chunk, sub_size, sub_axes = dim_geom[dim]
-            sub_sizes = [
+
+            dim = routed_dims[dim_idx]
+            sub_axes = tuple(
+                ax for ax in target.partitions[dim] if ax in target.mesh.axis_names
+            )
+            sub_sizes = tuple(
                 target.mesh.shape[mesh_axis_names.index(ax)] for ax in sub_axes
-            ]
-            for sub_rank in ranges[d_idx]:
-                # Unravel sub_rank into mesh coords on this dim's axes.
+            )
+            for sub_rank in per_dim_subranks[dim_idx]:
                 rem = sub_rank
-                local_coords = [0] * len(sub_sizes)
-                for i in range(len(sub_sizes)):
-                    rest = 1
-                    for s2 in sub_sizes[i + 1 :]:
-                        rest *= s2
-                    if rest == 0:
-                        local_coords[i] = 0
-                    elif i < len(sub_sizes) - 1:
-                        local_coords[i] = rem // rest
-                        rem = rem % rest
-                    else:
-                        local_coords[i] = rem
                 next_coords = list(mesh_coords)
-                for ax, c in zip(sub_axes, local_coords, strict=True):
-                    next_coords[mesh_axis_names.index(ax)] = c
-                _walk(d_idx + 1, next_coords)
+                for axis_pos, axis_size in enumerate(sub_sizes):
+                    tail = math.prod(sub_sizes[axis_pos + 1 :])
+                    coord = rem if tail == 1 else rem // tail
+                    rem = 0 if tail == 1 else rem % tail
+                    axis_name = sub_axes[axis_pos]
+                    mesh_pos = mesh_axis_names.index(axis_name)
+                    if next_coords[mesh_pos] not in (0, coord):
+                        raise ValueError(
+                            f"Overlapping target mesh axis {axis_name!r} maps to "
+                            f"conflicting coords {next_coords[mesh_pos]} and {coord}."
+                        )
+                    next_coords[mesh_pos] = coord
+                _walk(dim_idx + 1, next_coords)
 
         _walk(0, [0] * len(mesh_axis_names))
-        for d in hit_dsts:
-            counts[d] += 1
+        for dst_rank in hit_dsts:
+            if 0 <= dst_rank < dst_world:
+                counts[dst_rank] += 1
 
     return tuple(counts)
+
+
+def _hit_dst_subranks_for_dim(
+    src_spec: PhysicalLayout,
+    target: PhysicalLayout,
+    src_rank: int,
+    dim: int,
+    global_dim: int,
+) -> list[int]:
+    src_strategy = src_spec.strategy
+    dst_strategy = target.strategy
+    dst_sub_size = target.shard_size(dim)
+    if dst_sub_size <= 0:
+        raise ValueError(f"target shard size for dim={dim} must be positive.")
+
+    if dim not in src_spec.partitions:
+        return list(range(dst_sub_size))
+
+    src_sub_size = src_spec.shard_size(dim)
+    src_sub_rank = src_spec.get_shard_rank(src_rank, dim)
+
+    if isinstance(src_strategy, ChunkPartition) and isinstance(
+        dst_strategy, ChunkPartition
+    ):
+        src_chunk = max(1, (global_dim + src_sub_size - 1) // src_sub_size)
+        dst_chunk = max(1, (global_dim + dst_sub_size - 1) // dst_sub_size)
+        src_start = src_sub_rank * src_chunk
+        src_end = min(src_start + src_chunk, global_dim)
+        if src_start >= src_end:
+            return []
+        first = src_start // dst_chunk
+        last = (src_end - 1) // dst_chunk
+        return list(range(max(0, first), min(dst_sub_size - 1, last) + 1))
+
+    if isinstance(src_strategy, ChunkPartition) and isinstance(
+        dst_strategy, CyclicPartition
+    ):
+        src_chunk = max(1, (global_dim + src_sub_size - 1) // src_sub_size)
+        src_start = src_sub_rank * src_chunk
+        src_end = min(src_start + src_chunk, global_dim)
+        if src_start >= src_end:
+            return []
+        width = src_end - src_start
+        if width >= dst_sub_size:
+            return list(range(dst_sub_size))
+        return sorted({idx % dst_sub_size for idx in range(src_start, src_end)})
+
+    if isinstance(src_strategy, CyclicPartition) and isinstance(
+        dst_strategy, ChunkPartition
+    ):
+        dst_chunk = max(1, (global_dim + dst_sub_size - 1) // dst_sub_size)
+        hits = []
+        for dst_sub_rank in range(dst_sub_size):
+            dst_start = dst_sub_rank * dst_chunk
+            dst_end = min(dst_start + dst_chunk, global_dim)
+            if dst_start >= dst_end:
+                continue
+            first = dst_start + ((src_sub_rank - dst_start) % src_sub_size)
+            if first < dst_end:
+                hits.append(dst_sub_rank)
+        return hits
+
+    if isinstance(src_strategy, CyclicPartition) and isinstance(
+        dst_strategy, CyclicPartition
+    ):
+        gcd = math.gcd(src_sub_size, dst_sub_size)
+        return [
+            dst_sub_rank
+            for dst_sub_rank in range(dst_sub_size)
+            if src_sub_rank % gcd == dst_sub_rank % gcd
+        ]
+
+    raise NotImplementedError(
+        f"Static expected sender count is not implemented for "
+        f"{type(src_strategy).__name__} -> {type(dst_strategy).__name__}."
+    )
 
 
 def _materialise_dst_rank(
     target: PhysicalLayout,
     dims: list[int],
     coord: dict[int, int],
-    dst_global_shape: tuple[int, ...],
+    dst_global_shape: tuple[int | None, ...],
 ) -> int | None:
     """Closed-form dst rank for a single global entity coordinate.
 
@@ -413,7 +493,8 @@ def _materialise_dst_rank(
     for dim in dims:
         if dim not in target.partitions:
             continue
-        global_dim = int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
+        raw_dim = dst_global_shape[dim] if dim < len(dst_global_shape) else 0
+        global_dim = raw_dim if raw_dim is not None else 0
         sub_size = target.shard_size(dim)
         if sub_size <= 0 or global_dim <= 0:
             return None
@@ -450,7 +531,7 @@ def derive_src_side_view(
     src_spec: PhysicalLayout | None,
     src_local_rank: int,
     target: PhysicalLayout,
-    dst_global_shape: tuple[int, ...],
+    dst_global_shape: tuple[int | None, ...],
 ) -> SrcSideView:
     """Pure derivation of ``SrcSideView`` from layout + rank.
 
@@ -473,7 +554,8 @@ def derive_src_side_view(
     routed_dims = sorted(target.partitions.keys())
     per_dim: list[tuple[int, IndicesSpec]] = []
     for dim in routed_dims:
-        global_dim = int(dst_global_shape[dim]) if dim < len(dst_global_shape) else 0
+        raw_dim = dst_global_shape[dim] if dim < len(dst_global_shape) else 0
+        global_dim = raw_dim if raw_dim is not None else 0
         per_dim.append(
             (
                 dim,
@@ -524,6 +606,7 @@ class BaseDataDistributor:
         # consult ``expected_n_for_dst`` (or ``last_src_view``) instead of
         # threading their own implicit N to ``ArrivalBarrier``.
         self._current_src_view: SrcSideView | None = None
+        self._current_plan_manifest: TransportPlanManifest | None = None
 
     @property
     def last_src_view(self) -> SrcSideView | None:
@@ -551,12 +634,10 @@ class BaseDataDistributor:
         ``wait_for_n_slices`` so the receiver does not need to encode
         any private agreement with the distributor about empty packets.
         """
-        view = self._current_src_view
-        if view is None or view.expected_senders_per_dst is None:
-            return int(src_world_size)
-        if 0 <= dst_rank < len(view.expected_senders_per_dst):
-            return int(view.expected_senders_per_dst[dst_rank])
-        return int(src_world_size)
+        manifest = self._current_plan_manifest
+        if manifest is None:
+            return src_world_size
+        return manifest.expected_count_for(dst_rank)
 
     def _plan_mirror_group(
         self,
@@ -616,6 +697,8 @@ class BaseDataDistributor:
                     global_shapes_list,
                     has_meta_tensor_state_list,
                     slice_params,
+                    [int(EmptyKind.DATA_EMPTY_ALLOWED)]
+                    * len(has_meta_tensor_state_list),
                 )
             return
 
@@ -657,6 +740,14 @@ class BaseDataDistributor:
                 global_shapes_list,
                 has_meta_tensor_state_list,
                 slice_params,
+                [
+                    int(
+                        EmptyKind.DATA_EMPTY_ALLOWED
+                        if count > 0
+                        else EmptyKind.PROTOCOL_EMPTY
+                    )
+                ]
+                * len(has_meta_tensor_state_list),
             )
 
     def _plan_single_tensor_group(
@@ -673,6 +764,11 @@ class BaseDataDistributor:
         A group is defined as one or more tensors that SHARE the same routing indices
         (e.g. follow-sharding or explicitly aligned tensors).
         """
+        if tuuid is None:
+            raise ValueError(
+                "[Fluxway Distributor Error] tuuid is required for TransportFrame planning. "
+                "The frame ABI no longer supports implicit tensor identity."
+            )
 
         # Pack all tensors and lengths
         # local_data can be a TransportTensor or List[TransportTensor]
@@ -704,17 +800,9 @@ class BaseDataDistributor:
             target and target.is_referential
         )
         is_mirror = is_referential
-
-        # 1. Determine Addressability
-        # Mirror is never content-addressable (it uses physical receipts)
-        if is_referential:
-            dst_is_content_addressable = False
-        else:
-            dst_is_content_addressable = getattr(
-                target, "is_content_addressable", False
-            )
-
-        # 2. Pack Tensors and Metadata (Required for all paths)
+        source_is_content_addressable = bool(source and source.is_content_addressable)
+        target_is_content_addressable = bool(target and target.is_content_addressable)
+        # Pack Tensors and Metadata (Required for all paths)
         # All payloads/indices entering the eager pipeline below are
         # normalized to the active backend's native domain via
         # ``backend.adopt(x)`` here, so HybridBackend (which dispatches
@@ -725,7 +813,7 @@ class BaseDataDistributor:
         backend = get_backend()
         payloads = []
         has_meta_tensor_state_list = []
-        nested_length_list = []
+        nested_length_list: list[tuple | None] = []
         compact_desc_info: list[IndexDescriptor | None] = []
 
         for tt_idx, tt in enumerate(tensors_to_pack):
@@ -734,12 +822,18 @@ class BaseDataDistributor:
 
             if tt.is_ragged:
                 meta_tensor_state |= 1
-                splits = backend.adopt(tt.nested_splits[0])
-                lengths = splits[1:] - splits[:-1]
-                nested_length_list.append(lengths)
+                meta_tensor_state = encode_ragged_level_count(
+                    meta_tensor_state, len(tt.nested_splits)
+                )
+                level_lengths = []
+                for splits in tt.nested_splits:
+                    adopted_splits = backend.adopt(splits)
+                    level_lengths.append(adopted_splits[1:] - adopted_splits[:-1])
+                nested_length_list.append(tuple(level_lengths))
                 if is_mirror:
-                    payloads.append(lengths)
-                    nested_length_list.append(None)
+                    for lengths in level_lengths:
+                        payloads.append(lengths)
+                        nested_length_list.append(None)
             else:
                 nested_length_list.append(None)
 
@@ -749,52 +843,23 @@ class BaseDataDistributor:
                     compact_desc_info.append(tt.origin_indices)
                 else:
                     meta_tensor_state |= 2
-                    idx = (
-                        tt.origin_indices.materialize()
-                        if hasattr(tt.origin_indices, "materialize")
-                        else tt.origin_indices
-                    )
-                    # Hard interception: origin_indices length MUST match the
-                    # primary routing axis length of flat_values. A common
-                    # mistake is copying ``unique_ids.origin_indices`` (length
-                    # K = batch x col) onto a *deduplicated* TransportTensor
-                    # whose row count is N (unique count). The two lengths
-                    # silently disagree and would later surface as an opaque
-                    # ``numpy.take`` IndexError inside ``_jit_plan_and_pack``.
-                    # Catching it here keeps the error in fluxway's concept
-                    # space.
-                    pri_axis = (tt.routing_axes or (0,))[0]
-                    pri_shape = getattr(tt.flat_values, "shape", None)
-                    pri_len = (
-                        int(pri_shape[pri_axis])
-                        if pri_shape is not None and pri_axis < len(pri_shape)
-                        else None
-                    )
-                    idx_shape = getattr(idx, "shape", None)
-                    idx_len = (
-                        int(idx_shape[0])
-                        if idx_shape is not None and len(idx_shape) >= 1
-                        else None
-                    )
-                    if (
-                        pri_len is not None
-                        and idx_len is not None
-                        and idx_len != pri_len
-                    ):
+                    routing_len = routing_entity_count(tt.payload, tt.layout, backend)
+                    idx_len = index_descriptor_length(tt.origin_indices, backend)
+                    if idx_len is not None and idx_len != routing_len:
                         raise RuntimeError(
                             "[Fluxway TransportTensor Error] origin_indices "
                             f"length mismatch for tuuid(s)={self._format_tuuids(tuuid, tuuid_to_name)} "
                             f"(tt_idx={tt_idx}): "
-                            f"flat_values.shape={tuple(pri_shape) if pri_shape is not None else None}, "
-                            f"routing_axes={tt.routing_axes}, primary_axis={pri_axis}, "
-                            f"primary_axis_len={pri_len}, "
+                            f"flat_values.shape={tuple(getattr(tt.flat_values, 'shape', ()))}, "
+                            f"nested_levels={len(tt.nested_splits)}, "
+                            f"routing_axes={tt.routing_axes}, "
+                            f"routing_entity_count={routing_len}, "
                             f"origin_indices type={type(tt.origin_indices).__name__}, "
                             f"origin_indices length={idx_len}. "
-                            "Did you copy origin_indices from a different-length "
-                            "TransportTensor (e.g. unique_ids -> sparse_features after dedup)? "
-                            "Use TransportTensor(values) and rely on mirror reference "
-                            "to inherit the upstream routing instead."
+                            "For ragged tensors origin_indices describe outer routing "
+                            "entities, not flat occurrences."
                         )
+                    idx = tt.origin_indices.materialize()
                     payloads.append(backend.adopt(idx))
                     nested_length_list.append(None)
                     compact_desc_info.append(None)
@@ -803,7 +868,7 @@ class BaseDataDistributor:
 
             has_meta_tensor_state_list.append(meta_tensor_state)
 
-        # 3. Explicit Mirror Early-Exit
+        # Explicit Mirror Early-Exit
         # Hard interception: when the source/target declares mirror routing
         # (``is_referential``) we MUST have a SymmetryReceipt on the primary
         # tensor. Previously, a missing receipt silently fell through to the
@@ -838,97 +903,24 @@ class BaseDataDistributor:
             )
             return
 
-        # 1. Extract Initial Routing Signal from Primary Tensor
-        src_geometry_indices = primary.origin_indices
-        if src_geometry_indices is None:
-            src_geometry_indices = primary.routing_indices
-
-        # 2. Resolve Final Source Signal
-        if src_geometry_indices is not None:
-            # Case A: Explicitly provided indices (e.g. from a previous OP)
-            if hasattr(src_geometry_indices, "materialize"):
-                src_geometry_indices = src_geometry_indices.materialize()
-            src_geometry_indices = backend.adopt(src_geometry_indices)
-            # Hard interception: in the algebraic branch the routing source
-            # is built from ``primary.origin_indices`` (or, as a fallback,
-            # ``primary.routing_indices``). Its length defines the
-            # routing-domain size; if it disagrees with the primary's
-            # routing-axis length, ``sort_indices`` will index past the
-            # tensor's first dimension inside ``_jit_plan_and_pack``.
-            # Reject the mismatch here with a clear, fluxway-level error.
-            pri_axis_alg = (primary.routing_axes or (0,))[0]
-            pri_shape_alg = getattr(primary.flat_values, "shape", None)
-            pri_len_alg = (
-                int(pri_shape_alg[pri_axis_alg])
-                if pri_shape_alg is not None and pri_axis_alg < len(pri_shape_alg)
-                else None
-            )
-            src_shape_alg = getattr(src_geometry_indices, "shape", None)
-            src_len_alg = (
-                int(src_shape_alg[0])
-                if src_shape_alg is not None and len(src_shape_alg) >= 1
-                else None
-            )
-            if (
-                pri_len_alg is not None
-                and src_len_alg is not None
-                and src_len_alg != pri_len_alg
-            ):
-                raise RuntimeError(
-                    "[Fluxway Algebraic Routing Error] routing source "
-                    "length does not match primary.flat_values routing axis "
-                    f"for tuuid(s)={self._format_tuuids(tuuid, tuuid_to_name)}: "
-                    f"primary.flat_values.shape="
-                    f"{tuple(pri_shape_alg) if pri_shape_alg is not None else None}, "
-                    f"routing_axes={primary.routing_axes}, "
-                    f"primary_axis={pri_axis_alg}, primary_axis_len={pri_len_alg}, "
-                    f"routing_source_len={src_len_alg} "
-                    f"(from {'origin_indices' if primary.origin_indices is not None else 'routing_indices'}). "
-                    "Algebraic routing requires len(routing_source) == "
-                    "flat_values.shape[routing_axis]. Did you copy "
-                    "origin_indices from an upstream TransportTensor with a "
-                    "different row count? Either drop the stale "
-                    "origin_indices (use TransportTensor(values) and rely on "
-                    "mirror reference) or supply correctly-sized "
-                    "routing_indices."
-                )
-            dst_content_routing_values = None
-        elif source and source.is_content_addressable:
-            # Case B: Content-addressable (Dynamic) routing
-            src_geometry_indices = backend.adopt(primary.flat_values)
-            dst_content_routing_values = None
-        elif source:
-            # Case C: Rank-based (Static) routing
-            source_routing_dim = source.routing_dim
-            if isinstance(source_routing_dim, tuple):
-                source_routing_dim = source_routing_dim[0]
-
-            dim_size = (
-                local_shape[source_routing_dim]
-                if source_routing_dim < len(local_shape)
-                else 0
-            )
-            effective_rank = source.get_shard_rank(self.local_rank, source_routing_dim)
-            start = effective_rank * dim_size
-            src_geometry_indices = np.arange(start, start + dim_size, dtype=np.int32)
-            dst_content_routing_values = None
-        else:
+        if not source and primary.routing_indices is None:
             raise ValueError(
                 f"[Fluxway Distributor Error] No sharding source available for TUUID(s): {self._format_tuuids(tuuid, tuuid_to_name)}.\n"
                 f"  Problem: The algebraic path requires either a valid 'source' layout or explicit 'routing_indices'.\n"
                 f"  Fix: Ensure the TransportTensor is initialized with a source PhysicalLayout."
             )
 
-        # Resolve Destination Signal (Content-based Hash)
-        dst_is_content_addressable = target.is_content_addressable if target else False
-        if dst_is_content_addressable and not is_referential:
-            dst_content_routing_values = (
-                primary.routing_indices
-                if primary.routing_indices is not None
-                else primary.flat_values
+        src_geometry_indices, src_geometry_name = select_source_geometry_index_source(
+            routing_indices=primary.routing_indices,
+            origin_indices=primary.origin_indices,
+            source_is_content_addressable=source_is_content_addressable,
+            target_is_content_addressable=target_is_content_addressable,
+        )
+        if target_is_content_addressable and not is_referential:
+            dst_content_routing_values = select_destination_content_index_source(
+                routing_indices=primary.routing_indices,
+                flat_values=primary.flat_values,
             )
-            if hasattr(dst_content_routing_values, "materialize"):
-                dst_content_routing_values = dst_content_routing_values.materialize()
         else:
             dst_content_routing_values = None
 
@@ -950,7 +942,7 @@ class BaseDataDistributor:
             is_fallback_shape = (dst_shape == local_shape) or (
                 primary.global_shape is None
             )
-            src_mesh_size = source.mesh.size if source.mesh else 1
+            src_mesh_size = source.mesh.size if source.mesh is not None else 1
             # axis=[] → source.partitions == {} → fully replicated; local_shape == global_shape is correct
             is_src_replicated = not source.partitions
             if dst_shape is None or (
@@ -976,7 +968,11 @@ class BaseDataDistributor:
                     continue
                 global_dim = dst_shape[d]
                 sub_mesh_size = target.shard_size(d)
-                if global_dim > 0 and global_dim < sub_mesh_size:
+                if (
+                    global_dim is not None
+                    and global_dim > 0
+                    and global_dim < sub_mesh_size
+                ):
                     axis_names = list(axes)
                     raise ValueError(
                         f"\n[Fluxway Static Sharding Error] Data dimension {d} has size {global_dim}, "
@@ -989,11 +985,11 @@ class BaseDataDistributor:
                         f"or reduce the target mesh size."
                     )
 
-        if source and target:
+        if source is not None and target is not None:
             logger.debug(
-                f"[Distributor] Planning: src_mesh={source.mesh.size if source.mesh else 1}, "
-                f"dst_mesh={target.mesh.size if target.mesh else 1}, "
-                f"local_rank={self.local_rank}, src_indices={src_geometry_indices}"
+                f"[Distributor] Planning: src_mesh={source.mesh.size if source.mesh is not None else 1}, "
+                f"dst_mesh={target.mesh.size if target.mesh is not None else 1}, "
+                f"local_rank={self.local_rank}, src_index_source={src_geometry_name}"
             )
 
         # Set capacity bucket. Bucketing is *only* needed when the active
@@ -1001,6 +997,9 @@ class BaseDataDistributor:
         # eager paths (HybridBackend default, TorchBackend eager) keep
         # capacity == actual_req so all padding branches below are no-ops.
         actual_req = local_shape[0] if local_shape else 1
+        assert actual_req is not None, (
+            "actual_req (primary_local_shape[0]) must be statically known"
+        )
         bk_static = backend.requires_static_shapes()
         if isinstance(capacity, list | tuple):
             selected_capacity = None
@@ -1013,7 +1012,9 @@ class BaseDataDistributor:
             capacity = selected_capacity
         elif capacity is None:
             if bk_static:
-                if actual_req == 0:
+                if actual_req is None:
+                    capacity = None
+                elif actual_req == 0:
                     capacity = 0
                 elif actual_req <= 1024:
                     capacity = 1 << (actual_req - 1).bit_length()
@@ -1043,6 +1044,16 @@ class BaseDataDistributor:
             if not targets_to_send:
                 return
 
+            responsible = tuple(
+                (j * src_world_size) // target_world_size == self.local_rank
+                for j in range(target_world_size)
+            )
+            self._current_plan_manifest = TransportPlanManifest(
+                expected_senders_per_dst=(1,) * target_world_size,
+                sender_has_data_per_dst=responsible,
+                emission_mode=SenderEmissionMode.STATIC_PRODUCERS_ONLY,
+            )
+
             # Scalar payload has exactly 1 element; non-scalar carries actual length.
             counts = (
                 [1] * len(payloads)
@@ -1057,6 +1068,7 @@ class BaseDataDistributor:
                 global_shapes_list,
                 has_meta_tensor_state_list,
                 [None] * len(has_meta_tensor_state_list),
+                [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
             )
             return
 
@@ -1075,25 +1087,34 @@ class BaseDataDistributor:
         # eager backends the capacity equals actual_req and all branches
         # below are no-ops).
         padded_payloads = []
-        padded_nested_length_list = []
+        padded_nested_length_list: list[tuple[Any, ...] | None] = []
+        assert capacity is not None, "capacity must be resolved to an int"
         static_shapes = [capacity]
 
         for p, p_len in zip(payloads, nested_length_list, strict=True):
             if p_len is not None:
                 # Ragged payload
-                if bk_static and capacity != actual_req:
-                    pad_len_size = capacity - actual_req
-                else:
-                    pad_len_size = 0
+                padded_levels = []
+                for level, lengths in enumerate(p_len):
+                    if (
+                        bk_static
+                        and capacity is not None
+                        and actual_req is not None
+                        and capacity != actual_req
+                        and level == 0
+                    ):
+                        pad_len_size = capacity - actual_req
+                    else:
+                        pad_len_size = 0
 
-                if pad_len_size > 0:
-                    len_padding = backend.zeros(
-                        (pad_len_size,), dtype=backend.dtype(p_len)
-                    )
-                    padded_len = backend.cat([p_len, len_padding], dim=0)
-                else:
-                    padded_len = p_len
-                padded_nested_length_list.append(padded_len)
+                    if pad_len_size > 0:
+                        len_padding = backend.zeros(
+                            (pad_len_size,), dtype=backend.dtype(lengths)
+                        )
+                        padded_levels.append(backend.cat([lengths, len_padding], dim=0))
+                    else:
+                        padded_levels.append(lengths)
+                padded_nested_length_list.append(tuple(padded_levels))
 
                 flat_req = p.shape[0]
                 if bk_static and capacity != actual_req:
@@ -1142,31 +1163,6 @@ class BaseDataDistributor:
                     padded_p = p
                 padded_payloads.append(padded_p)
 
-        # Pad routing indices and routing values to capacity bucket shape with -1
-        if src_geometry_indices is not None:
-            src_geometry_indices = backend.as_tensor(
-                src_geometry_indices, dtype=backend.int32()
-            )
-            if bk_static and capacity != actual_req:
-                pad_size = capacity - actual_req
-                if pad_size > 0:
-                    padding = backend.full((pad_size,), -1, dtype=backend.int32())
-                    src_geometry_indices = backend.cat(
-                        [src_geometry_indices, padding], dim=0
-                    )
-
-        if dst_content_routing_values is not None:
-            dst_content_routing_values = backend.as_tensor(
-                dst_content_routing_values, dtype=backend.int32()
-            )
-            if bk_static and capacity != actual_req:
-                pad_size = capacity - actual_req
-                if pad_size > 0:
-                    padding = backend.full((pad_size,), -1, dtype=backend.int32())
-                    dst_content_routing_values = backend.cat(
-                        [dst_content_routing_values, padding], dim=0
-                    )
-
         # NOTE: ``capacity`` is a per-rank *padding bucket* applied to in-flight
         # tensors so XLA can trace stable shapes; it is intentionally decoupled
         # from the routing domain (which drives the routing math).  Do *not*
@@ -1195,16 +1191,24 @@ class BaseDataDistributor:
         # on src-replicated mesh axes (G), and static expected_senders_per_dst
         # (J). Distribution layer consumes ``src_view.is_sender_active`` and
         # ``src_view.expected_senders_per_dst`` in K-4/K-5.
+        if target is None:
+            raise ValueError(
+                f"[Fluxway Distributor Error] Cannot build routing domain for TUUID(s): "
+                f"{self._format_tuuids(tuuid, tuuid_to_name)}. Target must be a valid PhysicalLayout."
+            )
+
         src_view = derive_src_side_view(
             src_spec=source,
             src_local_rank=self.local_rank,
             target=target,
-            dst_global_shape=tuple(dst_shape)
+            dst_global_shape=tuple(s for s in dst_shape if s is not None)
             if dst_shape is not None
-            else tuple(local_shape),
+            else tuple(s for s in local_shape if s is not None),
         )
         # K-5: persist for upper layers (e.g. ArrivalBarrier N derivation).
         self._current_src_view = src_view
+
+        assert capacity is not None, "capacity must be resolved to an integer"
 
         domain = _build_routing_domain(
             target=target,
@@ -1215,7 +1219,9 @@ class BaseDataDistributor:
             bk_static=bk_static,
             capacity=capacity,
             actual_req=actual_req,
-            dst_global_shape=dst_shape,
+            dst_global_shape=tuple(s for s in dst_shape if s is not None)
+            if dst_shape is not None
+            else None,
         )
 
         # Split into (static, dynamic) legs so that under jax.jit the static
@@ -1257,7 +1263,12 @@ class BaseDataDistributor:
             static_shapes_tuple,
         )
 
-        if sort_indices is not None and capacity > actual_req:
+        if (
+            sort_indices is not None
+            and capacity is not None
+            and actual_req is not None
+            and capacity > actual_req
+        ):
             # Static-shape path only: trim sentinel rows that were padded into
             # the routing domain. Eager path has capacity == actual_req so
             # this branch is skipped.
@@ -1285,7 +1296,6 @@ class BaseDataDistributor:
                 strict=True,  # type: ignore
             ):  # type: ignore
                 if meta_tensor_state & 4:
-                    # TODO(He Jia): Support Cyclic
                     offset = int(offsets_host[device_id])
                     count = int(counts_host[device_id])
                     assert isinstance(desc_obj, ContinuousIndex)
@@ -1320,11 +1330,13 @@ class BaseDataDistributor:
                 p_flat.append(backend.get_contiguous_view(p_data, offset, count))
                 c_flat.append(count)
 
-                if p_len is not None:  # ragged: also slice the item-length array
+                for level_lengths in p_len or ():
                     len_offset = int(offsets_per_payload_host[c_idx + 1][device_id])
                     count_len = int(counts_per_payload_host[c_idx + 1][device_id])
                     p_flat.append(
-                        backend.get_contiguous_view(p_len, len_offset, count_len)
+                        backend.get_contiguous_view(
+                            level_lengths, len_offset, count_len
+                        )
                     )
                     c_flat.append(count_len)
                     c_idx += 1
@@ -1342,6 +1354,27 @@ class BaseDataDistributor:
                     c_idx += 1
             return p_flat, c_flat
 
+        empty_flat_payloads_cache = None
+
+        def _get_empty_flat_payloads():
+            nonlocal empty_flat_payloads_cache
+            if empty_flat_payloads_cache is not None:
+                return empty_flat_payloads_cache
+            p_flat = []
+            p_idx = 0
+            for meta_state in has_meta_tensor_state_list:
+                p_data, p_len = flat_buffers_lists[p_idx]
+                p_flat.append(backend.get_contiguous_view(p_data, 0, 0))
+                for level_lengths in p_len or ():
+                    p_flat.append(backend.get_contiguous_view(level_lengths, 0, 0))
+                p_idx += 1
+                if meta_state & 2:
+                    p_data, _ = flat_buffers_lists[p_idx]
+                    p_flat.append(backend.get_contiguous_view(p_data, 0, 0))
+                    p_idx += 1
+            empty_flat_payloads_cache = (p_flat, [0] * len(p_flat))
+            return empty_flat_payloads_cache
+
         is_replicated = replication_factor > 1
 
         # Patch K-4: src_view drives SPMD-safe empty-packet emission.
@@ -1358,28 +1391,54 @@ class BaseDataDistributor:
         # transmit zero-count payloads to avoid double-counting.
         expected_per_dst = src_view.expected_senders_per_dst
         is_sender_active = src_view.is_sender_active
+        if expected_per_dst is None:
+            if source is None or source.mesh is None:
+                raise ValueError(
+                    "[Fluxway Distributor Error] Dynamic transport manifest requires "
+                    "a source PhysicalLayout with mesh to determine sender world size."
+                )
+            source_world_size = source.mesh.size
+            manifest = TransportPlanManifest(
+                expected_senders_per_dst=(source_world_size,) * len(counts_host),
+                sender_has_data_per_dst=tuple(bool(count) for count in counts_host),
+                emission_mode=SenderEmissionMode.ALL_SENDERS_WITH_PROTOCOL_EMPTY,
+            )
+        else:
+            manifest = TransportPlanManifest(
+                expected_senders_per_dst=expected_per_dst,
+                sender_has_data_per_dst=tuple(
+                    (is_sender_active and int(count) > 0) for count in counts_host
+                ),
+                emission_mode=SenderEmissionMode.STATIC_PRODUCERS_ONLY,
+            )
+        self._current_plan_manifest = manifest
+        expected_counts = manifest.expected_senders_per_dst
+        sender_has_data = manifest.sender_has_data_per_dst
+        emit_all_senders = (
+            manifest.emission_mode is SenderEmissionMode.ALL_SENDERS_WITH_PROTOCOL_EMPTY
+        )
 
         if is_replicated:
             # Fan-out
             sorted_dest_host = _backend.to_numpy(dest_devices)
 
             for device_id, count in enumerate(counts_host):
-                # Static optimization: skip a dst whose expected sender
-                # count is 0 (proven unreached by the routing closed-form).
-                if (
-                    expected_per_dst is not None
-                    and device_id < len(expected_per_dst)
-                    and expected_per_dst[device_id] == 0
+                if expected_counts[device_id] <= 0 or (
+                    not emit_all_senders and not sender_has_data[device_id]
                 ):
                     continue
 
                 targets = sorted_dest_host[device_id].flatten().tolist()
-                p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
-
-                # Owner gating: non-canonical replicas emit empty packets
-                # but still participate in the SPMD round.
-                if not is_sender_active:
-                    c_flat = [0] * len(c_flat)
+                if sender_has_data[device_id]:
+                    p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
+                    empty_kind_list = [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(
+                        has_meta_tensor_state_list
+                    )
+                else:
+                    p_flat, c_flat = _get_empty_flat_payloads()
+                    empty_kind_list = [int(EmptyKind.PROTOCOL_EMPTY)] * len(
+                        has_meta_tensor_state_list
+                    )
 
                 yield (
                     targets,
@@ -1389,26 +1448,27 @@ class BaseDataDistributor:
                     global_shapes_list,
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
+                    empty_kind_list,
                 )
         else:
             # Scatter-send
             for device_id, count in enumerate(counts_host):
-                # Static optimization: skip a dst whose expected sender
-                # count is 0 (proven unreached by the routing closed-form).
-                if (
-                    expected_per_dst is not None
-                    and device_id < len(expected_per_dst)
-                    and expected_per_dst[device_id] == 0
+                if expected_counts[device_id] <= 0 or (
+                    not emit_all_senders and not sender_has_data[device_id]
                 ):
                     continue
 
                 targets = [device_id]
-                p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
-
-                # Owner gating: non-canonical replicas emit empty packets
-                # but still participate in the SPMD round.
-                if not is_sender_active:
-                    c_flat = [0] * len(c_flat)
+                if sender_has_data[device_id]:
+                    p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
+                    empty_kind_list = [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(
+                        has_meta_tensor_state_list
+                    )
+                else:
+                    p_flat, c_flat = _get_empty_flat_payloads()
+                    empty_kind_list = [int(EmptyKind.PROTOCOL_EMPTY)] * len(
+                        has_meta_tensor_state_list
+                    )
 
                 yield (
                     targets,
@@ -1418,6 +1478,7 @@ class BaseDataDistributor:
                     global_shapes_list,
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
+                    empty_kind_list,
                 )
 
     def plan_and_shard(
@@ -1430,6 +1491,11 @@ class BaseDataDistributor:
         tuuid_to_name: dict[int, str] | None = None,
     ) -> None:
         """Computes sharding plan and buffers data for all destinations."""
+        if tuuid is None:
+            raise ValueError(
+                "[Fluxway Distributor Error] tuuid is required for TransportFrame planning. "
+                "The frame ABI no longer supports implicit tensor identity."
+            )
 
         # PLAN ISOLATION:
         # We MUST NOT reuse plans across separate calls to plan_and_shard.
@@ -1438,6 +1504,7 @@ class BaseDataDistributor:
         self._meta_sort_indices = None
         self._current_source_spec = source
         self._current_target_spec = target
+        self._current_plan_manifest = None
 
         for (
             targets,
@@ -1447,6 +1514,7 @@ class BaseDataDistributor:
             global_shapes_list,
             has_meta_tensor_state_list,
             slice_compact_desc_params,
+            empty_kind_list,
         ) in self._plan_single_tensor_group(
             local_data, source, target, capacity, tuuid, tuuid_to_name
         ):
@@ -1465,72 +1533,68 @@ class BaseDataDistributor:
                         global_shapes_list,
                         has_meta_tensor_state_list,
                         slice_compact_desc_params,
+                        empty_kind_list,
                     )
                 )
 
 
-class SyncDataDistributor(BaseDataDistributor):
-    """Synchronous Data Distributor."""
-
-    def distribute(
-        self,
-        local_data: TransportTensor | list[TransportTensor] | None = None,
-        source: PhysicalLayout | None = None,
-        target: PhysicalLayout | None = None,
-        send_fn: Callable | None = None,
-        capacity: int | list[int] | None = None,
-        tuuid: int | list[int] | None = None,
-        tuuid_to_name: dict[int, str] | None = None,
-    ) -> tuple[list[Any], Any]:
-        """Performs synchronous distribution."""
-        if local_data is not None:
-            self.plan_and_shard(
-                local_data, source, target, capacity, tuuid, tuuid_to_name
-            )
-
-        if send_fn is None:
-            return [], self._meta_sort_indices
-
-        results = []
-        for target_id in sorted(self._dest_agg.keys()):
-            groups = self._dest_agg[target_id]
-            merged_tuuids = []
-            merged_tensors = []
-            merged_counts = []
-            merged_g_shapes = []
-            merged_h_states = []
-            merged_c_params = []
-            for tuuids, tensors, counts, g_shapes, h_states, c_params in groups:
-                if isinstance(tuuids, list | tuple):
-                    merged_tuuids.extend(tuuids)
-                else:
-                    merged_tuuids.append(tuuids)
-                merged_tensors.extend(tensors)
-                merged_counts.extend(counts)
-                merged_g_shapes.extend(g_shapes)
-                merged_h_states.extend(h_states)
-                merged_c_params.extend(c_params)
-
-            res = send_fn(
-                target_id,
-                merged_tuuids,
-                merged_tensors,
-                merged_counts,
-                merged_g_shapes,
-                merged_h_states,
-                merged_c_params,
-            )
-
-            results.append(res)
-
-        self._dest_agg.clear()
-        sort_indices = self._meta_sort_indices
-        self._meta_sort_indices = None
-        return results, sort_indices
-
-
 class AsyncDataDistributor(BaseDataDistributor):
-    """Asynchronous Data Distributor (using asyncio)."""
+    """Frame-only asynchronous data distributor."""
+
+    def build_transport_frame_args(
+        self,
+        *,
+        step: int,
+        sender_spmd_code: int,
+        sender_world_size: int,
+    ) -> list[tuple[int, Any, Any, Any, Any, Any, Any, tuple[Any, ...]]]:
+        frame_args = []
+        for target_id in sorted(self._dest_agg.keys()):
+            frame = self._build_transport_frame_for_target(
+                target_id=target_id,
+                groups=self._dest_agg[target_id],
+                step=step,
+                sender_spmd_code=sender_spmd_code,
+                sender_world_size=sender_world_size,
+            )
+            if logger.isEnabledFor(logging.DEBUG):
+                edge_summary = []
+                for row in frame.edge_i32:
+                    payload_begin = int(row[3])
+                    payload_count = int(row[4])
+                    valid_count = 0
+                    if payload_count > 0:
+                        valid_count = int(
+                            frame.payload_i32[payload_begin][PAYLOAD_VALID_COUNT]
+                        )
+                    edge_summary.append(
+                        (
+                            int(row[EDGE_TUUID]),
+                            valid_count,
+                            EmptyKind(int(row[EDGE_EMPTY_KIND])).name,
+                            int(row[EDGE_EXPECTED_COUNT]),
+                        )
+                    )
+                logger.debug(
+                    "[TransportFrame] sender_rank=%d target_rank=%d step=%d edges=%s",
+                    self.local_rank,
+                    target_id,
+                    step,
+                    edge_summary,
+                )
+            frame_args.append(
+                (
+                    target_id,
+                    frame.frame_i32,
+                    frame.edge_i32,
+                    frame.payload_i32,
+                    frame.shape_i32,
+                    frame.global_shape_i64,
+                    frame.compact_i64,
+                    frame.payload_segments,
+                )
+            )
+        return frame_args
 
     async def distribute(
         self,
@@ -1541,8 +1605,10 @@ class AsyncDataDistributor(BaseDataDistributor):
         capacity: int | list[int] | None = None,
         tuuid: int | list[int] | None = None,
         tuuid_to_name: dict[int, str] | None = None,
+        step: int = 0,
+        sender_spmd_code: int = 0,
+        sender_world_size: int = 1,
     ) -> tuple[list[Any], Any]:
-        """Performs asynchronous distribution."""
         if local_data is not None:
             self.plan_and_shard(
                 local_data, source, target, capacity, tuuid, tuuid_to_name
@@ -1551,35 +1617,32 @@ class AsyncDataDistributor(BaseDataDistributor):
         if send_fn is None:
             return [], self._meta_sort_indices
 
+        frame_args = self.build_transport_frame_args(
+            step=step,
+            sender_spmd_code=sender_spmd_code,
+            sender_world_size=sender_world_size,
+        )
         tasks = []
-        for target_id in sorted(self._dest_agg.keys()):
-            groups = self._dest_agg[target_id]
-            merged_tuuids = []
-            merged_tensors = []
-            merged_counts = []
-            merged_g_shapes = []
-            merged_h_states = []
-            merged_c_params = []
-            for tuuids, tensors, counts, g_shapes, h_states, c_params in groups:
-                if isinstance(tuuids, list | tuple):
-                    merged_tuuids.extend(tuuids)
-                else:
-                    merged_tuuids.append(tuuids)
-                merged_tensors.extend(tensors)
-                merged_counts.extend(counts)
-                merged_g_shapes.extend(g_shapes)
-                merged_h_states.extend(h_states)
-                merged_c_params.extend(c_params)
-
+        for (
+            target_id,
+            frame_i32,
+            edge_i32,
+            payload_i32,
+            shape_i32,
+            global_shape_i64,
+            compact_i64,
+            payload_segments,
+        ) in frame_args:
             tasks.append(
                 send_fn(
                     target_id,
-                    merged_tuuids,
-                    merged_tensors,
-                    merged_counts,
-                    merged_g_shapes,
-                    merged_h_states,
-                    merged_c_params,
+                    frame_i32,
+                    edge_i32,
+                    payload_i32,
+                    shape_i32,
+                    global_shape_i64,
+                    compact_i64,
+                    *payload_segments,
                 )
             )
 
@@ -1589,9 +1652,85 @@ class AsyncDataDistributor(BaseDataDistributor):
         self._meta_sort_indices = None
         return res, sort_indices
 
-
-# compatibility
-DataDistributor = SyncDataDistributor
+    def _build_transport_frame_for_target(
+        self,
+        *,
+        target_id: int,
+        groups: list[tuple],
+        step: int,
+        sender_spmd_code: int,
+        sender_world_size: int,
+    ):
+        builder = TransportFrameBuilder(
+            step=step,
+            sender_spmd_code=sender_spmd_code,
+            sender_rank=self.local_rank,
+            sender_world_size=sender_world_size,
+        )
+        expected_count = self.expected_n_for_dst(target_id, sender_world_size)
+        for (
+            tuuids,
+            tensors,
+            counts,
+            g_shapes,
+            h_states,
+            c_params,
+            empty_kinds,
+        ) in groups:
+            if isinstance(tuuids, list | tuple):
+                tuuid_seq = list(tuuids)
+            else:
+                tuuid_seq = [tuuids]
+            if len(empty_kinds) != len(tuuid_seq):
+                raise ValueError(
+                    f"empty_kinds length {len(empty_kinds)} does not match "
+                    f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+                )
+            cursor = 0
+            for edge_idx, u in enumerate(tuuid_seq):
+                meta_state = h_states[edge_idx]
+                component_count = 1 + ragged_level_count(meta_state)
+                if meta_state & 2:
+                    component_count += 1
+                edge_counts = counts[cursor : cursor + component_count]
+                compact_params = (
+                    c_params[edge_idx]
+                    if c_params is not None and edge_idx < len(c_params)
+                    else None
+                )
+                edge = builder.add_edge(
+                    tuuid=int(u),
+                    meta_state=int(meta_state),
+                    empty_kind=EmptyKind(int(empty_kinds[edge_idx])),
+                    min_rows=0,
+                    expected_count=expected_count,
+                    compact_params=compact_params,
+                    global_shape=g_shapes[edge_idx],
+                )
+                builder.add_payload(
+                    edge,
+                    PayloadRole.VALUES,
+                    tensors[cursor],
+                    int(edge_counts[0]),
+                )
+                cursor += 1
+                for _ in range(ragged_level_count(meta_state)):
+                    builder.add_payload(
+                        edge,
+                        PayloadRole.RAGGED_LENGTHS,
+                        tensors[cursor],
+                        int(counts[cursor]),
+                    )
+                    cursor += 1
+                if meta_state & 2:
+                    builder.add_payload(
+                        edge,
+                        PayloadRole.ORIGIN,
+                        tensors[cursor],
+                        int(counts[cursor]),
+                    )
+                    cursor += 1
+        return builder.build()
 
 
 # ---------------------------------------------------------------------------
@@ -1915,7 +2054,7 @@ def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
 def _build_routing_domain(
     target: PhysicalLayout,
     src_view: SrcSideView,
-    primary_local_shape: tuple[int, ...],
+    primary_local_shape: tuple[int | None, ...],
     src_geometry_indices: Any | None,
     dst_content_routing_values: Any | None,
     bk_static: bool,
@@ -1979,17 +2118,19 @@ def _build_routing_domain(
 
     # Encode capacity bucketing into the IndicesSpec: ``length`` is the
     # padded buffer length; ``valid_length`` is the real entry count.
-    padded = bool(bk_static and capacity > actual_req)
-    primary_length = int(capacity if padded else actual_req)
-    primary_valid_length: int | None = int(actual_req) if padded else None
+    padded = bk_static and capacity > actual_req
+    primary_length = capacity if padded else actual_req
+    primary_valid_length: int | None = actual_req if padded else None
 
     def _global_dim(d: int) -> int:
         if dst_global_shape is not None and d < len(dst_global_shape):
             v = dst_global_shape[d]
             if v is not None:
-                return int(v)
+                return v
         if d < len(primary_local_shape):
-            return int(primary_local_shape[d])
+            v2 = primary_local_shape[d]
+            if v2 is not None:
+                return v2
         raise ValueError(
             f"_build_routing_domain: cannot determine global size of routing dim {d}; "
             f"dst_global_shape={dst_global_shape}, primary_local_shape={primary_local_shape}"
@@ -2002,17 +2143,25 @@ def _build_routing_domain(
         if dim == primary_dim:
             if primary_indices is not None:
                 axis_indices_list.append(
-                    LiteralIndices(
+                    index_source_to_indices_spec(
+                        primary_indices,
                         length=primary_length,
-                        values=primary_indices,
                         valid_length=primary_valid_length,
+                        backend=get_backend(),
                     )
                 )
             else:
-                # No materialised indices supplied for the primary axis.
-                # Fall back to the SrcSideView-derived LOCAL spec so the
-                # planner still sees the rank's fragment correctly.
-                axis_indices_list.append(src_view.indices_for(dim))
+                src_spec = src_view.indices_for(dim)
+                if isinstance(src_spec, ConstantIndices) and src_spec.length < 0:
+                    axis_indices_list.append(
+                        RangeIndices.contiguous(
+                            start=src_spec.value,
+                            length=primary_length,
+                            valid_length=primary_valid_length,
+                        )
+                    )
+                else:
+                    axis_indices_list.append(src_spec)
         else:
             # Auxiliary routed axes: consume the LOCAL IndicesSpec from
             # SrcSideView (Patch K — fixes Patch F: previous code hard-
@@ -2037,7 +2186,7 @@ def _build_routing_domain(
     primary_eff_length: int | None = None
     for spec in axis_indices_list:
         if not (isinstance(spec, ConstantIndices) and spec.length < 0):
-            primary_eff_length = int(spec.length)
+            primary_eff_length = spec.length
             break
     if primary_eff_length is None:
         primary_eff_length = 1
@@ -2046,7 +2195,7 @@ def _build_routing_domain(
         if isinstance(spec, ConstantIndices) and spec.length < 0:
             finalised.append(
                 ConstantIndices(
-                    value=int(spec.value),
+                    value=spec.value,
                     length=primary_eff_length,
                     valid_length=spec.valid_length,
                 )
@@ -2079,6 +2228,51 @@ def _apply_with_binding(data: Any, sort_indices: Any, axes: tuple[int, ...]) -> 
         "Non-leading routing_axes binding is not yet supported across all "
         f"backends. Got axes={axes}; only the default (0,) is implemented."
     )
+
+
+def _ragged_project_rows_to_flat(
+    backend,
+    level_lengths: tuple[Any, ...],
+    row_sort_indices,
+    level_caps: tuple[int, ...],
+):
+    """Project routed outer rows through all ragged levels to flat values.
+
+    Example:
+      rows -> lists -> values
+      splits0: [0, 2, 3]      row 0 owns child lists [0, 2)
+      splits1: [0, 2, 3, 6]   those child lists own flat values [0, 3)
+
+    The planner only sorts outer rows. This helper keeps transport open to
+    deeper ragged topologies by repeatedly expanding sorted parent ids into
+    child ids until the last level describes flat value segments.
+    """
+    zero = backend.zeros((1,), dtype=backend.int32(), device="cpu")
+    parent_ids = row_sort_indices
+    reordered_levels = []
+
+    for lengths, total_children in zip(level_lengths, level_caps, strict=True):
+        offsets = backend.cat([zero, backend.cumsum(lengths)[:-1]], dim=0)
+        starts = backend.take(offsets, parent_ids)
+        reordered_lengths = backend.take(lengths, parent_ids)
+        reordered_levels.append(reordered_lengths)
+
+        child_offsets = backend.cat([zero, backend.cumsum(reordered_lengths)], dim=0)
+        child_count = backend.shape(reordered_lengths)[0]
+        child_parent_ids = backend.repeat_interleave(
+            backend.arange(0, child_count, dtype=backend.int32(), device="cpu"),
+            reordered_lengths,
+            total_repeat_length=total_children,
+        )
+        child_iota = backend.arange(
+            0, total_children, dtype=backend.int32(), device="cpu"
+        )
+        child_starts = backend.take(child_offsets, child_parent_ids)
+        child_inner_offsets = child_iota - child_starts
+        parent_starts = backend.take(starts, child_parent_ids)
+        parent_ids = parent_starts + child_inner_offsets
+
+    return parent_ids, tuple(reordered_levels)
 
 
 @compile(static_argnums=(2, 3, 5, 6))
@@ -2140,8 +2334,8 @@ def _jit_plan_and_pack(
 
     for i in range(len(payloads_tuple)):
         data = payloads_tuple[i]
-        lengths = nested_length_list[i]
-        is_ragged = lengths is not None
+        level_lengths = nested_length_list[i]
+        is_ragged = level_lengths is not None
         axes = payload_routing_axes[i]
 
         if not is_ragged:
@@ -2155,45 +2349,45 @@ def _jit_plan_and_pack(
             offsets_per_payload.append(send_offsets)
 
         else:
-            # Ragged path: routing always binds to the outermost axis (0,).
-            # ``flat_cap`` is the static upper bound on total flat elements
-            # so XLA knows the output size of repeat_interleave at trace time.
-            flat_cap = static_shapes[i + 1]
-            item_offsets_orig = backend.cat([zero, backend.cumsum(lengths)[:-1]], dim=0)
-            reordered_item_starts = backend.take(item_offsets_orig, sort_indices)
-            reordered_item_lengths = backend.take(lengths, sort_indices)
-
-            reordered_flat_offsets = backend.cat(
-                [zero, backend.cumsum(reordered_item_lengths)], dim=0
+            # Ragged path: routing binds to outer rows, then projects row
+            # order through every nested split level before gathering values.
+            level_caps = tuple(
+                int(backend.shape(level_lengths[j + 1])[0])
+                if j + 1 < len(level_lengths)
+                else static_shapes[i + 1]
+                for j in range(len(level_lengths))
             )
-
-            num_items = backend.shape(reordered_item_lengths)[0]
-            item_ids = backend.repeat_interleave(
-                backend.arange(0, num_items, dtype=backend.int32(), device="cpu"),
-                reordered_item_lengths,
-                total_repeat_length=flat_cap,
+            flat_indices, reordered_levels = _ragged_project_rows_to_flat(
+                backend, level_lengths, sort_indices, level_caps
             )
-
-            iota = backend.arange(0, flat_cap, dtype=backend.int32(), device="cpu")
-            reordered_flat_starts = backend.take(reordered_flat_offsets, item_ids)
-            inner_offsets = iota - reordered_flat_starts
-
-            orig_item_starts = backend.take(reordered_item_starts, item_ids)
-            flat_indices = orig_item_starts + inner_offsets
-
             reordered_data = backend.take(data, flat_indices)
-            send_flat_offsets = backend.take(reordered_flat_offsets, send_offsets)
 
-            flat_cs = backend.cat([zero, backend.cumsum(reordered_item_lengths)], dim=0)
-            send_flat_counts = backend.take(
-                flat_cs, send_offsets + send_counts
-            ) - backend.take(flat_cs, send_offsets)
+            level_counts = []
+            level_offsets = []
+            parent_offsets = send_offsets
+            parent_counts = send_counts
+            for reordered_lengths in reordered_levels:
+                level_counts.append(parent_counts)
+                level_offsets.append(parent_offsets)
+                level_cs = backend.cat([zero, backend.cumsum(reordered_lengths)], dim=0)
+                child_offsets = backend.take(level_cs, parent_offsets)
+                child_counts = backend.take(
+                    level_cs, parent_offsets + parent_counts
+                ) - backend.take(level_cs, parent_offsets)
+                parent_offsets = child_offsets
+                parent_counts = child_counts
 
-            flat_buffers_lists.append((reordered_data, reordered_item_lengths))
+            send_flat_counts = parent_counts
+            send_flat_offsets = parent_offsets
+
+            flat_buffers_lists.append((reordered_data, reordered_levels))
             counts_per_payload.append(send_flat_counts)
             offsets_per_payload.append(send_flat_offsets)
-            counts_per_payload.append(send_counts)
-            offsets_per_payload.append(send_offsets)
+            for child_counts, child_offsets in zip(
+                level_counts, level_offsets, strict=True
+            ):
+                counts_per_payload.append(child_counts)
+                offsets_per_payload.append(child_offsets)
 
     return (
         flat_buffers_lists,

@@ -33,15 +33,25 @@ WORKDIR /workspace
 # Install common Python dependencies required by the project
 # pylance is not a vscode plugin, it's lance-format
 RUN pip install --default-timeout=1000 --no-cache-dir \
-    minio \
-    "ray[all]==2.49.0" \
-    numba \
+    boto3 \
+    chex \
+    Cython \
     grain \
+    libclang \
+    minio \
+    numba \
     orjson \
     psutil \
     flask \
+    pandas \
+    "pyarrow>=14.0" \
+    pydantic \
     pylance \
-    zstandard \
+    "pyiceberg[sql-postgres,s3,glue,hive,pyarrow]" \
+    ray[all] \
+    rich \
+    s3fs \
+    vortex-data \
     fastparquet
 
 # Remove conflicting cupy-cuda12x installed by ray before installing RAPIDS to prevent breaking the cupy installation

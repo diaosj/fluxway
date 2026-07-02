@@ -122,6 +122,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         )
         w = cls(config, rank=rank)
         w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
+        w.register_spmd_code_map(1, {1: "loader", 2: "processor"})
         w._successor_handlers = {"processor": {0: AsyncMock(), 1: AsyncMock()}}
         loader_workers.append(w)
 
@@ -223,6 +224,7 @@ async def test_single_worker_interleaved_unit():
         )
         w = cls(config, rank=rank)
         w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
+        w.register_spmd_code_map(1, {1: "loader", 2: "processor"})
         w._successor_handlers = {"processor": {0: AsyncMock()}}
         loader_workers.append(w)
 

@@ -9,6 +9,7 @@ sys.path.append(os.getcwd())
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.common.types.configs import SPMDConfig, OperatorMeta
 from fluxway.common.mesh import DeviceMesh
+from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
 
 
 def _make_test_config(mesh: DeviceMesh, spmd_id: str = "") -> SPMDConfig:
@@ -37,37 +38,46 @@ def worker_config(mock_mesh):
 
 
 @pytest.mark.asyncio
-async def test_worker_receive_shards_dispatches_to_mailbox(worker_config):
-    """Verify that receive_shards correctly dispatches to the mailbox via deposit_shards."""
+async def test_worker_receive_transport_frame_dispatches_to_mailbox(worker_config):
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(worker_config, rank=0, spmd_id="test_spmd")
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
+    worker.register_spmd_code_map(1, {1: "src_spmd"})
 
-    from unittest.mock import MagicMock, AsyncMock
+    from unittest.mock import MagicMock
 
-    worker._mailbox.deposit_shards = AsyncMock(return_value=0)
     worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["test_op"])
-    worker._op_manager.get_sender_world_size = MagicMock(return_value=1)
-    worker._ensure_step_declared = MagicMock()
+    worker._op_manager.get_expected_tensor_shards = MagicMock(return_value={42: 1})
+    worker._op_manager.get_expected_control_arg_names = MagicMock(return_value=[])
+    worker._op_manager.get_operator_metadata = MagicMock(return_value=None)
 
     test_data = np.array([1.0, 2.0])
-    await worker.receive_shards(
-        tuuids=[42],
-        step=0,
-        sender_id="src_spmd",
-        sender_rank=0,
-        payloads=[test_data],
-        counts=[2],
+    builder = TransportFrameBuilder(
+        step=0, sender_spmd_code=1, sender_rank=0, sender_world_size=1
+    )
+    edge = builder.add_edge(
+        tuuid=42,
+        meta_state=0,
+        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
+        min_rows=0,
+        expected_count=1,
+    )
+    builder.add_payload(edge, PayloadRole.VALUES, test_data, 2)
+    frame = builder.build()
+    await worker.receive_transport_frame(
+        frame.frame_i32,
+        frame.edge_i32,
+        frame.payload_i32,
+        frame.shape_i32,
+        frame.global_shape_i64,
+        frame.compact_i64,
+        *frame.payload_segments,
     )
 
-    worker._mailbox.deposit_shards.assert_called_once()
-    call_args = worker._mailbox.deposit_shards.call_args
-    assert call_args[0][0] == "test_op"
-    assert call_args[0][1] == [42]
-    assert call_args[0][2] == 0
-    assert call_args[0][3] == "src_spmd"
-    assert call_args[0][4] == 0  # sender_rank
+    stored = await worker._mailbox.get_tensor_shard_views("test_op", 42, 0)
+    assert ("src_spmd", 0) in stored
+    np.testing.assert_array_equal(stored[("src_spmd", 0)][0].flat_values, test_data)
 
 
 @pytest.mark.asyncio

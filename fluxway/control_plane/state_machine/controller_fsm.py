@@ -270,12 +270,20 @@ class ControllerStateMachine:
 
         # Start heartbeat timeout monitoring now that system is fully initialized
         try:
-            await self._controller._heartbeat_manager.start_monitoring_async()
-            logger.debug("Heartbeat timeout monitoring started")
+            if getattr(self._controller, "_heartbeat_manager", None):
+                await self._controller._heartbeat_manager.start_monitoring_async()
+                logger.debug("Heartbeat timeout monitoring started")
             # If Drain strategy is configured, issue the first drain target to trigger execution
             has_trigger = getattr(self._controller, "_issue_initial_drain", None)
             if has_trigger:
                 await self._controller._issue_initial_drain()
+            if getattr(self._controller, "_start_sources_when_running", False):
+                self._controller._start_sources_when_running = False
+                start_sources = getattr(
+                    self._controller, "start_source_operators", None
+                )
+                if start_sources:
+                    await start_sources()
         except Exception as e:
             logger.error(
                 f"Failed to start heartbeat monitoring or issue initial drain: {e}"

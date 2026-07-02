@@ -21,6 +21,8 @@ See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 
 import asyncio
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 import logging
 import os
 import socket
@@ -28,7 +30,6 @@ import time
 import inspect
 from pathlib import Path
 
-import numpy as np
 
 import ray
 
@@ -60,6 +61,17 @@ from fluxway.common.types.sharding import (
     ReferentialRouting,
 )
 from fluxway.common.index_descriptor import IndexDescriptor
+from fluxway.transport.manifest import (
+    EDGE_EXPECTED_COUNT,
+    EDGE_TUUID,
+    EmptyKind,
+    FRAME_EDGE_COUNT,
+    FRAME_SENDER_SPMD_CODE,
+    FRAME_STEP,
+    PayloadRole,
+    TransportFrame,
+    TransportFrameBuilder,
+)
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.utils.tree import tree_flatten, tree_unflatten
@@ -114,7 +126,48 @@ def _jit_reduce_scalars(stacked, op: str):
     raise ValueError(f"Unsupported reduction op: {op}")
 
 
+def _describe_layout_for_error(layout: ShardingSpec | PhysicalLayout | None) -> str:
+    if layout is None:
+        return "None"
+
+    if isinstance(layout, ShardingSpec):
+        strategy_name = type(layout.strategy).__name__
+        return (
+            f"ShardingSpec(strategy={strategy_name}, "
+            f"content={layout.is_content_addressable}, "
+            f"static={layout.is_static}, "
+            f"partitions={layout.partitions}, "
+            f"routing_dim={layout.routing_dim})"
+        )
+
+    if isinstance(layout, PhysicalLayout):
+        strategy_name = type(layout.strategy).__name__
+        return (
+            f"PhysicalLayout(strategy={strategy_name}, "
+            f"content={layout.is_content_addressable}, "
+            f"static={layout.is_static}, "
+            f"partitions={layout.partitions}, "
+            f"routing_dim={layout.routing_dim}, "
+            f"global_shape={layout.global_shape}, "
+            f"mesh_shape={layout.mesh.shape}, "
+            f"mesh_axes={layout.mesh.axis_names})"
+        )
+
+    raise TypeError(
+        f"[Fluxway Protocol Error] Unsupported layout descriptor "
+        f"{type(layout).__name__}; expected ShardingSpec, PhysicalLayout, or None."
+    )
+
+
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _SuccessorSendContext:
+    spmd_id: str
+    info: Any
+    handlers: dict[int, Any]
+    effective_rank: int
 
 
 @ray.remote
@@ -197,26 +250,28 @@ class SPMDWorker:
 
         # Completed step counters {op_name: count} - tracks how many steps were executed
         self._completed_step_count: dict[str, int] = dict.fromkeys(
-            self.config.operators if self.config else {}, 0
+            self.config.operators if self.config is not None else {}, 0
         )
 
         # Op-level blocking: asyncio.Event (set=runnable, clear=blocked)
         self._op_runnable = {
             op_name: asyncio.Event()
-            for op_name in (self.config.operators if self.config else {})
+            for op_name in (self.config.operators if self.config is not None else {})
         }
         for event in self._op_runnable.values():
             event.set()  # Initially all ops are runnable
 
         # Pending tasks when blocked (to avoid priority queue reentry loop)
         self._pending_blocked: dict[str, list[int]] = {
-            op_name: [] for op_name in (self.config.operators if self.config else {})
+            op_name: []
+            for op_name in (self.config.operators if self.config is not None else {})
         }
 
         # Pending tasks for future steps (arrived early, waiting for current step to complete)
         # Structure: {op_name: List[step]} - steps waiting to be executed
         self._pending_future_steps: dict[str, list[int]] = {
-            op_name: [] for op_name in (self.config.operators if self.config else {})
+            op_name: []
+            for op_name in (self.config.operators if self.config is not None else {})
         }
 
         # Priority queue: asyncio.PriorityQueue with (priority, step, op_name)
@@ -228,6 +283,40 @@ class SPMDWorker:
         # --- Backpressure components ---
         self._max_in_flight = 50
         self._send_semaphore = asyncio.Semaphore(self._max_in_flight)
+        self._outbound_semaphore = asyncio.Semaphore(self._max_in_flight)
+        assemble_workers_text = os.getenv("FLUXWAY_ASSEMBLE_WORKERS", "2")
+        try:
+            assemble_workers = int(assemble_workers_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"FLUXWAY_ASSEMBLE_WORKERS must be a positive integer, got {assemble_workers_text!r}."
+            ) from exc
+        if assemble_workers <= 0:
+            raise ValueError(
+                f"FLUXWAY_ASSEMBLE_WORKERS must be a positive integer, got {assemble_workers}."
+            )
+        self._assemble_executor = ThreadPoolExecutor(
+            max_workers=assemble_workers,
+            thread_name_prefix=f"fluxway-assemble-{self.spmd_id}-{self.rank}",
+        )
+        transport_workers_text = os.getenv(
+            "FLUXWAY_TRANSPORT_WORKERS", str(assemble_workers)
+        )
+        try:
+            transport_workers = int(transport_workers_text)
+        except ValueError as exc:
+            raise ValueError(
+                "FLUXWAY_TRANSPORT_WORKERS must be a positive integer, "
+                f"got {transport_workers_text!r}."
+            ) from exc
+        if transport_workers <= 0:
+            raise ValueError(
+                f"FLUXWAY_TRANSPORT_WORKERS must be a positive integer, got {transport_workers}."
+            )
+        self._transport_executor = ThreadPoolExecutor(
+            max_workers=transport_workers,
+            thread_name_prefix=f"fluxway-transport-{self.spmd_id}-{self.rank}",
+        )
         self._mailbox_capacity = 100  # Default value
         self._high_watermark = int(self._mailbox_capacity * 0.8)
 
@@ -239,6 +328,8 @@ class SPMDWorker:
         # {spmd_id: {rank: DataPlaneCallable}}
         self._predecessor_handlers: dict[str, dict[int, DataPlaneCallable]] = {}
         self._successor_handlers = {}
+        self._local_spmd_code: int | None = None
+        self._spmd_id_by_code: dict[int, str] = {}
 
         # Heartbeat configuration
         self._heartbeat_interval: float = 5.0
@@ -256,6 +347,7 @@ class SPMDWorker:
         self._start_event = asyncio.Event()  # Signals when to start execution
         self._run_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
+        self._outbound_tasks: set[asyncio.Task] = set()
 
         # Source operator pause control
         self._source_pause_events: dict[str, asyncio.Event] = {}
@@ -263,7 +355,9 @@ class SPMDWorker:
         # Drain-to-step state
         self._drain_target_count: int | None = None
         self._drain_cond: asyncio.Condition = asyncio.Condition()
-        if self.config and getattr(self.config, "requires_drain_at_startup", False):
+        if self.config is not None and getattr(
+            self.config, "requires_drain_at_startup", False
+        ):
             # Block at step 0 until Controller issues the initial drain target!
             self._drain_target_count = 0
 
@@ -275,7 +369,8 @@ class SPMDWorker:
         # Cached assembled input tensors: {op_name: {tuuid: TransportTensor}}
         # Updated by _assemble_input, used by _send_output for pass-through metadata
         self._last_assembled_tensors: dict[str, dict[str, TransportTensor | None]] = {
-            op_name: {} for op_name in (self.config.operators if self.config else {})
+            op_name: {}
+            for op_name in (self.config.operators if self.config is not None else {})
         }
 
         # Metadata for "Mirror Sharding" (Symmetry Routing)
@@ -495,7 +590,9 @@ class SPMDWorker:
             )
             self._source_pause_events = {
                 op_name: asyncio.Event()
-                for op_name in (self.config.operators if self.config else {})
+                for op_name in (
+                    self.config.operators if self.config is not None else {}
+                )
                 if self.op_manager.is_source_operator(op_name)
             }
             for event in self._source_pause_events.values():
@@ -534,6 +631,20 @@ class SPMDWorker:
     def get_driver_handle(self) -> Any | None:
         """Get the driver handle."""
         return self._driver_handle
+
+    def register_spmd_code_map(
+        self, local_spmd_code: int, spmd_id_by_code: dict[int, str]
+    ) -> None:
+        if not isinstance(local_spmd_code, int) or local_spmd_code < 0:
+            raise ValueError(
+                f"local_spmd_code must be a non-negative int, got {local_spmd_code!r}."
+            )
+        if local_spmd_code not in spmd_id_by_code:
+            raise ValueError(
+                f"local_spmd_code={local_spmd_code} is missing from spmd_id_by_code."
+            )
+        self._local_spmd_code = local_spmd_code
+        self._spmd_id_by_code = dict(spmd_id_by_code)
 
     # =========================================================================
     # Handler Registration (handlers only, topology from config)
@@ -661,15 +772,53 @@ class SPMDWorker:
         self._start_event.set()
         logger.debug(f"Worker auto-started spmd_id={self.spmd_id} rank={self.rank}")
 
-        # Trigger source operators (operators with 0 input tensors)
-        self._spawn_background_task(self._trigger_source_operators())
+        if self.config.auto_start_source_operators:
+            self._spawn_background_task(self._trigger_source_operators())
 
     def _spawn_background_task(self, coro: Any) -> asyncio.Task:
         """Track detached tasks so stop() can await their shutdown."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._on_background_task_done)
         return task
+
+    def _on_background_task_done(self, task: asyncio.Task) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+        self._last_error = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "Background task failed spmd_id=%s rank=%s error=%s",
+            self.spmd_id,
+            self.rank,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+    def _spawn_outbound_task(self, coro: Any) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        self._outbound_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._outbound_tasks.discard(t)
+            self._outbound_semaphore.release()
+            self._on_background_task_done(t)
+
+        task.add_done_callback(_done)
+        return task
+
+    async def _drain_outbound_tasks(self) -> None:
+        while True:
+            tasks = [task for task in self._outbound_tasks if not task.done()]
+            if not tasks:
+                break
+            await asyncio.gather(*tasks)
+        if self._last_error is not None:
+            raise RuntimeError(f"Worker has failed background task: {self._last_error}")
 
     async def _trigger_source_operators(self) -> None:
         """
@@ -685,6 +834,9 @@ class SPMDWorker:
                 f"Auto-triggering source op for step {target_step} op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
             )
             await self._enqueue(op_name, target_step)
+
+    async def start_source_operators(self) -> None:
+        await self._trigger_source_operators()
 
     # =========================================================================
     # Op-Level Blocking
@@ -791,117 +943,82 @@ class SPMDWorker:
             op_name, step=step, names=names, values=values
         )
 
-    async def receive_shards(
+    async def receive_transport_frame(
         self,
-        tuuids: list[int],
-        step: int,
-        sender_id: str,
-        sender_rank: int,
-        payloads: list[Any],
-        counts: list[int],
-        global_shapes: list[tuple[int, ...] | None] | None = None,
-        meta_tensor_state_list: list[int] | None = None,
-        slice_compact_desc_params: list[list[int] | None] | None = None,
+        frame_i32: Any,
+        edge_i32: Any,
+        payload_i32: Any,
+        shape_i32: Any,
+        global_shape_i64: Any,
+        compact_i64: Any,
+        *payload_segments: Any,
     ) -> int:
-        """Receive multiple tensor shards and dispatch to local operators by TUUID.
-
-        Args:
-            op_name: Operation type
-            tuuids: List of TUUIDs
-            step: Execution step
-            sender_id: ID of the sender
-            rank: Sender rank
-            sender_world_size: World size of the sender mesh
-            payloads: Flat list of raw data arrays for all tensors in the bundle
-            counts: Flat list of counts for each element in the payloads
-            global_shapes: Optional global shapes per TUUID
-            meta_tensor_state_list: List of ints representing the bitmask state of each tensor
-            slice_compact_desc_params: Parameters for compact index reconstruction
-        """
-        num = len(tuuids)
-        meta_tensor_state_list = (
-            meta_tensor_state_list if meta_tensor_state_list is not None else [0] * num
+        frame = TransportFrame(
+            frame_i32=frame_i32,
+            edge_i32=edge_i32,
+            payload_i32=payload_i32,
+            shape_i32=shape_i32,
+            global_shape_i64=global_shape_i64,
+            compact_i64=compact_i64,
+            payload_segments=payload_segments,
         )
-        global_shapes = (
-            global_shapes
-            if global_shapes is not None
-            else cast(list[tuple[int, ...] | None], [None] * num)
-        )
-        _slice_compact = (
-            slice_compact_desc_params
-            if slice_compact_desc_params is not None
-            else [None] * num
-        )
-
-        op_bundles: dict[str, dict[str, list[Any]]] = {}
-        cursor = 0
-        for i in range(num):
-            u = tuuids[i]
-            meta_state = meta_tensor_state_list[i]
-
-            n_elements = 1
-            if meta_state & 1:
-                n_elements += 1
-            if meta_state & 2:
-                n_elements += 1
-
-            tuuid_payloads = payloads[cursor : cursor + n_elements]
-            tuuid_counts = counts[cursor : cursor + n_elements]
-            cursor += n_elements
-
-            ops = self.op_manager.get_operators_for_tuuid(u)
-            for op_name in ops:
-                if op_name not in op_bundles:
-                    op_bundles[op_name] = {
-                        "uuids": [],
-                        "payloads": [],
-                        "counts": [],
-                        "shapes": [],
-                        "meta": [],
-                        "compact": [],
-                    }
-                bundle = op_bundles[op_name]
-                bundle["uuids"].append(u)
-                bundle["payloads"].extend(tuuid_payloads)
-                bundle["counts"].extend(tuuid_counts)
-                bundle["shapes"].append(global_shapes[i])
-                bundle["meta"].append(meta_state)
-                bundle["compact"].append(_slice_compact[i])
+        frame.validate()
+        sender_spmd_code = int(frame.frame_i32[FRAME_SENDER_SPMD_CODE])
+        try:
+            sender_id = self._spmd_id_by_code[sender_spmd_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"[SPMDWorker] Unknown sender_spmd_code={sender_spmd_code} "
+                f"spmd_id={self.spmd_id} rank={self.rank}."
+            ) from exc
 
         watermark = 0
-        for op_name, bundle in op_bundles.items():
-            sub_uuids = bundle["uuids"]
-            sub_payloads = bundle["payloads"]
-            sub_counts = bundle["counts"]
-            sub_shapes = bundle["shapes"]
-            sub_meta = bundle["meta"]
-            sub_compact = bundle["compact"]
-            self._ensure_step_declared(op_name, step)
+        op_to_edge_rows: dict[str, list[int]] = {}
+        for row_idx, edge in enumerate(frame.edge_i32):
+            tuuid = int(edge[EDGE_TUUID])
+            for op_name in self.op_manager.get_operators_for_tuuid(tuuid):
+                op_to_edge_rows.setdefault(op_name, []).append(row_idx)
 
-            sender_world_size = self.op_manager.get_sender_world_size(
-                op_name, sender_id, sub_uuids[0]
+        for op_name, rows in op_to_edge_rows.items():
+            self._ensure_step_declared(op_name, int(frame.frame_i32[FRAME_STEP]))
+            op_frame = TransportFrame(
+                frame_i32=frame.frame_i32.copy(),
+                edge_i32=frame.edge_i32[rows],
+                payload_i32=frame.payload_i32,
+                shape_i32=frame.shape_i32,
+                global_shape_i64=frame.global_shape_i64,
+                compact_i64=frame.compact_i64,
+                payload_segments=frame.payload_segments,
             )
-            if sender_world_size is None:
-                raise ValueError(
-                    f"Could not determine sender world size for op={op_name}, "
-                    f"sender_id={sender_id}, tuuid={sub_uuids[0]}"
-                )
-
-            watermark = await self._mailbox.deposit_shards(
+            op_frame.frame_i32[FRAME_EDGE_COUNT] = len(rows)
+            expected_counts = {}
+            for edge in op_frame.edge_i32:
+                tuuid = int(edge[EDGE_TUUID])
+                expected_count = int(edge[EDGE_EXPECTED_COUNT])
+                if expected_count <= 0:
+                    raise ValueError(
+                        f"[SPMDWorker] Transport frame for op={op_name} "
+                        f"step={int(frame.frame_i32[FRAME_STEP])} tuuid={tuuid} "
+                        f"has invalid EDGE_EXPECTED_COUNT={expected_count}."
+                    )
+                previous = expected_counts.get(tuuid)
+                if previous is not None and previous != expected_count:
+                    raise ValueError(
+                        f"[SPMDWorker] Transport frame for op={op_name} "
+                        f"step={int(frame.frame_i32[FRAME_STEP])} tuuid={tuuid} "
+                        f"contains conflicting EDGE_EXPECTED_COUNT values: "
+                        f"{previous} and {expected_count}."
+                    )
+                expected_counts[tuuid] = expected_count
+            self._mailbox.configure_transport_expected_counts(
+                op_name, int(frame.frame_i32[FRAME_STEP]), expected_counts
+            )
+            watermark = await self._mailbox.deposit_transport_frame(
                 op_name,
-                sub_uuids,
-                step,
                 sender_id,
-                sender_rank,
-                sender_world_size,
-                sub_payloads,
-                sub_counts,
-                sub_shapes,
-                meta_tensor_state_list=sub_meta,
-                slice_compact_desc_params=(
-                    sub_compact if any(c is not None for c in sub_compact) else None
-                ),
+                op_frame,
             )
+
         return watermark
 
     def _ensure_step_declared(self, op_name: str, step: int) -> None:
@@ -934,7 +1051,7 @@ class SPMDWorker:
             step,
             expected_tensors,
             expected_states,
-            barrier_config=meta.barrier_config if meta else None,
+            barrier_config=meta.barrier_config if meta is not None else None,
         )
         self._barriers_declared[(op_name, step)] = True
 
@@ -1068,6 +1185,10 @@ class SPMDWorker:
                         continue
 
                 # Execute (for periodic mode, execute any task that comes)
+                if self._last_error is not None:
+                    raise RuntimeError(
+                        f"Worker has failed background task: {self._last_error}"
+                    )
                 result = await self._execute_operator(op_name, step)
 
                 # Guard: if a restore happened during execution (e.g. while
@@ -1107,6 +1228,9 @@ class SPMDWorker:
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             pending_tasks.append(self._heartbeat_task)
+        outbound_tasks = [task for task in self._outbound_tasks if not task.done()]
+        if outbound_tasks:
+            await asyncio.gather(*outbound_tasks, return_exceptions=True)
         background_tasks = [task for task in self._background_tasks if not task.done()]
         for task in background_tasks:
             task.cancel()
@@ -1115,6 +1239,8 @@ class SPMDWorker:
         if pending_tasks:
             await asyncio.gather(*pending_tasks, return_exceptions=True)
         self._background_tasks.clear()
+        self._assemble_executor.shutdown(wait=True, cancel_futures=True)
+        self._transport_executor.shutdown(wait=True, cancel_futures=True)
 
         logger.debug(f"Worker stopping spmd_id={self.spmd_id} rank={self.rank}")
 
@@ -1124,7 +1250,9 @@ class SPMDWorker:
         if not expected_tuuids:
             return False
 
-        all_tensor_shards = await self._mailbox.get_all_tensor_shards(op_name, step)
+        all_tensor_shards = await self._mailbox.get_all_tensor_shard_views(
+            op_name, step
+        )
 
         for tuuid in expected_tuuids:
             if tuuid not in all_tensor_shards:
@@ -1149,25 +1277,25 @@ class SPMDWorker:
         if not successor_ids:
             return
 
+        if self._local_spmd_code is None:
+            raise ValueError(
+                f"[SPMDWorker] local_spmd_code is not registered "
+                f"spmd_id={self.spmd_id} rank={self.rank}."
+            )
         backend = get_backend()
-        empty_tensor = TransportTensor.from_tensor(
-            backend.zeros((0,), dtype=backend.int32())
-        )
+        empty_values = backend.zeros((0,), dtype=backend.int32())
 
         for spmd_id in successor_ids:
             succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
             if not succ_info:
                 continue
 
-            # In empty propagation, we send for ALL UUIDs mapped to this successor.
-            # Routing decision MUST mirror the non-empty path (see _execute_operator
-            # around L2178): bind logical ShardingSpec to its physical mesh and call
-            # the bipartite-graph primitive `PhysicalLayout.resolve_consumers`. This
-            # is the same math used by `_precompute_expected_tensor_shards` on the
-            # receiver side via `resolve_tensor_producers`, so sender's actual count
-            # and receiver's expected count are guaranteed to agree (no barrier
-            # mismatch).
             output_sharding = self.op_manager.get_output_sharding(op_name)
+            effective_rank = self.rank
+            dispatcher = self.op_manager.get_dispatcher(op_name)
+            if getattr(dispatcher, "interleave_unit_size", None) is not None:
+                effective_rank = self.rank % dispatcher.interleave_unit_size
+            frames_by_target: dict[int, TransportFrameBuilder] = {}
             for target_name, tuuid in succ_info.tuuid_map.items():
                 source_logical = output_sharding.get(tuuid)
                 target_logical = succ_info.tuuid_sharding.get(tuuid)
@@ -1182,32 +1310,69 @@ class SPMDWorker:
 
                 source_spec = source_logical.bind(self._mesh)
                 target_spec = target_logical.bind(succ_info.mesh or self._mesh)
-
-                effective_rank = self.rank
-                dispatcher = self.op_manager.get_dispatcher(op_name)
-                if getattr(dispatcher, "interleave_unit_size", None) is not None:
-                    effective_rank = self.rank % dispatcher.interleave_unit_size
-
-                # Same math as the non-empty routing path; covers static 1:1 / N->M /
-                # mirror / dynamic by dispatching through `strategy.intersects` or a
-                # full-fanout fallback inside the layout helper.
                 consumers = source_spec.resolve_consumers(target_spec, effective_rank)
-
                 for target_rank in consumers:
-                    handler = self._successor_handlers.get(spmd_id, {}).get(target_rank)
-                    if handler:
-                        # Send single-tensor payload for this TUUID
-                        await handler.receive_shards(
-                            tuuids=[tuuid],
-                            step=step,
-                            sender_id=self.spmd_id,
-                            sender_rank=self.rank,
-                            payloads=[empty_tensor.flat_values],
-                            counts=[0],
-                            global_shapes=[None],
-                            meta_tensor_state_list=[empty_tensor.meta_state],
-                            slice_compact_desc_params=[None],
+                    expected_count = len(
+                        source_spec.resolve_producers(target_spec, target_rank)
+                    )
+                    if expected_count <= 0:
+                        raise ValueError(
+                            f"[SPMDWorker] Empty propagation resolved invalid "
+                            f"expected_count={expected_count} target_rank={target_rank} "
+                            f"spmd_id={self.spmd_id} successor={spmd_id} tuuid={tuuid}."
                         )
+                    builder = frames_by_target.get(target_rank)
+                    if builder is None:
+                        builder = TransportFrameBuilder(
+                            step=step,
+                            sender_spmd_code=self._local_spmd_code,
+                            sender_rank=effective_rank,
+                            sender_world_size=self._world_size,
+                        )
+                        frames_by_target[target_rank] = builder
+                    edge = builder.add_edge(
+                        tuuid=tuuid,
+                        meta_state=0,
+                        empty_kind=EmptyKind.PROTOCOL_EMPTY,
+                        min_rows=0,
+                        expected_count=expected_count,
+                    )
+                    builder.add_payload(edge, PayloadRole.VALUES, empty_values, 0)
+
+            handlers = self._successor_handlers.get(spmd_id, {})
+            frame_args = []
+            for target_rank, builder in sorted(frames_by_target.items()):
+                frame = builder.build()
+                frame_args.append(
+                    (
+                        target_rank,
+                        frame.frame_i32,
+                        frame.edge_i32,
+                        frame.payload_i32,
+                        frame.shape_i32,
+                        frame.global_shape_i64,
+                        frame.compact_i64,
+                        frame.payload_segments,
+                    )
+                )
+            await self._outbound_semaphore.acquire()
+            self._spawn_outbound_task(
+                self._send_protocol_empty_frames_background(handlers, frame_args, step)
+            )
+
+    async def _send_protocol_empty_frames_background(
+        self,
+        handlers: dict[int, Any],
+        frame_args: list[tuple[int, Any, Any, Any, Any, Any, Any, tuple[Any, ...]]],
+        step: int,
+    ) -> None:
+        if frame_args:
+            await asyncio.gather(
+                *(
+                    self._submit_transport_frame(handlers, frame_arg, step)
+                    for frame_arg in frame_args
+                )
+            )
 
     async def _execute_operator(self, op_name: str, step: int) -> ExecutionResult:
         """Execute an operator: assemble data, execute, send outputs."""
@@ -1361,13 +1526,21 @@ class SPMDWorker:
         unique_tuuids = list(set(all_tuuids))
 
         shard_tasks = [
-            self._mailbox.get_tensor_shards(op_name, u, step) for u in unique_tuuids
+            self._mailbox.get_tensor_shard_views(op_name, u, step)
+            for u in unique_tuuids
+        ]
+        arrival_tasks = [
+            self._mailbox.get_tensor_arrivals(op_name, u, step) for u in unique_tuuids
         ]
         all_shards_list = await asyncio.gather(*shard_tasks)
+        all_arrivals_list = await asyncio.gather(*arrival_tasks)
         tuuid_to_shards = dict(zip(unique_tuuids, all_shards_list, strict=True))  # type: ignore
+        tuuid_to_arrivals = dict(zip(unique_tuuids, all_arrivals_list, strict=True))  # type: ignore
 
         assemble_tasks = [
-            self._assemble_tensor(op_name, u, step, tuuid_to_shards[u])
+            self._assemble_tensor(
+                op_name, u, step, tuuid_to_shards[u], tuuid_to_arrivals[u]
+            )
             for u in unique_tuuids
         ]
         assembled_list = await asyncio.gather(*assemble_tasks)
@@ -1398,18 +1571,18 @@ class SPMDWorker:
         return final_args
 
     def _get_values(self, obj: Any) -> Any:
-        if isinstance(obj, TransportTensor):
+        if hasattr(obj, "flat_values"):
             return obj.flat_values
         return obj
 
     def _get_routing_indices(self, obj: Any) -> Any | None:
-        if isinstance(obj, TransportTensor):
+        if hasattr(obj, "routing_indices_materialized"):
             return obj.routing_indices_materialized
         return None
 
     def _flatten_shards(
-        self, shards: dict[tuple[str, int], list[TransportTensor]], index: int = 0
-    ) -> list[TransportTensor]:
+        self, shards: dict[tuple[str, int], list[Any]], index: int = 0
+    ) -> list[Any]:
         """
         Extract the N-th tensor from each multi-tensor packet.
         """
@@ -1420,8 +1593,8 @@ class SPMDWorker:
         return tensors
 
     def _flatten_shards_with_ranks(
-        self, shards: dict[Any, list[TransportTensor]], index: int = 0
-    ) -> list[tuple[Any, TransportTensor]]:
+        self, shards: dict[Any, list[Any]], index: int = 0
+    ) -> list[tuple[Any, Any]]:
         """Flatten shards and include their sender keys (ranks)."""
         flat = []
         for key in sorted(shards.keys()):
@@ -1431,13 +1604,10 @@ class SPMDWorker:
         return flat
 
     def _normalize_and_cat_shards(self, tensor_list: list[Any], dim: int = 0) -> Any:
-        """
-        Robustly concatenate high-dimensional shards, healing rank/dtype mismatches.
-        """
         backend = get_backend()
         count = len(tensor_list)
         if count == 0:
-            return backend.zeros((0,), dtype=backend.float32())
+            raise ValueError("Cannot concatenate an empty shard list.")
 
         # Fast Path: Single tensor is already the result (Zero-copy)
         if count == 1:
@@ -1454,9 +1624,19 @@ class SPMDWorker:
                 prototype = t
                 break
 
-        # All empty fallback: use the most "structured" one
         if prototype is None:
-            prototype = max(tensor_list, key=lambda t: len(backend.shape(t)))
+            proto_shape = tuple(backend.shape(tensor_list[0]))
+            proto_dtype = backend.dtype(tensor_list[0])
+            for t in tensor_list[1:]:
+                if tuple(backend.shape(t)) != proto_shape:
+                    raise ValueError(
+                        "Cannot concatenate all-empty shards with different shapes."
+                    )
+                if backend.dtype(t) != proto_dtype:
+                    raise ValueError(
+                        "Cannot concatenate all-empty shards with different dtypes."
+                    )
+            return backend.cat(tensor_list, dim=dim)
 
         # Check for mismatch against prototype to decide if we need the slow-path
         needs_normalization = False
@@ -1475,14 +1655,12 @@ class SPMDWorker:
         proto_dtype = backend.dtype(prototype)
         proto_ndims = len(proto_shape)
 
-        # Slow Path: Align and Repair empty tensors shape
         normalized = []
         for t in tensor_list:
             t_shape = backend.shape(t)
             if len(t_shape) != proto_ndims:
-                # Common case: (0,) being concatenated with (N, D)
                 new_shape = list(proto_shape)
-                new_shape[dim] = 0  # Ensure it's empty along the cat dimension
+                new_shape[dim] = 0
                 normalized.append(backend.zeros(tuple(new_shape), dtype=proto_dtype))
             elif backend.dtype(t) != proto_dtype:
                 normalized.append(backend.cast(t, proto_dtype))
@@ -1496,7 +1674,7 @@ class SPMDWorker:
     # =========================================================================
 
     def _merge_index_descriptors(
-        self, shard_list: list["TransportTensor"], property: str = "origin_indices"
+        self, shard_list: list[Any], property: str = "origin_indices"
     ) -> Optional["IndexDescriptor"]:
         """Merge IndexDescriptors from shards only when ALL shards carry one."""
         descriptors: list[IndexDescriptor] = [
@@ -1508,11 +1686,10 @@ class SPMDWorker:
 
     def _merge_materialized_index_descriptors(
         self,
-        shards: list["TransportTensor"],
+        shards: list[Any],
         property: str = "origin_indices_materialized",
     ) -> Any | None:
-        """Merge materialized indices from shards, falling back to spatial / arange."""
-        backend = get_backend()
+        """Merge materialized indices from shards."""
         if not any(
             hasattr(s, property) and getattr(s, property) is not None for s in shards
         ):
@@ -1525,51 +1702,146 @@ class SPMDWorker:
                     f"Shard {s} is missing materialized index descriptor {property}"
                 )
             if idx is None:
-                # Fallback to routing if origin is missing, then to arange
-                idx = self._get_routing_indices(s)
-            if idx is None:
-                num = backend.shape(self._get_values(s))[0]
-                idx = backend.arange(0, num, dtype=backend.int32())
+                raise ValueError(
+                    f"Shard {s} is missing {property}; partial metadata cannot be merged."
+                )
             index_list.append(idx)
         return self._normalize_and_cat_shards(index_list, dim=0)
 
-    def _maybe_merge_receipts(
-        self, shards: list["TransportTensor"]
-    ) -> Optional["SymmetryReceipt"]:
+    def _maybe_merge_receipts(self, shards: list[Any]) -> Optional["SymmetryReceipt"]:
         """Merge SymmetryReceipts from input shards into a single receipt."""
         receipts = [s.receipt for s in shards]
         if all(r is not None for r in receipts) and receipts:
-            backend = get_backend()
-            lengths = [int(backend.shape(self._get_values(s))[0]) for s in shards]
+            lengths = [self._routing_entity_count(s) for s in shards]
             return SymmetryReceipt.concatenate(receipts, lengths)  # type: ignore[arg-type]
         return None
 
-    def _heal_empty_shape(
-        self,
-        input_layout: "PhysicalLayout",
-        global_shape: tuple[int, ...] | None = None,
-    ) -> "TransportTensor":
-        """Return a correctly-shaped empty TransportTensor when no data arrived.
-
-        Strict mode: Must have explicit global_shape or layout info.
-        """
+    def _routing_entity_count(self, shard: Any) -> int:
         backend = get_backend()
-        dtype = backend.int32()
+        if getattr(shard, "is_ragged", False):
+            splits = shard.nested_splits
+            if not splits:
+                raise ValueError("Ragged shard is missing nested_splits.")
+            return int(backend.shape(splits[0])[0]) - 1
+        values = self._get_values(shard)
+        shape = backend.shape(values)
+        if not shape:
+            return 1
+        return int(shape[0])
 
-        target_shape = global_shape
-        if target_shape is None and hasattr(input_layout, "global_shape"):
-            target_shape = input_layout.global_shape
+    def _merge_nested_splits(self, shards: list[Any]) -> list[Any]:
+        if not any(getattr(s, "is_ragged", False) for s in shards):
+            return []
+        if not all(getattr(s, "is_ragged", False) for s in shards):
+            raise ValueError("Cannot merge mixed dense and ragged shards.")
 
-        if target_shape is None:
-            raise ValueError(
-                f"[Fluxway Protocol Error] Cannot heal empty tensor for layout {input_layout}. "
-                "The global_shape is missing from both incoming shards and static specification. "
-                "Ensure source operator sets global_shape or define it in @operator(output_sharding=...)."
+        backend = get_backend()
+        level_count = len(shards[0].nested_splits)
+        if level_count == 0:
+            raise ValueError("Ragged shard is missing nested_splits.")
+        for shard in shards[1:]:
+            if len(shard.nested_splits) != level_count:
+                raise ValueError(
+                    "Cannot merge ragged shards with different nested level counts."
+                )
+
+        merged_splits = []
+        for level in range(level_count):
+            lengths = []
+            for shard in shards:
+                splits = shard.nested_splits[level]
+                lengths.append(splits[1:] - splits[:-1])
+            merged_lengths = self._normalize_and_cat_shards(lengths, dim=0)
+            zero = backend.zeros((1,), dtype=backend.dtype(merged_lengths))
+            merged_splits.append(
+                backend.cat([zero, backend.cumsum(merged_lengths, dim=0)], dim=0)
+            )
+        return merged_splits
+
+    def _wrap_shard_for_operator(self, shard: Any) -> TransportTensor:
+        if isinstance(shard, TransportTensor):
+            return shard
+        return TransportTensor(
+            self._get_values(shard),
+            nested_splits=shard.nested_splits,
+            routing_indices=shard.routing_indices,
+            origin_indices=shard.origin_indices,
+            global_shape=shard.global_shape,
+            receipt=shard.receipt,
+            routing_axes=shard.routing_axes,
+        )
+
+    def _describe_shard_flow_for_error(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        shards_dict: dict[Any, list[Any]],
+        filtered_shards: list[Any],
+        input_layout: "PhysicalLayout | None",
+        predecessor_topology: dict[str, Any],
+    ) -> str:
+        backend = get_backend()
+        producer_path = getattr(self.op_manager, "_tuuid_to_op_outputs", {}).get(tuuid)
+        tuuid_name = ".".join(producer_path) if producer_path else f"TUUID:{tuuid}"
+
+        predecessor_lines = []
+        for pre_spmd_id, pre_info in predecessor_topology.items():
+            if tuuid not in pre_info.tuuid_sharding:
+                continue
+            producer_layout = self.op_manager._resolve_producer_spec(
+                tuuid, provider_map=pre_info.tuuid_sharding
+            )
+            rank_keys = [
+                key
+                for key in shards_dict.keys()
+                if isinstance(key, tuple) and len(key) == 2 and key[0] == pre_spmd_id
+            ]
+            predecessor_lines.append(
+                f"{pre_spmd_id}: producer={_describe_layout_for_error(producer_layout)}, "
+                f"mailbox_keys={rank_keys}"
             )
 
-        empty_shape = (0,) + tuple(target_shape[1:])
-        return TransportTensor.from_tensor(
-            backend.zeros(empty_shape, dtype=dtype), global_shape=target_shape
+        shard_lines = []
+        for i, shard in enumerate(filtered_shards[:16]):
+            values = self._get_values(shard)
+            shape = tuple(backend.shape(values))
+            origin = shard.origin_indices_materialized
+            routing = self._get_routing_indices(shard)
+            if origin is not None and int(backend.shape(origin)[0]) > 0:
+                origin_np = backend.to_numpy(origin)
+                origin_text = (
+                    f"origin_len={len(origin_np)}, "
+                    f"origin_min={int(origin_np.min())}, "
+                    f"origin_max={int(origin_np.max())}"
+                )
+            else:
+                origin_text = "origin_len=0"
+            if routing is not None and int(backend.shape(routing)[0]) > 0:
+                routing_np = backend.to_numpy(routing)
+                routing_text = (
+                    f"routing_len={len(routing_np)}, "
+                    f"routing_min={int(routing_np.min())}, "
+                    f"routing_max={int(routing_np.max())}"
+                )
+            else:
+                routing_text = "routing_len=0"
+            shard_lines.append(
+                f"shard[{i}]: shape={shape}, global_shape={shard.global_shape}, "
+                f"{origin_text}, {routing_text}, ragged_levels={len(shard.nested_splits)}"
+            )
+
+        shard_summary = "; ".join(shard_lines) if shard_lines else "none"
+        predecessor_summary = (
+            "; ".join(predecessor_lines) if predecessor_lines else "none"
+        )
+        return (
+            f"name={tuuid_name}, op={op_name}, tuuid={tuuid}, step={step}, "
+            f"consumer_rank={self.rank}, consumer={_describe_layout_for_error(input_layout)}, "
+            f"mailbox_keys={list(shards_dict.keys())}, "
+            f"filtered_shards={len(filtered_shards)}, "
+            f"predecessors=[{predecessor_summary}], "
+            f"filtered_detail=[{shard_summary}]"
         )
 
     # =========================================================================
@@ -1581,7 +1853,27 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: dict[Any, list["TransportTensor"]],
+        shards: dict[Any, list[Any]],
+        arrivals: dict[Any, dict[str, Any]],
+    ) -> "TransportTensor":
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._assemble_executor,
+            self._assemble_tensor_sync,
+            op_name,
+            tuuid,
+            step,
+            shards,
+            arrivals,
+        )
+
+    def _assemble_tensor_sync(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        shards: dict[Any, list[Any]],
+        arrivals: dict[Any, dict[str, Any]],
     ) -> "TransportTensor":
         """Assemble tensor shards into a complete TransportTensor."""
         # Note: Input layout is now retrieved as a PhysicalLayout bound to current mesh
@@ -1591,7 +1883,7 @@ class SPMDWorker:
         if input_layout is None or input_layout.is_content_addressable:
             # Fallback or dynamic: merge all shards
             return self._assemble_to_dynamic_tensor(
-                op_name, tuuid, step, shards, predecessor_topology
+                op_name, tuuid, step, shards, arrivals, predecessor_topology
             )
 
         # Check for dynamic predecessors
@@ -1605,19 +1897,18 @@ class SPMDWorker:
             return self._assemble_dynamic_to_static_tensor(
                 op_name, tuuid, step, shards, input_layout, predecessor_topology
             )
-        else:
-            return await self._assemble_static_to_static_tensor(
-                op_name, tuuid, step, shards, input_layout, predecessor_topology
-            )
+        return self._assemble_static_to_static_tensor(
+            op_name, tuuid, step, shards, input_layout, predecessor_topology
+        )
 
     def _filter_shards_by_routing(
         self,
         op_name: str,
         tuuid: int,
         step: int,
-        shards_dict: dict[Any, list[TransportTensor]],
+        shards_dict: dict[Any, list[Any]],
         predecessor_topology: dict[str, Any],
-    ) -> list[TransportTensor]:
+    ) -> list[Any]:
         """
         Filters shards from mailbox based on analytical or fallback routing.
         """
@@ -1625,6 +1916,26 @@ class SPMDWorker:
         for pre_spmd_id, pre_info in predecessor_topology.items():
             # Only query predecessors that actually provide this TUUID.
             if tuuid not in pre_info.tuuid_sharding:
+                continue
+
+            input_layout = self.op_manager._resolve_input_spec(op_name, tuuid)
+            producer_layout = self.op_manager._resolve_producer_spec(
+                tuuid, provider_map=pre_info.tuuid_sharding
+            )
+            if (
+                producer_layout is not None
+                and producer_layout.is_content_addressable
+                and input_layout is not None
+                and not input_layout.is_content_addressable
+            ):
+                for key, rank_shards in shards_dict.items():
+                    if not isinstance(key, tuple) or len(key) != 2:
+                        continue
+                    shard_spmd_id, _rank = key
+                    if shard_spmd_id != pre_spmd_id:
+                        continue
+                    found = self._flatten_shards({key: rank_shards}, index=0)
+                    filtered_shards.extend(found)
                 continue
 
             # Unified resolution (handles interleave, etc.)
@@ -1639,12 +1950,157 @@ class SPMDWorker:
                     filtered_shards.extend(found)
         return filtered_shards
 
-    async def _assemble_static_to_static_tensor(
+    def _collect_arrived_shards_for_tuuid(
+        self,
+        tuuid: int,
+        shards_dict: dict[Any, list[Any]],
+        predecessor_topology: dict[str, Any],
+    ) -> list[Any]:
+        collected: list[Any] = []
+        for pre_spmd_id, pre_info in predecessor_topology.items():
+            if tuuid not in pre_info.tuuid_sharding:
+                continue
+            for key, rank_shards in shards_dict.items():
+                if not isinstance(key, tuple) or len(key) != 2:
+                    continue
+                shard_spmd_id, _rank = key
+                if shard_spmd_id != pre_spmd_id:
+                    continue
+                collected.extend(self._flatten_shards({key: rank_shards}, index=0))
+        return collected
+
+    def _collect_arrivals_for_tuuid(
+        self,
+        tuuid: int,
+        arrivals_dict: dict[Any, dict[str, Any]],
+        predecessor_topology: dict[str, Any],
+    ) -> dict[Any, dict[str, Any]]:
+        arrivals: dict[Any, dict[str, Any]] = {}
+        for pre_spmd_id, pre_info in predecessor_topology.items():
+            if tuuid not in pre_info.tuuid_sharding:
+                continue
+            for key, meta in arrivals_dict.items():
+                if not isinstance(key, tuple) or len(key) != 2:
+                    continue
+                shard_spmd_id, _rank = key
+                if shard_spmd_id == pre_spmd_id:
+                    arrivals[key] = meta
+        return arrivals
+
+    def _protocol_empty_dynamic_tensor(
         self,
         op_name: str,
         tuuid: int,
         step: int,
-        shards: dict[Any, list["TransportTensor"]],
+        arrivals: dict[Any, dict[str, Any]],
+    ) -> "TransportTensor":
+        expected_values = {
+            int(meta.get("expected_count", 0)) for meta in arrivals.values()
+        }
+        if len(expected_values) != 1:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Conflicting expected_count metadata "
+                f"for all-empty dynamic tensor op={op_name} tuuid={tuuid} "
+                f"step={step}: {sorted(expected_values)}."
+            )
+        expected = next(iter(expected_values), 0)
+        if expected <= 0:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Missing expected_count for all-empty "
+                f"dynamic tensor op={op_name} tuuid={tuuid} step={step}."
+            )
+        if len(arrivals) != expected:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Incomplete all-empty dynamic tensor "
+                f"arrival metadata op={op_name} tuuid={tuuid} step={step}: "
+                f"arrived={len(arrivals)} expected={expected}."
+            )
+
+        first_meta = next(iter(arrivals.values()))
+        first_schema = tuple(first_meta.get("payload_schema") or ())
+        if not first_schema:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Protocol-empty tensor lacks payload schema "
+                f"op={op_name} tuuid={tuuid} step={step}."
+            )
+        first_empty_kind = first_meta.get("empty_kind")
+        if first_empty_kind is None:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Protocol-empty tensor lacks empty_kind "
+                f"op={op_name} tuuid={tuuid} step={step}."
+            )
+        if EmptyKind(int(first_empty_kind)) is not EmptyKind.PROTOCOL_EMPTY:
+            raise ValueError(
+                f"[Fluxway Protocol Error] All-empty dynamic tensor must be composed "
+                f"only of PROTOCOL_EMPTY arrivals op={op_name} tuuid={tuuid} step={step}."
+            )
+
+        for key, meta in arrivals.items():
+            raw_empty_kind = meta.get("empty_kind")
+            if raw_empty_kind is None:
+                raise ValueError(
+                    f"[Fluxway Protocol Error] Protocol-empty tensor lacks empty_kind "
+                    f"op={op_name} tuuid={tuuid} step={step} sender={key}."
+                )
+            empty_kind = EmptyKind(int(raw_empty_kind))
+            if empty_kind is not EmptyKind.PROTOCOL_EMPTY:
+                raise ValueError(
+                    f"[Fluxway Protocol Error] Mixed empty semantics for dynamic tensor "
+                    f"op={op_name} tuuid={tuuid} step={step} sender={key}: "
+                    f"{empty_kind.name}."
+                )
+            schema = tuple(meta.get("payload_schema") or ())
+            if schema != first_schema:
+                raise ValueError(
+                    f"[Fluxway Protocol Error] Protocol-empty schema mismatch "
+                    f"op={op_name} tuuid={tuuid} step={step} sender={key}."
+                )
+
+        value_schema = [
+            s for s in first_schema if int(s["role"]) == int(PayloadRole.VALUES)
+        ]
+        if len(value_schema) != 1:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Protocol-empty tensor requires exactly "
+                f"one VALUES payload schema op={op_name} tuuid={tuuid} step={step}; "
+                f"got {len(value_schema)}."
+            )
+        shape = list(value_schema[0]["shape"])
+        if not shape:
+            shape = [0]
+        shape[0] = 0
+        from fluxway.common.types.tensor import SymmetryReceipt
+
+        backend = get_backend()
+        values = backend.zeros(tuple(shape), dtype=value_schema[0]["dtype"])
+        global_shape = first_meta.get("global_shape")
+        sender_world_sizes = {
+            int(meta.get("sender_world_size", 0)) for meta in arrivals.values()
+        }
+        if len(sender_world_sizes) != 1:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Conflicting sender_world_size metadata "
+                f"for all-empty dynamic tensor op={op_name} tuuid={tuuid} "
+                f"step={step}: {sorted(sender_world_sizes)}."
+            )
+        sender_world_size = next(iter(sender_world_sizes), 0)
+        if sender_world_size <= 0:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Missing sender_world_size for all-empty "
+                f"dynamic tensor op={op_name} tuuid={tuuid} step={step}."
+            )
+        receipt = SymmetryReceipt(
+            sender_world_size,
+            backend.zeros((0,), dtype=backend.int32()),
+        )
+        return TransportTensor(values, global_shape=global_shape, receipt=receipt)
+
+    def _assemble_static_to_static_tensor(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        shards: dict[Any, list[Any]],
         input_layout: "PhysicalLayout",
         predecessor_topology: dict[str, Any],
     ) -> "TransportTensor":
@@ -1659,10 +2115,11 @@ class SPMDWorker:
             )
 
         if len(shard_list) == 1:
-            return shard_list[0]
+            return self._wrap_shard_for_operator(shard_list[0])
 
         flat_values = [self._get_values(s) for s in shard_list]
         merged_values = self._normalize_and_cat_shards(flat_values, dim=0)
+        merged_nested_splits = self._merge_nested_splits(shard_list)
         merged_routing_indices = self._merge_index_descriptors(
             shard_list, "routing_indices"
         )
@@ -1679,6 +2136,7 @@ class SPMDWorker:
 
         return TransportTensor(
             merged_values,
+            nested_splits=merged_nested_splits,
             routing_indices=merged_routing_indices,
             origin_indices=merged_origin_indices,
             global_shape=global_shape,
@@ -1690,7 +2148,7 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: dict[Any, list[TransportTensor]],
+        shards: dict[Any, list[Any]],
         input_layout: "PhysicalLayout",
     ) -> TransportTensor:
         backend = get_backend()
@@ -1722,7 +2180,7 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: dict[Any, list["TransportTensor"]],
+        shards: dict[Any, list[Any]],
         input_layout: "PhysicalLayout",
         predecessor_topology: dict[str, Any],
     ) -> "TransportTensor":
@@ -1754,12 +2212,32 @@ class SPMDWorker:
         ]
 
         if not valid_shards:
-            # Pass inferred global_shape to help healing
-            healed = self._heal_empty_shape(input_layout, global_shape=global_shape)
-            all_receipt = self._maybe_merge_receipts(filtered_shards)
-            if all_receipt is not None:
-                healed.receipt = all_receipt
-            return healed
+            flow_detail = self._describe_shard_flow_for_error(
+                op_name,
+                tuuid,
+                step,
+                shards,
+                filtered_shards,
+                input_layout,
+                predecessor_topology,
+            )
+            raise ValueError(
+                f"[Fluxway Assembly Error] Dynamic-to-static assembly for op "
+                f"'{op_name}' (TUUID {tuuid}, rank {self.rank}, step {step}) "
+                "received no non-empty data shards. Dense SPMD inputs must be "
+                "slot-addressed by real payload rows; constructing a zero local "
+                "buffer would hide upstream routing data loss. "
+                f"Flow detail: {flow_detail}"
+            )
+
+        if any(getattr(s, "is_ragged", False) for s in valid_shards):
+            raise ValueError(
+                f"[Fluxway Assembly Error] Dynamic-to-static assembly for op "
+                f"'{op_name}' (TUUID {tuuid}, rank {self.rank}, step {step}) "
+                "received ragged payload shards. Fluxway transport keeps dynamic "
+                "ragged streams compact; consumer-specific padding/pooling/masking "
+                "must be implemented in the SPMD operator input adapter."
+            )
 
         all_receipt = self._maybe_merge_receipts(valid_shards)
 
@@ -1900,22 +2378,11 @@ class SPMDWorker:
             )
             assembled_receipt = SymmetryReceipt(all_receipt.world_size, final_ranks)
 
-        # Capture logical boundary to prevent padding-leaks in future transport steps.
-        # Even if the tensor is physically padding buffer (e.g. 12 rows), the nested_splits
-        # [0, logical_len] signal to the distributor to only route the first 8.
-        logical_len = int(backend.sum(mask))
-        splits = (
-            [np.array([0, logical_len], dtype=np.int32)]
-            if logical_len < local_shape[0]
-            else None
-        )
-
         return TransportTensor(
             assembled_data,
             routing_indices=None,
             global_shape=global_shape,
             receipt=assembled_receipt,
-            nested_splits=splits,
         )
 
     def _assemble_to_dynamic_tensor(
@@ -1923,7 +2390,8 @@ class SPMDWorker:
         op_name: str,
         tuuid: int,
         step: int,
-        shards: dict[Any, list["TransportTensor"]],
+        shards: dict[Any, list[Any]],
+        arrivals: dict[Any, dict[str, Any]],
         predecessor_topology: dict[str, Any],
     ) -> "TransportTensor":
         """
@@ -1932,17 +2400,39 @@ class SPMDWorker:
         """
         backend = get_backend()
 
-        filtered_shards = self._filter_shards_by_routing(
-            op_name, tuuid, step, shards, predecessor_topology
+        filtered_shards = self._collect_arrived_shards_for_tuuid(
+            tuuid, shards, predecessor_topology
         )
 
         if not filtered_shards:
-            return TransportTensor.from_tensor(
-                backend.zeros((0,), dtype=backend.int32())
+            filtered_arrivals = self._collect_arrivals_for_tuuid(
+                tuuid, arrivals, predecessor_topology
+            )
+            if filtered_arrivals:
+                return self._protocol_empty_dynamic_tensor(
+                    op_name, tuuid, step, filtered_arrivals
+                )
+            flow_detail = self._describe_shard_flow_for_error(
+                op_name,
+                tuuid,
+                step,
+                shards,
+                filtered_shards,
+                None,
+                predecessor_topology,
+            )
+            raise ValueError(
+                f"[Fluxway Assembly Error] Dynamic assembly for op '{op_name}' "
+                f"(TUUID {tuuid}, rank {self.rank}, step {step}) received no "
+                "arrived shards. Dynamic inputs require an explicit empty or "
+                "non-empty packet from every expected sender; synthesizing an "
+                f"empty TransportTensor would hide a transport/barrier bug. "
+                f"Flow detail: {flow_detail}"
             )
 
         all_values_list = [self._get_values(s) for s in filtered_shards]
         merged_values = self._normalize_and_cat_shards(all_values_list, dim=0)
+        merged_nested_splits = self._merge_nested_splits(filtered_shards)
 
         # Spatial Indices (global keys).  If *any* shard carries
         # routing_indices, *every* shard must — they label per-row global
@@ -2043,6 +2533,7 @@ class SPMDWorker:
 
         return TransportTensor(
             merged_values,
+            nested_splits=merged_nested_splits,
             routing_indices=merged_routing_indices,
             global_shape=(
                 original_global_shape
@@ -2161,13 +2652,17 @@ class SPMDWorker:
         # Flatten the result using guided tree_flatten
         meta = self.op_manager.get_operator_metadata(op_name)
         flat_results, treedef = tree_flatten(
-            result.data, treedef_template=meta.output_treedef if meta else None
+            result.data,
+            treedef_template=meta.output_treedef if meta is not None else None,
         )
 
         if exec_step not in self._step_tuuid_cache:
             self._step_tuuid_cache[exec_step] = {}
 
         successor_ids = sorted(set(self.op_manager.get_successor_ids(op_name)))
+        output_sharding = self.op_manager.get_output_sharding(op_name)
+        tuuid_to_name = self.op_manager.get_output_tuuid_to_name(op_name)
+        step_tuuid_cache = dict(self._step_tuuid_cache.get(exec_step, {}))
 
         # Extract state arguments
         state_data = {}
@@ -2181,261 +2676,66 @@ class SPMDWorker:
                 if val is not None:
                     state_data[name] = val
 
+        successor_contexts = []
         for spmd_id in successor_ids:
             succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
             if succ_info is None:
-                continue
-
-            output_step = exec_step
-            batches = defaultdict(list)
-
-            # Map flattened results to UUIDs for this successor using the canonical ordered list
-            for i, leaf_tensor in enumerate(flat_results):
-                if leaf_tensor is None or i >= len(output_uuids):
-                    continue
-
-                tuuid = output_uuids[i]
-
-                # Check if this successor's tuuid_map (or sharding) contains this u
-                if tuuid not in succ_info.tuuid_sharding:
-                    continue
-
-                if not isinstance(leaf_tensor, TransportTensor):
-                    leaf_tensor = TransportTensor.from_tensor(leaf_tensor)
-
-                source_logical = self.op_manager.get_output_sharding(op_name).get(tuuid)
-                target_logical = succ_info.tuuid_sharding.get(tuuid)
-
-                if source_logical is None or target_logical is None:
-                    continue
-
-                source_spec = source_logical.bind(self._mesh)
-                target_spec = target_logical.bind(succ_info.mesh or self._mesh)
-
-                dispatcher = self.op_manager.get_dispatcher(op_name)
-                unit_size = getattr(dispatcher, "interleave_unit_size", None)
-                if isinstance(unit_size, int):
-                    unit_idx = self.rank // unit_size
-                    unit_ranks = list(
-                        range(unit_idx * unit_size, (unit_idx + 1) * unit_size)
-                    )
-                    if source_spec.mesh is not None:
-                        base_mesh = source_spec.mesh
-                        other_dims_size = 1
-                        for s in base_mesh.shape[1:]:
-                            other_dims_size *= s
-                        if unit_size % other_dims_size == 0:
-                            first_axis_size = unit_size // other_dims_size
-                            new_shape = (first_axis_size,) + base_mesh.shape[1:]
-                            from fluxway.common.mesh import DeviceMesh
-
-                            sub_mesh = DeviceMesh(
-                                device_shape=new_shape,
-                                axis_names=base_mesh.axis_names,
-                                device_ids=unit_ranks,
-                            )
-                            source_spec = source_logical.bind(sub_mesh)
-
-                # Search _step_tuuid_cache for complete mirror(backflow) receipt
-                if isinstance(source_spec, PhysicalLayout) and isinstance(
-                    source_spec.spec.routing, ReferentialRouting
-                ):
-                    mirror_tuuid = source_spec.spec.routing.tuuid
-                    if exec_step not in self._step_tuuid_cache:
-                        raise ValueError(
-                            f"[Fluxway Mirror Error] Critical inconsistency in operator '{op_name}' at SPMD {self.spmd_id} rank {self.rank} step {exec_step}. "
-                            f"The input cache for this step is missing, making mirror-sharding (backflow) inheritance impossible. "
-                            f"Internal state may be corrupted."
-                        )
-                    if mirror_tuuid is not None:
-                        source_ref = self._step_tuuid_cache[exec_step].get(mirror_tuuid)
-                        if source_ref is None:
-                            tuuid_to_name = self.op_manager.get_output_tuuid_to_name(
-                                op_name
-                            )
-                            output_name = (
-                                (tuuid_to_name.get(tuuid, f"TUUID:{tuuid}"))
-                                if tuuid_to_name
-                                else f"TUUID:{tuuid}"
-                            )
-                            source_path = getattr(
-                                source_spec.spec.routing,
-                                "path",
-                                f"TUUID:{mirror_tuuid}",
-                            )
-                            raise ValueError(
-                                f"[Fluxway Mirror Error] Mirror resolution failed for output '{output_name}' in operator '{op_name}'. "
-                                f"It is configured to follow the sharding of '{source_path}' (TUUID {mirror_tuuid}), "
-                                f"but this mirror source was not found in the SPMD {self.spmd_id} rank {self.rank} step {exec_step} input cache. "
-                                f"Verify that '{source_path}' is properly declared as an input to '{op_name}' in the graph configuration."
-                            )
-                        if source_ref.receipt:
-                            inherited_global_shape = leaf_tensor.global_shape
-                            if (
-                                inherited_global_shape is None
-                                and source_ref.global_shape is not None
-                            ):
-                                actual_shape = leaf_tensor.shape
-                                src_axes = source_ref.routing_axes
-                                dst_axes = leaf_tensor.routing_axes
-                                if len(src_axes) != len(dst_axes):
-                                    raise ValueError(
-                                        f"[Fluxway Mirror Error] Mirror shape alignment mismatch in operator '{op_name}'. "
-                                        f"Source routing axes {src_axes} (length {len(src_axes)}) does not match "
-                                        f"destination routing axes {dst_axes} (length {len(dst_axes)})."
-                                    )
-                                new_shape = list(actual_shape)
-                                for idx, out_axis in enumerate(dst_axes):
-                                    if out_axis >= len(new_shape):
-                                        raise ValueError(
-                                            f"[Fluxway Mirror Error] Destination routing axis {out_axis} "
-                                            f"is out of bounds for shape {actual_shape} in operator '{op_name}'."
-                                        )
-                                    src_axis = src_axes[idx]
-                                    if src_axis >= len(source_ref.global_shape):
-                                        raise ValueError(
-                                            f"[Fluxway Mirror Error] Source routing axis {src_axis} "
-                                            f"is out of bounds for global shape {source_ref.global_shape} in operator '{op_name}'."
-                                        )
-                                    new_shape[out_axis] = source_ref.global_shape[
-                                        src_axis
-                                    ]
-                                inherited_global_shape = tuple(new_shape)
-
-                            leaf_tensor = TransportTensor(
-                                leaf_tensor.flat_values,
-                                nested_splits=leaf_tensor.nested_splits,
-                                routing_indices=leaf_tensor.routing_indices,
-                                global_shape=inherited_global_shape,
-                                origin_indices=leaf_tensor.origin_indices
-                                or source_ref.origin_indices,
-                                receipt=source_ref.receipt,
-                            )
-
-                if target_spec is not None and target_spec.is_content_addressable:
-                    if (
-                        leaf_tensor.routing_indices is None
-                        and leaf_tensor.receipt is None
-                        and leaf_tensor.flat_values is None
-                    ):
-                        tuuid_to_name = self.op_manager.get_output_tuuid_to_name(
-                            op_name
-                        )
-                        output_name = (
-                            tuuid_to_name.get(tuuid, f"TUUID:{tuuid}")
-                            if tuuid_to_name
-                            else f"TUUID:{tuuid}"
-                        )
-                        raise ValueError(
-                            f"[Fluxway Routing Error] Operator '{op_name}' output '{output_name}' "
-                            f"is destined for a dynamic routing edge, but its TransportTensor "
-                            f"lacks routing metadata (routing_indices, receipt, or flat_values). "
-                            f"If you returned a TransportTensor manually, ensure you provide explicit routing metadata."
-                        )
-
-                # We use Python's built-in id() to batch tensors that share the EXACT same
-                # routing metadata object reference.
-                # WARNING: Do NOT use content hashing (like .to_numpy().tobytes()) here!
-                # Routing indices can be large JAX/PyTorch tensors on the device.
-                # Fetching them to the host for content hashing triggers a massive Device-to-Host (D2H)
-                # synchronization overhead, which completely blocks the asynchronous execution pipeline.
-                # In this framework, structurally identical routing patterns are typically
-                # assigned the same shared metadata object during graph compilation or execution.
-                # Therefore, checking object identity via id() is O(1), zero-sync, and optimal for HPC.
-                if leaf_tensor.routing_indices is not None:
-                    routing_id = id(leaf_tensor.routing_indices)
-                elif leaf_tensor.origin_indices is not None:
-                    routing_id = id(leaf_tensor.origin_indices)
-                elif leaf_tensor.receipt is not None:
-                    routing_id = id(leaf_tensor.receipt)
-                else:
-                    routing_id = 0
-                batches[(source_spec, target_spec, routing_id)].append(
-                    (tuuid, leaf_tensor)
+                raise ValueError(
+                    f"[SPMDWorker] Missing successor topology for op={op_name} "
+                    f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
                 )
 
             handlers = self._successor_handlers.get(spmd_id, {})
             if not handlers:
-                continue
+                raise ValueError(
+                    f"[SPMDWorker] Missing successor handlers for op={op_name} "
+                    f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
+                )
+            if self._local_spmd_code is None:
+                raise ValueError(
+                    f"[SPMDWorker] local_spmd_code is not registered "
+                    f"spmd_id={self.spmd_id} rank={self.rank}."
+                )
 
             effective_rank = self.rank
             if succ_info.is_interleaved:
                 effective_rank = self.rank % succ_info.interleave_unit_size
 
-            distributor = AsyncDataDistributor(effective_rank)
-
-            # Build TUUID -> Name mapping for debugging and reporting (cached in OpManager)
-            tuuid_to_name = self.op_manager.get_output_tuuid_to_name(op_name)
-
-            for (source_spec, target_spec, _), batch in batches.items():
-                batch_target_uuids = [t[0] for t in batch]
-                batch_transport_tensors = [t[1] for t in batch]
-
-                if logger.level <= logging.DEBUG:
-                    for leaf_tuuid, leaf_val in batch:
-                        name = (
-                            tuuid_to_name.get(leaf_tuuid, "unknown")
-                            if tuuid_to_name
-                            else "unknown"
-                        )
-                        logger.debug(
-                            f"Distributor plan name={name} tuuid={leaf_tuuid} "
-                            f"global_shape={leaf_val.global_shape} "
-                            f"origin_indices={leaf_val.origin_indices} "
-                            f"routing_indices={leaf_val.routing_indices} "
-                            f"spmd_id={self.spmd_id} rank={self.rank}"
-                        )
-
-                # Accrue to distributor's internal plan
-                distributor.plan_and_shard(
-                    batch_transport_tensors,
-                    source_spec,
-                    target_spec,
-                    tuuid=batch_target_uuids,
-                    tuuid_to_name=tuuid_to_name,
+            successor_contexts.append(
+                _SuccessorSendContext(
+                    spmd_id=spmd_id,
+                    info=succ_info,
+                    handlers=handlers,
+                    effective_rank=effective_rank,
                 )
+            )
 
-            async def _send_fn(
-                target_rank: int,
-                tuuids: list,
-                tensors: list,
-                counts: list,
-                global_shapes_list: list | None = None,
-                hash_meta_tensor_state_list: list | None = None,
-                slice_compact_desc_params: list | None = None,
-                *,
-                _handlers=handlers,
-                _step=output_step,
-            ) -> bool:
-                handler = _handlers.get(target_rank)
-                if handler is None:
-                    return False
-
-                await self._send_semaphore.acquire()
-
-                ref_task = handler.receive_shards(
-                    tuuids=tuuids,
-                    step=_step,
-                    sender_id=self.spmd_id,
-                    sender_rank=self.rank,
-                    payloads=tensors,
-                    counts=counts,
-                    global_shapes=global_shapes_list,
-                    meta_tensor_state_list=hash_meta_tensor_state_list,
-                    slice_compact_desc_params=slice_compact_desc_params,
+        if successor_contexts:
+            local_spmd_code = self._local_spmd_code
+            assert local_spmd_code is not None
+            await self._outbound_semaphore.acquire()
+            self._spawn_outbound_task(
+                self._send_successor_frames_background(
+                    op_name,
+                    flat_results,
+                    output_uuids,
+                    output_sharding,
+                    successor_contexts,
+                    tuuid_to_name,
+                    step_tuuid_cache,
+                    exec_step,
+                    local_spmd_code,
+                    self._world_size,
                 )
+            )
 
-                async def _wait_and_release():
-                    try:
-                        await ref_task
-                    finally:
-                        self._send_semaphore.release()
-
-                self._spawn_background_task(_wait_and_release())
-                return True
-
-            await distributor.distribute(send_fn=_send_fn)
-
+        for spmd_id in successor_ids:
+            succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
+            if succ_info is None:
+                raise ValueError(
+                    f"[SPMDWorker] Missing successor topology for op={op_name} "
+                    f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
+                )
             # --- Send control_argument via control plane ---
             if state_data:
                 # Check condition
@@ -2463,7 +2763,7 @@ class SPMDWorker:
                 if names_to_send:
                     logger.debug(
                         f"Sending control_arguments names={names_to_send} "
-                        f"step={output_step} target_spmd_id={spmd_id} "
+                        f"step={exec_step} target_spmd_id={spmd_id} "
                         f"spmd_id={self.spmd_id} rank={self.rank}"
                     )
                     if self._driver_handle is not None:
@@ -2472,7 +2772,7 @@ class SPMDWorker:
                                 spmd_id,
                                 op_name,
                                 names_to_send,
-                                output_step,
+                                exec_step,
                                 values_to_send,
                             )
                         except Exception as e:
@@ -2480,6 +2780,331 @@ class SPMDWorker:
                                 f"Failed to send control_arguments via driver error={e} "
                                 f"target_spmd_id={spmd_id} spmd_id={self.spmd_id} rank={self.rank}"
                             )
+
+    async def _send_successor_frames_background(
+        self,
+        op_name: str,
+        flat_results: list[Any],
+        output_uuids: list[int],
+        output_sharding: dict[int, ShardingSpec],
+        successor_contexts: list[_SuccessorSendContext],
+        tuuid_to_name: dict[int, str] | None,
+        step_tuuid_cache: dict[int, Any],
+        exec_step: int,
+        sender_spmd_code: int,
+        sender_world_size: int,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        frame_groups = await loop.run_in_executor(
+            self._transport_executor,
+            self._build_successor_frame_groups_sync,
+            op_name,
+            flat_results,
+            output_uuids,
+            output_sharding,
+            successor_contexts,
+            tuuid_to_name,
+            step_tuuid_cache,
+            exec_step,
+            sender_spmd_code,
+            sender_world_size,
+        )
+        send_tasks = [
+            self._submit_transport_frame(handlers, frame_arg, exec_step)
+            for handlers, frame_arg in frame_groups
+        ]
+        if send_tasks:
+            await asyncio.gather(*send_tasks)
+
+    def _build_successor_frame_groups_sync(
+        self,
+        op_name: str,
+        flat_results: list[Any],
+        output_uuids: list[int],
+        output_sharding: dict[int, ShardingSpec],
+        successor_contexts: list[_SuccessorSendContext],
+        tuuid_to_name: dict[int, str] | None,
+        step_tuuid_cache: dict[int, Any],
+        exec_step: int,
+        sender_spmd_code: int,
+        sender_world_size: int,
+    ) -> list[
+        tuple[dict[int, Any], tuple[int, Any, Any, Any, Any, Any, Any, tuple[Any, ...]]]
+    ]:
+        frame_groups = []
+        wrapped_results: dict[int, TransportTensor] = {}
+        dispatcher = self.op_manager.get_dispatcher(op_name)
+        unit_size = getattr(dispatcher, "interleave_unit_size", None)
+
+        for context in successor_contexts:
+            batches = self._build_successor_batches_sync(
+                op_name,
+                flat_results,
+                output_uuids,
+                output_sharding,
+                context,
+                tuuid_to_name,
+                step_tuuid_cache,
+                exec_step,
+                wrapped_results,
+                unit_size,
+            )
+            if not batches:
+                continue
+
+            distributor = AsyncDataDistributor(context.effective_rank)
+            for (source_spec, target_spec, _), batch in batches.items():
+                batch_target_uuids = [t[0] for t in batch]
+                batch_transport_tensors = [t[1] for t in batch]
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    for leaf_tuuid, leaf_val in batch:
+                        name = (
+                            tuuid_to_name.get(leaf_tuuid, "unknown")
+                            if tuuid_to_name
+                            else "unknown"
+                        )
+                        logger.debug(
+                            f"Distributor plan name={name} tuuid={leaf_tuuid} "
+                            f"global_shape={leaf_val.global_shape} "
+                            f"origin_indices={leaf_val.origin_indices} "
+                            f"routing_indices={leaf_val.routing_indices} "
+                            f"spmd_id={self.spmd_id} rank={self.rank}"
+                        )
+
+                distributor.plan_and_shard(
+                    batch_transport_tensors,
+                    source_spec,
+                    target_spec,
+                    tuuid=batch_target_uuids,
+                    tuuid_to_name=tuuid_to_name,
+                )
+
+            for frame_arg in distributor.build_transport_frame_args(
+                step=exec_step,
+                sender_spmd_code=sender_spmd_code,
+                sender_world_size=sender_world_size,
+            ):
+                frame_groups.append((context.handlers, frame_arg))
+
+        return frame_groups
+
+    def _build_successor_batches_sync(
+        self,
+        op_name: str,
+        flat_results: list[Any],
+        output_uuids: list[int],
+        output_sharding: dict[int, ShardingSpec],
+        context: _SuccessorSendContext,
+        tuuid_to_name: dict[int, str] | None,
+        step_tuuid_cache: dict[int, Any],
+        exec_step: int,
+        wrapped_results: dict[int, TransportTensor],
+        unit_size: int | None,
+    ) -> dict[Any, list[tuple[int, TransportTensor]]]:
+        batches: dict[Any, list[tuple[int, TransportTensor]]] = defaultdict(list)
+        succ_info = context.info
+        for i, raw_leaf in enumerate(flat_results):
+            if raw_leaf is None or i >= len(output_uuids):
+                continue
+
+            tuuid = output_uuids[i]
+            if tuuid not in succ_info.tuuid_sharding:
+                continue
+
+            leaf_tensor = wrapped_results.get(i)
+            if leaf_tensor is None:
+                if isinstance(raw_leaf, TransportTensor):
+                    leaf_tensor = raw_leaf
+                else:
+                    leaf_tensor = TransportTensor.from_tensor(raw_leaf)
+                wrapped_results[i] = leaf_tensor
+
+            source_logical = output_sharding.get(tuuid)
+            target_logical = succ_info.tuuid_sharding.get(tuuid)
+            if source_logical is None or target_logical is None:
+                raise ValueError(
+                    f"[SPMDWorker] Missing sharding for output tuuid={tuuid} "
+                    f"op={op_name} successor={context.spmd_id} "
+                    f"source_has={source_logical is not None} "
+                    f"target_has={target_logical is not None}."
+                )
+
+            source_spec = source_logical.bind(self._mesh)
+            target_spec = target_logical.bind(succ_info.mesh or self._mesh)
+            if isinstance(unit_size, int):
+                unit_idx = self.rank // unit_size
+                unit_ranks = list(
+                    range(unit_idx * unit_size, (unit_idx + 1) * unit_size)
+                )
+                if source_spec.mesh is not None:
+                    base_mesh = source_spec.mesh
+                    other_dims_size = 1
+                    for s in base_mesh.shape[1:]:
+                        other_dims_size *= s
+                    if unit_size % other_dims_size == 0:
+                        first_axis_size = unit_size // other_dims_size
+                        new_shape = (first_axis_size,) + base_mesh.shape[1:]
+                        from fluxway.common.mesh import DeviceMesh
+
+                        sub_mesh = DeviceMesh(
+                            device_shape=new_shape,
+                            axis_names=base_mesh.axis_names,
+                            device_ids=unit_ranks,
+                        )
+                        source_spec = source_logical.bind(sub_mesh)
+
+            if isinstance(source_spec, PhysicalLayout) and isinstance(
+                source_spec.spec.routing, ReferentialRouting
+            ):
+                leaf_tensor = self._inherit_mirror_metadata_sync(
+                    op_name,
+                    tuuid,
+                    leaf_tensor,
+                    source_spec,
+                    tuuid_to_name,
+                    step_tuuid_cache,
+                    exec_step,
+                )
+
+            if target_spec is not None and target_spec.is_content_addressable:
+                if (
+                    leaf_tensor.routing_indices is None
+                    and leaf_tensor.receipt is None
+                    and leaf_tensor.flat_values is None
+                ):
+                    output_name = (
+                        tuuid_to_name.get(tuuid, f"TUUID:{tuuid}")
+                        if tuuid_to_name
+                        else f"TUUID:{tuuid}"
+                    )
+                    raise ValueError(
+                        f"[Fluxway Routing Error] Operator '{op_name}' output '{output_name}' "
+                        f"is destined for a dynamic routing edge, but its TransportTensor "
+                        f"lacks routing metadata (routing_indices, receipt, or flat_values). "
+                        f"If you returned a TransportTensor manually, ensure you provide explicit routing metadata."
+                    )
+
+            if leaf_tensor.routing_indices is not None:
+                routing_id = id(leaf_tensor.routing_indices)
+            elif leaf_tensor.origin_indices is not None:
+                routing_id = id(leaf_tensor.origin_indices)
+            elif leaf_tensor.receipt is not None:
+                routing_id = id(leaf_tensor.receipt)
+            else:
+                routing_id = 0
+            batches[(source_spec, target_spec, routing_id)].append((tuuid, leaf_tensor))
+        return batches
+
+    def _inherit_mirror_metadata_sync(
+        self,
+        op_name: str,
+        tuuid: int,
+        leaf_tensor: TransportTensor,
+        source_spec: PhysicalLayout,
+        tuuid_to_name: dict[int, str] | None,
+        step_tuuid_cache: dict[int, Any],
+        exec_step: int,
+    ) -> TransportTensor:
+        if not source_spec.is_referential:
+            return leaf_tensor
+        mirror_tuuid = getattr(source_spec.spec.routing, "tuuid", None)
+        if mirror_tuuid is None:
+            return leaf_tensor
+
+        source_ref = step_tuuid_cache.get(mirror_tuuid)
+        if source_ref is None:
+            output_name = (
+                tuuid_to_name.get(tuuid, f"TUUID:{tuuid}")
+                if tuuid_to_name
+                else f"TUUID:{tuuid}"
+            )
+            source_path = getattr(
+                source_spec.spec.routing, "path", f"TUUID:{mirror_tuuid}"
+            )
+            raise ValueError(
+                f"[Fluxway Mirror Error] Mirror resolution failed for output '{output_name}' in operator '{op_name}'. "
+                f"It is configured to follow the sharding of '{source_path}' (TUUID {mirror_tuuid}), "
+                f"but this mirror source was not found in the SPMD {self.spmd_id} rank {self.rank} step {exec_step} input cache. "
+                f"Verify that '{source_path}' is properly declared as an input to '{op_name}' in the graph configuration."
+            )
+        if not source_ref.receipt:
+            return leaf_tensor
+
+        inherited_global_shape = leaf_tensor.global_shape
+        if inherited_global_shape is None and source_ref.global_shape is not None:
+            actual_shape = leaf_tensor.shape
+            src_axes = source_ref.routing_axes
+            dst_axes = leaf_tensor.routing_axes
+            if len(src_axes) != len(dst_axes):
+                raise ValueError(
+                    f"[Fluxway Mirror Error] Mirror shape alignment mismatch in operator '{op_name}'. "
+                    f"Source routing axes {src_axes} (length {len(src_axes)}) does not match "
+                    f"destination routing axes {dst_axes} (length {len(dst_axes)})."
+                )
+            new_shape = list(actual_shape)
+            for idx, out_axis in enumerate(dst_axes):
+                if out_axis >= len(new_shape):
+                    raise ValueError(
+                        f"[Fluxway Mirror Error] Destination routing axis {out_axis} "
+                        f"is out of bounds for shape {actual_shape} in operator '{op_name}'."
+                    )
+                src_axis = src_axes[idx]
+                if src_axis >= len(source_ref.global_shape):
+                    raise ValueError(
+                        f"[Fluxway Mirror Error] Source routing axis {src_axis} "
+                        f"is out of bounds for global shape {source_ref.global_shape} in operator '{op_name}'."
+                    )
+                new_shape[out_axis] = source_ref.global_shape[src_axis]
+            inherited_global_shape = tuple(new_shape)
+
+        return TransportTensor(
+            leaf_tensor.flat_values,
+            nested_splits=leaf_tensor.nested_splits,
+            routing_indices=leaf_tensor.routing_indices,
+            global_shape=inherited_global_shape,
+            origin_indices=leaf_tensor.origin_indices or source_ref.origin_indices,
+            receipt=source_ref.receipt,
+        )
+
+    async def _submit_transport_frame(
+        self,
+        handlers: dict[int, Any],
+        frame_arg: tuple[int, Any, Any, Any, Any, Any, Any, tuple[Any, ...]],
+        output_step: int,
+    ) -> bool:
+        (
+            target_rank,
+            frame_i32,
+            edge_i32,
+            payload_i32,
+            shape_i32,
+            global_shape_i64,
+            compact_i64,
+            payload_segments,
+        ) = frame_arg
+        handler = handlers.get(target_rank)
+        if handler is None:
+            raise ValueError(
+                f"[SPMDWorker] Missing successor handler for transport frame: "
+                f"source={self.spmd_id}:{self.rank} target_rank={target_rank} "
+                f"step={output_step}."
+            )
+
+        await self._send_semaphore.acquire()
+        try:
+            await handler.receive_transport_frame(
+                frame_i32,
+                edge_i32,
+                payload_i32,
+                shape_i32,
+                global_shape_i64,
+                compact_i64,
+                *payload_segments,
+            )
+        finally:
+            self._send_semaphore.release()
+        return True
 
     def _reconstruct_data_type_from_dict(self, cls: type, data: dict[str, Any]) -> Any:
         """Reconstruct a @data_type or dataclass from a nested dictionary of fields."""
@@ -2717,6 +3342,7 @@ class SPMDWorker:
         Trigger the snapshot begin hook for all operators on this worker.
         Called on Rank 0 by the Driver before parallel saving starts.
         """
+        await self._drain_outbound_tasks()
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         if self._op_manager:
             seen_cls_ids: set = set()
@@ -2746,6 +3372,7 @@ class SPMDWorker:
         Trigger the snapshot commit hook for all operators on this worker.
         Called on Rank 0 by the Driver after all ranks have saved successfully.
         """
+        await self._drain_outbound_tasks()
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         if self._op_manager:
             seen_cls_ids: set = set()
@@ -2779,8 +3406,8 @@ class SPMDWorker:
             A ``(spmd_state, rank_storage, operator_states)`` triple:
 
             - ``spmd_state``: SPMD-level logical state that is topology-independent
-              (``completed_step_count``, ``static_args``).  All ranks in the same
-              SPMD share identical values; the Driver stores this once per SPMD.
+              (``completed_step_count``).  All ranks in the same SPMD share
+              identical values; the Driver stores this once per SPMD.
             - ``rank_storage``: rank-specific physical storage paths returned by the
               checkpoint backend (``ckpt_dir``, ``orbax_final_path``,
               ``local_state_dir``, …).  Empty dict when this rank has no on-disk
@@ -2790,8 +3417,8 @@ class SPMDWorker:
               ``trigger_snapshot_commit`` so that operators requiring cross-rank
               coordination (e.g. lance commit_fragments) can finalize.
         """
+        await self._drain_outbound_tasks()
         completed_step_count_snapshot = dict(self._completed_step_count)
-        static_args_snapshot = self.op_manager.get_static_args()
 
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         operator_states = self._call_operator_save_state(spmd_dir)
@@ -2809,7 +3436,6 @@ class SPMDWorker:
 
         spmd_state = {
             "completed_step_count": completed_step_count_snapshot,
-            "static_args": static_args_snapshot,
         }
 
         logger.debug(
@@ -2830,7 +3456,7 @@ class SPMDWorker:
 
         Args:
             spmd_state:   SPMD-level logical state shared by all ranks
-                          (``completed_step_count``, ``static_args``).
+                          (``completed_step_count``).
             rank_storage: Rank-specific physical storage paths.  ``None`` when
                           this rank has no on-disk checkpoint (e.g. scale-up to
                           a larger worker count).
@@ -2856,34 +3482,38 @@ class SPMDWorker:
                     )
                     self._spawn_background_task(self._enqueue(op_name, count))
 
-        if "static_args" not in spmd_state:
-            raise RuntimeError(
-                f"load_state_from_disk: 'static_args' missing from spmd_state "
-                f"for spmd_id={self.spmd_id} rank={self.rank}."
-            )
-        for name, value in spmd_state["static_args"].items():
-            self.op_manager.set_static_arg(name, value)
-
+        shared_operator_states = spmd_state.get("operator_states")
         if rank_storage is None:
+            if shared_operator_states:
+                self._call_operator_restore_state(shared_operator_states, "")
+                logger.debug(
+                    "State loaded from shared operator metadata spmd_id=%s rank=%s",
+                    self.spmd_id,
+                    self.rank,
+                )
+                return
             logger.debug(
-                "No on-disk state for spmd_id=%s rank=%s (scale-up rank), skipping backend load",
+                "No on-disk or shared operator state for spmd_id=%s rank=%s",
                 self.spmd_id,
                 self.rank,
             )
             return
 
-        target_state = {
+        target_state: dict[str, Any] = {
             "completed_step_count": self._completed_step_count,
-            "static_args": self.op_manager.get_static_args(),
-            "operator_states": self._call_operator_save_state(""),
         }
+        if "orbax_final_path" in rank_storage:
+            target_state["operator_states"] = self._call_operator_restore_target_state()
+        elif shared_operator_states:
+            target_state["operator_states"] = shared_operator_states
         state = await self._get_checkpoint_backend().load(
             rank_storage, target_state=target_state
         )
 
         ckpt_dir = rank_storage.get("ckpt_dir", "")
-        if "operator_states" in state:
-            self._call_operator_restore_state(state["operator_states"], ckpt_dir)
+        operator_states = state.get("operator_states", shared_operator_states)
+        if operator_states:
+            self._call_operator_restore_state(operator_states, ckpt_dir)
         logger.debug(
             "State loaded from disk spmd_id=%s rank=%s", self.spmd_id, self.rank
         )
@@ -2911,6 +3541,34 @@ class SPMDWorker:
                     states[op_name] = instance.save_state(ckpt_dir=ckpt_dir)
                 else:
                     states[op_name] = instance.save_state()
+        return states
+
+    def _call_operator_restore_target_state(self) -> dict[str, Any]:
+        seen_cls_ids: set = set()
+        states: dict[str, Any] = {}
+        storage, lock = get_instance_storage()
+        for op_name, op_meta in (self.config.operator_metas or {}).items():
+            if not op_meta.owner_class_qualname:
+                continue
+            cls = _resolve_owner_class(
+                op_meta.owner_class_module, op_meta.owner_class_qualname
+            )
+            if cls is None or id(cls) in seen_cls_ids:
+                continue
+            seen_cls_ids.add(id(cls))
+            with lock:
+                instance = storage.get(id(cls))
+            if instance is None:
+                continue
+            target_fn = getattr(instance, "restore_target_state", None)
+            if callable(target_fn):
+                states[op_name] = target_fn()
+        if not states:
+            raise RuntimeError(
+                f"Global checkpoint restore requires at least one operator to "
+                f"implement restore_target_state() spmd_id={self.spmd_id} "
+                f"rank={self.rank}"
+            )
         return states
 
     def _call_operator_restore_state(
@@ -2945,6 +3603,34 @@ class SPMDWorker:
                     instance.restore_state(op_state, ckpt_dir=ckpt_dir)
                 else:
                     instance.restore_state(op_state)
+
+    def inspect_operator_state(self) -> dict[str, Any]:
+        seen_cls_ids: set[int] = set()
+        snapshots: dict[str, Any] = {}
+        storage, lock = get_instance_storage()
+        for op_name, op_meta in (self.config.operator_metas or {}).items():
+            if not op_meta.owner_class_qualname:
+                continue
+            cls = _resolve_owner_class(
+                op_meta.owner_class_module, op_meta.owner_class_qualname
+            )
+            if cls is None or id(cls) in seen_cls_ids:
+                continue
+            seen_cls_ids.add(id(cls))
+            with lock:
+                instance = storage.get(id(cls))
+            if instance is None:
+                continue
+            snapshot_fn = getattr(instance, "audit_state_snapshot", None)
+            if callable(snapshot_fn):
+                snapshots[op_name] = snapshot_fn()
+        return {
+            "spmd_id": self.spmd_id,
+            "rank": self.rank,
+            "world_size": self._world_size,
+            "completed_step_count": dict(self._completed_step_count),
+            "operators": snapshots,
+        }
 
     # =========================================================================
     # Utility

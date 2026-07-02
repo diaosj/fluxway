@@ -848,6 +848,14 @@ class OperatorManager:
                         ):
                             n = meta.barrier_config.n
                         expected[u] = n
+                    elif spec.is_content_addressable:
+                        if pre_info.world_size <= 0:
+                            raise ValueError(
+                                f"[OperatorManager] Dynamic producer '{pre_id}' for "
+                                f"op '{op_name}' tuuid={u} has invalid world_size="
+                                f"{pre_info.world_size}."
+                            )
+                        expected[u] = expected.get(u, 0) + pre_info.world_size
                     else:
                         # Use the unified topology model to resolve physical producers.
                         producers = self.resolve_tensor_producers(

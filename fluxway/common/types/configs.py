@@ -160,6 +160,9 @@ class SPMDConfig(FluxwayBaseSchema):
     # If true, worker will block identically at step=0 until a drain target is provided.
     requires_drain_at_startup: bool = False
 
+    # If true, workers enqueue source operators immediately after topology startup.
+    auto_start_source_operators: bool = True
+
     # Per-node Ray runtime_env for Driver/Worker actors.
     # Passed through to .options(runtime_env=...) when creating actors.
     # Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}

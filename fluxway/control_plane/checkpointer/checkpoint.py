@@ -3,6 +3,7 @@ import pickle
 import logging
 import os
 import shutil
+import inspect
 from pathlib import Path
 from typing import Any
 from collections.abc import Callable
@@ -131,6 +132,7 @@ class FluxwayCheckpointer:
 
     def _persist(self, step: int, manifest: dict[str, Any]) -> None:
         """Write the manifest that maps spmd_id to {spmd_state, rank_storage}."""
+        _validate_manifest_pure_data(manifest)
         step_dir = Path(self._ckpt_dir) / str(step)
         manifest_path = step_dir / "manifest.pkl"
 
@@ -184,3 +186,40 @@ class FluxwayCheckpointer:
         steps = self.list_steps()
         for old_step in steps[: -self._max_to_keep]:
             shutil.rmtree(Path(self._ckpt_dir) / str(old_step))
+
+
+def _validate_manifest_pure_data(value: Any, path: str = "manifest") -> None:
+    if value is None or isinstance(value, str | int | float | bool):
+        return
+    if isinstance(value, Path):
+        raise TypeError(
+            f"{path} contains pathlib.Path; checkpoint manifests must store plain strings."
+        )
+    if isinstance(value, bytes):
+        return
+    if isinstance(value, list | tuple):
+        for idx, item in enumerate(value):
+            _validate_manifest_pure_data(item, f"{path}[{idx}]")
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str | int):
+                raise TypeError(
+                    f"{path} contains non-scalar key {key!r} of type {type(key).__name__}."
+                )
+            _validate_manifest_pure_data(item, f"{path}.{key}")
+        return
+    if inspect.isclass(value) or inspect.ismodule(value) or callable(value):
+        raise TypeError(
+            f"{path} contains runtime object {value!r} of type {type(value).__name__}; "
+            "checkpoint manifests must contain pure data only."
+        )
+    module = type(value).__module__
+    if module.startswith("ray."):
+        raise TypeError(
+            f"{path} contains Ray runtime object of type {type(value).__name__}; "
+            "actor handles and object refs must not be persisted in checkpoint manifests."
+        )
+    raise TypeError(
+        f"{path} contains unsupported manifest value type {type(value).__name__}."
+    )

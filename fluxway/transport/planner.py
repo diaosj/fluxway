@@ -210,10 +210,15 @@ class TransportPlanner:
                     f"length=-1; ``_build_routing_domain`` must finalise "
                     f"the length before reaching the planner."
                 )
-            eff_len = int(spec.length)
+            eff_len = spec.length
             effective_lengths.append(eff_len)
 
             is_constant = isinstance(spec, ConstantIndices)
+            if is_constant and not zip_mode:
+                raise ValueError(
+                    "ConstantIndices is only supported when RoutingDomain.combine='zip'. "
+                    "Cartesian mode would require materializing a repeated constant axis."
+                )
 
             # ConstantIndices fast path (zip-mode only): the rank tensor is
             # a single scalar broadcast to the primary axis length
@@ -221,6 +226,7 @@ class TransportPlanner:
             # array.  Cartesian mode falls through to the slow path so the
             # axis still inflates ``primary_dest`` correctly.
             if is_constant and zip_mode:
+                assert isinstance(spec, ConstantIndices)
                 if eff_len == 0:
                     ranks_axis = backend.zeros(
                         (0,), dtype=backend.int32(), device="cpu"
@@ -249,30 +255,12 @@ class TransportPlanner:
                 ranks_axis = backend.zeros((0,), dtype=backend.int32(), device="cpu")
                 valid_axis = backend.zeros((0,), dtype=backend.int32(), device="cpu")
             else:
-                # Materialise the spec into a 1-D tensor so the strategy's
-                # generic `(indices, dim_size, num_workers, idx_desc) -> ranks`
-                # contract holds.  TODO(perf): when the strategy implements
-                # `routes_for_range(spec, ...)` we can skip materialisation
-                # entirely — see Task 11 follow-up.
-                materialised = _materialize(spec, backend)
-                tensor_valid = materialised >= 0
-                safe = backend.where(tensor_valid, materialised, 0)
-                ranks_axis = axis.strategy(
-                    safe,
+                ranks_axis, valid_axis = axis.strategy.ranks_for_indices_spec(
+                    spec,
                     dim_size=axis.size,
                     num_workers=axis.num_workers,
                     index_desc=axis.index_descriptor,
                 )
-                valid_axis = backend.cast(tensor_valid, backend.int32())
-
-                # Apply spec.valid_length sentinel mask (Cartesian AND with
-                # the materialised tensor mask).
-                if spec.valid_length is not None and spec.valid_length < eff_len:
-                    iota = backend.arange(
-                        0, eff_len, dtype=backend.int32(), device="cpu"
-                    )
-                    spec_valid = backend.cast(iota < spec.valid_length, backend.int32())
-                    valid_axis = valid_axis * spec_valid
 
             # Combine semantics:
             #   - cartesian: reshape this axis's rank/valid tensors into
@@ -303,7 +291,7 @@ class TransportPlanner:
         # IndicesSpec rather than silently truncating via broadcast.
         if zip_mode:
             non_const_lens = [
-                int(domain.axes[i].indices.length)
+                domain.axes[i].indices.length
                 for i in range(num_axes)
                 if not isinstance(domain.axes[i].indices, ConstantIndices)
             ]
@@ -446,7 +434,7 @@ def _materialize(spec: IndicesSpec, backend: Any) -> Any:
         if spec.length <= 0:
             return backend.zeros((0,), dtype=backend.int32(), device="cpu")
         return backend.tensor(
-            [int(spec.value)] * int(spec.length),
+            [spec.value] * spec.length,
             dtype=backend.int32(),
             device="cpu",
         )

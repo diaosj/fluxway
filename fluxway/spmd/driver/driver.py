@@ -14,10 +14,11 @@ The SPMD Driver coordinates all workers within the SPMD:
 
 import asyncio
 from collections import defaultdict
+import copy
 import threading
 import time
 import pathlib
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 try:
     import ray
@@ -38,6 +39,7 @@ from fluxway.common.types import (
     WorkerHeartbeat,
 )
 from fluxway.common.utils import ensure_logging_configured
+from fluxway.control_plane.checkpointer.checkpoint import _validate_manifest_pure_data
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.driver.state_machine import DriverStateMachine
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
@@ -49,7 +51,7 @@ from fluxway.common.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-if RAY_AVAILABLE:
+if TYPE_CHECKING or RAY_AVAILABLE:
 
     @ray.remote  # type: ignore[reportPossiblyUnboundVariable]
     class SPMDDriver:  # pyright: ignore[reportRedeclaration]
@@ -250,7 +252,7 @@ if RAY_AVAILABLE:
                 opts = self._build_worker_opts(
                     bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}"
                 )
-                worker = SPMDWorker.options(**opts).remote(
+                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
                     config=self.config,
                     rank=rank,
                     spmd_id=self.spmd_id,
@@ -359,6 +361,16 @@ if RAY_AVAILABLE:
             """Get all worker handles for topology registration."""
             return dict(self._worker_handles)
 
+        async def inspect_operator_state(self) -> dict[int, Any]:
+            tasks = {
+                rank: worker.inspect_operator_state.remote()
+                for rank, worker in self._worker_handles.items()
+            }
+            if not tasks:
+                return {}
+            results = await asyncio.gather(*tasks.values())
+            return dict(zip(tasks.keys(), results, strict=True))
+
         def register_topology(
             self,
             predecessor_handlers: dict[
@@ -369,6 +381,8 @@ if RAY_AVAILABLE:
             ],  # {spmd_id: {rank: handle}}
             predecessor_count: int,
             successor_count: int,
+            local_spmd_code: int,
+            spmd_id_by_code: dict[int, str],
         ) -> None:
             """
             Register topology with provided worker handles.
@@ -391,6 +405,7 @@ if RAY_AVAILABLE:
             # Step 1: Notify workers of expected topology counts
             for worker in self._worker_handles.values():
                 worker.set_expected_topology.remote(predecessor_count, successor_count)
+                worker.register_spmd_code_map.remote(local_spmd_code, spmd_id_by_code)
 
             # Step 2: Register predecessor worker handles
             for spmd_id, handlers in predecessor_handlers.items():
@@ -468,9 +483,9 @@ if RAY_AVAILABLE:
         # =====================================================================
 
         async def request_drain(self, target_count: int, reason: str = "") -> None:
-            if self.state_machine.state not in (DriverState.RUNNING, DriverState.READY):
+            if self.state_machine.state != DriverState.RUNNING:
                 raise RuntimeError(
-                    f"request_drain requires RUNNING or READY state, "
+                    f"request_drain requires RUNNING state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
             self._pending_target_step_count = target_count
@@ -575,13 +590,6 @@ if RAY_AVAILABLE:
                 # is required during restore_from_disk; without forwarding it to the
                 # controller the persisted manifest is empty and any subsequent
                 # resume raises `'completed_step_count' missing from spmd_state`.
-                rank_metadata: dict[int, tuple[dict, dict]] = {
-                    rank: (spmd_state, rank_storage)
-                    for rank, (spmd_state, rank_storage, _) in zip(
-                        ranks, results, strict=True
-                    )
-                }
-
                 # Aggregate raw operator_states across ranks for
                 # trigger_snapshot_commit.  Operators like sparse_spmd need
                 # the gathered metadata (e.g. lance fragment metas from all
@@ -597,6 +605,31 @@ if RAY_AVAILABLE:
                         self._pending_target_step_count,
                         dict(gathered_states),
                     )
+
+                canonical_spmd_state = results[0][0]
+                shared_operator_states = {}
+                for op_name, per_rank_states in gathered_states.items():
+                    if ranks[0] not in per_rank_states:
+                        continue
+                    candidate_state = copy.deepcopy(per_rank_states[ranks[0]])
+                    try:
+                        _validate_manifest_pure_data(
+                            candidate_state,
+                            path=(
+                                f"manifest.{self.spmd_id}."
+                                f"spmd_state.operator_states.{op_name}"
+                            ),
+                        )
+                    except TypeError:
+                        continue
+                    shared_operator_states[op_name] = candidate_state
+                canonical_spmd_state = dict(canonical_spmd_state)
+                canonical_spmd_state["operator_states"] = shared_operator_states
+
+                rank_metadata: dict[int, tuple[dict, dict]] = {
+                    rank: (canonical_spmd_state, rank_storage)
+                    for rank, (_, rank_storage, _) in zip(ranks, results, strict=True)
+                }
 
             except Exception as e:
                 logger.error(
@@ -1114,7 +1147,7 @@ if RAY_AVAILABLE:
                 opts = self._build_worker_opts(
                     bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}_recovered"
                 )
-                worker = SPMDWorker.options(**opts).remote(
+                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
                     config=self.config,
                     rank=rank,
                     spmd_id=self.spmd_id,
@@ -1251,6 +1284,15 @@ if RAY_AVAILABLE:
                     logger.error(
                         f"Failed to resume worker error={e} spmd_id={self.spmd_id}"
                     )
+
+        async def start_source_operators(self) -> None:
+            self._source_state = ReaderState.READING
+            tasks = [
+                worker.start_source_operators.remote()
+                for worker in self._worker_handles.values()
+            ]
+            if tasks:
+                await asyncio.gather(*tasks)
 
         def get_source_state(self) -> ReaderState | None:
             """Get current source state."""

@@ -16,16 +16,21 @@ Test scenarios
 
 from __future__ import annotations
 
+import typing
 import unittest
-from unittest.mock import MagicMock
 
 import jax.numpy as jnp
 import numpy as np
 
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.index_descriptor import ExplicitIndex
+from fluxway.common.types.sharding import AlgebraicRouting, ChunkPartition
+from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
+from fluxway.spmd.worker.worker import SPMDWorker as RaySPMDWorker
 
+SPMDWorker = getattr(RaySPMDWorker, "__ray_actor_class__", RaySPMDWorker)  # type: ignore
 # ─── Helper: build a minimal TransportTensor ─────────────────────────────────
 
 
@@ -139,24 +144,6 @@ class _AssemblyMixin:
             return SymmetryReceipt.concatenate(receipts, lengths)
         return None
 
-    def _heal_empty_shape(self, input_spec, reference_values=None):
-        backend = get_backend()
-        dtype = backend.float32()
-        feature_dim = None
-        if hasattr(input_spec, "global_shape") and input_spec.global_shape:
-            gs = list(input_spec.global_shape)
-            if len(gs) >= 2:
-                feature_dim = gs[1]
-        if feature_dim is None and reference_values is not None:
-            ref_shape = backend.shape(reference_values)
-            if len(ref_shape) >= 2:
-                feature_dim = int(ref_shape[1])
-        if feature_dim is not None:
-            return TransportTensor.from_tensor(
-                backend.zeros((0, feature_dim), dtype=dtype)
-            )
-        return TransportTensor.from_tensor(backend.zeros((0,), dtype=dtype))
-
     def _assemble_dynamic_to_static_core(
         self, valid_shards: list[TransportTensor], input_spec, has_mirror: bool
     ):
@@ -245,6 +232,17 @@ class _MockWorker(_AssemblyMixin):
         self.rank = rank
 
 
+class _DirectWorker:
+    rank: int = 0
+    spmd_id: str = ""
+    _filter_shards_by_routing: typing.Any = None
+    _get_values: typing.Any = None
+    _get_routing_indices: typing.Any = None
+    _normalize_and_cat_shards: typing.Any = None
+    _maybe_merge_receipts: typing.Any = None
+    _assemble_dynamic_to_static_tensor: typing.Any = None
+
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -273,6 +271,7 @@ class TestSymmetryReceiptHelpers(unittest.TestCase):
         ]
         result = self.w._maybe_merge_receipts(shards, has_mirror=True)
         self.assertIsNotNone(result)
+        assert result is not None
         np.testing.assert_array_equal(result.sender_rank_tags, [0, 0, 1, 1])
 
     def test_partial_receipts_returns_none_even_with_mirror_flag(self):
@@ -283,34 +282,6 @@ class TestSymmetryReceiptHelpers(unittest.TestCase):
         ]
         result = self.w._maybe_merge_receipts(shards, has_mirror=True)
         self.assertIsNone(result)
-
-
-class TestHealEmptyShape(unittest.TestCase):
-    """Unit tests for _heal_empty_shape."""
-
-    def setUp(self):
-        self.w = _MockWorker(rank=0)
-
-    def test_returns_0d_when_no_info(self):
-        spec = MagicMock()
-        spec.global_shape = None
-        result = self.w._heal_empty_shape(spec)
-        self.assertEqual(get_backend().shape(result.flat_values), (0,))
-
-    def test_infers_feature_dim_from_spec(self):
-        spec = MagicMock()
-        spec.global_shape = (100, 64)
-        result = self.w._heal_empty_shape(spec)
-        shape = get_backend().shape(result.flat_values)
-        self.assertEqual(shape, (0, 64))
-
-    def test_infers_feature_dim_from_reference(self):
-        spec = MagicMock()
-        spec.global_shape = None
-        ref = jnp.ones((5, 32))
-        result = self.w._heal_empty_shape(spec, reference_values=ref)
-        shape = get_backend().shape(result.flat_values)
-        self.assertEqual(shape, (0, 32))
 
 
 class TestMergeOriginIndices(unittest.TestCase):
@@ -374,7 +345,9 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         w = _MockWorker(rank=rank)
         valid = [s for s in shards if get_backend().shape(w._get_values(s))[0] > 0]
         if not valid:
-            return w._heal_empty_shape(spec)
+            raise ValueError(
+                "Dynamic-to-static assembly requires at least one non-empty shard."
+            )
         return w._assemble_dynamic_to_static_core(valid, spec, has_mirror)
 
     def test_basic_reassembly_no_mirror(self):
@@ -401,6 +374,54 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             )
             # No mirror → no receipt
             self.assertIsNone(result.receipt)
+
+    def test_real_worker_slot_addressed_sparse_embedding_assembly(self):
+        mesh = DeviceMesh(device_shape=(2,), axis_names=("dp",))
+        input_layout = ShardingSpec(
+            routing=AlgebraicRouting(
+                strategy=ChunkPartition(), partition=PartitionSpec("dp")
+            )
+        ).bind(mesh)
+
+        worker: typing.Any = _DirectWorker()
+        worker.rank = 1
+        worker.spmd_id = "Dense"
+        worker._filter_shards_by_routing = lambda op, tuuid, step, shards, topo: [
+            packet[0] for packet in shards.values()
+        ]
+        worker._get_values = SPMDWorker._get_values.__get__(worker, _DirectWorker)  # type: ignore
+        worker._get_routing_indices = SPMDWorker._get_routing_indices.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
+        worker._normalize_and_cat_shards = SPMDWorker._normalize_and_cat_shards.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
+        worker._maybe_merge_receipts = SPMDWorker._maybe_merge_receipts.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
+        assemble = SPMDWorker._assemble_dynamic_to_static_tensor.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
+
+        shard = TransportTensor(
+            np.array([[8, 8], [10, 10], [13, 13]], dtype=np.float32),
+            origin_indices=ExplicitIndex(np.array([8, 10, 13], dtype=np.int64)),
+            global_shape=(16, 2),
+            receipt=SymmetryReceipt(4, np.array([0, 1, 1], dtype=np.int32)),
+        )
+
+        result = assemble("step", 7, 0, {("Sparse", 0): [shard]}, input_layout, {})
+        data = np.asarray(result.flat_values)
+
+        self.assertEqual(data.shape, (8, 2))
+        np.testing.assert_array_equal(data[0], [8, 8])
+        np.testing.assert_array_equal(data[2], [10, 10])
+        np.testing.assert_array_equal(data[5], [13, 13])
+        np.testing.assert_array_equal(data[1], [0, 0])
+        np.testing.assert_array_equal(
+            np.asarray(result.receipt.sender_rank_tags),
+            [0, 4, 1, 4, 4, 1, 4, 4],
+        )
 
     def test_unequal_shard_sizes(self):
         """
@@ -467,7 +488,9 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
 
             if n > 0:
                 receipt = result.receipt
+                assert receipt is not None
                 # sender_rank_tags must be in [0,3] (valid SPMD_A ranks)
+                assert receipt is not None
                 tags = np.array(receipt.sender_rank_tags)
                 self.assertTrue(
                     np.all(tags >= 0), f"Rank {rank}: invalid sender_rank < 0"
@@ -488,6 +511,8 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         grad_tensor = make_tt([[0.1], [0.2]], receipt=receipt)
 
         # The backward pass reads receipt.sender_rank_tags → routes gradient to SPMD_A rank 0
+        assert grad_tensor.receipt is not None
+        assert grad_tensor.receipt is not None
         backward_targets = set(np.array(grad_tensor.receipt.sender_rank_tags).tolist())
         self.assertEqual(backward_targets, {0})  # both rows go back to SPMD_A[0]
 
@@ -530,7 +555,6 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
                 tensor_tuuid: {"type": output_sharding_type, "axis": [output_axis]}
             },
             tuuid_map={output_tensor_name: tensor_tuuid},
-            target_op=sender_op,
         )
         meta = OperatorMeta(
             name=sender_op,
@@ -591,6 +615,7 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
 
         # In the new architecture, mesh is stored on ResolvedTopologyInfo, not ShardingSpec.
         # The ShardingSpec is purely logical; binding to a mesh produces a PhysicalLayout.
+        assert succ_entry.mesh is not None
         self.assertEqual(
             succ_entry.mesh.size,
             RECEIVER_SIZE,
@@ -630,8 +655,8 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
         from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 
         edge = EdgeShardingInfo(
-            tensor_sharding={"emb1": {"type": "static", "axis": ["dp"]}},
-            target_op="forward",
+            tuuid_sharding={1: {"type": "static", "axis": ["dp"]}},
+            tuuid_map={"emb1": 1},
         )
         meta = OperatorMeta(
             name="forward",
@@ -662,9 +687,13 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
 
         pred_entry = mgr._predecessor_topology.get("forward", {}).get("EmbeddingTable")
         self.assertIsNotNone(pred_entry, "EmbeddingTable predecessor entry missing")
+        assert pred_entry is not None
+        self.assertIsNotNone(pred_entry.mesh, "EmbeddingTable predecessor mesh missing")
+        assert pred_entry.mesh is not None
 
         # Physical identity comes from Phase 0 (Builder-injected), not from sharding spec parsing.
         self.assertEqual(pred_entry.world_size, SENDER_SIZE)
+        assert pred_entry.mesh is not None
         self.assertEqual(pred_entry.mesh.size, SENDER_SIZE)
         self.assertEqual(pred_entry.mesh.axis_names, ("shard",))
 
@@ -683,6 +712,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
             ShardingSpec,
             PartitionSpec,
             ChunkPartition,
+            IndexedModuloPartition,
         )
         import asyncio
 
@@ -694,7 +724,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
         sender_mesh = DeviceMesh(device_shape=(SENDER_SIZE,), axis_names=("shard",))
         source_spec = ShardingSpec(
             routing=AlgebraicRouting(
-                strategy=ChunkPartition(), partition=PartitionSpec("shard")
+                strategy=IndexedModuloPartition(), partition=PartitionSpec("shard")
             )
         ).bind(sender_mesh)
 
@@ -726,13 +756,9 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
 
         async def simulate_sender(rank):
             indices, values = sender_shards[rank]
-            # Real scenario: 'routing_indices' holds the feature IDs (which SparseEmbedding passes through)
-            # while 'origin_indices' holds the batch index.
-            feature_ids = [idx * 1000 + 42 for idx in indices]
             tt = make_tt(
                 values=values,
                 origin_indices=indices,
-                routing_indices=feature_ids,  # Simulate unique_ids' routing_indices
                 global_shape=(TOTAL_ITEMS, 1),
             )
 
@@ -740,25 +766,42 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
 
             async def mock_send(
                 target_rank: int,
-                tuuids: list,
-                tensors: list,
-                counts: list,
-                global_shapes_list: list | None = None,
-                meta_tensor_state_list: list | None = None,
-                compact_params_list: list | None = None,
+                frame_i32,
+                edge_i32,
+                payload_i32,
+                shape_i32,
+                global_shape_i64,
+                compact_i64,
+                *payload_segments,
             ):
-                if int(counts[0]) > 0:
-                    g_shape = global_shapes_list[0] if global_shapes_list else None
+                valid_count = int(payload_i32[0, 5])
+                if valid_count > 0:
+                    g_begin = int(edge_i32[0, 9])
+                    g_count = int(edge_i32[0, 10])
+                    g_shape = (
+                        tuple(
+                            int(x)
+                            for x in global_shape_i64[g_begin : g_begin + g_count]
+                        )
+                        if g_count
+                        else None
+                    )
                     received_tt = TransportTensor(
-                        tensors[0],
-                        origin_indices=tensors[1] if len(tensors) > 1 else None,
+                        payload_segments[0],
+                        origin_indices=payload_segments[1]
+                        if len(payload_segments) > 1
+                        else None,
                         global_shape=g_shape,
                     )
                     network_mailbox[target_rank].append(received_tt)
                 return True
 
             await distributor.distribute(
-                [tt], source=source_spec, target=target_spec, send_fn=mock_send
+                [tt],
+                source=source_spec,
+                target=target_spec,
+                send_fn=mock_send,
+                tuuid=77,
             )
 
         # Run all senders
@@ -767,13 +810,31 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
 
         # 4. Receiver Reassembly
         final_results = []
-        w_helpers = _MockWorker(rank=0)
         for r in range(RECEIVER_SIZE):
-            received_shards = network_mailbox[r]
-            w_helpers.rank = r
-            assembled = w_helpers._assemble_dynamic_to_static_core(
-                received_shards, target_spec, has_mirror=False
+            worker: typing.Any = _DirectWorker()
+            worker.rank = r
+            worker.spmd_id = "Dense"
+            worker._filter_shards_by_routing = lambda op, tuuid, step, shards, topo: [
+                packet[0] for packet in shards.values()
+            ]
+            worker._get_values = SPMDWorker._get_values.__get__(worker, _DirectWorker)  # type: ignore
+            worker._get_routing_indices = SPMDWorker._get_routing_indices.__get__(  # type: ignore
+                worker, _DirectWorker
             )
+            worker._normalize_and_cat_shards = (
+                SPMDWorker._normalize_and_cat_shards.__get__(worker, _DirectWorker)  # type: ignore
+            )
+            worker._maybe_merge_receipts = SPMDWorker._maybe_merge_receipts.__get__(  # type: ignore
+                worker, _DirectWorker
+            )
+            assemble = SPMDWorker._assemble_dynamic_to_static_tensor.__get__(  # type: ignore
+                worker, _DirectWorker
+            )
+            shards = {
+                ("Sparse", sender_rank): [shard]
+                for sender_rank, shard in enumerate(network_mailbox[r])
+            }
+            assembled = assemble("step", 1, 0, shards, target_spec, {})
             final_results.append(assembled)
 
         # 5. Verification
@@ -894,7 +955,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
             return True
 
         async def _run():
-            await distributor.distribute([tt], source_spec, target_spec, mock_send)
+            await distributor.distribute(
+                [tt], source_spec, target_spec, mock_send, tuuid=78
+            )
 
         asyncio.run(_run())
 
@@ -912,7 +975,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
         with self.assertRaises(ValueError) as ctx:
             asyncio.run(
-                distributor.distribute([tt], source_spec, target_spec, mock_send)
+                distributor.distribute(
+                    [tt], source_spec, target_spec, mock_send, tuuid=79
+                )
             )
         self.assertIn("Static Sharding Error", str(ctx.exception))
         self.assertIn("6", str(ctx.exception))  # sub_mesh_size mentioned
@@ -931,7 +996,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
         try:
             asyncio.run(
-                distributor.distribute([tt], source_spec, target_spec, mock_send)
+                distributor.distribute(
+                    [tt], source_spec, target_spec, mock_send, tuuid=80
+                )
             )
         except ValueError as e:
             self.fail(f"Unexpected ValueError for exact-size batch: {e}")
@@ -954,7 +1021,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         # Should not raise
         try:
             asyncio.run(
-                distributor.distribute([empty_tt], source_spec, target_spec, mock_send)
+                distributor.distribute(
+                    [empty_tt], source_spec, target_spec, mock_send, tuuid=81
+                )
             )
         except ValueError as e:
             if "Static Sharding Error" in str(e):

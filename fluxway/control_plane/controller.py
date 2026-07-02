@@ -17,6 +17,7 @@ Implemented as a Ray Actor for async operation.
 
 import asyncio
 import functools
+import inspect
 import os
 import time
 from typing import Any, TYPE_CHECKING
@@ -73,7 +74,7 @@ def require_manager(manager_attr: str):
     """
 
     def decorator(func):
-        if asyncio.iscoroutinefunction(func):
+        if inspect.iscoroutinefunction(func):
 
             @functools.wraps(func)
             async def async_wrapper(self, *args, **kwargs):
@@ -119,7 +120,7 @@ def require_heartbeat_manager(func):
     return require_manager("_heartbeat_manager")(func)
 
 
-if RAY_AVAILABLE:
+if TYPE_CHECKING or RAY_AVAILABLE:
 
     @ray.remote
     class ControllerActor:
@@ -258,6 +259,7 @@ if RAY_AVAILABLE:
             self._last_requested_drain_target: int = 0
             self._last_completed_drain_target: int = 0
             self._drained_drivers: set = set()
+            self._start_sources_when_running: bool = False
 
             # Backpressure tracking
             self._busy_spmds: dict[str, float] = {}  # {spmd_id: busy_worker_ratio}
@@ -356,6 +358,7 @@ if RAY_AVAILABLE:
 
                     if self._drain_strategy is not None:
                         node.spmd_config.requires_drain_at_startup = True
+                        node.spmd_config.auto_start_source_operators = False
 
                 # Register SPMDs for heartbeat monitoring
                 for node_name in self._graph.nodes:
@@ -497,6 +500,11 @@ if RAY_AVAILABLE:
                     self._last_requested_drain_target
                 )
                 if initial_target is not None:
+                    max_steps = getattr(
+                        self.async_step_manager._config, "max_steps", None
+                    )
+                    if max_steps is not None:
+                        initial_target = min(initial_target, max_steps)
                     logger.info(f"Issuing initial drain target: {initial_target}")
                     await self._schedule_drain(initial_target)
 
@@ -993,7 +1001,21 @@ if RAY_AVAILABLE:
                 )
 
             restored_step = await self._checkpointer.restore(step)
+            if restored_step is None:
+                self._start_sources_when_running = True
+                if self.state_machine.is_running():
+                    await self.start_source_operators()
             return restored_step
+
+        @require_spmd_manager
+        async def start_source_operators(self) -> None:
+            tasks = []
+            for spmd_id in self.spmd_manager.get_all_spmd_ids():
+                driver = self.spmd_manager.get_driver_handle(spmd_id)
+                if driver is not None:
+                    tasks.append(driver.start_source_operators.remote())
+            if tasks:
+                await asyncio.gather(*tasks)
 
         async def stop_checkpointer(self) -> None:
             """Await any in-flight checkpoint to completion before shutdown.
@@ -1009,6 +1031,18 @@ if RAY_AVAILABLE:
                 if task is not current_task:
                     await task
             self._checkpoint_task = None
+
+        @require_spmd_manager
+        async def inspect_operator_state(self) -> dict[str, Any]:
+            tasks: dict[str, Any] = {}
+            for spmd_id in self.spmd_manager.get_all_spmd_ids():
+                driver = self.spmd_manager.get_driver_handle(spmd_id)
+                if driver is not None:
+                    tasks[spmd_id] = driver.inspect_operator_state.remote()
+            if not tasks:
+                return {}
+            results = await asyncio.gather(*tasks.values())
+            return dict(zip(tasks.keys(), results, strict=True))
 
         # =====================================================================
         # SPMD Error Handling
@@ -1269,17 +1303,17 @@ if RAY_AVAILABLE:
                     return getattr(node.spmd_config, "transport_type", "ray")
                 return "ray"
 
-            # Wrap raw handles with DataPlaneCallable
-            all_wrapped_handles: dict[str, dict[int, Any]] = {}
-            for target_spmd_id, raw_handles in all_worker_handles.items():
-                transport_type = _get_transport_type(target_spmd_id)
-                wrapped = {
-                    rank: DataPlaneRegistry.create(transport_type, h)
-                    for rank, h in raw_handles.items()
-                }
-                all_wrapped_handles[target_spmd_id] = wrapped
+            # Wrap raw handles with DataPlaneCallable after predecessor/successor
+            # direction is known, so each sender-side adapter can bind sender_id
+            # once instead of carrying it in every hot-path data frame.
 
             # Initiate topology registration on each driver
+            spmd_code_by_id = {
+                spmd_id: code for code, spmd_id in enumerate(sorted(all_spmd_ids))
+            }
+            spmd_id_by_code = {
+                code: spmd_id for spmd_id, code in spmd_code_by_id.items()
+            }
             for spmd_id in all_spmd_ids:
                 driver = self.spmd_manager.get_driver_handle(spmd_id)
                 if driver is None:
@@ -1293,15 +1327,29 @@ if RAY_AVAILABLE:
                 )
 
                 # Build predecessor/successor worker handle maps: {spmd_id: {rank: handle}}
-                pred_handlers = {
-                    p: all_wrapped_handles[p]
-                    for p in predecessors
-                    if p in all_wrapped_handles
-                }
                 succ_handlers = {
-                    s: all_wrapped_handles[s]
+                    s: {
+                        rank: DataPlaneRegistry.create(
+                            _get_transport_type(s),
+                            handle,
+                            sender_spmd_code=spmd_code_by_id[spmd_id],
+                        )
+                        for rank, handle in all_worker_handles[s].items()
+                    }
                     for s in successors
-                    if s in all_wrapped_handles
+                    if s in all_worker_handles
+                }
+                pred_handlers = {
+                    p: {
+                        rank: DataPlaneRegistry.create(
+                            _get_transport_type(p),
+                            handle,
+                            sender_spmd_code=spmd_code_by_id[p],
+                        )
+                        for rank, handle in all_worker_handles[p].items()
+                    }
+                    for p in predecessors
+                    if p in all_worker_handles
                 }
 
                 logger.debug(f"  - pred_handlers keys: {list(pred_handlers.keys())}")
@@ -1310,7 +1358,12 @@ if RAY_AVAILABLE:
                 try:
                     # Now call register_topology with ACTUAL DataPlaneCallable objects
                     driver.register_topology.remote(
-                        pred_handlers, succ_handlers, len(predecessors), len(successors)
+                        pred_handlers,
+                        succ_handlers,
+                        len(predecessors),
+                        len(successors),
+                        spmd_code_by_id[spmd_id],
+                        spmd_id_by_code,
                     )
                     logger.debug(f"Initiated topology registration for SPMD {spmd_id}")
                 except Exception as e:
@@ -1428,6 +1481,27 @@ else:
         def __init__(self, *args, **kwargs):
             raise RuntimeError("Ray is not available")
 
+        @property
+        def _heartbeat_manager(self) -> Any:
+            return None
+
+        async def _initiate_topology_registration(self) -> None:
+            pass
+
+        async def _issue_initial_drain(self) -> None:
+            pass
+
+        async def start_source_operators(self) -> None:
+            pass
+
+        def __getattr__(self, name: str) -> Any:
+            """Provide dummy attributes for type checkers and mocks."""
+            return None
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            """Provide dummy setter for type checkers and mocks."""
+            pass
+
         @classmethod
         def options(cls, **kwargs):
             return cls
@@ -1470,7 +1544,7 @@ async def create_controller(
         raise RuntimeError("Ray is not available")
 
     # Create the actor
-    controller = ControllerActor.options(runtime_env=runtime_env).remote(
+    controller = ControllerActor.options(runtime_env=runtime_env).remote(  # type: ignore[attr-defined]
         graph=graph,
         heartbeat_config=heartbeat_config,
         async_step_config=async_step_config,
@@ -1487,12 +1561,7 @@ async def create_controller(
 
 
 # Alias for backwards compatibility
-if RAY_AVAILABLE:
-    Controller = ControllerActor
+if TYPE_CHECKING or RAY_AVAILABLE:
+    Controller = ControllerActor  # type: ignore
 else:
-    # Mock for when Ray is not available
-    class Controller:
-        """Mock Controller when Ray is not available."""
-
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("Ray is not available")
+    Controller = _ControllerActorFallback  # type: ignore[assignment]

@@ -62,7 +62,9 @@ async def test_spmd_worker_backpressure_throttles_sender():
             return 2
 
     recv_side_effect.call_count = 0
-    mock_handler.receive_shards.remote = MagicMock(side_effect=recv_side_effect)
+    mock_handler.receive_transport_frame.remote = MagicMock(
+        side_effect=recv_side_effect
+    )
 
     # Patch asyncio.sleep
     sleep_calls = []
@@ -72,14 +74,32 @@ async def test_spmd_worker_backpressure_throttles_sender():
         sleep_calls.append(delay)
         await original_sleep(0.001)
 
-    # Create a simplified version of the backpressure logic in _send_fn
-    async def simulated_send_fn(target_rank, tensors, counts, _handlers):
+    # Create a simplified frame-only version of the backpressure logic in _send_fn.
+    async def simulated_send_fn(
+        target_rank,
+        frame_i32,
+        edge_i32,
+        payload_i32,
+        shape_i32,
+        global_shape_i64,
+        compact_i64,
+        *payload_segments,
+        _handlers,
+    ):
         handler = _handlers.get(target_rank)
+        if handler is None:
+            raise ValueError(f"missing handler for target_rank={target_rank}")
 
         await worker._send_semaphore.acquire()
 
-        ref = handler.receive_shards.remote(
-            "target", "tensor", 0, worker.rank, tensors, counts, False, False
+        ref = handler.receive_transport_frame.remote(
+            frame_i32,
+            edge_i32,
+            payload_i32,
+            shape_i32,
+            global_shape_i64,
+            compact_i64,
+            *payload_segments,
         )
 
         async def _wait_and_release(r=ref):
@@ -101,24 +121,26 @@ async def test_spmd_worker_backpressure_throttles_sender():
         worker_module.asyncio.sleep = mock_sleep
 
         # Test the simulated _send_fn callback
-        data_to_send = [np.array([1])]
-        counts = [1]
+        frame_args = (
+            np.zeros((8,), dtype=np.int32),
+            np.zeros((1, 11), dtype=np.int32),
+            np.zeros((1, 8), dtype=np.int32),
+            np.zeros((1,), dtype=np.int32),
+            np.zeros((0,), dtype=np.int64),
+            np.zeros((0,), dtype=np.int64),
+            np.array([1]),
+        )
         handlers = {0: mock_handler, 1: mock_handler, 2: mock_handler}
 
-        # Send 1
-        await simulated_send_fn(0, data_to_send, counts, handlers)
-        # Yield to let the wait_and_release task run
+        await simulated_send_fn(0, *frame_args, _handlers=handlers)
         await asyncio.sleep(0)
 
-        # Send 2 (receives high watermark from call 2) -> will trigger delay
-        await simulated_send_fn(1, data_to_send, counts, handlers)
+        await simulated_send_fn(1, *frame_args, _handlers=handlers)
         await asyncio.sleep(0)
 
-        # Send 3
-        await simulated_send_fn(2, data_to_send, counts, handlers)
+        await simulated_send_fn(2, *frame_args, _handlers=handlers)
         await asyncio.sleep(0)
 
-        # Verify sleep was called indicating throttling occurred
         assert len(sleep_calls) >= 1
     finally:
         worker_module.asyncio.sleep = old_sleep

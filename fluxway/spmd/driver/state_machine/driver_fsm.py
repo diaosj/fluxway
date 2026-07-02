@@ -51,7 +51,6 @@ class DriverStateMachine:
         (DriverState.RUNNING, DriverEvent.COMPLETE): DriverState.COMPLETED,
         # Drain → Drained → Snapshot → Running
         (DriverState.RUNNING, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
-        (DriverState.READY, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
         (DriverState.DRAINING, DriverEvent.DRAIN_COMPLETE): DriverState.DRAINED,
         (DriverState.DRAINING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.DRAINED, DriverEvent.SNAPSHOT_REQUESTED): DriverState.SNAPSHOTTING,

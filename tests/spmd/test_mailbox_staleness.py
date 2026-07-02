@@ -34,7 +34,7 @@ async def test_mailbox_staleness_tensor_fallback():
 
     assert mb.is_step_ready("op", 3)
 
-    shards = await mb.get_tensor_shards("op", TUUID_A, 3)
+    shards = await mb.get_tensor_shard_views("op", TUUID_A, 3)
     assert len(shards) == 1
     np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, [2.0])
 
@@ -102,6 +102,6 @@ async def test_mailbox_future_resolution():
     )
 
     assert mb.is_step_ready("op", 2)
-    shards = await mb.get_tensor_shards("op", TUUID_X, 2)
+    shards = await mb.get_tensor_shard_views("op", TUUID_X, 2)
     assert len(shards) == 1
     np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, [10.0])

@@ -32,7 +32,6 @@ class StatefulExecutor:
         self._metrics: dict[str, Any] = {}
 
     def execute_on_all_workers(self, method: str, *args, **kwargs) -> list[Any]:
-        return []
         """
         Execute a method on all workers.
 
@@ -46,14 +45,15 @@ class StatefulExecutor:
         TODO: Implement parallel execution
         TODO: Handle failures
         """
-        pass
+        return []
 
     def get_operator_state(self, op_name: str) -> dict[str, Any]:
-        """Get state for a specific operator."""
+        """
+        Get state for a specific operator.
+        """
         return {}
 
     def save_worker_states(self) -> dict[str, Any]:
-        return {}
         """
         Save all worker states.
 
@@ -63,7 +63,7 @@ class StatefulExecutor:
         TODO: Call save_states on all workers
         TODO: Aggregate saved states
         """
-        pass
+        return {}
 
     def load_worker_states(self, states: dict[str, Any]) -> None:
         """
@@ -86,7 +86,7 @@ class StatefulExecutor:
         """
         pass
 
-    def collect_metrics(self) -> dict[str, Any]:  # type: ignore
+    def collect_metrics(self) -> dict[str, Any]:
         """
         Collect metrics from all workers.
 
@@ -96,7 +96,7 @@ class StatefulExecutor:
         TODO: Query each worker for metrics
         TODO: Aggregate (mean, sum, etc.)
         """
-        pass
+        return self._metrics
 
     def report_to_state_manager(self, state: SPMDState) -> None:
         """
@@ -117,7 +117,7 @@ class StatefulExecutor:
 
         The actual execution is driven by the Worker's mailbox:
         workers begin processing when all expected shards for that (op_name, step)
-        have arrived via receive_shards / receive_control.
+        have arrived via receive_transport_frame / receive_control.
 
         Args:
             op_name: Name of the operator to execute (e.g., "train_step", "rollout")

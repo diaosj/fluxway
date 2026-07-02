@@ -17,20 +17,22 @@ class DataPlaneCallable(ABC):
     """
 
     @abstractmethod
-    async def receive_shards(
+    def __init__(self, handle: Any, sender_spmd_code: int):
+        pass
+
+    @abstractmethod
+    async def receive_transport_frame(
         self,
-        tuuids: list[int],
-        step: int,
-        sender_id: str,
-        sender_rank: int,
-        payloads: list[Any],
-        counts: list[int],
-        global_shapes: list[tuple[int, ...] | None] | None = None,
-        meta_tensor_state_list: list[int] | None = None,
-        slice_compact_desc_params: list[list[int] | None] | None = None,
+        frame_i32: Any,
+        edge_i32: Any,
+        payload_i32: Any,
+        shape_i32: Any,
+        global_shape_i64: Any,
+        compact_i64: Any,
+        *payload_segments: Any,
     ) -> Any:
         """
-        Data Plane: Primary method for tensor shard transmission.
+        Data Plane: flat transport manifest frame.
         """
         pass
 
@@ -49,32 +51,33 @@ class RayActorDataPlane(DataPlaneCallable):
     Ray-specific implementation of DataPlaneCallable.
     """
 
-    def __init__(self, handle: Any):
+    def __init__(self, handle: Any, sender_spmd_code: int):
         self._handle = handle
+        if not isinstance(sender_spmd_code, int) or sender_spmd_code < 0:
+            raise ValueError(
+                f"sender_spmd_code must be a non-negative int, got {sender_spmd_code!r}."
+            )
+        self._sender_spmd_code = sender_spmd_code
 
-    async def receive_shards(
+    async def receive_transport_frame(
         self,
-        tuuids: list[int],
-        step: int,
-        sender_id: str,
-        sender_rank: int,
-        payloads: list[Any],
-        counts: list[int],
-        global_shapes: list[tuple[int, ...] | None] | None = None,
-        meta_tensor_state_list: list[int] | None = None,
-        slice_compact_desc_params: list[list[int] | None] | None = None,
+        frame_i32: Any,
+        edge_i32: Any,
+        payload_i32: Any,
+        shape_i32: Any,
+        global_shape_i64: Any,
+        compact_i64: Any,
+        *payload_segments: Any,
     ) -> Any:
-        cpu_payloads = [ensure_cpu_serializable(p) for p in payloads]
-        return await self._handle.receive_shards.remote(
-            tuuids=tuuids,
-            step=step,
-            sender_id=sender_id,
-            sender_rank=sender_rank,
-            payloads=cpu_payloads,
-            counts=counts,
-            global_shapes=global_shapes,
-            meta_tensor_state_list=meta_tensor_state_list,
-            slice_compact_desc_params=slice_compact_desc_params,
+        cpu_segments = tuple(ensure_cpu_serializable(p) for p in payload_segments)
+        return await self._handle.receive_transport_frame.remote(
+            frame_i32,
+            edge_i32,
+            payload_i32,
+            shape_i32,
+            global_shape_i64,
+            compact_i64,
+            *cpu_segments,
         )
 
     async def receive_control(
@@ -96,11 +99,13 @@ class DataPlaneRegistry:
         cls._registry[name] = impl_cls
 
     @classmethod
-    def create(cls, transport_type: str, handle: Any) -> DataPlaneCallable:
+    def create(
+        cls, transport_type: str, handle: Any, sender_spmd_code: int
+    ) -> DataPlaneCallable:
         impl_cls = cls._registry.get(transport_type)
         if impl_cls is None:
             raise ValueError(f"Unknown transport_type: {transport_type}")
-        return impl_cls(handle)
+        return impl_cls(handle, sender_spmd_code=sender_spmd_code)
 
 
 # Register default Ray implementation

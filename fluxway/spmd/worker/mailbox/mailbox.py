@@ -14,19 +14,198 @@ Zero-copy shard writing is supported via TransportReceiver delegation.
 
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Optional
 from collections.abc import Callable
 
 import numpy as np
 
 from fluxway.common.tensor_backend import get_backend
-from fluxway.common.index_descriptor import ContinuousIndex
+from fluxway.common.index_descriptor import ContinuousIndex, ExplicitIndex
+from fluxway.common.ragged import ragged_level_count
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.common.types.configs import BarrierConfig, TolerantBarrierConfig
-from fluxway.common.types.tensor import TransportTensor, Scalar
+from fluxway.common.types.tensor import Scalar
 from fluxway.transport.communication import TransportReceiver
+from fluxway.transport.manifest import (
+    EDGE_EMPTY_KIND,
+    EDGE_COMPACT_BEGIN,
+    EDGE_COMPACT_COUNT,
+    EDGE_EXPECTED_COUNT,
+    EDGE_GLOBAL_SHAPE_BEGIN,
+    EDGE_GLOBAL_SHAPE_COUNT,
+    EDGE_META_STATE,
+    EDGE_PAYLOAD_BEGIN,
+    EDGE_PAYLOAD_COUNT,
+    EDGE_TUUID,
+    EmptyKind,
+    FRAME_SENDER_RANK,
+    FRAME_SENDER_WORLD_SIZE,
+    FRAME_STEP,
+    PAYLOAD_ROLE,
+    PAYLOAD_SEGMENT_ARG_INDEX,
+    PAYLOAD_DTYPE,
+    PAYLOAD_NDIM,
+    PAYLOAD_SHAPE_BEGIN,
+    PAYLOAD_SHAPE_COUNT,
+    PAYLOAD_VALID_COUNT,
+    PayloadRole,
+    TransportFrame,
+    dtype_from_code,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_MISSING = object()
+
+
+@dataclass(slots=True)
+class TransportShardView:
+    payloads: tuple[Any, ...]
+    counts: tuple[int, ...]
+    meta_state: int
+    sender_world_size: int
+    sender_rank: int
+    global_shape: tuple[int, ...] | None
+    compact_params: tuple[int, ...] | None
+    _flat_values_cache: Any = field(default=_MISSING, init=False, repr=False)
+    _nested_splits_cache: Any = field(default=_MISSING, init=False, repr=False)
+    _origin_indices_cache: Any = field(default=_MISSING, init=False, repr=False)
+    _origin_values_cache: Any = field(default=_MISSING, init=False, repr=False)
+    _receipt_cache: Any = field(default=_MISSING, init=False, repr=False)
+
+    @property
+    def data_count(self) -> int:
+        return self.counts[0] if self.counts else 0
+
+    def _unwrap(self, payload: Any) -> Any:
+        return payload.tensor if isinstance(payload, Scalar) else payload
+
+    def _payload_view(self, index: int) -> Any:
+        payload = self._unwrap(self.payloads[index])
+        count = self.counts[index]
+        backend = get_backend()
+        if backend.shape(payload):
+            return payload[:count]
+        return payload
+
+    @property
+    def flat_values(self) -> Any:
+        if self._flat_values_cache is not _MISSING:
+            return self._flat_values_cache
+        data_payload = self._payload_view(0)
+        self._flat_values_cache = data_payload
+        return data_payload
+
+    @property
+    def nested_splits(self) -> list[Any]:
+        if self._nested_splits_cache is not _MISSING:
+            return list(self._nested_splits_cache)
+        backend = get_backend()
+        splits = []
+        cursor = 1
+        for _ in range(ragged_level_count(self.meta_state)):
+            if cursor >= len(self.payloads):
+                raise ValueError(
+                    "TransportShardView is missing ragged lengths payload."
+                )
+            lengths = self._payload_view(cursor)
+            zero = backend.zeros((1,), dtype=backend.dtype(lengths))
+            splits.append(backend.cat([zero, backend.cumsum(lengths, dim=0)], dim=0))
+            cursor += 1
+        self._nested_splits_cache = tuple(splits)
+        return list(splits)
+
+    @property
+    def origin_indices(self) -> Any | None:
+        if self._origin_indices_cache is not _MISSING:
+            return self._origin_indices_cache
+        has_origin_indices = bool(self.meta_state & 2)
+        has_compact_index = bool(self.meta_state & 4)
+        if has_origin_indices and has_compact_index:
+            raise ValueError(
+                "TransportShardView cannot carry explicit and compact origin metadata."
+            )
+        if has_compact_index:
+            if self.compact_params is None:
+                raise ValueError("TransportShardView is missing compact metadata.")
+            self._origin_indices_cache = ContinuousIndex.from_compact_params(
+                list(self.compact_params)
+            )
+        elif has_origin_indices:
+            self._origin_indices_cache = ExplicitIndex(self._origin_payload_view())
+        else:
+            self._origin_indices_cache = None
+        return self._origin_indices_cache
+
+    @property
+    def origin_indices_materialized(self) -> Any | None:
+        if self._origin_values_cache is not _MISSING:
+            return self._origin_values_cache
+        indices = self.origin_indices
+        if indices is None:
+            self._origin_values_cache = None
+        elif isinstance(indices, ExplicitIndex):
+            self._origin_values_cache = indices.indices
+        else:
+            self._origin_values_cache = indices.materialize()
+        return self._origin_values_cache
+
+    @property
+    def routing_indices(self) -> None:
+        return None
+
+    @property
+    def routing_indices_materialized(self) -> None:
+        return None
+
+    @property
+    def receipt(self) -> Any:
+        if self._receipt_cache is _MISSING:
+            from fluxway.common.types.tensor import SymmetryReceipt
+
+            self._receipt_cache = SymmetryReceipt(
+                self.sender_world_size, self.sender_rank
+            )
+        return self._receipt_cache
+
+    @property
+    def routing_axes(self) -> tuple[int, ...]:
+        return (0,)
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return get_backend().shape(self.flat_values)
+
+    @property
+    def dtype(self) -> Any:
+        return get_backend().dtype(self.flat_values)
+
+    @property
+    def is_ragged(self) -> bool:
+        return bool(self.meta_state & 1)
+
+    @property
+    def is_dense(self) -> bool:
+        return not self.is_ragged
+
+    def __len__(self) -> int:
+        if self.is_ragged:
+            if len(self.counts) < 2:
+                raise ValueError("TransportShardView is missing ragged row counts.")
+            return self.counts[1]
+        shape = self.shape
+        if not shape:
+            return 1
+        return shape[0]
+
+    def _origin_payload_view(self) -> Any:
+        origin_index = 1 + ragged_level_count(self.meta_state)
+        if origin_index >= len(self.payloads):
+            raise ValueError("TransportShardView is missing origin payload.")
+        return self._payload_view(origin_index)
+
 
 # ---------------------------------------------------------------------------
 # StepBarrier — one per (op_type, step)
@@ -129,6 +308,37 @@ class StepBarrier:
             )
         return False
 
+    def configure_expected_tensor_count(self, tuuid: int, expected_count: int) -> None:
+        if expected_count < 0:
+            raise ValueError(
+                f"expected_count for tuuid={tuuid} must be non-negative, got {expected_count}."
+            )
+        barrier = self._tensor_barriers.get(tuuid)
+        if barrier is None:
+            raise ValueError(
+                f"[StepBarrier {self._op_name}:{self._step}] Cannot configure "
+                f"unexpected tensor tuuid={tuuid}; expected={list(self._tensor_barriers.keys())}."
+            )
+        if self._combined.is_set() and barrier.target != expected_count:
+            raise ValueError(
+                f"[StepBarrier {self._op_name}:{self._step}] Cannot change "
+                f"tuuid={tuuid} expected count from {barrier.target} to "
+                f"{expected_count} after the step barrier fired."
+            )
+        if barrier.count:
+            if barrier.target != expected_count:
+                raise ValueError(
+                    f"[StepBarrier {self._op_name}:{self._step}] Cannot change "
+                    f"tuuid={tuuid} expected count from {barrier.target} to "
+                    f"{expected_count} after {barrier.count} arrivals."
+                )
+            return
+        barrier._n = expected_count
+        if not self._periodic and expected_count == 0:
+            barrier._event.set()
+        elif not self._periodic:
+            barrier._event.clear()
+
     def satisfy_tensor(self, tuuid: int, current_step: int | None = None) -> bool:
         """Force a tensor barrier to be satisfied (e.g., via staleness fallback)."""
         barrier = self._tensor_barriers.get(tuuid)
@@ -183,6 +393,9 @@ class StepBarrier:
     def is_ready(self) -> bool:
         return self._combined.is_set()
 
+    def recompute_ready(self, current_step: int | None = None) -> bool:
+        return self._check(current_step=current_step)
+
     async def wait(self) -> None:
         await self._combined.wait()
 
@@ -218,7 +431,10 @@ class WorkerMailbox:
 
         # Data plane (buffered path)
         self._tensor_slots: dict[
-            str, dict[int, dict[int, dict[tuple[str, int], list[TransportTensor]]]]
+            str, dict[int, dict[int, dict[tuple[str, int], list[TransportShardView]]]]
+        ] = {}
+        self._tensor_arrivals: dict[
+            str, dict[int, dict[int, dict[tuple[str, int], dict[str, Any]]]]
         ] = {}
 
         # Completion barriers: {op_name: {step: StepBarrier}}
@@ -411,6 +627,28 @@ class WorkerMailbox:
         if barrier.is_ready() and self._on_ready:
             self._on_ready(op_name, step)
 
+    def configure_transport_expected_counts(
+        self, op_name: str, step: int, expected_counts: dict[int, int]
+    ) -> None:
+        if not expected_counts:
+            return
+        if op_name in self._periodic_barriers:
+            barrier = self._periodic_barriers[op_name]
+            actual_step = self._periodic_steps[op_name]
+        else:
+            actual_step = step
+            barrier = self._barriers.get(op_name, {}).get(step)
+        if barrier is None:
+            raise ValueError(
+                f"[WorkerMailbox] Cannot configure transport expected counts "
+                f"before declare_step: op={op_name} step={step}."
+            )
+        for tuuid, expected_count in expected_counts.items():
+            barrier.configure_expected_tensor_count(tuuid, expected_count)
+            self._expected_tensor_counts.setdefault(op_name, {})[tuuid] = expected_count
+        if barrier.recompute_ready(current_step=actual_step) and self._on_ready:
+            self._on_ready(op_name, actual_step)
+
     # ------------------------------------------------------------------
     # Control plane — state data
     # ------------------------------------------------------------------
@@ -519,9 +757,18 @@ class WorkerMailbox:
 
     def _buffered_slot(
         self, op_name: str, tuuid: int, step: int
-    ) -> dict[tuple[str, int], list["TransportTensor"]]:
+    ) -> dict[tuple[str, int], list[TransportShardView]]:
         return (
             self._tensor_slots.setdefault(op_name, {})
+            .setdefault(tuuid, {})
+            .setdefault(step, {})
+        )
+
+    def _arrival_slot(
+        self, op_name: str, tuuid: int, step: int
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        return (
+            self._tensor_arrivals.setdefault(op_name, {})
             .setdefault(tuuid, {})
             .setdefault(step, {})
         )
@@ -571,20 +818,17 @@ class WorkerMailbox:
                 )
 
                 meta_state = meta_tensor_state_list[i] if meta_tensor_state_list else 0
-                is_ragged = bool(meta_state & 1)
                 has_origin_indices = bool(meta_state & 2)
-                has_compact_index = bool(meta_state & 4)
                 compact_params = (
                     slice_compact_desc_params[i] if slice_compact_desc_params else None
                 )
 
-                # Each TransportTensor can have multiple physical parts in the flat list:
-                # 1. Tensor Data (Always)
-                # 2. Ragged Lengths (if bit 1)
-                # 3. Origin Indices (if bit 2 and NOT compact)
+                # Payload protocol:
+                #   [flat_values, level0_lengths, ..., levelN_lengths, origins?]
+                # Planner routes outer rows; length levels preserve the full
+                # topology needed to project that row slice to flat values.
                 n_elements = 1
-                if is_ragged:
-                    n_elements += 1
+                n_elements += ragged_level_count(meta_state)
                 if has_origin_indices:
                     n_elements += 1
 
@@ -599,17 +843,44 @@ class WorkerMailbox:
                 )
 
                 # Strict Duplicate Validation
-                slot = (
-                    self._tensor_slots.get(op_name, {}).get(u, {}).get(actual_step, {})
-                )
                 key = (sender_id, rank)
-                if key in slot:
+                arrival_slot = self._arrival_slot(op_name, u, actual_step)
+                if key in arrival_slot:
                     msg = (
                         f"[WorkerMailbox Error] DUPLICATE SHARD RECEIVED: op={op_name} tuuid={u} step={actual_step} sender={sender_id} rank={rank}. "
                         "This indicates that the same worker is receiving the same shard from the same sender twice. "
-                        f"Current slot content: {slot[key]}"
+                        f"Current arrival metadata: {arrival_slot[key]}"
                     )
                     raise ValueError(msg)
+                arrival_slot[key] = {
+                    "empty_kind": EmptyKind.DATA_EMPTY_ALLOWED,
+                    "meta_state": meta_state,
+                    "payload_schema": tuple(
+                        {
+                            "role": int(
+                                PayloadRole.VALUES
+                                if j == 0
+                                else PayloadRole.ORIGIN
+                                if has_origin_indices and j == n_elements - 1
+                                else PayloadRole.RAGGED_LENGTHS
+                            ),
+                            "dtype": np.dtype(sub_payloads[j].dtype),
+                            "shape": tuple(
+                                int(x) for x in getattr(sub_payloads[j], "shape", ())
+                            ),
+                            "valid_count": sub_counts[j],
+                        }
+                        for j in range(n_elements)
+                    ),
+                    "global_shape": global_shape,
+                    "compact_params": tuple(compact_params)
+                    if compact_params is not None
+                    else None,
+                    "sender_world_size": sender_world_size,
+                    "expected_count": self._expected_tensor_counts.get(op_name, {}).get(
+                        u, 0
+                    ),
+                }
 
                 # Route to Zero-Copy or Buffered path
                 zc = self._zc_receivers.get(op_name, {}).get(u, {}).get(actual_step)
@@ -617,7 +888,7 @@ class WorkerMailbox:
                     # Note: Zero-copy bundling is not yet implemented; use flat sub-lists
                     zc.receive_slices(rank, sub_payloads, sub_counts)
                 else:
-                    self._deposit_buffered_shards(
+                    self._deposit_buffered_shard_views(
                         op_name,
                         u,
                         actual_step,
@@ -626,10 +897,8 @@ class WorkerMailbox:
                         sender_world_size,
                         sub_payloads,
                         sub_counts,
+                        meta_state=meta_state,
                         global_shape=global_shape,
-                        is_ragged=is_ragged,
-                        has_origin_indices=has_origin_indices,
-                        has_compact_index=has_compact_index,
                         compact_desc_params=compact_params,
                     )
 
@@ -668,7 +937,171 @@ class WorkerMailbox:
 
         return self._get_size_lock_free()
 
-    def _deposit_buffered_shards(
+    async def deposit_transport_frame(
+        self,
+        op_name: str,
+        sender_id: str,
+        frame: TransportFrame,
+    ) -> int:
+        frame.validate()
+        step = int(frame.frame_i32[FRAME_STEP])
+        rank = int(frame.frame_i32[FRAME_SENDER_RANK])
+        sender_world_size = int(frame.frame_i32[FRAME_SENDER_WORLD_SIZE])
+
+        async with self._lock:
+            if op_name in self._periodic_barriers:
+                actual_step = self._periodic_steps[op_name]
+                barrier = self._periodic_barriers[op_name]
+            else:
+                actual_step = step
+                barrier = self._barriers.get(op_name, {}).get(step)
+
+            any_fired = False
+            watermark = 0
+            for edge in frame.edge_i32:
+                tuuid = int(edge[EDGE_TUUID])
+                meta_state = int(edge[EDGE_META_STATE])
+                empty_kind = EmptyKind(int(edge[EDGE_EMPTY_KIND]))
+                expected_count = int(edge[EDGE_EXPECTED_COUNT])
+                if expected_count <= 0:
+                    raise ValueError(
+                        f"[WorkerMailbox Error] Invalid EDGE_EXPECTED_COUNT={expected_count}: "
+                        f"op={op_name} tuuid={tuuid} step={actual_step} "
+                        f"sender={sender_id}:{rank}."
+                    )
+                if barrier is not None:
+                    barrier.configure_expected_tensor_count(tuuid, expected_count)
+                payload_begin = int(edge[EDGE_PAYLOAD_BEGIN])
+                payload_count = int(edge[EDGE_PAYLOAD_COUNT])
+                compact_begin = int(edge[EDGE_COMPACT_BEGIN])
+                compact_count = int(edge[EDGE_COMPACT_COUNT])
+                global_shape_begin = int(edge[EDGE_GLOBAL_SHAPE_BEGIN])
+                global_shape_count = int(edge[EDGE_GLOBAL_SHAPE_COUNT])
+
+                edge_payloads = []
+                edge_counts = []
+                payload_schema = []
+                for payload_row in frame.payload_i32[
+                    payload_begin : payload_begin + payload_count
+                ]:
+                    role = PayloadRole(int(payload_row[PAYLOAD_ROLE]))
+                    segment_idx = int(payload_row[PAYLOAD_SEGMENT_ARG_INDEX])
+                    valid_count = int(payload_row[PAYLOAD_VALID_COUNT])
+                    shape_begin = int(payload_row[PAYLOAD_SHAPE_BEGIN])
+                    shape_count = int(payload_row[PAYLOAD_SHAPE_COUNT])
+                    shape = tuple(
+                        int(x)
+                        for x in frame.shape_i32[
+                            shape_begin : shape_begin + shape_count
+                        ]
+                    )
+                    if role in (
+                        PayloadRole.VALUES,
+                        PayloadRole.RAGGED_LENGTHS,
+                        PayloadRole.ORIGIN,
+                    ):
+                        edge_payloads.append(frame.payload_segments[segment_idx])
+                        edge_counts.append(valid_count)
+                        payload_schema.append(
+                            {
+                                "role": int(role),
+                                "dtype": dtype_from_code(
+                                    int(payload_row[PAYLOAD_DTYPE])
+                                ),
+                                "shape": shape,
+                                "valid_count": valid_count,
+                                "ndim": int(payload_row[PAYLOAD_NDIM]),
+                            }
+                        )
+
+                if not edge_payloads:
+                    raise ValueError(
+                        f"[WorkerMailbox Error] Transport frame edge has no payload schema: "
+                        f"op={op_name} tuuid={tuuid} step={actual_step} "
+                        f"sender={sender_id}:{rank} empty_kind={empty_kind.name}."
+                    )
+
+                data_count = edge_counts[0]
+                if empty_kind == EmptyKind.DATA_REQUIRED and data_count == 0:
+                    raise ValueError(
+                        f"[WorkerMailbox Error] DATA_REQUIRED edge arrived empty: "
+                        f"op={op_name} tuuid={tuuid} step={actual_step} "
+                        f"sender={sender_id}:{rank}."
+                    )
+
+                key = (sender_id, rank)
+                arrival_slot = self._arrival_slot(op_name, tuuid, actual_step)
+                if key in arrival_slot:
+                    raise ValueError(
+                        f"[WorkerMailbox Error] DUPLICATE SHARD RECEIVED: "
+                        f"op={op_name} tuuid={tuuid} step={actual_step} "
+                        f"sender={sender_id} rank={rank}."
+                    )
+
+                compact_params = None
+                if compact_count:
+                    compact_params = tuple(
+                        int(x)
+                        for x in frame.compact_i64[
+                            compact_begin : compact_begin + compact_count
+                        ]
+                    )
+                global_shape = None
+                if global_shape_count:
+                    global_shape = tuple(
+                        int(x)
+                        for x in frame.global_shape_i64[
+                            global_shape_begin : global_shape_begin + global_shape_count
+                        ]
+                    )
+                arrival_slot[key] = {
+                    "empty_kind": empty_kind,
+                    "meta_state": meta_state,
+                    "payload_schema": tuple(payload_schema),
+                    "global_shape": global_shape,
+                    "compact_params": compact_params,
+                    "sender_world_size": sender_world_size,
+                    "expected_count": expected_count,
+                }
+
+                if empty_kind != EmptyKind.PROTOCOL_EMPTY:
+                    has_compact_index = bool(meta_state & 4)
+                    if has_compact_index:
+                        if compact_params is None:
+                            raise ValueError(
+                                f"[WorkerMailbox Error] missing compact metadata: "
+                                f"op={op_name} tuuid={tuuid} step={actual_step} "
+                                f"sender={sender_id}:{rank}."
+                            )
+                    watermark = self._deposit_buffered_shard_views(
+                        op_name,
+                        tuuid,
+                        actual_step,
+                        sender_id,
+                        rank,
+                        sender_world_size,
+                        edge_payloads,
+                        edge_counts,
+                        meta_state=meta_state,
+                        global_shape=global_shape,
+                        compact_desc_params=list(compact_params)
+                        if compact_params is not None
+                        else None,
+                    )
+
+                if barrier is not None:
+                    if barrier.tensor_arrived(tuuid, current_step=actual_step):
+                        any_fired = True
+
+            if any_fired:
+                if op_name in self._periodic_barriers:
+                    self._periodic_steps[op_name] += 1
+                if self._on_ready:
+                    self._on_ready(op_name, actual_step)
+
+            return max(watermark, self._get_size_lock_free())
+
+    def _deposit_buffered_shard_views(
         self,
         op_name: str,
         tuuid: int,
@@ -678,93 +1111,50 @@ class WorkerMailbox:
         sender_world_size: int,
         payloads: list[Any],
         counts: list[int],
+        meta_state: int,
         global_shape: tuple[int, ...] | None = None,
-        is_ragged: bool = False,
-        has_origin_indices: bool = False,
-        has_compact_index: bool = False,
         compact_desc_params: list[int] | None = None,
     ) -> int:
-        """Internal helper for buffered shard storage."""
-
-        cursor = 0
-        backend = get_backend()
-        tensors = []
-
-        def _unwrap(p):
-            return p.tensor if isinstance(p, Scalar) else p
-
-        while cursor < len(payloads):
-            count = counts[cursor] if cursor < len(counts) else 0
-            data_payload = _unwrap(payloads[cursor])
-            if backend.shape(data_payload):
-                data_payload = data_payload[:count]
-
-            cursor += 1
-
-            lengths_payload = None
-            if is_ragged and cursor < len(payloads):
-                length_count = counts[cursor] if cursor < len(counts) else 0
-                lengths_payload = _unwrap(payloads[cursor])
-                if backend.shape(lengths_payload):
-                    lengths_payload = lengths_payload[:length_count]
-                cursor += 1
-
-            origin_indices = None
-            if has_origin_indices or has_compact_index:
-                if has_compact_index and compact_desc_params:
-                    origin_indices = ContinuousIndex.from_compact_params(
-                        compact_desc_params
-                    )
-                elif cursor < len(payloads):
-                    asmb_count = counts[cursor] if cursor < len(counts) else 0
-                    origin_indices = _unwrap(payloads[cursor])
-                    if backend.shape(origin_indices):
-                        origin_indices = origin_indices[:asmb_count]
-                    cursor += 1
-                else:
-                    raise ValueError(
-                        f"[WorkerMailbox Error] MISSING ORIGIN INDICES: op={op_name} tuuid={tuuid} step={step} sender={sender_id} rank={rank}. "
-                        f"Expected payload at cursor {cursor}, but total payloads is {len(payloads)}."
-                    )
-
-            # Assemble nested splits if ragged.
-            # lengths_payload arrives as a host-level int32 array: either a numpy
-            # ndarray or a backend tensor that must be moved to host before cumsum.
-            # TransportTensor.nested_splits is typed List[np.ndarray], so we always
-            # produce a numpy array here — no GPU kernels involved.
-            nested_splits = []
-            if lengths_payload is not None:
-                if not hasattr(lengths_payload, "__len__"):
-                    raise TypeError(
-                        f"lengths_payload must be an array-like, got {type(lengths_payload)}"
-                    )
-                lengths_np = (
-                    lengths_payload
-                    if isinstance(lengths_payload, np.ndarray)
-                    else backend.to_numpy(lengths_payload)
-                )
-                nested_splits = [
-                    np.concatenate([np.zeros(1, dtype=np.int32), np.cumsum(lengths_np)])
-                ]
-
-            # Create local receipt for the shard (Zero-Overhead: reconstructed locally)
-            from fluxway.common.types.tensor import SymmetryReceipt
-
-            shard_receipt = SymmetryReceipt(sender_world_size, rank)
-
-            tensors.append(
-                TransportTensor(
-                    data_payload,
-                    nested_splits=nested_splits,
-                    origin_indices=origin_indices,
-                    routing_indices=None,
-                    global_shape=global_shape,
-                    receipt=shard_receipt,
-                )
+        is_ragged = bool(meta_state & 1)
+        has_origin_indices = bool(meta_state & 2)
+        has_compact_index = bool(meta_state & 4)
+        expected_payload_count = 1
+        if is_ragged:
+            expected_payload_count += ragged_level_count(meta_state)
+        if has_origin_indices or has_compact_index:
+            expected_payload_count += 0 if has_compact_index else 1
+        if len(payloads) != expected_payload_count:
+            raise ValueError(
+                f"[WorkerMailbox Error] payload count mismatch: op={op_name} "
+                f"tuuid={tuuid} step={step} sender={sender_id}:{rank} "
+                f"payloads={len(payloads)} expected={expected_payload_count}."
+            )
+        if len(counts) != len(payloads):
+            raise ValueError(
+                f"[WorkerMailbox Error] count count mismatch: op={op_name} "
+                f"tuuid={tuuid} step={step} sender={sender_id}:{rank} "
+                f"counts={len(counts)} payloads={len(payloads)}."
+            )
+        if has_compact_index and compact_desc_params is None:
+            raise ValueError(
+                f"[WorkerMailbox Error] missing compact metadata: op={op_name} "
+                f"tuuid={tuuid} step={step} sender={sender_id}:{rank}."
             )
 
         key = (sender_id, rank)
-        self._buffered_slot(op_name, tuuid, step)[key] = tensors
+        self._buffered_slot(op_name, tuuid, step)[key] = [
+            TransportShardView(
+                payloads=tuple(payloads),
+                counts=tuple(count for count in counts),
+                meta_state=meta_state,
+                sender_world_size=sender_world_size,
+                sender_rank=rank,
+                global_shape=global_shape,
+                compact_params=tuple(compact_desc_params)
+                if compact_desc_params is not None
+                else None,
+            )
+        ]
 
         # Debug Trace for barrier status
         barrier = self._barriers.get(op_name, {}).get(step)
@@ -772,45 +1162,23 @@ class WorkerMailbox:
             logger.debug(
                 f"[WorkerMailbox] Shard stored: op={op_name} tuuid={tuuid} step={step} rank={rank}"
             )
-        return int(counts[0]) if counts else 0
+        return counts[0] if counts else 0
 
-    async def get_all_tensor_shards(
+    async def get_all_tensor_shard_views(
         self, op_name: str, step: int
-    ) -> dict[int, dict[tuple[str, int], list[TransportTensor]]]:
-        """Get all received shards for a step, prioritizing Zero-Copy buffers."""
+    ) -> dict[int, dict[tuple[str, int], list[TransportShardView]]]:
         async with self._lock:
-            # Combine all TUUIDs for this operator
-            all_tuuids = set(self._tensor_slots.get(op_name, {}).keys()) | set(
-                self._zc_receivers.get(op_name, {}).keys()
-            )
-
-            result: dict[int, dict[tuple[str, int], list[TransportTensor]]] = {}
-            # We want to collect ALL tensors expected by this operator, including stale ones
-            # First, check what TUUIDs this operator expects
             expected_counts = self._expected_tensor_counts.get(op_name, {})
-
-            # Combine all TUUIDs from current slots and expected list
-            all_tuuids = (
-                set(self._tensor_slots.get(op_name, {}).keys())
-                | set(self._zc_receivers.get(op_name, {}).keys())
-                | set(expected_counts.keys())
+            all_tuuids = set(self._tensor_slots.get(op_name, {}).keys()) | set(
+                expected_counts.keys()
             )
-
+            result: dict[int, dict[tuple[str, int], list[TransportShardView]]] = {}
             for tuuid in all_tuuids:
-                # 1. Try exact step (ZC first)
-                zc = self._zc_receivers.get(op_name, {}).get(tuuid, {}).get(step)
-                if zc and zc.target_buffers:
-                    zc_tensor = TransportTensor(*zc.target_buffers)
-                    result[tuuid] = {("__zero_copy__", -1): [zc_tensor]}
-                    continue
-
                 slotted = self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step)
                 if slotted and len(slotted) >= expected_counts.get(tuuid, 0):
                     result[tuuid] = dict(slotted)
                     continue
 
-                # 2. Try staleness lookback
-                # Need to check the barrier config to be sure about TUUID staleness
                 barrier_config = self._get_barrier_config(op_name)
                 max_staleness = 0
                 if isinstance(barrier_config, TolerantBarrierConfig):
@@ -822,13 +1190,11 @@ class WorkerMailbox:
                     )
                     step_slots = self._tensor_slots.get(op_name, {}).get(tuuid, {})
                     target_count = expected_counts.get(tuuid, 0)
-
                     valid_steps = [
                         k
                         for k in range(max(0, step - max_staleness), step + 1)
                         if k in step_slots and len(step_slots[k]) >= target_count
                     ]
-
                     if valid_steps:
                         best_k = (
                             valid_steps[0] if policy == "oldest" else valid_steps[-1]
@@ -836,11 +1202,15 @@ class WorkerMailbox:
                         result[tuuid] = dict(step_slots[best_k])
                         continue
 
-                # 3. Last resort: just return whatever arrived for this step even if incomplete
-                # (Standard behavior if no staleness defined)
                 if slotted:
+                    target_count = expected_counts.get(tuuid, 0)
+                    if target_count > 0 and len(slotted) < target_count:
+                        raise ValueError(
+                            f"[WorkerMailbox Error] Incomplete tensor shards for "
+                            f"op={op_name} tuuid={tuuid} step={step}: "
+                            f"arrived={len(slotted)} expected={target_count}."
+                        )
                     result[tuuid] = dict(slotted)
-
             return result
 
     def _get_barrier(self, op_name: str, step: int) -> StepBarrier | None:
@@ -853,14 +1223,14 @@ class WorkerMailbox:
         """Internal helper to get barrier config."""
         return self._barrier_configs.get(op_name)
 
-    async def get_tensor_shard(
+    async def get_tensor_shard_views_for_rank(
         self,
         op_name: str,
         tuuid: int,
         step: int,
         rank: int,
         sender_id: str | None = None,
-    ) -> list["TransportTensor"] | None:
+    ) -> list[TransportShardView] | None:
         async with self._lock:
             slot = self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
             if sender_id is not None:
@@ -872,9 +1242,9 @@ class WorkerMailbox:
                     return tensors
             return None
 
-    async def get_tensor_shards(
+    async def get_tensor_shard_views(
         self, op_name: str, tuuid: int, step: int
-    ) -> dict[tuple[str, int], list["TransportTensor"]]:
+    ) -> dict[tuple[str, int], list[TransportShardView]]:
         async with self._lock:
             staleness = self._staleness_config.get(op_name, {}).get(tuuid, 0)
             if staleness > 0:
@@ -899,10 +1269,17 @@ class WorkerMailbox:
                 self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
             )
 
-    async def get_all_tensor_shards_with_staleness(
+    async def get_tensor_arrivals(
+        self, op_name: str, tuuid: int, step: int
+    ) -> dict[tuple[str, int], dict[str, Any]]:
+        async with self._lock:
+            return dict(
+                self._tensor_arrivals.get(op_name, {}).get(tuuid, {}).get(step, {})
+            )
+
+    async def get_all_tensor_shard_views_with_staleness(
         self, op_name: str, step: int
-    ) -> dict[int, dict[tuple[str, int], list[TransportTensor]]]:
-        """Prioritized version of get_all_tensor_shards including staleness check."""
+    ) -> dict[int, dict[tuple[str, int], list[TransportShardView]]]:
         async with self._lock:
             result = {}
             for tuuid, step_dict in self._tensor_slots.get(op_name, {}).items():

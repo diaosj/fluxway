@@ -24,7 +24,7 @@ from fluxway.common.types.sharding import (
     IdentityIndices,
 )
 from .planner import TransportPlanner, TransportPlan
-from .communication import DataDistributor, TransportReceiver
+from .communication import AsyncDataDistributor
 
 __all__ = [
     "TransportTensor",
@@ -46,8 +46,7 @@ __all__ = [
     "IdentityIndices",
     "TransportPlanner",
     "TransportPlan",
-    "DataDistributor",
-    "TransportReceiver",
+    "AsyncDataDistributor",
 ]
 
 ensure_logging_configured()

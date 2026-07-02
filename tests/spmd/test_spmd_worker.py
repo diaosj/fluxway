@@ -5,14 +5,13 @@ Covers:
 - ArrivalBarrier: N-arrival primitive shared across transport and mailbox layers
 - StepBarrier: per-step composite barrier in WorkerMailbox
 - WorkerMailbox: declare_step, deposit_shards/put_state, wait_step_ready, on_ready callback
-- TransportReceiver: async wait() via ArrivalBarrier
 - Worker integration: mesh, config, data reception
 """
 
 import sys
 import os
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 import numpy as np
 import pytest
 
@@ -23,9 +22,10 @@ from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.common.types.configs import SPMDConfig, OperatorMeta, ArgumentType
+from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
-from fluxway.transport.communication import TransportReceiver
+from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
 from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 
 # ---------------------------------------------------------------------------
@@ -163,168 +163,6 @@ async def test_arrival_barrier_periodic_async():
         received.append(count)
 
     assert received == [3, 6, 9, 10], f"expected [3,6,9,10], got {received}"
-
-
-# ===========================================================================
-# TransportReceiver — now backed by ArrivalBarrier
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_transport_receiver_async_wait():
-    """TransportReceiver.wait() resolves when wait_for_n_slices payloads arrive."""
-    receiver = TransportReceiver(wait_for_n_slices=2)
-    assert not receiver.is_done()
-
-    async def send():
-        await asyncio.sleep(0)
-        receiver.receive_slices(0, [np.zeros(4)], [4])
-        await asyncio.sleep(0)
-        receiver.receive_slices(1, [np.zeros(4)], [4])
-
-    asyncio.create_task(send())
-    await receiver.wait()
-    assert receiver.is_done()
-    slices = receiver.get_buffered_slices()
-    assert len(slices) == 2
-
-
-def test_transport_receiver_buffered():
-    """Synchronous usage: receive_slices accumulates; get_buffered_slices consumes."""
-    receiver = TransportReceiver(wait_for_n_slices=3)
-    for i in range(3):
-        receiver.receive_slices(i, [np.eye(2)], [2])
-    assert receiver.is_done()
-    slices = receiver.get_buffered_slices()
-    assert len(slices) == 3
-    assert receiver.get_buffered_slices() == []  # consumed
-
-
-@pytest.mark.asyncio
-async def test_transport_receiver_periodic_10_batch3():
-    """
-    10 slices total, periodic batch_size=3.
-    Expect 4 triggers: at cumulative counts 3, 6, 9, and 10 (remainder).
-    """
-    receiver = TransportReceiver(wait_for_n_slices=3, periodic=True)
-    trigger_counts = []
-
-    async def producer():
-        for _ in range(10):
-            await asyncio.sleep(0)
-            receiver.receive_slices(0, [np.zeros(4)], [4])
-        receiver.close()  # flushes remainder (1 slice)
-
-    asyncio.create_task(producer())
-
-    async for count in receiver:
-        trigger_counts.append(count)
-
-    assert trigger_counts == [3, 6, 9, 10], f"got {trigger_counts}"
-
-
-def test_transport_receiver_zero_copy_offset():
-    """
-    Offset (shared buffer) zero-copy: two senders each write 2 rows
-    into a shared 4-row buffer at different offsets.  No concat needed.
-    """
-    shared = np.zeros((4, 3), dtype=np.float32)
-    receiver = TransportReceiver(wait_for_n_slices=2)
-    receiver.register_zero_copy_buffers(
-        target_buffers=[shared],
-        expect_offsets={0: 0, 1: 2},  # rank 0 → rows 0-1, rank 1 → rows 2-3
-    )
-
-    data0 = np.ones((2, 3), dtype=np.float32) * 1.0
-    data1 = np.ones((2, 3), dtype=np.float32) * 2.0
-    receiver.receive_slices(0, [data0], [2])
-    receiver.receive_slices(1, [data1], [2])
-
-    assert receiver.is_done()
-    # shared buffer should have rank-0 data in rows 0-1, rank-1 in rows 2-3
-    np.testing.assert_array_equal(receiver.target_buffers[0][:2], data0)
-    np.testing.assert_array_equal(receiver.target_buffers[0][2:], data1)
-    # verify actual written-row counts are recorded
-    wc = receiver.get_written_counts()
-    assert wc[0] == [2], f"rank-0 written_counts={wc[0]}"
-    assert wc[1] == [2], f"rank-1 written_counts={wc[1]}"
-
-
-def test_transport_receiver_zero_copy_dlpack_and_no_concat():
-    """
-    Verifies two essential properties of offset zero-copy mode:
-
-    1. The underlying buffer's base memory address does NOT change after
-       either write — pure in-place update, no realloc.
-
-    2. Both senders' data is readable directly from the single contiguous
-       buffer without any concat/stack step.
-
-    Note: get_dlpack_slice belongs to the registration phase, not the
-    receive path.  The receive path writes directly into the pre-allocated
-    slice via index assignment, which already avoids any final concat.
-    """
-    shared = np.zeros((6, 4), dtype=np.float32)
-    from fluxway.common.tensor_backend import get_backend
-
-    backend = get_backend()
-
-    # Capture memory address before writes (numpy __array_interface__)
-    ptr_before = shared.__array_interface__["data"][0]
-
-    receiver = TransportReceiver(wait_for_n_slices=2)
-    receiver.register_zero_copy_buffers(
-        target_buffers=[shared],
-        # rank 0 writes rows 0-2, rank 1 writes rows 3-5
-        expect_offsets={0: 0, 1: 3},
-    )
-
-    data0 = np.ones((3, 4), dtype=np.float32) * 10.0
-    data1 = np.ones((3, 4), dtype=np.float32) * 20.0
-    receiver.receive_slices(0, [data0], [3])
-    receiver.receive_slices(1, [data1], [3])
-    assert receiver.is_done()
-
-    # --- Property 1: No realloc — same underlying buffer ---
-    # (JAX's dynamic_update_slice always returns a new jax.Array,
-    #  so we only check identity for non-JAX backends.)
-    if backend.name() != "jax":
-        ptr_after = receiver.target_buffers[0].__array_interface__["data"][0]
-        assert ptr_after == ptr_before, (
-            f"Buffer was reallocated! Before: {ptr_before:#x}, After: {ptr_after:#x}"
-        )
-
-    # --- Property 2: No concat needed — read directly from the single buffer ---
-    buf = receiver.target_buffers[0]  # single contiguous pre-allocated array
-    np.testing.assert_array_equal(buf[:3], data0)  # rank-0 rows
-    np.testing.assert_array_equal(buf[3:], data1)  # rank-1 rows
-
-
-def test_transport_receiver_zero_copy_per_sender():
-    """
-    No-offset (per-sender) zero-copy: each sender writes into its own
-    independent buffer at row 0.  No shared buffer, no concat.
-    """
-    buf0 = np.zeros((3, 2), dtype=np.float32)
-    buf1 = np.zeros((5, 2), dtype=np.float32)
-
-    receiver = TransportReceiver(wait_for_n_slices=2)
-    receiver.register_per_sender_buffers({0: [buf0], 1: [buf1]})
-
-    data0 = np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32)
-    data1 = np.array([[7.0, 8.0], [9.0, 10.0]], dtype=np.float32)
-
-    receiver.receive_slices(0, [data0], [3])  # fill all 3 rows of buf0
-    receiver.receive_slices(1, [data1], [2])  # fill first 2 rows of buf1
-
-    assert receiver.is_done()
-    per_sender = receiver.get_per_sender_buffers()
-    np.testing.assert_array_equal(per_sender[0][0], data0)
-    np.testing.assert_array_equal(per_sender[1][0][:2], data1)
-    # verify actual written-row counts (buf1 has 5 rows but only 2 were written)
-    wc = receiver.get_written_counts()
-    assert wc[0] == [3], f"rank-0 written_counts={wc[0]}"
-    assert wc[1] == [2], f"rank-1 written_counts={wc[1]}"
 
 
 def test_worker_phase_one_does_not_start_runtime(monkeypatch):
@@ -681,14 +519,14 @@ async def test_mailbox_periodic_trigger():
         participant WorkerMailbox
         participant ExecutionLoop
 
-        Sender->>SPMDWorker: receive_shards(op, name, step=100)
-        SPMDWorker->>WorkerMailbox: deposit_shards(op, name, step=100)
+        Sender->>SPMDWorker: receive_transport_frame(step=100)
+        SPMDWorker->>WorkerMailbox: deposit_transport_frame(step=100)
         Note over WorkerMailbox: Virtual step mapping: 100 -> 0
         WorkerMailbox->>SPMDWorker: on_ready(op, step=0)
         SPMDWorker->>ExecutionLoop: Enqueue(op, step=0)
 
-        Sender->>SPMDWorker: receive_shards(op, name, step=101)
-        SPMDWorker->>WorkerMailbox: deposit_shards(op, name, step=101)
+        Sender->>SPMDWorker: receive_transport_frame(step=101)
+        SPMDWorker->>WorkerMailbox: deposit_transport_frame(step=101)
         Note over WorkerMailbox: Virtual step mapping: 101 -> 1
         WorkerMailbox->>SPMDWorker: on_ready(op, step=1)
         SPMDWorker->>ExecutionLoop: Enqueue(op, step=1)
@@ -744,9 +582,9 @@ async def test_mailbox_periodic_trigger():
     assert ready_steps == [("periodic_op", 0), ("periodic_op", 1)]
 
     # Verify data storage
-    shards0 = await mb.get_tensor_shards("periodic_op", 301, 0)
+    shards0 = await mb.get_tensor_shard_views("periodic_op", 301, 0)
     assert ("s0", 0) in shards0
-    shards1 = await mb.get_tensor_shards("periodic_op", 301, 1)
+    shards1 = await mb.get_tensor_shard_views("periodic_op", 301, 1)
     assert ("s1", 1) in shards1
 
 
@@ -837,7 +675,7 @@ async def test_mailbox_tensor_put_get():
         counts=[2],
         meta_tensor_state_list=[0],
     )
-    shards = await mb.get_tensor_shards("compute", 401, 0)
+    shards = await mb.get_tensor_shard_views("compute", 401, 0)
     assert ("sender0", 0) in shards
     np.testing.assert_array_equal(shards[("sender0", 0)][0].flat_values, d)
 
@@ -897,8 +735,8 @@ async def test_mailbox_op_isolation():
         counts=[1],
         meta_tensor_state_list=[0],
     )
-    fwd = await mb.get_tensor_shards("compute", 601, 0)
-    bwd = await mb.get_tensor_shards("optimize", 601, 0)
+    fwd = await mb.get_tensor_shard_views("compute", 601, 0)
+    bwd = await mb.get_tensor_shard_views("optimize", 601, 0)
     np.testing.assert_array_equal(fwd[("sender0", 0)][0].flat_values, [1.0])
     np.testing.assert_array_equal(bwd[("sender0", 0)][0].flat_values, [2.0])
 
@@ -1034,33 +872,72 @@ async def test_spmd_worker_init():
 @pytest.mark.asyncio
 async def test_receive_multi_tensor_data():
     mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
-    config = _make_config(mesh, "compute")
+    input_spec = ShardingSpec.chunk(PartitionSpec("data"))
+    meta = OperatorMeta(
+        name="compute",
+        input_arguments={ArgumentType.DATA.value: ["x", "y"]},
+        input_sharding={"x": input_spec, "y": input_spec},
+        output_arguments=None,
+    )
+    config = SPMDConfig(
+        mesh=mesh,
+        operators={"compute": "compute"},
+        operator_metas={"compute": meta},
+        topology={
+            "compute": SPMDTopology(
+                predecessors={
+                    "s0": SPMDTopologyInfo(
+                        spmd_id="s0",
+                        world_size=2,
+                        mesh=mesh,
+                        tuuid_sharding={998: input_spec, 999: input_spec},
+                        tuuid_map={"x": 998, "y": 999},
+                    )
+                }
+            )
+        },
+    )
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
     worker = cls(config, rank=0)
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
 
-    worker._mailbox.declare_step(
-        "compute", step=1, expected_tensors={998: 1, 999: 1}, expected_states=[]
-    )
-    worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["compute"])
-    worker._op_manager.get_sender_world_size = MagicMock(return_value=2)
+    worker.register_spmd_code_map(3, {3: "s0"})
 
     t1 = TransportTensor.from_tensor(np.array([1, 2]))
     t2 = TransportTensor.from_tensor(np.array([3, 4]))
 
-    # Two TUUIDs in one RPC call: flat payloads/counts for each
-    await worker.receive_shards(
-        tuuids=[998, 999],
-        step=1,
-        sender_id="s0",
-        sender_rank=0,
-        payloads=[t1.flat_values, t2.flat_values],
-        counts=[2, 2],
-        meta_tensor_state_list=[0, 0],
+    builder = TransportFrameBuilder(
+        step=1, sender_spmd_code=3, sender_rank=0, sender_world_size=2
     )
-    s1 = await worker._mailbox.get_tensor_shards("compute", 998, 1)
-    s2 = await worker._mailbox.get_tensor_shards("compute", 999, 1)
+    edge1 = builder.add_edge(
+        tuuid=998,
+        meta_state=0,
+        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
+        min_rows=0,
+        expected_count=1,
+    )
+    builder.add_payload(edge1, PayloadRole.VALUES, t1.flat_values, 2)
+    edge2 = builder.add_edge(
+        tuuid=999,
+        meta_state=0,
+        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
+        min_rows=0,
+        expected_count=1,
+    )
+    builder.add_payload(edge2, PayloadRole.VALUES, t2.flat_values, 2)
+    frame = builder.build()
+    await worker.receive_transport_frame(
+        frame.frame_i32,
+        frame.edge_i32,
+        frame.payload_i32,
+        frame.shape_i32,
+        frame.global_shape_i64,
+        frame.compact_i64,
+        *frame.payload_segments,
+    )
+    s1 = await worker._mailbox.get_tensor_shard_views("compute", 998, 1)
+    s2 = await worker._mailbox.get_tensor_shard_views("compute", 999, 1)
     np.testing.assert_array_equal(s1[("s0", 0)][0].flat_values, [1, 2])
     np.testing.assert_array_equal(s2[("s0", 0)][0].flat_values, [3, 4])
 
@@ -1198,9 +1075,13 @@ async def test_send_output_none_mesh():
 
     # Mock successor handlers
     handler = MagicMock()
+    handler.receive_transport_frame.remote = AsyncMock(return_value=0)
     from fluxway.rpc.protocol import RayActorDataPlane
 
-    worker._successor_handlers = {"succ": {0: RayActorDataPlane(handler)}}
+    worker.register_spmd_code_map(4, {4: "compute"})
+    worker._successor_handlers = {
+        "succ": {0: RayActorDataPlane(handler, sender_spmd_code=4)}
+    }
 
     from fluxway.spmd.worker.operator_manager.dispatcher import (
         ExecutionStatus,
@@ -1210,8 +1091,9 @@ async def test_send_output_none_mesh():
     data = [np.array([1, 2, 3])]
     result = ExecutionResult(status=ExecutionStatus.SUCCESS, data=data)
     await worker._send_output("compute", result, exec_step=0)
+    await worker._drain_outbound_tasks()
 
-    assert handler.receive_shards.remote.called
+    assert handler.receive_transport_frame.remote.called
 
 
 @pytest.mark.asyncio

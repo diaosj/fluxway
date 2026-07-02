@@ -143,18 +143,20 @@ class SPMDSynchronizer:
             self._expected_ops.add(op)
 
     def _active_ops_for_drain(self) -> set:
-        """Drain denominator: expected ops that have actually been executed.
+        """Drain denominator for checkpoint-safe SPMD progress.
 
-        An op present in ``_expected_ops`` but never reported (e.g. skipped by
-        Dispatcher for every rank, or a conditional Eager op that never ran on
-        this SPMD) must not block drain completion.  Only ops that have reached
-        ``_spmd_completed_count`` -- meaning at least one worker completed at
-        least one step -- are included.
+        Every operator registered in ``_expected_ops`` is part of the SPMD
+        state machine and must reach the drain boundary before checkpointing.
+        Otherwise a fast upstream op can trigger a snapshot while a downstream
+        op is one step behind, producing manifests such as
+        ``lookup=2, update=1`` that cannot resume in a step-ordered worker.
 
+        Optional or conditional work must be modeled explicitly by graph
+        construction instead of being inferred from missing completion reports.
         Must be called while holding ``_lock``.
         """
         if self._expected_ops:
-            return self._expected_ops & set(self._spmd_completed_count.keys())
+            return set(self._expected_ops)
         return set(self._spmd_completed_count.keys())
 
     def set_callbacks(

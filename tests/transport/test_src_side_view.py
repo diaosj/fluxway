@@ -268,7 +268,7 @@ def _build_chunked_tensor(local_shape, global_shape):
 
 def test_distributor_last_src_view_populated_after_plan():
     """After ``plan_and_shard`` runs, the distributor exposes the SrcSideView."""
-    from fluxway.transport.communication import DataDistributor
+    from fluxway.transport.communication import AsyncDataDistributor
 
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(6,), axis_names=("x",))
@@ -276,9 +276,9 @@ def test_distributor_last_src_view_populated_after_plan():
     dst = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     tt = _build_chunked_tensor(local_shape=(12,), global_shape=(24,))
-    dist = DataDistributor(local_rank=0)
+    dist = AsyncDataDistributor(local_rank=0)
     assert dist.last_src_view is None
-    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=12)
+    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=12, tuuid=1)
 
     view = dist.last_src_view
     assert view is not None
@@ -299,7 +299,7 @@ def test_distributor_expected_n_for_dst_static_chunk():
     contiguous rows and reaches 3 contiguous dst ranks; therefore each
     dst receives exactly 1 sender.
     """
-    from fluxway.transport.communication import DataDistributor
+    from fluxway.transport.communication import AsyncDataDistributor
 
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(6,), axis_names=("x",))
@@ -307,8 +307,8 @@ def test_distributor_expected_n_for_dst_static_chunk():
     dst = ShardingSpec.chunk(P("x")).bind(dst_mesh)
 
     tt = _build_chunked_tensor(local_shape=(12,), global_shape=(24,))
-    dist = DataDistributor(local_rank=0)
-    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=12)
+    dist = AsyncDataDistributor(local_rank=0)
+    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=12, tuuid=2)
 
     src_world = src_mesh.size
     for d in range(dst_mesh.size):
@@ -324,7 +324,7 @@ def test_distributor_expected_n_for_dst_data_driven_falls_back():
     """
     import jax.numpy as jnp
     from fluxway.common.types.tensor import TransportTensor
-    from fluxway.transport.communication import DataDistributor
+    from fluxway.transport.communication import AsyncDataDistributor
 
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("y",))
@@ -333,8 +333,8 @@ def test_distributor_expected_n_for_dst_data_driven_falls_back():
 
     keys = jnp.arange(0, 6, dtype=jnp.int32)
     tt = TransportTensor(keys, global_shape=(12,))
-    dist = DataDistributor(local_rank=0)
-    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=6)
+    dist = AsyncDataDistributor(local_rank=0)
+    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=6, tuuid=3)
 
     view = dist.last_src_view
     assert view is not None
@@ -347,9 +347,9 @@ def test_distributor_expected_n_for_dst_data_driven_falls_back():
 
 def test_distributor_expected_n_for_dst_no_plan_yet():
     """Before any plan: helper returns the always-full fallback."""
-    from fluxway.transport.communication import DataDistributor
+    from fluxway.transport.communication import AsyncDataDistributor
 
-    dist = DataDistributor(local_rank=0)
+    dist = AsyncDataDistributor(local_rank=0)
     assert dist.last_src_view is None
     # Any positive src_world_size must be returned verbatim.
     assert dist.expected_n_for_dst(0, 4) == 4

@@ -104,8 +104,8 @@ class IndexDescriptor:
 
     def __eq__(self, other):
         if isinstance(other, IndexDescriptor):
-            return bool(get_backend().equal(self.materialize(), other.materialize()))
-        return bool(get_backend().equal(self.materialize(), other))
+            return get_backend().equal(self.materialize(), other.materialize())
+        return get_backend().equal(self.materialize(), other)
 
 
 class IndexPattern(enum.Enum):
@@ -130,20 +130,20 @@ class ContinuousIndex(IndexDescriptor):
     def to_compact_params(self) -> list[int]:
         """Calculate sharded parameters for compact transport."""
         return [
-            int(self.start),
-            int(self.step),
-            int(self.count),
-            int(self.pattern.value),
+            self.start,
+            self.step,
+            self.count,
+            self.pattern.value,
         ]
 
     @staticmethod
     def from_compact_params(p: list[int]) -> "ContinuousIndex":
         """Reconstruct from parameters."""
         return ContinuousIndex(
-            pattern=IndexPattern(int(p[3])),
-            start=int(p[0]),
-            step=int(p[1]),
-            count=int(p[2]),
+            pattern=IndexPattern(p[3]),
+            start=p[0],
+            step=p[1],
+            count=p[2],
         )
 
     @property
@@ -228,8 +228,8 @@ class ContinuousIndex(IndexDescriptor):
                 and self.count == other.count
             )
         if isinstance(other, IndexDescriptor):
-            return bool(get_backend().equal(self.materialize(), other.materialize()))
-        return bool(get_backend().equal(self.materialize(), other))
+            return get_backend().equal(self.materialize(), other.materialize())
+        return get_backend().equal(self.materialize(), other)
 
     def __hash__(self):
         return hash((self.pattern, self.start, self.step, self.count))
@@ -305,10 +305,10 @@ class ExplicitIndex(IndexDescriptor):
     def __eq__(self, other):
         bk = get_backend()
         if isinstance(other, ExplicitIndex):
-            return bool(bk.equal(self.indices, other.indices))
+            return bk.equal(self.indices, other.indices)
         if isinstance(other, IndexDescriptor):
-            return bool(bk.equal(self.indices, other.materialize()))
-        return bool(bk.equal(self.indices, other))
+            return bk.equal(self.indices, other.materialize())
+        return bk.equal(self.indices, other)
 
     def __hash__(self):
         return id(self)
@@ -345,9 +345,9 @@ if _JAX_AVAILABLE:
 
     jax.tree_util.register_pytree_node(
         ContinuousIndex,
-        lambda x: ((x.start, x.step, x.count), {"pattern": x.pattern}),  # type: ignore
+        lambda x: ((x.start, x.step, x.count), x.pattern),
         lambda aux, children: ContinuousIndex(
-            pattern=aux["pattern"],  # type: ignore
+            pattern=aux,
             start=children[0],
             step=children[1],
             count=children[2],

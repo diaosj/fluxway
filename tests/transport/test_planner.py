@@ -174,6 +174,38 @@ def test_dynamic_to_static():
     assert counts == [2, 1]
 
 
+def test_hash_literal_indices_keep_negative_bit_patterns_valid():
+    dst_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
+    dst_layout = ShardingSpec.hash(P("x")).bind(dst_mesh)
+
+    keys = jnp.array([4, -1, 8], dtype=jnp.int32)
+    domain = _domain(
+        dst_layout,
+        axis_sizes=(3,),
+        axis_indices=(LiteralIndices(length=3, values=keys),),
+    )
+
+    plan = TransportPlanner.compute_plan(src_local_rank=0, domain=domain)
+
+    assert plan.send_counts.tolist() == [3]
+
+
+def test_literal_indices_valid_length_masks_only_padding_tail():
+    dst_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
+    dst_layout = ShardingSpec.hash(P("x")).bind(dst_mesh)
+
+    keys = jnp.array([4, -1, 8, -1], dtype=jnp.int32)
+    domain = _domain(
+        dst_layout,
+        axis_sizes=(4,),
+        axis_indices=(LiteralIndices(length=4, values=keys, valid_length=3),),
+    )
+
+    plan = TransportPlanner.compute_plan(src_local_rank=0, domain=domain)
+
+    assert plan.send_counts.tolist() == [3]
+
+
 # ---- Scenario 4: dynamic -> dynamic (greedy via RaggedIndex) ----
 
 
@@ -320,7 +352,7 @@ def test_no_implicit_none():
         RoutingDomain.from_layout(
             target=dst_layout,
             axis_sizes=(4,),
-            axis_indices=(None,),
+            axis_indices=(None,),  # type: ignore
         )
 
 
@@ -333,7 +365,7 @@ def test_no_implicit_bare_tensor():
         RoutingDomain.from_layout(
             target=dst_layout,
             axis_sizes=(4,),
-            axis_indices=(jnp.arange(0, 4, dtype=jnp.int32),),
+            axis_indices=(jnp.arange(0, 4, dtype=jnp.int32),),  # type: ignore
         )
 
 
@@ -366,6 +398,28 @@ def test_indices_semantics_decoupled_from_axis_size():
     # axis.size unchanged (both layouts share the same dst); only the
     # per-rank slice differs.
     assert domain_a.axes[0].size == domain_b.axes[0].size == 100
+
+
+def test_range_indices_planner_path_does_not_call_materialize(monkeypatch):
+    """RangeIndices is a symbolic routing source; planner must not expand it via _materialize."""
+    import fluxway.transport.planner as planner_mod
+
+    dst_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
+    dst_layout = ShardingSpec.chunk(P("x")).bind(dst_mesh)
+
+    domain = _domain(
+        dst_layout,
+        axis_sizes=(16,),
+        axis_indices=(RangeIndices.contiguous(start=0, length=8),),
+    )
+
+    def forbidden(spec, backend):
+        raise AssertionError(f"_materialize called for {type(spec).__name__}")
+
+    monkeypatch.setattr(planner_mod, "_materialize", forbidden)
+    plan = TransportPlanner.compute_plan(src_local_rank=0, domain=domain)
+
+    assert plan.send_counts.tolist() == [8, 0]
 
 
 # ============================================================
@@ -416,7 +470,7 @@ def test_zip_mode_const_axis_does_not_inflate_sort_indices():
     # 4..7 -> rank 2 (dp=1,tp=0).
     counts = plan.send_counts.tolist()
     assert counts == [4, 0, 4, 0]
-    assert int(plan.target_num_workers) == 4
+    assert plan.target_num_workers == 4
 
 
 def test_zip_mode_const_axis_value_routes_correctly():
@@ -550,7 +604,7 @@ def test_multi_replica_axes_dest_devices_fanout():
 
     # dest_devices fans out to 4 replicas per primary entity.
     assert tuple(plan.dest_devices.shape) == (8, 4)
-    assert int(plan.replication_factor) == 4
+    assert plan.replication_factor == 4
 
     # sort_indices stays at primary count -- the replica fan-out lives in
     # the second axis of dest_devices, not in sort_indices.
@@ -560,7 +614,7 @@ def test_multi_replica_axes_dest_devices_fanout():
     # dest_devices[:, 0] which corresponds to (rep1=0, rep2=0); under
     # row-major device_ids, dst_rank = dp*4 + rep1*2 + rep2, so
     # entities 0..3 -> dp=0 -> rank 0, entities 4..7 -> dp=1 -> rank 4.
-    assert int(plan.target_num_workers) == 8
+    assert plan.target_num_workers == 8
     counts = plan.send_counts.tolist()
     assert counts == [4, 0, 0, 0, 4, 0, 0, 0], (
         f"send_counts must accumulate on the canonical (rep1=0, rep2=0) "
