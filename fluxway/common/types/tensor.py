@@ -1099,6 +1099,7 @@ class TransportTensor:
                 self._routing_indices,
                 self._global_shape,
                 self._origin_indices,
+                self._receipt,
                 self._routing_axes,
             ),
         )
@@ -1118,6 +1119,7 @@ def _reconstruct_transport_tensor(
     routing_indices,
     global_shape=None,
     origin_indices=None,
+    receipt=None,
     routing_axes=(0,),
 ):
     """Pickle reconstruction helper (top-level function for pickling)."""
@@ -1127,6 +1129,7 @@ def _reconstruct_transport_tensor(
         routing_indices=routing_indices,
         global_shape=global_shape,
         origin_indices=origin_indices,
+        receipt=receipt,
         routing_axes=routing_axes,
     )
 

@@ -61,3 +61,25 @@ def test_recommendation_train_uses_fluxway_launch():
     assert launch_calls, (
         "expected train.py to call fluxway.launch() for zero-config Ray initialization"
     )
+
+
+def _is_controller_resource_summary_remote_call(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if not isinstance(func, ast.Attribute) or func.attr != "remote":
+        return False
+    owner = func.value
+    if not isinstance(owner, ast.Attribute):
+        return False
+    if owner.attr != "get_resource_allocation_summary":
+        return False
+    return isinstance(owner.value, ast.Name) and owner.value.id == "controller"
+
+
+def test_recommendation_train_prints_controller_resource_summary():
+    module = _load_module(EXAMPLE_DIR / "train.py")
+
+    assert any(
+        _is_controller_resource_summary_remote_call(node) for node in ast.walk(module)
+    ), "train.py should query controller.get_resource_allocation_summary.remote()"

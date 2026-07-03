@@ -473,6 +473,57 @@ _DYNAMIC_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset({"ctx"})
 _CONTEXT_ATTR_NAMES: frozenset[str] = (
     _STATIC_CONTEXT_ATTR_NAMES | _DYNAMIC_CONTEXT_ATTR_NAMES
 )
+_WORKER_PROCESS_PROTOCOL_ATTR = "__fluxway_process_affine__"
+
+
+def requires_worker_process(cls: type) -> type:
+    """Run a stateful operator class inside its owning SPMD worker process.
+
+    Use this for operators that initialize process-local systems such as
+    ``jax.distributed.initialize``. Ordinary stateful operators should not need
+    this decorator; Fluxway can run them in an isolated execution actor.
+    """
+    setattr(cls, _WORKER_PROCESS_PROTOCOL_ATTR, True)
+    return cls
+
+
+def _is_worker_process_required(cls: type) -> bool:
+    return bool(getattr(cls, _WORKER_PROCESS_PROTOCOL_ATTR, False))
+
+
+def _source_mentions_jax_distributed_initialize(cls: type) -> bool:
+    try:
+        source = inspect.getsource(cls)
+    except (OSError, TypeError):
+        source = ""
+    if "jax.distributed.initialize" in source:
+        return True
+    for value in cls.__dict__.values():
+        fn = value
+        if isinstance(value, (staticmethod, classmethod)):
+            fn = value.__func__
+        code = getattr(fn, "__code__", None)
+        if code is None:
+            continue
+        names = set(code.co_names)
+        if {"jax", "distributed", "initialize"}.issubset(names):
+            return True
+    return False
+
+
+def _validate_worker_process_marker(cls: type) -> None:
+    if _is_worker_process_required(cls):
+        return
+    if not _source_mentions_jax_distributed_initialize(cls):
+        return
+    raise RuntimeError(
+        "Fluxway Worker Process Error: "
+        f"{cls.__module__}.{cls.__qualname__} calls jax.distributed.initialize "
+        "but is not marked with @fluxway.requires_worker_process.\n"
+        "Fix: add @fluxway.requires_worker_process above the class definition. "
+        "This tells Fluxway to run the operator inside the SPMD worker process "
+        "instead of moving it to an isolated Ray execution actor."
+    )
 
 
 def _inject_context_properties(cls: type) -> None:

@@ -29,15 +29,10 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
 
         async def send_fn(
             target_rank,
-            frame_i32,
-            edge_i32,
-            payload_i32,
-            shape_i32,
-            global_shape_i64,
-            compact_i64,
-            *payload_segments,
+            header,
+            *payload_iovs,
         ):
-            captured[target_rank] = (frame_i32, edge_i32, payload_segments)
+            captured[target_rank] = (header, payload_iovs)
             return True
 
         await AsyncDataDistributor(rank).distribute(
@@ -57,7 +52,7 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
 
     assert set(captured0) == {0}
     assert set(captured1) == {1}
-    assert int(captured0[0][0][FRAME_SENDER_SPMD_CODE]) == 9
-    assert int(captured1[1][0][FRAME_SENDER_SPMD_CODE]) == 9
-    assert int(captured0[0][1][0, EDGE_EXPECTED_COUNT]) == 1
-    assert np.asarray(captured0[0][2][0]).shape == ()
+    assert int(captured0[0][0].frame_i32[FRAME_SENDER_SPMD_CODE]) == 9
+    assert int(captured1[1][0].frame_i32[FRAME_SENDER_SPMD_CODE]) == 9
+    assert int(captured0[0][0].edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
+    assert np.asarray(captured0[0][1][0]).shape == ()

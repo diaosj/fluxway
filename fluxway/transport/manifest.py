@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+import struct
 from typing import Any
 
 import numpy as np
 
+from fluxway.transport.kernels import FRAME_TABLE_KERNEL, FrameTableCapacity
+
 
 INT32_MAX = np.iinfo(np.int32).max
 INT64_MAX = np.iinfo(np.int64).max
+INT32_NBYTES = np.dtype(np.int32).itemsize
+INT64_NBYTES = np.dtype(np.int64).itemsize
 PROTOCOL_VERSION = 1
 
 
@@ -209,40 +214,67 @@ def _validate_enum(enum_type: type[IntEnum], value: int, field: str) -> None:
         ) from exc
 
 
-@dataclass(frozen=True)
-class TransportFrame:
+def _require_host_metadata_array(
+    name: str,
+    table: Any,
+    *,
+    dtype: Any,
+    ndim: int,
+    width: int | None = None,
+    shape: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    if not isinstance(table, np.ndarray):
+        raise TypeError(
+            f"{name} must be a host numpy metadata array, got {type(table).__name__}."
+        )
+    if hasattr(table, "__cuda_array_interface__"):
+        raise TypeError(f"{name} must be host metadata, not a CUDA array.")
+    expected_dtype = np.dtype(dtype)
+    if table.dtype != expected_dtype:
+        raise ValueError(
+            f"{name} must have dtype={expected_dtype}, got dtype={table.dtype}."
+        )
+    if table.ndim != ndim:
+        raise ValueError(f"{name} must have ndim={ndim}, got ndim={table.ndim}.")
+    if width is not None and (table.ndim != 2 or table.shape[1] != width):
+        raise ValueError(f"{name} width must be {width}, got shape={table.shape}.")
+    if shape is not None and table.shape != shape:
+        raise ValueError(f"{name} must have shape={shape}, got shape={table.shape}.")
+    return table
+
+
+@dataclass(frozen=True, slots=True)
+class TransportFrameHeader:
     frame_i32: np.ndarray
     edge_i32: np.ndarray
     payload_i32: np.ndarray
     shape_i32: np.ndarray
     global_shape_i64: np.ndarray
     compact_i64: np.ndarray
-    payload_segments: tuple[Any, ...]
 
     def validate(self) -> None:
-        if self.frame_i32.dtype != np.int32 or self.frame_i32.shape != (FRAME_WIDTH,):
-            raise ValueError(
-                f"frame_i32 must have dtype=int32 shape=({FRAME_WIDTH},), "
-                f"got dtype={self.frame_i32.dtype} shape={self.frame_i32.shape}."
-            )
-        if self.edge_i32.dtype != np.int32 or self.edge_i32.ndim != 2:
-            raise ValueError("edge_i32 must be a 2-D int32 array.")
-        if self.edge_i32.shape[1] != EDGE_WIDTH:
-            raise ValueError(
-                f"edge_i32 width must be {EDGE_WIDTH}, got {self.edge_i32.shape[1]}."
-            )
-        if self.payload_i32.dtype != np.int32 or self.payload_i32.ndim != 2:
-            raise ValueError("payload_i32 must be a 2-D int32 array.")
-        if self.payload_i32.shape[1] != PAYLOAD_WIDTH:
-            raise ValueError(
-                f"payload_i32 width must be {PAYLOAD_WIDTH}, got {self.payload_i32.shape[1]}."
-            )
-        if self.shape_i32.dtype != np.int32 or self.shape_i32.ndim != 1:
-            raise ValueError("shape_i32 must be a 1-D int32 array.")
-        if self.global_shape_i64.dtype != np.int64 or self.global_shape_i64.ndim != 1:
-            raise ValueError("global_shape_i64 must be a 1-D int64 array.")
-        if self.compact_i64.dtype != np.int64 or self.compact_i64.ndim != 1:
-            raise ValueError("compact_i64 must be a 1-D int64 array.")
+        _require_host_metadata_array(
+            "frame_i32", self.frame_i32, dtype=np.int32, ndim=1, shape=(FRAME_WIDTH,)
+        )
+        _require_host_metadata_array(
+            "edge_i32", self.edge_i32, dtype=np.int32, ndim=2, width=EDGE_WIDTH
+        )
+        _require_host_metadata_array(
+            "payload_i32",
+            self.payload_i32,
+            dtype=np.int32,
+            ndim=2,
+            width=PAYLOAD_WIDTH,
+        )
+        _require_host_metadata_array(
+            "shape_i32", self.shape_i32, dtype=np.int32, ndim=1
+        )
+        _require_host_metadata_array(
+            "global_shape_i64", self.global_shape_i64, dtype=np.int64, ndim=1
+        )
+        _require_host_metadata_array(
+            "compact_i64", self.compact_i64, dtype=np.int64, ndim=1
+        )
         _require_nonnegative_i32_table("frame_i32", self.frame_i32)
         _require_nonnegative_i32_table("edge_i32", self.edge_i32)
         _require_nonnegative_i32_table("payload_i32", self.payload_i32)
@@ -297,12 +329,51 @@ class TransportFrame:
             )
             shape_begin = int(row[PAYLOAD_SHAPE_BEGIN])
             shape_count = int(row[PAYLOAD_SHAPE_COUNT])
-            segment_idx = int(row[PAYLOAD_SEGMENT_ARG_INDEX])
             if shape_begin + shape_count > self.shape_i32.shape[0]:
                 raise ValueError(
                     f"payload row {row_idx} shape range [{shape_begin}, "
                     f"{shape_begin + shape_count}) exceeds shape_i32 size={self.shape_i32.shape[0]}."
                 )
+
+    def to_frame(self, payload_segments: tuple[Any, ...]) -> TransportFrame:
+        frame = TransportFrame(
+            frame_i32=self.frame_i32,
+            edge_i32=self.edge_i32,
+            payload_i32=self.payload_i32,
+            shape_i32=self.shape_i32,
+            global_shape_i64=self.global_shape_i64,
+            compact_i64=self.compact_i64,
+            payload_segments=payload_segments,
+        )
+        frame.validate()
+        return frame
+
+
+@dataclass(frozen=True)
+class TransportFrame:
+    frame_i32: np.ndarray
+    edge_i32: np.ndarray
+    payload_i32: np.ndarray
+    shape_i32: np.ndarray
+    global_shape_i64: np.ndarray
+    compact_i64: np.ndarray
+    payload_segments: tuple[Any, ...]
+
+    @property
+    def header(self) -> TransportFrameHeader:
+        return TransportFrameHeader(
+            frame_i32=self.frame_i32,
+            edge_i32=self.edge_i32,
+            payload_i32=self.payload_i32,
+            shape_i32=self.shape_i32,
+            global_shape_i64=self.global_shape_i64,
+            compact_i64=self.compact_i64,
+        )
+
+    def validate(self) -> None:
+        self.header.validate()
+        for row_idx, row in enumerate(self.payload_i32):
+            segment_idx = int(row[PAYLOAD_SEGMENT_ARG_INDEX])
             if segment_idx >= len(self.payload_segments):
                 raise ValueError(
                     f"payload row {row_idx} segment index {segment_idx} exceeds "
@@ -324,6 +395,10 @@ class TransportFrame:
 
 
 class TransportFrameBuilder:
+    _EDGE_STRUCT = struct.Struct("=" + "i" * EDGE_WIDTH)
+    _PAYLOAD_STRUCT = struct.Struct("=" + "i" * PAYLOAD_WIDTH)
+    _I32_SCALAR_STRUCT = struct.Struct("=i")
+
     def __init__(
         self,
         step: int,
@@ -331,18 +406,50 @@ class TransportFrameBuilder:
         sender_rank: int,
         sender_world_size: int,
         flags: int = 0,
+        capacity: FrameTableCapacity | None = None,
     ):
         self._step = _as_i32(step, "step")
         self._sender_spmd_code = _as_i32(sender_spmd_code, "sender_spmd_code")
         self._sender_rank = _as_i32(sender_rank, "sender_rank")
         self._sender_world_size = _as_i32(sender_world_size, "sender_world_size")
         self._flags = _as_i32(flags, "flags")
-        self._edges: list[list[int]] = []
-        self._payloads: list[list[int]] = []
-        self._shape: list[int] = []
-        self._global_shape: list[int] = []
-        self._compact: list[int] = []
-        self._segments: list[Any] = []
+        self._capacity = capacity or FrameTableCapacity()
+        self._edge_i32_buffer = FRAME_TABLE_KERNEL.empty_byte_buffer(
+            self._capacity.edge_count * EDGE_WIDTH,
+            INT32_NBYTES,
+            "edge_i32",
+        )
+        self._payload_i32_buffer = FRAME_TABLE_KERNEL.empty_byte_buffer(
+            self._capacity.payload_count * PAYLOAD_WIDTH,
+            INT32_NBYTES,
+            "payload_i32",
+        )
+        self._shape_i32_buffer = FRAME_TABLE_KERNEL.empty_byte_buffer(
+            self._capacity.shape_count, INT32_NBYTES, "shape_i32"
+        )
+        self._global_shape_i64_buffer = FRAME_TABLE_KERNEL.empty_byte_buffer(
+            self._capacity.global_shape_count,
+            INT64_NBYTES,
+            "global_shape_i64",
+        )
+        self._compact_i64_buffer = FRAME_TABLE_KERNEL.empty_byte_buffer(
+            self._capacity.compact_count,
+            INT64_NBYTES,
+            "compact_i64",
+        )
+        self._segments = [None] * self._capacity.segment_count
+        self._edge_capacity = self._capacity.edge_count
+        self._payload_capacity = self._capacity.payload_count
+        self._shape_capacity = self._capacity.shape_count
+        self._global_shape_capacity = self._capacity.global_shape_count
+        self._compact_capacity = self._capacity.compact_count
+        self._segment_capacity = self._capacity.segment_count
+        self._edge_count = 0
+        self._payload_count = 0
+        self._shape_count = 0
+        self._global_shape_count = 0
+        self._compact_count = 0
+        self._segment_count = 0
 
     def add_edge(
         self,
@@ -355,62 +462,104 @@ class TransportFrameBuilder:
         compact_params: list[int] | tuple[int, ...] | None = None,
         global_shape: tuple[int, ...] | None = None,
     ) -> int:
-        payload_begin = len(self._payloads)
+        payload_begin = self._payload_count
         compact_begin = self.add_compact_params(compact_params)
         compact_count = 0 if compact_params is None else COMPACT_PARAM_COUNT
-        global_shape_begin = len(self._global_shape)
+        global_shape_begin = self._global_shape_count
         global_shape_count = 0
         if global_shape is not None:
-            for i, value in enumerate(global_shape):
-                self._global_shape.append(_as_i64(value, f"global_shape[{i}]"))
+            global_shape_values = tuple(
+                _as_i64(value, f"global_shape[{i}]")
+                for i, value in enumerate(global_shape)
+            )
+            self._ensure_global_shape_capacity(
+                self._global_shape_count + len(global_shape_values)
+            )
+            struct.pack_into(
+                "=" + "q" * len(global_shape_values),
+                self._global_shape_i64_buffer,
+                self._global_shape_count * INT64_NBYTES,
+                *global_shape_values,
+            )
             global_shape_count = len(global_shape)
-        edge_index = len(self._edges)
-        self._edges.append(
-            [
-                _as_i32(tuuid, "tuuid"),
-                _as_i32(meta_state, "meta_state"),
-                _as_i32(int(empty_kind), "empty_kind"),
-                _as_i32(payload_begin, "payload_begin"),
-                0,
-                _as_i32(min_rows, "min_rows"),
-                _as_i32(expected_count, "expected_count"),
-                _as_i32(compact_begin, "compact_begin"),
-                _as_i32(compact_count, "compact_count"),
-                _as_i32(global_shape_begin, "global_shape_begin"),
-                _as_i32(global_shape_count, "global_shape_count"),
-            ]
+            self._global_shape_count += global_shape_count
+        edge_index = self._edge_count
+        self._ensure_edge_capacity(edge_index + 1)
+        self._EDGE_STRUCT.pack_into(
+            self._edge_i32_buffer,
+            edge_index * self._EDGE_STRUCT.size,
+            _as_i32(tuuid, "tuuid"),
+            _as_i32(meta_state, "meta_state"),
+            _as_i32(int(empty_kind), "empty_kind"),
+            _as_i32(payload_begin, "payload_begin"),
+            0,
+            _as_i32(min_rows, "min_rows"),
+            _as_i32(expected_count, "expected_count"),
+            _as_i32(compact_begin, "compact_begin"),
+            _as_i32(compact_count, "compact_count"),
+            _as_i32(global_shape_begin, "global_shape_begin"),
+            _as_i32(global_shape_count, "global_shape_count"),
         )
+        self._edge_count += 1
         return edge_index
 
     def add_payload(
         self, edge_index: int, role: PayloadRole, segment: Any, valid_count: int
     ) -> None:
-        if edge_index < 0 or edge_index >= len(self._edges):
+        if edge_index < 0 or edge_index >= self._edge_count:
             raise IndexError(f"edge_index {edge_index} is out of range.")
         if not hasattr(segment, "dtype"):
             raise TypeError(
                 f"payload segment must expose dtype metadata, got {type(segment).__name__}."
             )
         shape = tuple(int(x) for x in getattr(segment, "shape", ()))
-        shape_begin = len(self._shape)
-        for dim, value in enumerate(shape):
-            self._shape.append(_as_i32(value, f"payload shape dim {dim}"))
-        segment_idx = len(self._segments)
-        self._segments.append(segment)
-        self._payloads.append(
-            [
-                _as_i32(int(role), "payload role"),
-                _as_i32(dtype_code(segment.dtype), "dtype_code"),
-                _as_i32(len(shape), "ndim"),
-                _as_i32(shape_begin, "shape_begin"),
-                _as_i32(len(shape), "shape_count"),
-                _as_i32(valid_count, "valid_count"),
-                _as_i32(segment_idx, "segment_arg_index"),
-                0,
-            ]
+        shape_begin = self._shape_count
+        shape_values = tuple(
+            _as_i32(value, f"payload shape dim {dim}")
+            for dim, value in enumerate(shape)
         )
-        self._edges[edge_index][EDGE_PAYLOAD_COUNT] += 1
-        _as_i32(self._edges[edge_index][EDGE_PAYLOAD_COUNT], "payload_count")
+        self._ensure_shape_capacity(self._shape_count + len(shape_values))
+        struct.pack_into(
+            "=" + "i" * len(shape_values),
+            self._shape_i32_buffer,
+            self._shape_count * INT32_NBYTES,
+            *shape_values,
+        )
+        self._shape_count += len(shape_values)
+
+        segment_idx = self._segment_count
+        self._ensure_segment_capacity(segment_idx + 1)
+        self._segments[segment_idx] = segment
+        self._segment_count += 1
+
+        payload_index = self._payload_count
+        self._ensure_payload_capacity(payload_index + 1)
+        self._PAYLOAD_STRUCT.pack_into(
+            self._payload_i32_buffer,
+            payload_index * self._PAYLOAD_STRUCT.size,
+            _as_i32(int(role), "payload role"),
+            _as_i32(dtype_code(segment.dtype), "dtype_code"),
+            _as_i32(len(shape), "ndim"),
+            _as_i32(shape_begin, "shape_begin"),
+            _as_i32(len(shape), "shape_count"),
+            _as_i32(valid_count, "valid_count"),
+            _as_i32(segment_idx, "segment_arg_index"),
+            0,
+        )
+        self._payload_count += 1
+        payload_count_byte = (
+            edge_index * EDGE_WIDTH + EDGE_PAYLOAD_COUNT
+        ) * INT32_NBYTES
+        payload_count = (
+            self._I32_SCALAR_STRUCT.unpack_from(
+                self._edge_i32_buffer, payload_count_byte
+            )[0]
+            + 1
+        )
+        self._I32_SCALAR_STRUCT.pack_into(
+            self._edge_i32_buffer, payload_count_byte, payload_count
+        )
+        _as_i32(payload_count, "payload_count")
 
     def add_compact_params(self, params: list[int] | tuple[int, ...] | None) -> int:
         if params is None:
@@ -419,14 +568,23 @@ class TransportFrameBuilder:
             raise ValueError(
                 f"compact params must have {COMPACT_PARAM_COUNT} entries, got {len(params)}."
             )
-        begin = len(self._compact)
-        for i, value in enumerate(params):
-            self._compact.append(_as_i64(value, f"compact[{i}]"))
+        begin = self._compact_count
+        compact_values = tuple(
+            _as_i64(value, f"compact[{i}]") for i, value in enumerate(params)
+        )
+        self._ensure_compact_capacity(self._compact_count + COMPACT_PARAM_COUNT)
+        struct.pack_into(
+            "=" + "q" * len(compact_values),
+            self._compact_i64_buffer,
+            self._compact_count * INT64_NBYTES,
+            *compact_values,
+        )
+        self._compact_count += COMPACT_PARAM_COUNT
         return begin
 
     def build(self) -> TransportFrame:
-        edge_count = _as_i32(len(self._edges), "edge_count")
-        payload_count = _as_i32(len(self._payloads), "payload_count")
+        edge_count = _as_i32(self._edge_count, "edge_count")
+        payload_count = _as_i32(self._payload_count, "payload_count")
         frame_i32 = np.array(
             [
                 PROTOCOL_VERSION,
@@ -440,15 +598,23 @@ class TransportFrameBuilder:
             ],
             dtype=np.int32,
         )
-        edge_i32 = np.asarray(self._edges, dtype=np.int32).reshape(
-            edge_count, EDGE_WIDTH
+        edge_i32 = FRAME_TABLE_KERNEL.i32_table_from_byte_buffer(
+            self._edge_i32_buffer, edge_count, EDGE_WIDTH, "edge_i32"
         )
-        payload_i32 = np.asarray(self._payloads, dtype=np.int32).reshape(
-            payload_count, PAYLOAD_WIDTH
+        payload_i32 = FRAME_TABLE_KERNEL.i32_table_from_byte_buffer(
+            self._payload_i32_buffer, payload_count, PAYLOAD_WIDTH, "payload_i32"
         )
-        shape_i32 = np.asarray(self._shape, dtype=np.int32)
-        global_shape_i64 = np.asarray(self._global_shape, dtype=np.int64)
-        compact_i64 = np.asarray(self._compact, dtype=np.int64)
+        shape_i32 = FRAME_TABLE_KERNEL.i32_vector_from_byte_buffer(
+            self._shape_i32_buffer, self._shape_count, "shape_i32"
+        )
+        global_shape_i64 = FRAME_TABLE_KERNEL.i64_vector_from_byte_buffer(
+            self._global_shape_i64_buffer,
+            self._global_shape_count,
+            "global_shape_i64",
+        )
+        compact_i64 = FRAME_TABLE_KERNEL.i64_vector_from_byte_buffer(
+            self._compact_i64_buffer, self._compact_count, "compact_i64"
+        )
         frame = TransportFrame(
             frame_i32=frame_i32,
             edge_i32=edge_i32,
@@ -456,10 +622,84 @@ class TransportFrameBuilder:
             shape_i32=shape_i32,
             global_shape_i64=global_shape_i64,
             compact_i64=compact_i64,
-            payload_segments=tuple(self._segments),
+            payload_segments=tuple(self._segments[: self._segment_count]),
         )
         frame.validate()
         return frame
+
+    def _ensure_edge_capacity(self, needed: int) -> None:
+        if needed <= self._edge_capacity:
+            return
+        next_capacity = self._next_capacity(self._edge_capacity, needed)
+        self._edge_i32_buffer = FRAME_TABLE_KERNEL.grow_byte_buffer(
+            self._edge_i32_buffer,
+            next_capacity * EDGE_WIDTH,
+            INT32_NBYTES,
+            "edge_i32",
+        )
+        self._edge_capacity = next_capacity
+
+    def _ensure_payload_capacity(self, needed: int) -> None:
+        if needed <= self._payload_capacity:
+            return
+        next_capacity = self._next_capacity(self._payload_capacity, needed)
+        self._payload_i32_buffer = FRAME_TABLE_KERNEL.grow_byte_buffer(
+            self._payload_i32_buffer,
+            next_capacity * PAYLOAD_WIDTH,
+            INT32_NBYTES,
+            "payload_i32",
+        )
+        self._payload_capacity = next_capacity
+
+    def _ensure_shape_capacity(self, needed: int) -> None:
+        if needed <= self._shape_capacity:
+            return
+        next_capacity = self._next_capacity(self._shape_capacity, needed)
+        self._shape_i32_buffer = FRAME_TABLE_KERNEL.grow_byte_buffer(
+            self._shape_i32_buffer,
+            next_capacity,
+            INT32_NBYTES,
+            "shape_i32",
+        )
+        self._shape_capacity = next_capacity
+
+    def _ensure_global_shape_capacity(self, needed: int) -> None:
+        if needed <= self._global_shape_capacity:
+            return
+        next_capacity = self._next_capacity(self._global_shape_capacity, needed)
+        self._global_shape_i64_buffer = FRAME_TABLE_KERNEL.grow_byte_buffer(
+            self._global_shape_i64_buffer,
+            next_capacity,
+            INT64_NBYTES,
+            "global_shape_i64",
+        )
+        self._global_shape_capacity = next_capacity
+
+    def _ensure_compact_capacity(self, needed: int) -> None:
+        if needed <= self._compact_capacity:
+            return
+        next_capacity = self._next_capacity(self._compact_capacity, needed)
+        self._compact_i64_buffer = FRAME_TABLE_KERNEL.grow_byte_buffer(
+            self._compact_i64_buffer,
+            next_capacity,
+            INT64_NBYTES,
+            "compact_i64",
+        )
+        self._compact_capacity = next_capacity
+
+    def _ensure_segment_capacity(self, needed: int) -> None:
+        if needed <= self._segment_capacity:
+            return
+        next_capacity = self._next_capacity(self._segment_capacity, needed)
+        self._segments.extend([None] * (next_capacity - self._segment_capacity))
+        self._segment_capacity = next_capacity
+
+    def _next_capacity(self, current: int, needed: int) -> int:
+        if needed <= current:
+            return current
+        if current == 0:
+            return needed
+        return max(needed, current * 2)
 
 
 def metadata_nbytes(frame: TransportFrame) -> int:

@@ -42,7 +42,7 @@ def controller(mock_spmd_manager):
     graph_stub = MagicMock()
     graph_stub.nodes.keys.return_value = ["op1", "op2"]
 
-    ctrl = ControllerActor.__ray_actor_class__(graph=graph_stub)
+    ctrl = ControllerActor.__ray_actor_class__(graph=graph_stub)  # type: ignore[attr-defined]
     ctrl._spmd_manager = mock_spmd_manager
     ctrl._graph = graph_stub
 

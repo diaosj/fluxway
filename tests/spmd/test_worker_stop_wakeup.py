@@ -28,6 +28,7 @@ def _make_worker_stub():
         _run_task=None,
         _heartbeat_task=None,
         _background_tasks=[],
+        _outbound_tasks=set(),
         spmd_id="test_spmd",
         rank=0,
     )

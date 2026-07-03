@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.common.types.configs import SPMDConfig
 from fluxway.common.mesh import DeviceMesh
+from fluxway.transport.manifest import TransportFrameHeader
 
 
 def _make_config(mesh, *op_names):
@@ -77,13 +78,8 @@ async def test_spmd_worker_backpressure_throttles_sender():
     # Create a simplified frame-only version of the backpressure logic in _send_fn.
     async def simulated_send_fn(
         target_rank,
-        frame_i32,
-        edge_i32,
-        payload_i32,
-        shape_i32,
-        global_shape_i64,
-        compact_i64,
-        *payload_segments,
+        header,
+        *payload_iovs,
         _handlers,
     ):
         handler = _handlers.get(target_rank)
@@ -92,15 +88,7 @@ async def test_spmd_worker_backpressure_throttles_sender():
 
         await worker._send_semaphore.acquire()
 
-        ref = handler.receive_transport_frame.remote(
-            frame_i32,
-            edge_i32,
-            payload_i32,
-            shape_i32,
-            global_shape_i64,
-            compact_i64,
-            *payload_segments,
-        )
+        ref = handler.receive_transport_frame.remote(header, *payload_iovs)
 
         async def _wait_and_release(r=ref):
             try:
@@ -121,15 +109,15 @@ async def test_spmd_worker_backpressure_throttles_sender():
         worker_module.asyncio.sleep = mock_sleep
 
         # Test the simulated _send_fn callback
-        frame_args = (
-            np.zeros((8,), dtype=np.int32),
-            np.zeros((1, 11), dtype=np.int32),
-            np.zeros((1, 8), dtype=np.int32),
-            np.zeros((1,), dtype=np.int32),
-            np.zeros((0,), dtype=np.int64),
-            np.zeros((0,), dtype=np.int64),
-            np.array([1]),
+        header = TransportFrameHeader(
+            frame_i32=np.array([1, 0, 0, 0, 1, 1, 1, 0], dtype=np.int32),
+            edge_i32=np.array([[1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0]], dtype=np.int32),
+            payload_i32=np.array([[0, 1, 1, 0, 1, 1, 0, 0]], dtype=np.int32),
+            shape_i32=np.array([1], dtype=np.int32),
+            global_shape_i64=np.zeros((0,), dtype=np.int64),
+            compact_i64=np.zeros((0,), dtype=np.int64),
         )
+        frame_args = (header, np.array([1], dtype=np.int32))
         handlers = {0: mock_handler, 1: mock_handler, 2: mock_handler}
 
         await simulated_send_fn(0, *frame_args, _handlers=handlers)

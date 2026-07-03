@@ -6,6 +6,7 @@ from fluxway.transport.manifest import (
     PAYLOAD_DTYPE,
     EmptyKind,
     PayloadRole,
+    TransportFrameHeader,
     TransportFrameBuilder,
     legacy_metadata_nbytes_as_i64,
     metadata_nbytes,
@@ -37,6 +38,40 @@ def test_manifest_uses_i32_metadata_and_preserves_u64_payload_and_i64_shape():
     assert int(frame.payload_segments[0][0]) == 2**40
     assert int(frame.global_shape_i64[0]) == 2**35
     assert metadata_nbytes(frame) < legacy_metadata_nbytes_as_i64(frame)
+
+
+def test_transport_frame_header_round_trips_without_payload_copy():
+    values = np.array([1.0, 2.0], dtype=np.float32)
+    builder = TransportFrameBuilder(
+        step=2, sender_spmd_code=1, sender_rank=0, sender_world_size=1
+    )
+    edge = builder.add_edge(
+        tuuid=7,
+        meta_state=0,
+        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
+        min_rows=0,
+        expected_count=1,
+    )
+    builder.add_payload(edge, PayloadRole.VALUES, values, 2)
+    frame = builder.build()
+
+    rebuilt = frame.header.to_frame(frame.payload_segments)
+
+    assert rebuilt.payload_segments[0] is values
+    assert rebuilt.header is not frame.header
+    assert np.array_equal(rebuilt.frame_i32, frame.frame_i32)
+
+
+def test_transport_frame_header_rejects_non_numpy_metadata():
+    with pytest.raises(TypeError, match="host numpy metadata"):
+        TransportFrameHeader(
+            frame_i32=[1, 2, 3],
+            edge_i32=np.zeros((0, 11), dtype=np.int32),
+            payload_i32=np.zeros((0, 8), dtype=np.int32),
+            shape_i32=np.zeros((0,), dtype=np.int32),
+            global_shape_i64=np.zeros((0,), dtype=np.int64),
+            compact_i64=np.zeros((0,), dtype=np.int64),
+        ).validate()
 
 
 def test_manifest_rejects_i32_shape_overflow():

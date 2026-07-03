@@ -190,3 +190,94 @@ async def test_mailbox_frame_expected_count_reconfigures_after_control_arrival()
 
     assert fired == []
     assert mailbox._barriers["op"][6].tensor_progress[14] == "1/4"
+
+
+@pytest.mark.asyncio
+async def test_mailbox_zero_copy_writes_into_buffer():
+    mailbox = WorkerMailbox()
+    buffer = np.zeros((4, 2), dtype=np.float32)
+
+    await mailbox.register_zero_copy_slot(
+        "compute", 701, step=0, target_buffers=[buffer], expect_offsets={0: 0}
+    )
+    await mailbox.deposit_shards(
+        "compute",
+        [701],
+        step=0,
+        sender_id="s0",
+        rank=0,
+        sender_world_size=4,
+        payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
+        counts=[2],
+        meta_tensor_state_list=[0],
+    )
+
+    buffers = await mailbox.get_zero_copy_buffers("compute", 701, step=0)
+    assert buffers is not None
+    np.testing.assert_array_equal(buffers[0][:2], [[1.0, 2.0], [3.0, 4.0]])
+
+
+@pytest.mark.asyncio
+async def test_mailbox_zero_copy_ragged_writes_data_and_lengths():
+    mailbox = WorkerMailbox()
+    data_buffer = np.zeros(10, dtype=np.float32)
+    lengths_buffer = np.zeros(4, dtype=np.int32)
+    flat_values = np.array([1, 1, 1, 2, 2], dtype=np.float32)
+    lengths = np.array([3, 2], dtype=np.int32)
+
+    await mailbox.register_zero_copy_slot(
+        "compute",
+        1001,
+        step=0,
+        target_buffers=[data_buffer, lengths_buffer],
+        expect_offsets={0: [0, 0]},
+    )
+    await mailbox.deposit_shards(
+        "compute",
+        [1001],
+        0,
+        "s0",
+        0,
+        1,
+        payloads=[flat_values, lengths],
+        counts=[5, 2],
+        meta_tensor_state_list=[1],
+    )
+
+    buffers = await mailbox.get_zero_copy_buffers("compute", 1001, step=0)
+    assert buffers is not None
+    np.testing.assert_array_equal(buffers[0][:5], flat_values)
+    np.testing.assert_array_equal(buffers[1][:2], lengths)
+
+
+@pytest.mark.asyncio
+async def test_mailbox_zero_copy_slots_accept_multiple_tensor_payloads():
+    mailbox = WorkerMailbox()
+    first_buffer = np.zeros(4, dtype=np.float32)
+    second_buffer = np.zeros(4, dtype=np.float32)
+
+    await mailbox.register_zero_copy_slot("op", 101, 0, [first_buffer], {0: 0})
+    await mailbox.register_zero_copy_slot("op", 102, 0, [second_buffer], {0: 0})
+
+    first_payload = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    second_payload = np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32)
+
+    await mailbox.deposit_shards(
+        "op",
+        [101, 102],
+        0,
+        "Input",
+        0,
+        1,
+        payloads=[first_payload, second_payload],
+        counts=[4, 4],
+        meta_tensor_state_list=[0, 0],
+    )
+
+    first_result = await mailbox.get_zero_copy_buffers("op", 101, 0)
+    second_result = await mailbox.get_zero_copy_buffers("op", 102, 0)
+
+    assert first_result is not None
+    assert second_result is not None
+    np.testing.assert_array_equal(first_result[0], first_payload)
+    np.testing.assert_array_equal(second_result[0], second_payload)

@@ -5,9 +5,120 @@ Control plane operations (scheduling, heartbeats) still use native Ray.
 """
 
 from abc import ABC, abstractmethod
+from enum import Enum
+from inspect import isawaitable
 from typing import Any, ClassVar
 
+import numpy as np
+
 from fluxway.common.tensor_backend import ensure_cpu_serializable
+from fluxway.transport.manifest import TransportFrameHeader
+
+
+class PayloadDeviceClass(str, Enum):
+    CPU = "cpu"
+    CUDA = "cuda"
+
+
+class AxonCompletionMode(str, Enum):
+    RECEIVER_SUCCESS = "receiver_success"
+    SEND_ENQUEUED = "send_enqueued"
+
+
+_DLPACK_CPU_DEVICE_TYPE = 1
+_DLPACK_CUDA_DEVICE_TYPE = 2
+
+
+def _coerce_payload_device_class(value: PayloadDeviceClass | str) -> PayloadDeviceClass:
+    if isinstance(value, PayloadDeviceClass):
+        return value
+    try:
+        return PayloadDeviceClass(value)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported payload device class {value!r}.") from exc
+
+
+def _coerce_axon_completion_mode(value: AxonCompletionMode | str) -> AxonCompletionMode:
+    if isinstance(value, AxonCompletionMode):
+        return value
+    try:
+        return AxonCompletionMode(value)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported Axon completion mode {value!r}.") from exc
+
+
+def payload_device_class(payload_iov: Any) -> PayloadDeviceClass:
+    dlpack_device = getattr(payload_iov, "__dlpack_device__", None)
+    if dlpack_device is not None:
+        device_type, _ = dlpack_device()
+        device_type = int(device_type)
+        if device_type == _DLPACK_CPU_DEVICE_TYPE:
+            return PayloadDeviceClass.CPU
+        if device_type == _DLPACK_CUDA_DEVICE_TYPE:
+            return PayloadDeviceClass.CUDA
+        raise TypeError(
+            f"Unsupported DLPack device type {device_type} for Axon payload iov."
+        )
+
+    if hasattr(payload_iov, "__cuda_array_interface__"):
+        return PayloadDeviceClass.CUDA
+    if isinstance(payload_iov, np.ndarray) or hasattr(
+        payload_iov, "__array_interface__"
+    ):
+        return PayloadDeviceClass.CPU
+    if hasattr(payload_iov, "__dlpack__"):
+        raise TypeError(
+            "Axon payload iov exposes __dlpack__ but not __dlpack_device__; "
+            "device class cannot be validated."
+        )
+    raise TypeError(
+        "Axon payload iov must expose __dlpack_device__, __cuda_array_interface__, "
+        f"or __array_interface__, got {type(payload_iov).__name__}."
+    )
+
+
+def validate_payload_iov_device_class(
+    payload_iovs: tuple[Any, ...],
+    *,
+    expected_device_class: PayloadDeviceClass | str | None = None,
+) -> PayloadDeviceClass | None:
+    expected = (
+        None
+        if expected_device_class is None
+        else _coerce_payload_device_class(expected_device_class)
+    )
+    actual: PayloadDeviceClass | None = None
+    for index, payload_iov in enumerate(payload_iovs):
+        current = payload_device_class(payload_iov)
+        if actual is None:
+            actual = current
+        elif current is not actual:
+            raise ValueError(
+                "Axon payload iovs must share one device class; "
+                f"payload 0 is {actual.value}, payload {index} is {current.value}."
+            )
+
+    if expected is not None and actual is not None and actual is not expected:
+        raise ValueError(
+            "Axon payload iov source device class does not match destination "
+            f"device class: source={actual.value} destination={expected.value}."
+        )
+    return expected if actual is None else actual
+
+
+def _validated_transport_header(header: TransportFrameHeader) -> TransportFrameHeader:
+    if not isinstance(header, TransportFrameHeader):
+        raise TypeError(
+            f"header must be TransportFrameHeader, got {type(header).__name__}."
+        )
+    header.validate()
+    return header
+
+
+async def _await_required(result: Any, method_name: str) -> Any:
+    if not isawaitable(result):
+        raise TypeError(f"Axon handle {method_name} must return an awaitable.")
+    return await result
 
 
 class DataPlaneCallable(ABC):
@@ -23,17 +134,10 @@ class DataPlaneCallable(ABC):
     @abstractmethod
     async def receive_transport_frame(
         self,
-        frame_i32: Any,
-        edge_i32: Any,
-        payload_i32: Any,
-        shape_i32: Any,
-        global_shape_i64: Any,
-        compact_i64: Any,
-        *payload_segments: Any,
+        header: TransportFrameHeader,
+        *payload_iovs: Any,
     ) -> Any:
-        """
-        Data Plane: flat transport manifest frame.
-        """
+        """Data Plane: host metadata header plus tensor payload buffers."""
         pass
 
     @abstractmethod
@@ -61,22 +165,13 @@ class RayActorDataPlane(DataPlaneCallable):
 
     async def receive_transport_frame(
         self,
-        frame_i32: Any,
-        edge_i32: Any,
-        payload_i32: Any,
-        shape_i32: Any,
-        global_shape_i64: Any,
-        compact_i64: Any,
-        *payload_segments: Any,
+        header: TransportFrameHeader,
+        *payload_iovs: Any,
     ) -> Any:
-        cpu_segments = tuple(ensure_cpu_serializable(p) for p in payload_segments)
+        header = _validated_transport_header(header)
+        cpu_segments = tuple(ensure_cpu_serializable(p) for p in payload_iovs)
         return await self._handle.receive_transport_frame.remote(
-            frame_i32,
-            edge_i32,
-            payload_i32,
-            shape_i32,
-            global_shape_i64,
-            compact_i64,
+            header,
             *cpu_segments,
         )
 
@@ -87,6 +182,73 @@ class RayActorDataPlane(DataPlaneCallable):
 
     def __repr__(self):
         return f"RayActorDataPlane(handle={self._handle})"
+
+
+class AxonDataPlane(DataPlaneCallable):
+    def __init__(self, handle: Any, sender_spmd_code: int):
+        self._handle = handle
+        if not isinstance(sender_spmd_code, int) or sender_spmd_code < 0:
+            raise ValueError(
+                f"sender_spmd_code must be a non-negative int, got {sender_spmd_code!r}."
+            )
+        destination_device_class = getattr(handle, "payload_device_class", None)
+        if destination_device_class is None:
+            raise TypeError(
+                "AxonDataPlane handle must expose payload_device_class for "
+                "source/destination iov device validation."
+            )
+        self._sender_spmd_code = sender_spmd_code
+        self._payload_device_class = _coerce_payload_device_class(
+            destination_device_class
+        )
+        completion_mode = getattr(handle, "completion_mode", None)
+        if completion_mode is None:
+            raise TypeError(
+                "AxonDataPlane handle must expose completion_mode="
+                "'receiver_success' for Local Deposit Boundary semantics."
+            )
+        self._completion_mode = _coerce_axon_completion_mode(completion_mode)
+        if self._completion_mode is not AxonCompletionMode.RECEIVER_SUCCESS:
+            raise ValueError(
+                "AxonDataPlane requires completion_mode='receiver_success'; "
+                f"got {self._completion_mode.value!r}. send_enqueued hides receiver "
+                "deposit/assemble failures from the current step."
+            )
+
+    async def receive_transport_frame(
+        self,
+        header: TransportFrameHeader,
+        *payload_iovs: Any,
+    ) -> Any:
+        header = _validated_transport_header(header)
+        payload_class = validate_payload_iov_device_class(
+            payload_iovs, expected_device_class=self._payload_device_class
+        )
+        invoke = getattr(self._handle, "invoke_transport_frame", None)
+        if invoke is None:
+            raise TypeError("AxonDataPlane handle must expose invoke_transport_frame.")
+        return await _await_required(
+            invoke(header, payload_class.value, self._sender_spmd_code, *payload_iovs),
+            "invoke_transport_frame",
+        )
+
+    async def receive_control(
+        self, op_name: str, step: int, names: list[str], values: list[Any]
+    ) -> Any:
+        invoke = getattr(self._handle, "invoke_control", None)
+        if invoke is None:
+            raise TypeError("AxonDataPlane handle must expose invoke_control.")
+        return await _await_required(
+            invoke(op_name, step, names, values, self._sender_spmd_code),
+            "invoke_control",
+        )
+
+    def __repr__(self):
+        return (
+            "AxonDataPlane("
+            f"handle={self._handle}, payload_device_class={self._payload_device_class.value}, "
+            f"completion_mode={self._completion_mode.value})"
+        )
 
 
 class DataPlaneRegistry:
@@ -110,3 +272,4 @@ class DataPlaneRegistry:
 
 # Register default Ray implementation
 DataPlaneRegistry.register("ray", RayActorDataPlane)
+DataPlaneRegistry.register("axon", AxonDataPlane)

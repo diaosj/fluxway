@@ -1,6 +1,5 @@
 import numpy as np
 import pytest
-import asyncio
 from unittest.mock import AsyncMock, patch
 
 from fluxway.spmd.worker.worker import SPMDWorker
@@ -15,6 +14,10 @@ from fluxway.common.types.configs import (
 from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.decorators import spmd, operator as fw_operator
+from fluxway.spmd.worker.data_plane import (
+    SuccessorRouteContext,
+    build_step_frame_groups,
+)
 
 
 @spmd(mesh_axis_names=("data", "mp"), mesh_axis_shapes=(2, 2))
@@ -147,17 +150,39 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         f"Target processor should expect 2 shards, got {shards_dict}"
     )
 
-    # 2. RUN STEP 0: Unit 0 (Ranks 0, 1) active
-    with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:
+    # 2. BUILD STEP 0: Unit 0 (Ranks 0, 1) active
+    with patch("fluxway.spmd.worker.data_plane.AsyncDataDistributor") as mock_dist_cls:
         mock_dist = mock_dist_cls.return_value
-        mock_dist.distribute = AsyncMock()
+        mock_dist.build_transport_frame_args.return_value = []
 
-        await asyncio.gather(
-            *[w._execute_operator("loader", 0) for w in loader_workers]
-        )
+        for w in loader_workers[:2]:
+            succ_info = w.op_manager.get_successor_info("loader", "processor")
+            assert succ_info is not None
+            build_step_frame_groups(
+                op_name="loader",
+                rank=w.rank,
+                mesh=w._mesh,
+                flat_results=[np.ones((10, 10))],
+                output_uuids=[1001],
+                output_sharding={1001: sharding},
+                successor_contexts=[
+                    SuccessorRouteContext(
+                        context_index=0,
+                        spmd_id="processor",
+                        info=succ_info,
+                        effective_rank=w.rank % edge_info.interleave_unit_size,
+                    )
+                ],
+                tuuid_to_name={1001: "t1"},
+                step_tuuid_cache={},
+                exec_step=0,
+                sender_spmd_code=1,
+                sender_world_size=4,
+                interleave_unit_size=loader_meta.interleave_unit_size,
+            )
 
         assert mock_dist.plan_and_shard.call_count == 2
-        assert mock_dist.distribute.call_count == 2
+        assert mock_dist.build_transport_frame_args.call_count == 2
         found_u0 = False
         for call in mock_dist.plan_and_shard.call_args_list:
             source_spec = call.args[1]
@@ -167,17 +192,39 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
                 found_u0 = True
         assert found_u0, "Unit 0 sub-mesh distribution not found"
 
-    # 3. RUN STEP 1: Unit 1 (Ranks 2, 3) active
-    with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:
+    # 3. BUILD STEP 1: Unit 1 (Ranks 2, 3) active
+    with patch("fluxway.spmd.worker.data_plane.AsyncDataDistributor") as mock_dist_cls:
         mock_dist = mock_dist_cls.return_value
-        mock_dist.distribute = AsyncMock()
+        mock_dist.build_transport_frame_args.return_value = []
 
-        await asyncio.gather(
-            *[w._execute_operator("loader", 1) for w in loader_workers]
-        )
+        for w in loader_workers[2:]:
+            succ_info = w.op_manager.get_successor_info("loader", "processor")
+            assert succ_info is not None
+            build_step_frame_groups(
+                op_name="loader",
+                rank=w.rank,
+                mesh=w._mesh,
+                flat_results=[np.ones((10, 10))],
+                output_uuids=[1001],
+                output_sharding={1001: sharding},
+                successor_contexts=[
+                    SuccessorRouteContext(
+                        context_index=0,
+                        spmd_id="processor",
+                        info=succ_info,
+                        effective_rank=w.rank % edge_info.interleave_unit_size,
+                    )
+                ],
+                tuuid_to_name={1001: "t1"},
+                step_tuuid_cache={},
+                exec_step=1,
+                sender_spmd_code=1,
+                sender_world_size=4,
+                interleave_unit_size=loader_meta.interleave_unit_size,
+            )
 
         assert mock_dist.plan_and_shard.call_count == 2
-        assert mock_dist.distribute.call_count == 2
+        assert mock_dist.build_transport_frame_args.call_count == 2
         found_u1 = False
         for call in mock_dist.plan_and_shard.call_args_list:
             source_spec = call.args[1]
@@ -228,15 +275,37 @@ async def test_single_worker_interleaved_unit():
         w._successor_handlers = {"processor": {0: AsyncMock()}}
         loader_workers.append(w)
 
-    with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:
+    with patch("fluxway.spmd.worker.data_plane.AsyncDataDistributor") as mock_dist_cls:
         mock_dist = mock_dist_cls.return_value
-        mock_dist.distribute = AsyncMock()
+        mock_dist.build_transport_frame_args.return_value = []
 
-        await asyncio.gather(
-            *[w._execute_operator("loader", 0) for w in loader_workers]
+        w = loader_workers[0]
+        succ_info = w.op_manager.get_successor_info("loader", "processor")
+        assert succ_info is not None
+        build_step_frame_groups(
+            op_name="loader",
+            rank=w.rank,
+            mesh=w._mesh,
+            flat_results=[np.ones((10, 10))],
+            output_uuids=[2001],
+            output_sharding={2001: sharding},
+            successor_contexts=[
+                SuccessorRouteContext(
+                    context_index=0,
+                    spmd_id="processor",
+                    info=succ_info,
+                    effective_rank=w.rank % edge.interleave_unit_size,
+                )
+            ],
+            tuuid_to_name={2001: "t1"},
+            step_tuuid_cache={},
+            exec_step=0,
+            sender_spmd_code=1,
+            sender_world_size=4,
+            interleave_unit_size=loader_meta.interleave_unit_size,
         )
         assert mock_dist.plan_and_shard.call_count == 1
-        assert mock_dist.distribute.call_count == 1
+        assert mock_dist.build_transport_frame_args.call_count == 1
 
         source_spec = mock_dist.plan_and_shard.call_args.args[1]
         assert source_spec.mesh.shape == (1,)

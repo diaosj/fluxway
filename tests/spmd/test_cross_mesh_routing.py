@@ -399,6 +399,9 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         worker._maybe_merge_receipts = SPMDWorker._maybe_merge_receipts.__get__(  # type: ignore
             worker, _DirectWorker
         )
+        worker._routing_entity_count = SPMDWorker._routing_entity_count.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
         assemble = SPMDWorker._assemble_dynamic_to_static_tensor.__get__(  # type: ignore
             worker, _DirectWorker
         )
@@ -766,30 +769,27 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
 
             async def mock_send(
                 target_rank: int,
-                frame_i32,
-                edge_i32,
-                payload_i32,
-                shape_i32,
-                global_shape_i64,
-                compact_i64,
-                *payload_segments,
+                header,
+                *payload_iovs,
             ):
-                valid_count = int(payload_i32[0, 5])
+                valid_count = int(header.payload_i32[0, 5])
                 if valid_count > 0:
-                    g_begin = int(edge_i32[0, 9])
-                    g_count = int(edge_i32[0, 10])
+                    g_begin = int(header.edge_i32[0, 9])
+                    g_count = int(header.edge_i32[0, 10])
                     g_shape = (
                         tuple(
                             int(x)
-                            for x in global_shape_i64[g_begin : g_begin + g_count]
+                            for x in header.global_shape_i64[
+                                g_begin : g_begin + g_count
+                            ]
                         )
                         if g_count
                         else None
                     )
                     received_tt = TransportTensor(
-                        payload_segments[0],
-                        origin_indices=payload_segments[1]
-                        if len(payload_segments) > 1
+                        payload_iovs[0],
+                        origin_indices=payload_iovs[1]
+                        if len(payload_iovs) > 1
                         else None,
                         global_shape=g_shape,
                     )

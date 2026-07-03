@@ -11,7 +11,7 @@ Covers:
 import sys
 import os
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
@@ -22,10 +22,8 @@ from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.common.types.configs import SPMDConfig, OperatorMeta, ArgumentType
-from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
-from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
 from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 
 # ---------------------------------------------------------------------------
@@ -742,34 +740,6 @@ async def test_mailbox_op_isolation():
 
 
 # ===========================================================================
-# WorkerMailbox — zero-copy
-# ===========================================================================
-
-
-@pytest.mark.asyncio
-async def test_mailbox_zero_copy_writes_into_buffer():
-    mb = WorkerMailbox()
-    buf = np.zeros((4, 2), dtype=np.float32)
-    await mb.register_zero_copy_slot(
-        "compute", 701, step=0, target_buffers=[buf], expect_offsets={0: 0}
-    )
-    await mb.deposit_shards(
-        "compute",
-        [701],
-        step=0,
-        sender_id="s0",
-        rank=0,
-        sender_world_size=4,
-        payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
-        counts=[2],
-        meta_tensor_state_list=[0],
-    )
-    buffers = await mb.get_zero_copy_buffers("compute", 701, step=0)
-    assert buffers is not None
-    np.testing.assert_array_equal(buffers[0][:2], [[1.0, 2.0], [3.0, 4.0]])
-
-
-# ===========================================================================
 # WorkerMailbox — cleanup / backpressure
 # ===========================================================================
 
@@ -869,120 +839,6 @@ async def test_spmd_worker_init():
     assert worker._op_manager._mesh is mesh
 
 
-@pytest.mark.asyncio
-async def test_receive_multi_tensor_data():
-    mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
-    input_spec = ShardingSpec.chunk(PartitionSpec("data"))
-    meta = OperatorMeta(
-        name="compute",
-        input_arguments={ArgumentType.DATA.value: ["x", "y"]},
-        input_sharding={"x": input_spec, "y": input_spec},
-        output_arguments=None,
-    )
-    config = SPMDConfig(
-        mesh=mesh,
-        operators={"compute": "compute"},
-        operator_metas={"compute": meta},
-        topology={
-            "compute": SPMDTopology(
-                predecessors={
-                    "s0": SPMDTopologyInfo(
-                        spmd_id="s0",
-                        world_size=2,
-                        mesh=mesh,
-                        tuuid_sharding={998: input_spec, 999: input_spec},
-                        tuuid_map={"x": 998, "y": 999},
-                    )
-                }
-            )
-        },
-    )
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-    worker = cls(config, rank=0)
-    worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
-
-    worker.register_spmd_code_map(3, {3: "s0"})
-
-    t1 = TransportTensor.from_tensor(np.array([1, 2]))
-    t2 = TransportTensor.from_tensor(np.array([3, 4]))
-
-    builder = TransportFrameBuilder(
-        step=1, sender_spmd_code=3, sender_rank=0, sender_world_size=2
-    )
-    edge1 = builder.add_edge(
-        tuuid=998,
-        meta_state=0,
-        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
-        min_rows=0,
-        expected_count=1,
-    )
-    builder.add_payload(edge1, PayloadRole.VALUES, t1.flat_values, 2)
-    edge2 = builder.add_edge(
-        tuuid=999,
-        meta_state=0,
-        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
-        min_rows=0,
-        expected_count=1,
-    )
-    builder.add_payload(edge2, PayloadRole.VALUES, t2.flat_values, 2)
-    frame = builder.build()
-    await worker.receive_transport_frame(
-        frame.frame_i32,
-        frame.edge_i32,
-        frame.payload_i32,
-        frame.shape_i32,
-        frame.global_shape_i64,
-        frame.compact_i64,
-        *frame.payload_segments,
-    )
-    s1 = await worker._mailbox.get_tensor_shard_views("compute", 998, 1)
-    s2 = await worker._mailbox.get_tensor_shard_views("compute", 999, 1)
-    np.testing.assert_array_equal(s1[("s0", 0)][0].flat_values, [1, 2])
-    np.testing.assert_array_equal(s2[("s0", 0)][0].flat_values, [3, 4])
-
-
-@pytest.mark.asyncio
-async def test_mailbox_zero_copy_ragged():
-    mb = WorkerMailbox()
-    # For ragged, we expect 2 buffers: data and lengths
-    data_buf = np.zeros((10,), dtype=np.float32)
-    len_buf = np.zeros((4,), dtype=np.int32)
-
-    await mb.register_zero_copy_slot(
-        "compute",
-        1001,
-        step=0,
-        target_buffers=[data_buf, len_buf],
-        expect_offsets={0: [0, 0]},
-    )
-
-    # Create a ragged tensor: 2 elements, counts [3, 2], values [1,1,1, 2,2]
-    flat_values = np.array([1, 1, 1, 2, 2], dtype=np.float32)
-    splits = np.array([0, 3, 5], dtype=np.int32)
-    tt = TransportTensor(flat_values, nested_splits=[splits])
-
-    await mb.deposit_shards(
-        "compute",
-        [1001],
-        0,
-        "s0",
-        0,
-        1,
-        payloads=[tt.flat_values, np.array([3, 2], dtype=np.int32)],
-        counts=[5, 2],
-        meta_tensor_state_list=[1],  # meta_state 1 for ragged
-    )
-
-    # Verify buffers from mailbox (handles JAX-style non-inplace updates)
-    buffers = await mb.get_zero_copy_buffers("compute", 1001, step=0)
-    assert buffers is not None
-    # Verify data buffer
-    np.testing.assert_array_equal(buffers[0][:5], flat_values)
-    # Verify lengths buffer
-    np.testing.assert_array_equal(buffers[1][:2], [3, 2])
-
-
 def test_replicate_operator_manager():
     from fluxway.common.types.configs import OperatorMeta
 
@@ -1065,7 +921,9 @@ async def test_send_output_none_mesh():
     disp_mock.interleave_unit_size = None
     worker._op_manager.get_dispatcher.return_value = disp_mock
 
-    succ_info = MagicMock()
+    from types import SimpleNamespace
+
+    succ_info = SimpleNamespace()
     succ_info.is_self_loop = False
     succ_info.tuuid_sharding = {123: unbound_spec}
     succ_info.mesh = test_mesh
@@ -1073,15 +931,18 @@ async def test_send_output_none_mesh():
     succ_info.interleave_unit_size = None
     worker._op_manager.get_successor_info.return_value = succ_info
 
-    # Mock successor handlers
-    handler = MagicMock()
-    handler.receive_transport_frame.remote = AsyncMock(return_value=0)
-    from fluxway.rpc.protocol import RayActorDataPlane
+    class RecordingDataPlaneExecutor:
+        def __init__(self):
+            self.calls = []
+
+        async def send_step_frames(self, **kwargs):
+            self.calls.append(kwargs)
+            return [True]
 
     worker.register_spmd_code_map(4, {4: "compute"})
-    worker._successor_handlers = {
-        "succ": {0: RayActorDataPlane(handler, sender_spmd_code=4)}
-    }
+    worker._successor_handlers = {"succ": {0: object()}}
+    recorder = RecordingDataPlaneExecutor()
+    worker._data_plane_executor = recorder
 
     from fluxway.spmd.worker.operator_manager.dispatcher import (
         ExecutionStatus,
@@ -1093,7 +954,11 @@ async def test_send_output_none_mesh():
     await worker._send_output("compute", result, exec_step=0)
     await worker._drain_outbound_tasks()
 
-    assert handler.receive_transport_frame.remote.called
+    assert len(recorder.calls) == 1
+    call = recorder.calls[0]
+    assert call["op_name"] == "compute"
+    assert call["exec_step"] == 0
+    assert call["successor_handlers"] == [{0: worker._successor_handlers["succ"][0]}]
 
 
 @pytest.mark.asyncio

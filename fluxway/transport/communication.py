@@ -37,6 +37,7 @@ from fluxway.common.tensor_components import (
     select_source_geometry_index_source,
 )
 from fluxway.transport.manifest import (
+    COMPACT_PARAM_COUNT,
     EDGE_EMPTY_KIND,
     EDGE_EXPECTED_COUNT,
     EDGE_TUUID,
@@ -45,8 +46,10 @@ from fluxway.transport.manifest import (
     PayloadRole,
     SenderEmissionMode,
     TransportFrameBuilder,
+    TransportFrameHeader,
     TransportPlanManifest,
 )
+from fluxway.transport.kernels import FrameTableCapacity
 
 logger = logging.getLogger(__name__)
 
@@ -1547,7 +1550,7 @@ class AsyncDataDistributor(BaseDataDistributor):
         step: int,
         sender_spmd_code: int,
         sender_world_size: int,
-    ) -> list[tuple[int, Any, Any, Any, Any, Any, Any, tuple[Any, ...]]]:
+    ) -> list[tuple[int, TransportFrameHeader, tuple[Any, ...]]]:
         frame_args = []
         for target_id in sorted(self._dest_agg.keys()):
             frame = self._build_transport_frame_for_target(
@@ -1585,12 +1588,7 @@ class AsyncDataDistributor(BaseDataDistributor):
             frame_args.append(
                 (
                     target_id,
-                    frame.frame_i32,
-                    frame.edge_i32,
-                    frame.payload_i32,
-                    frame.shape_i32,
-                    frame.global_shape_i64,
-                    frame.compact_i64,
+                    frame.header,
                     frame.payload_segments,
                 )
             )
@@ -1623,28 +1621,8 @@ class AsyncDataDistributor(BaseDataDistributor):
             sender_world_size=sender_world_size,
         )
         tasks = []
-        for (
-            target_id,
-            frame_i32,
-            edge_i32,
-            payload_i32,
-            shape_i32,
-            global_shape_i64,
-            compact_i64,
-            payload_segments,
-        ) in frame_args:
-            tasks.append(
-                send_fn(
-                    target_id,
-                    frame_i32,
-                    edge_i32,
-                    payload_i32,
-                    shape_i32,
-                    global_shape_i64,
-                    compact_i64,
-                    *payload_segments,
-                )
-            )
+        for target_id, header, payload_segments in frame_args:
+            tasks.append(send_fn(target_id, header, *payload_segments))
 
         res = await asyncio.gather(*tasks) if tasks else []
         self._dest_agg.clear()
@@ -1666,6 +1644,7 @@ class AsyncDataDistributor(BaseDataDistributor):
             sender_spmd_code=sender_spmd_code,
             sender_rank=self.local_rank,
             sender_world_size=sender_world_size,
+            capacity=_frame_table_capacity_for_groups(groups),
         )
         expected_count = self.expected_n_for_dst(target_id, sender_world_size)
         for (
@@ -1731,6 +1710,85 @@ class AsyncDataDistributor(BaseDataDistributor):
                     )
                     cursor += 1
         return builder.build()
+
+
+def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
+    edge_count = 0
+    payload_count = 0
+    shape_count = 0
+    global_shape_count = 0
+    compact_count = 0
+
+    for group_index, (
+        tuuids,
+        tensors,
+        _counts,
+        global_shapes,
+        meta_states,
+        compact_params,
+        empty_kinds,
+    ) in enumerate(groups):
+        if isinstance(tuuids, list | tuple):
+            tuuid_seq = tuple(tuuids)
+        else:
+            tuuid_seq = (tuuids,)
+        if len(empty_kinds) != len(tuuid_seq):
+            raise ValueError(
+                f"empty_kinds length {len(empty_kinds)} does not match "
+                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+            )
+        if len(meta_states) != len(tuuid_seq):
+            raise ValueError(
+                f"meta_states length {len(meta_states)} does not match "
+                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+            )
+        if len(global_shapes) != len(tuuid_seq):
+            raise ValueError(
+                f"global_shapes length {len(global_shapes)} does not match "
+                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+            )
+
+        cursor = 0
+        edge_count += len(tuuid_seq)
+        for edge_idx, meta_state in enumerate(meta_states):
+            component_count = 1 + ragged_level_count(int(meta_state))
+            if int(meta_state) & 2:
+                component_count += 1
+            if cursor + component_count > len(tensors):
+                raise ValueError(
+                    f"group_index={group_index} edge_index={edge_idx} requires "
+                    f"{component_count} payload components from cursor={cursor}, "
+                    f"but tensors length is {len(tensors)}."
+                )
+            payload_count += component_count
+            for tensor in tensors[cursor : cursor + component_count]:
+                shape_count += len(tuple(int(x) for x in getattr(tensor, "shape", ())))
+            cursor += component_count
+
+            global_shape = global_shapes[edge_idx]
+            if global_shape is not None:
+                global_shape_count += len(global_shape)
+            if (
+                compact_params is not None
+                and edge_idx < len(compact_params)
+                and compact_params[edge_idx] is not None
+            ):
+                compact_count += COMPACT_PARAM_COUNT
+
+        if cursor != len(tensors):
+            raise ValueError(
+                f"group_index={group_index} consumed {cursor} payload components, "
+                f"but tensors length is {len(tensors)}."
+            )
+
+    return FrameTableCapacity(
+        edge_count=edge_count,
+        payload_count=payload_count,
+        shape_count=shape_count,
+        global_shape_count=global_shape_count,
+        compact_count=compact_count,
+        segment_count=payload_count,
+    )
 
 
 # ---------------------------------------------------------------------------

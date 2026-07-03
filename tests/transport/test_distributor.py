@@ -1,6 +1,7 @@
 import asyncio
 
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from fluxway.common.index_descriptor import ContinuousIndex
@@ -9,7 +10,11 @@ from fluxway.common.tensor_backend import get_backend, set_backend
 from fluxway.common.types.sharding import P, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.transport.communication import AsyncDataDistributor
-from fluxway.transport.manifest import EDGE_COMPACT_COUNT, EDGE_EXPECTED_COUNT
+from fluxway.transport.manifest import (
+    EDGE_COMPACT_COUNT,
+    EDGE_EXPECTED_COUNT,
+    PAYLOAD_VALID_COUNT,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -23,22 +28,12 @@ async def _capture(local_rank, local_data, source, target, **kwargs):
 
     async def send_fn(
         target_rank,
-        frame_i32,
-        edge_i32,
-        payload_i32,
-        shape_i32,
-        global_shape_i64,
-        compact_i64,
-        *payload_segments,
+        header,
+        *payload_iovs,
     ):
         captured[target_rank] = (
-            frame_i32,
-            edge_i32,
-            payload_i32,
-            shape_i32,
-            global_shape_i64,
-            compact_i64,
-            payload_segments,
+            header,
+            payload_iovs,
         )
         return True
 
@@ -74,15 +69,10 @@ def test_colocation_dispatch_uses_two_payload_segments():
 
     assert set(captured) == {0}
     (
-        _frame_i32,
-        edge_i32,
-        _payload_i32,
-        _shape_i32,
-        _global_shape_i64,
-        _compact_i64,
+        header,
         segments,
     ) = captured[0]
-    assert int(edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
+    assert int(header.edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
     assert len(segments) == 2
     assert get_backend().to_numpy(segments[0]).tolist() == [10, 20]
     assert get_backend().to_numpy(segments[1]).tolist() == pytest.approx([0.1, 0.2])
@@ -161,8 +151,30 @@ def test_content_source_to_static_target_keeps_origin_descriptor_symbolic(monkey
     )
 
     non_empty = [
-        (target_rank, frame[1][0, EDGE_COMPACT_COUNT], frame[6][0].shape[0])
-        for target_rank, frame in captured.items()
-        if frame[6][0].shape[0] > 0
+        (target_rank, header.edge_i32[0, EDGE_COMPACT_COUNT], payload_iovs[0].shape[0])
+        for target_rank, (header, payload_iovs) in captured.items()
+        if payload_iovs[0].shape[0] > 0
     ]
     assert non_empty == [(1, 4, 2)]
+
+
+def test_mirror_routing_builds_single_expected_frame():
+    mesh = DeviceMesh(device_shape=(1,), axis_names=("worker",))
+    receipt = SymmetryReceipt(world_size=43, sender_rank_tags=jnp.array([42, 42, 42]))
+    data = jnp.array([[1.0], [2.0], [3.0]])
+    tensor = TransportTensor(data, receipt=receipt)
+    spec = ShardingSpec.follow("source.input").bind(mesh)
+
+    distributor = AsyncDataDistributor(local_rank=0)
+    distributor.plan_and_shard([tensor], source=spec, target=spec, tuuid=[123])
+    frame = distributor._build_transport_frame_for_target(
+        target_id=42,
+        groups=distributor._dest_agg[42],
+        step=1,
+        sender_spmd_code=0,
+        sender_world_size=1,
+    )
+
+    assert int(frame.edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
+    assert int(frame.payload_i32[0, PAYLOAD_VALID_COUNT]) == 3
+    np.testing.assert_allclose(frame.payload_segments[0], data)

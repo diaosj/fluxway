@@ -34,23 +34,10 @@ async def _capture_frame(distributor, **kwargs):
 
     async def send_fn(
         target_id,
-        frame_i32,
-        edge_i32,
-        payload_i32,
-        shape_i32,
-        global_shape_i64,
-        compact_i64,
-        *payload_segments,
+        header,
+        *payload_iovs,
     ):
-        captured[target_id] = (
-            frame_i32,
-            edge_i32,
-            payload_i32,
-            shape_i32,
-            global_shape_i64,
-            compact_i64,
-            payload_segments,
-        )
+        captured[target_id] = (header, payload_iovs)
         return True
 
     result = await distributor.distribute(send_fn=send_fn, **kwargs)
@@ -77,22 +64,17 @@ def test_async_distributor_uses_only_flat_frame_abi():
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0}
     (
-        frame_i32,
-        edge_i32,
-        payload_i32,
-        shape_i32,
-        global_shape_i64,
-        compact_i64,
+        header,
         segments,
     ) = captured[0]
-    assert int(frame_i32[FRAME_SENDER_SPMD_CODE]) == 5
-    assert int(frame_i32[FRAME_EDGE_COUNT]) == 1
-    assert int(frame_i32[FRAME_PAYLOAD_COUNT]) == 1
-    assert edge_i32.dtype == np.int32
-    assert payload_i32.dtype == np.int32
-    assert shape_i32.dtype == np.int32
-    assert global_shape_i64.dtype == np.int64
-    assert compact_i64.dtype == np.int64
+    assert int(header.frame_i32[FRAME_SENDER_SPMD_CODE]) == 5
+    assert int(header.frame_i32[FRAME_EDGE_COUNT]) == 1
+    assert int(header.frame_i32[FRAME_PAYLOAD_COUNT]) == 1
+    assert header.edge_i32.dtype == np.int32
+    assert header.payload_i32.dtype == np.int32
+    assert header.shape_i32.dtype == np.int32
+    assert header.global_shape_i64.dtype == np.int64
+    assert header.compact_i64.dtype == np.int64
     assert len(segments) == 1
 
 
@@ -124,7 +106,9 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
         )
 
     (_results, _sort), captured = asyncio.run(run_test())
-    _frame_i32, edge_i32, payload_i32, *_rest = captured[0]
+    header, _payload_iovs = captured[0]
+    edge_i32 = header.edge_i32
+    payload_i32 = header.payload_i32
     assert int(edge_i32[0, EDGE_META_STATE]) == 0
     assert ragged_level_count(int(edge_i32[1, EDGE_META_STATE])) == 1
     assert bool(int(edge_i32[1, EDGE_META_STATE]) & 1)
@@ -167,25 +151,17 @@ def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():
 
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0, 1}
-    for (
-        frame_i32,
-        edge_i32,
-        payload_i32,
-        _shape_i32,
-        _global_shape_i64,
-        _compact_i64,
-        payload_segments,
-    ) in captured.values():
-        assert int(frame_i32[FRAME_EDGE_COUNT]) == 1
-        assert int(frame_i32[FRAME_PAYLOAD_COUNT]) == 3
-        assert int(edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
-        assert ragged_level_count(int(edge_i32[0, EDGE_META_STATE])) == 2
-        assert payload_i32[:, PAYLOAD_ROLE].tolist() == [
+    for header, payload_iovs in captured.values():
+        assert int(header.frame_i32[FRAME_EDGE_COUNT]) == 1
+        assert int(header.frame_i32[FRAME_PAYLOAD_COUNT]) == 3
+        assert int(header.edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
+        assert ragged_level_count(int(header.edge_i32[0, EDGE_META_STATE])) == 2
+        assert header.payload_i32[:, PAYLOAD_ROLE].tolist() == [
             int(PayloadRole.VALUES),
             int(PayloadRole.RAGGED_LENGTHS),
             int(PayloadRole.RAGGED_LENGTHS),
         ]
-        assert payload_segments[0].dtype == np.uint64
+        assert payload_iovs[0].dtype == np.uint64
 
 
 def test_transport_frame_static_manifest_emits_only_real_producers():
@@ -209,8 +185,8 @@ def test_transport_frame_static_manifest_emits_only_real_producers():
 
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0, 1}
-    assert int(captured[0][1][0, EDGE_EXPECTED_COUNT]) == 1
-    assert int(captured[1][1][0, EDGE_EXPECTED_COUNT]) == 2
+    assert int(captured[0][0].edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
+    assert int(captured[1][0].edge_i32[0, EDGE_EXPECTED_COUNT]) == 2
 
 
 def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
@@ -235,7 +211,11 @@ def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0, 1, 2, 3}
     for frame in captured.values():
-        edge_i32 = frame[1]
+        edge_i32 = frame[0].edge_i32
         assert int(edge_i32[0, EDGE_EXPECTED_COUNT]) == src_mesh.size
-    assert int(captured[2][1][0, EDGE_EMPTY_KIND]) == int(EmptyKind.PROTOCOL_EMPTY)
-    assert int(captured[3][1][0, EDGE_EMPTY_KIND]) == int(EmptyKind.PROTOCOL_EMPTY)
+    assert int(captured[2][0].edge_i32[0, EDGE_EMPTY_KIND]) == int(
+        EmptyKind.PROTOCOL_EMPTY
+    )
+    assert int(captured[3][0].edge_i32[0, EDGE_EMPTY_KIND]) == int(
+        EmptyKind.PROTOCOL_EMPTY
+    )

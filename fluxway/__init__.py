@@ -34,7 +34,7 @@ __version__ = "0.1.0"
 from fluxway.common.utils.logging import ensure_logging_configured
 
 # Import decorators for top-level access
-from fluxway.common.decorators import data_type, spmd, operator
+from fluxway.common.decorators import data_type, spmd, operator, requires_worker_process
 from fluxway.common.bind import bind_spmd
 
 # Import common types
@@ -69,6 +69,7 @@ __all__ = [
     "data_type",
     "spmd",
     "operator",
+    "requires_worker_process",
     "bind_spmd",
     # Types
     "PartitionSpec",

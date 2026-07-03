@@ -1318,6 +1318,51 @@ class WorkerMailbox:
         barrier = self._barriers.get(op_name, {}).get(step)
         return barrier is not None and barrier.is_ready()
 
+    async def snapshot(self) -> dict[str, Any]:
+        async with self._lock:
+            barriers = {
+                op_name: {
+                    str(step): {
+                        "ready": barrier.is_ready(),
+                        "tensor_progress": dict(barrier.tensor_progress),
+                        "control_progress": {
+                            name: f"{arg_barrier.count}/{arg_barrier.target}"
+                            for name, arg_barrier in barrier._control_arg_barriers.items()
+                        },
+                    }
+                    for step, barrier in step_map.items()
+                }
+                for op_name, step_map in self._barriers.items()
+            }
+            tensor_arrivals = {
+                op_name: {
+                    str(tuuid): {
+                        str(step): len(arrivals) for step, arrivals in step_map.items()
+                    }
+                    for tuuid, step_map in tuuid_map.items()
+                }
+                for op_name, tuuid_map in self._tensor_arrivals.items()
+            }
+            tensor_slots = {
+                op_name: {
+                    str(tuuid): {
+                        str(step): sum(len(items) for items in sender_map.values())
+                        for step, sender_map in step_map.items()
+                    }
+                    for tuuid, step_map in tuuid_map.items()
+                }
+                for op_name, tuuid_map in self._tensor_slots.items()
+            }
+            return {
+                "barriers": barriers,
+                "tensor_arrivals": tensor_arrivals,
+                "tensor_slots": tensor_slots,
+                "expected_tensor_counts": {
+                    op_name: {str(k): v for k, v in values.items()}
+                    for op_name, values in self._expected_tensor_counts.items()
+                },
+            }
+
     async def wait_step_ready(self, op_name: str, step: int) -> None:
         """Async wait until the step barrier fires.
 
