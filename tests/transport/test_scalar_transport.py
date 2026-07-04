@@ -43,6 +43,7 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
             tuuid=20,
             step=1,
             sender_spmd_code=9,
+            sender_rank=rank,
             sender_world_size=mesh.size,
         )
         return captured

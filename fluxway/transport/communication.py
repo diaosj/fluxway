@@ -1550,6 +1550,7 @@ class AsyncDataDistributor(BaseDataDistributor):
         step: int,
         sender_spmd_code: int,
         sender_world_size: int,
+        sender_rank: int,
     ) -> list[tuple[int, TransportFrameHeader, tuple[Any, ...]]]:
         frame_args = []
         for target_id in sorted(self._dest_agg.keys()):
@@ -1558,6 +1559,7 @@ class AsyncDataDistributor(BaseDataDistributor):
                 groups=self._dest_agg[target_id],
                 step=step,
                 sender_spmd_code=sender_spmd_code,
+                sender_rank=sender_rank,
                 sender_world_size=sender_world_size,
             )
             if logger.isEnabledFor(logging.DEBUG):
@@ -1580,7 +1582,7 @@ class AsyncDataDistributor(BaseDataDistributor):
                     )
                 logger.debug(
                     "[TransportFrame] sender_rank=%d target_rank=%d step=%d edges=%s",
-                    self.local_rank,
+                    sender_rank,
                     target_id,
                     step,
                     edge_summary,
@@ -1605,6 +1607,7 @@ class AsyncDataDistributor(BaseDataDistributor):
         tuuid_to_name: dict[int, str] | None = None,
         step: int = 0,
         sender_spmd_code: int = 0,
+        sender_rank: int | None = None,
         sender_world_size: int = 1,
     ) -> tuple[list[Any], Any]:
         if local_data is not None:
@@ -1614,10 +1617,13 @@ class AsyncDataDistributor(BaseDataDistributor):
 
         if send_fn is None:
             return [], self._meta_sort_indices
+        if sender_rank is None:
+            raise ValueError("sender_rank is required when sending transport frames.")
 
         frame_args = self.build_transport_frame_args(
             step=step,
             sender_spmd_code=sender_spmd_code,
+            sender_rank=sender_rank,
             sender_world_size=sender_world_size,
         )
         tasks = []
@@ -1637,12 +1643,13 @@ class AsyncDataDistributor(BaseDataDistributor):
         groups: list[tuple],
         step: int,
         sender_spmd_code: int,
+        sender_rank: int,
         sender_world_size: int,
     ):
         builder = TransportFrameBuilder(
             step=step,
             sender_spmd_code=sender_spmd_code,
-            sender_rank=self.local_rank,
+            sender_rank=sender_rank,
             sender_world_size=sender_world_size,
             capacity=_frame_table_capacity_for_groups(groups),
         )

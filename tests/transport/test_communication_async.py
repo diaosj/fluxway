@@ -58,6 +58,7 @@ def test_async_distributor_uses_only_flat_frame_abi():
             tuuid=17,
             step=3,
             sender_spmd_code=5,
+            sender_rank=0,
             sender_world_size=mesh.size,
         )
 
@@ -102,6 +103,7 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
             tuuid=[21, 22, 23],
             step=4,
             sender_spmd_code=2,
+            sender_rank=0,
             sender_world_size=1,
         )
 
@@ -146,6 +148,7 @@ def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():
             tuuid=91,
             step=7,
             sender_spmd_code=3,
+            sender_rank=0,
             sender_world_size=1,
         )
 
@@ -180,6 +183,7 @@ def test_transport_frame_static_manifest_emits_only_real_producers():
             tuuid=92,
             step=8,
             sender_spmd_code=1,
+            sender_rank=0,
             sender_world_size=src_mesh.size,
         )
 
@@ -205,6 +209,7 @@ def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
             tuuid=93,
             step=9,
             sender_spmd_code=1,
+            sender_rank=0,
             sender_world_size=src_mesh.size,
         )
 

@@ -86,22 +86,26 @@ def launch(
         ray.init(**init_kw)
 
     sandbox_env = {
+        "JAX_PLATFORMS": "cpu",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
     }
     if runtime_env is not None and "env_vars" in runtime_env:
         sandbox_env.update(runtime_env["env_vars"])
 
+    sandbox_runtime_env = dict(runtime_env or {})
+    sandbox_runtime_env["env_vars"] = dict(sandbox_env)
+
     task_options: dict[str, Any] = {
         "num_cpus": num_cpus,
         "num_gpus": 0,
-        "runtime_env": runtime_env or {},
+        "runtime_env": sandbox_runtime_env,
     }
 
     @ray.remote(**task_options)
     def _sandbox(fn, a, kw):
-        # Apply sandbox environment variables locally to this task's process.
-        # We do this here instead of in `runtime_env` to avoid polluting the
-        # environment of child actors (which inherit runtime_env by default).
+        # Re-apply the same sandbox environment around user orchestration code
+        # so direct environment reads observe the launch contract for the whole
+        # entry_fn execution.
         with _EnvRestorer(sandbox_env.keys()):
             for k, v in sandbox_env.items():
                 os.environ[k] = v

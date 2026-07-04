@@ -1291,7 +1291,7 @@ class SPMDWorker:
                 target_rank: TransportFrameBuilder(
                     step=step,
                     sender_spmd_code=self._local_spmd_code,
-                    sender_rank=effective_rank,
+                    sender_rank=self.rank,
                     sender_world_size=self._world_size,
                     capacity=FrameTableCapacity(
                         edge_count=edge_count,
@@ -2168,8 +2168,19 @@ class SPMDWorker:
         )
 
         if not shard_list:
+            flow_detail = self._describe_shard_flow_for_error(
+                op_name,
+                tuuid,
+                step,
+                shards,
+                shard_list,
+                input_layout,
+                predecessor_topology,
+            )
             raise ValueError(
-                f"No shards for TUUID {tuuid} at step {step} (SPMD {self.spmd_id} Rank {self.rank})"
+                f"[Fluxway Assembly Error] Static-to-static assembly for op "
+                f"'{op_name}' (TUUID {tuuid}, rank {self.rank}, step {step}) "
+                f"received no routed shards. Flow detail: {flow_detail}"
             )
 
         if len(shard_list) == 1:
@@ -3263,20 +3274,13 @@ class SPMDWorker:
                 f"for spmd_id={self.spmd_id} rank={self.rank}. "
                 f"The manifest may be corrupt or was produced by an incompatible version."
             )
+        restored_source_steps: list[tuple[str, int]] = []
         for op_name, count in spmd_state["completed_step_count"].items():
             self._completed_step_count[op_name] = count
             if self.op_manager.is_source_operator(op_name):
                 max_steps = self.config.max_steps
                 if max_steps is None or count < max_steps:
-                    logger.info(
-                        "Auto-triggering source op for restored step %s op=%s "
-                        "spmd_id=%s rank=%s",
-                        count,
-                        op_name,
-                        self.spmd_id,
-                        self.rank,
-                    )
-                    self._spawn_background_task(self._enqueue(op_name, count))
+                    restored_source_steps.append((op_name, count))
 
         shared_operator_states = spmd_state.get("operator_states")
         if rank_storage is None:
@@ -3287,12 +3291,14 @@ class SPMDWorker:
                     self.spmd_id,
                     self.rank,
                 )
+                self._trigger_restored_source_steps(restored_source_steps)
                 return
             logger.debug(
                 "No on-disk or shared operator state for spmd_id=%s rank=%s",
                 self.spmd_id,
                 self.rank,
             )
+            self._trigger_restored_source_steps(restored_source_steps)
             return
 
         target_state: dict[str, Any] = {
@@ -3313,6 +3319,21 @@ class SPMDWorker:
         logger.debug(
             "State loaded from disk spmd_id=%s rank=%s", self.spmd_id, self.rank
         )
+        self._trigger_restored_source_steps(restored_source_steps)
+
+    def _trigger_restored_source_steps(
+        self, restored_source_steps: list[tuple[str, int]]
+    ) -> None:
+        for op_name, count in restored_source_steps:
+            logger.info(
+                "Auto-triggering source op for restored step %s op=%s "
+                "spmd_id=%s rank=%s",
+                count,
+                op_name,
+                self.spmd_id,
+                self.rank,
+            )
+            self._spawn_background_task(self._enqueue(op_name, count))
 
     async def _collect_operator_save_state(self, ckpt_dir: str) -> dict[str, Any]:
         states = self._call_operator_save_state(ckpt_dir)

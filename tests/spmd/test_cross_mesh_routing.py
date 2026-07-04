@@ -802,6 +802,8 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                 target=target_spec,
                 send_fn=mock_send,
                 tuuid=77,
+                sender_rank=rank,
+                sender_world_size=SENDER_SIZE,
             )
 
         # Run all senders
@@ -956,7 +958,13 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
 
         async def _run():
             await distributor.distribute(
-                [tt], source_spec, target_spec, mock_send, tuuid=78
+                [tt],
+                source_spec,
+                target_spec,
+                mock_send,
+                tuuid=78,
+                sender_rank=0,
+                sender_world_size=1,
             )
 
         asyncio.run(_run())
@@ -976,7 +984,13 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             asyncio.run(
                 distributor.distribute(
-                    [tt], source_spec, target_spec, mock_send, tuuid=79
+                    [tt],
+                    source_spec,
+                    target_spec,
+                    mock_send,
+                    tuuid=79,
+                    sender_rank=0,
+                    sender_world_size=1,
                 )
             )
         self.assertIn("Static Sharding Error", str(ctx.exception))
@@ -997,7 +1011,13 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         try:
             asyncio.run(
                 distributor.distribute(
-                    [tt], source_spec, target_spec, mock_send, tuuid=80
+                    [tt],
+                    source_spec,
+                    target_spec,
+                    mock_send,
+                    tuuid=80,
+                    sender_rank=0,
+                    sender_world_size=1,
                 )
             )
         except ValueError as e:
@@ -1022,7 +1042,13 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         try:
             asyncio.run(
                 distributor.distribute(
-                    [empty_tt], source_spec, target_spec, mock_send, tuuid=81
+                    [empty_tt],
+                    source_spec,
+                    target_spec,
+                    mock_send,
+                    tuuid=81,
+                    sender_rank=0,
+                    sender_world_size=1,
                 )
             )
         except ValueError as e:

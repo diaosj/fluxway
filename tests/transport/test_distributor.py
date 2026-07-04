@@ -63,6 +63,7 @@ def test_colocation_dispatch_uses_two_payload_segments():
             tuuid=[101, 102],
             step=1,
             sender_spmd_code=6,
+            sender_rank=0,
             sender_world_size=mesh.size,
         )
     )
@@ -146,6 +147,7 @@ def test_content_source_to_static_target_keeps_origin_descriptor_symbolic(monkey
             tuuid=201,
             step=2,
             sender_spmd_code=7,
+            sender_rank=0,
             sender_world_size=src_mesh.size,
         )
     )
@@ -172,6 +174,7 @@ def test_mirror_routing_builds_single_expected_frame():
         groups=distributor._dest_agg[42],
         step=1,
         sender_spmd_code=0,
+        sender_rank=0,
         sender_world_size=1,
     )
 

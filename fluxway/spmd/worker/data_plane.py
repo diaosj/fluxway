@@ -104,6 +104,7 @@ def build_step_frame_groups(
             step=exec_step,
             sender_spmd_code=sender_spmd_code,
             sender_world_size=sender_world_size,
+            sender_rank=rank,
         ):
             frame_groups.append((context.context_index, frame_arg))
 

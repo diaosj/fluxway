@@ -183,6 +183,10 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
 
         assert mock_dist.plan_and_shard.call_count == 2
         assert mock_dist.build_transport_frame_args.call_count == 2
+        assert [
+            call.kwargs["sender_rank"]
+            for call in mock_dist.build_transport_frame_args.call_args_list
+        ] == [0, 1]
         found_u0 = False
         for call in mock_dist.plan_and_shard.call_args_list:
             source_spec = call.args[1]
@@ -225,6 +229,10 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
 
         assert mock_dist.plan_and_shard.call_count == 2
         assert mock_dist.build_transport_frame_args.call_count == 2
+        assert [
+            call.kwargs["sender_rank"]
+            for call in mock_dist.build_transport_frame_args.call_args_list
+        ] == [2, 3]
         found_u1 = False
         for call in mock_dist.plan_and_shard.call_args_list:
             source_spec = call.args[1]
@@ -306,6 +314,7 @@ async def test_single_worker_interleaved_unit():
         )
         assert mock_dist.plan_and_shard.call_count == 1
         assert mock_dist.build_transport_frame_args.call_count == 1
+        assert mock_dist.build_transport_frame_args.call_args.kwargs["sender_rank"] == 0
 
         source_spec = mock_dist.plan_and_shard.call_args.args[1]
         assert source_spec.mesh.shape == (1,)
