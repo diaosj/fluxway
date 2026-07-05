@@ -1,0 +1,1050 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    asynccontextmanager,
+    contextmanager,
+)
+import time
+from collections.abc import AsyncGenerator, Generator
+
+from fluxway.profiler.record import (
+    EMPTY_TRACE_PAYLOAD,
+    ProfilerSnapshot,
+    TraceArena,
+    TraceCarrier,
+    TraceEventKind,
+    TraceMetadata,
+    stable_u64,
+)
+from fluxway.profiler.clock import ClockCalibration
+
+
+EMPTY_PAYLOAD_FIELDS: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TraceEventSpec:
+    name: str
+    track: str
+    payload_fields: tuple[str, ...] = EMPTY_PAYLOAD_FIELDS
+
+
+DATA_PLANE_RECEIVE_TRANSPORT_FRAME = TraceEventSpec(
+    "data_plane.receive_transport_frame",
+    "transport/send",
+    ("remote_rank",),
+)
+DATA_PLANE_RECEIVE_CONTROL = TraceEventSpec(
+    "data_plane.receive_control",
+    "control/send",
+    ("step", "field_count"),
+)
+DATA_PLANE_HLC_RECEIVE = TraceEventSpec(
+    "data_plane.hlc_receive",
+    "transport/clock",
+    ("receiver_hlc_physical_ns", "receiver_hlc_logical", "clock_source"),
+)
+DATA_PLANE_SEND_STEP_FRAMES = TraceEventSpec(
+    "data_plane.send_step_frames",
+    "transport/build",
+    ("rank", "exec_step"),
+)
+DATA_PLANE_SEND_TRANSPORT_FRAME = TraceEventSpec(
+    "data_plane.send_transport_frame",
+    "transport/send",
+    ("source_rank", "output_step"),
+)
+DATA_PLANE_BUILD_FRAME_GROUPS = TraceEventSpec(
+    "data_plane.build_frame_groups",
+    "transport/split",
+    ("op_id", "rank", "step", "successor_count", "output_count"),
+)
+DATA_PLANE_TENSOR_SPLIT = TraceEventSpec(
+    "data_plane.tensor_split",
+    "transport/split",
+    ("op_id", "rank", "step", "target_rank", "payload_count"),
+)
+WORKER_RECEIVE_TRANSPORT_FRAME = TraceEventSpec(
+    "worker.receive_transport_frame",
+    "transport/recv",
+    ("step", "sender_spmd_code", "edge_count", "payload_count"),
+)
+WORKER_DEPOSIT_TRANSPORT_FRAME = TraceEventSpec(
+    "worker.deposit_transport_frame",
+    "mailbox/deposit",
+    ("op_id", "step", "edge_count", "watermark"),
+)
+WORKER_ASSEMBLE_INPUT = TraceEventSpec(
+    "worker.assemble_input",
+    "tensor/reassemble",
+    ("op_id", "step", "tuuid_count", "state_count"),
+)
+WORKER_ASSEMBLE_TENSOR = TraceEventSpec(
+    "worker.assemble_tensor",
+    "tensor/reassemble",
+    ("op_id", "tuuid", "step", "sender_count", "shard_count"),
+)
+WORKER_SEND_OUTPUT = TraceEventSpec(
+    "worker.send_output",
+    "tensor/split",
+    ("op_id", "step", "output_count", "successor_count"),
+)
+LOCAL_STEP_PLAN_EXECUTE = TraceEventSpec(
+    "local_step_plan.execute",
+    "compute/local_plan",
+    ("node_count",),
+)
+USER_CALLABLE_EXECUTE = TraceEventSpec(
+    "user_callable.execute",
+    "compute/user_callable",
+    ("callable_id", "resource_id"),
+)
+USER_CALLABLE_LANE_SELECT = TraceEventSpec(
+    "user_callable.lane_select",
+    "compute/user_callable_lane",
+    ("callable_id", "resource_id", "lane_id"),
+)
+USER_CALLABLE_INLINE_ASYNC = TraceEventSpec(
+    "user_callable.inline_async",
+    "compute/user_callable_lane",
+    ("callable_id", "resource_id"),
+)
+USER_CALLABLE_INLINE_SYNC_SAMPLE = TraceEventSpec(
+    "user_callable.inline_sync_sample",
+    "compute/user_callable_lane",
+    ("callable_id", "resource_id"),
+)
+USER_CALLABLE_LOCAL_FREE_THREAD = TraceEventSpec(
+    "user_callable.local_free_thread",
+    "compute/user_callable_lane",
+    ("callable_id", "resource_id"),
+)
+USER_CALLABLE_WORKER_PROCESS = TraceEventSpec(
+    "user_callable.worker_process",
+    "compute/user_callable_lane",
+    ("callable_id", "resource_id"),
+)
+USER_CALLABLE_RAY_ACTOR_EXECUTE = TraceEventSpec(
+    "user_callable.ray_actor_execute",
+    "compute/user_callable_actor",
+    ("callable_id", "resource_id"),
+)
+USER_CALLABLE_SNAPSHOT_HOOK = TraceEventSpec(
+    "user_callable.snapshot_hook",
+    "checkpoint/user_callable",
+    ("hook_id", "operator_count"),
+)
+DATA_PLANE_SEND_SEMAPHORE_WAIT = TraceEventSpec(
+    "data_plane.send_semaphore_wait",
+    "transport/send",
+    ("source_rank", "output_step"),
+)
+TRANSPORT_DISTRIBUTE = TraceEventSpec(
+    "transport.distribute",
+    "transport/distribute",
+    ("op_id", "rank", "step", "target_spmd_id"),
+)
+TRANSPORT_RECEIVER_WAIT = TraceEventSpec(
+    "transport.receiver_wait",
+    "transport/receiver",
+    ("expected_slice_count", "periodic"),
+)
+CONTROLLER_INITIALIZE = TraceEventSpec(
+    "controller.initialize",
+    "controller/lifecycle",
+    ("spmd_count",),
+)
+CONTROLLER_TOPOLOGY_REGISTRATION = TraceEventSpec(
+    "controller.topology_registration",
+    "controller/topology",
+    ("spmd_count", "edge_count"),
+)
+CONTROLLER_DRAIN = TraceEventSpec(
+    "controller.drain",
+    "controller/drain",
+    ("target_step", "spmd_count"),
+)
+CONTROLLER_CHECKPOINT = TraceEventSpec(
+    "controller.checkpoint",
+    "controller/checkpoint",
+    ("target_step",),
+)
+CONTROLLER_RESTORE = TraceEventSpec(
+    "controller.restore",
+    "controller/checkpoint",
+    ("checkpoint_id",),
+)
+CONTROLLER_BACKPRESSURE = TraceEventSpec(
+    "controller.backpressure",
+    "controller/backpressure",
+    ("busy_spmd_count", "paused_reader_count"),
+)
+CONTROLLER_COMPLETION = TraceEventSpec(
+    "controller.completion",
+    "controller/lifecycle",
+    ("spmd_count",),
+)
+CONTROLLER_CLEANUP = TraceEventSpec(
+    "controller.cleanup",
+    "controller/lifecycle",
+    ("spmd_count",),
+)
+CONTROLLER_PROFILER_EXPORT = TraceEventSpec(
+    "controller.profiler_export",
+    "controller/profiler",
+    ("spmd_count", "record_count"),
+)
+CONTROLLER_FSM_TRANSITION = TraceEventSpec(
+    "controller_fsm.transition",
+    "controller/fsm",
+    ("from_state_id", "event_id", "to_state_id"),
+)
+CONTROLLER_FSM_ENTRY_CALLBACK = TraceEventSpec(
+    "controller_fsm.entry_callback",
+    "controller/fsm",
+    ("state_id",),
+)
+HEARTBEAT_RECEIVE = TraceEventSpec(
+    "heartbeat.receive",
+    "controller/heartbeat",
+    ("spmd_id", "state_id", "healthy_workers", "num_workers"),
+)
+HEARTBEAT_MONITOR_LOOP = TraceEventSpec(
+    "heartbeat.monitor_loop",
+    "controller/heartbeat",
+    ("spmd_count",),
+)
+HEARTBEAT_TIMEOUT_CHECK = TraceEventSpec(
+    "heartbeat.timeout_check",
+    "controller/heartbeat",
+    ("spmd_id", "elapsed_ms"),
+)
+HEARTBEAT_BLOCKED_WATCHDOG = TraceEventSpec(
+    "heartbeat.blocked_watchdog",
+    "controller/heartbeat",
+    ("timeout_ms",),
+)
+SPMD_MANAGER_PLACEMENT_GROUP_CREATE = TraceEventSpec(
+    "spmd_manager.placement_group_create",
+    "controller/spmd_manager",
+    ("spmd_id", "worker_count"),
+)
+SPMD_MANAGER_DRIVER_START = TraceEventSpec(
+    "spmd_manager.driver_start",
+    "controller/spmd_manager",
+    ("spmd_id", "worker_count"),
+)
+SPMD_MANAGER_DRIVER_STOP = TraceEventSpec(
+    "spmd_manager.driver_stop",
+    "controller/spmd_manager",
+    ("spmd_id",),
+)
+SPMD_MANAGER_BROADCAST = TraceEventSpec(
+    "spmd_manager.broadcast",
+    "controller/spmd_manager",
+    ("method_id", "spmd_count"),
+)
+DRIVER_INITIALIZE = TraceEventSpec(
+    "driver.initialize",
+    "driver/lifecycle",
+    ("worker_count",),
+)
+DRIVER_START_WORKERS = TraceEventSpec(
+    "driver.start_workers",
+    "driver/lifecycle",
+    ("worker_count",),
+)
+DRIVER_REGISTER_TOPOLOGY = TraceEventSpec(
+    "driver.register_topology",
+    "driver/topology",
+    ("predecessor_count", "successor_count"),
+)
+DRIVER_DRAIN = TraceEventSpec(
+    "driver.drain",
+    "driver/drain",
+    ("target_step", "worker_count"),
+)
+DRIVER_SNAPSHOT = TraceEventSpec(
+    "driver.snapshot",
+    "driver/checkpoint",
+    ("snapshot_id", "target_step", "worker_count"),
+)
+DRIVER_RESTORE = TraceEventSpec(
+    "driver.restore",
+    "driver/checkpoint",
+    ("snapshot_id", "worker_count"),
+)
+DRIVER_HEARTBEAT_THREAD_JOIN = TraceEventSpec(
+    "driver.heartbeat_thread_join",
+    "driver/heartbeat",
+    ("timeout_ms",),
+)
+DRIVER_SOURCE_START = TraceEventSpec(
+    "driver.source_start",
+    "driver/source",
+    ("worker_count",),
+)
+DRIVER_WORKER_HEARTBEAT = TraceEventSpec(
+    "driver.worker_heartbeat",
+    "driver/heartbeat",
+    ("rank", "status_id", "completed_count", "mailbox_full"),
+)
+DRIVER_OP_COMPLETION = TraceEventSpec(
+    "driver.op_completion",
+    "driver/completion",
+    ("rank", "op_id", "step"),
+)
+WORKER_BACKGROUND_TASK = TraceEventSpec(
+    "worker.background_task",
+    "worker/scheduler",
+    ("task_id",),
+)
+WORKER_OUTBOUND_TASK = TraceEventSpec(
+    "worker.outbound_task",
+    "worker/scheduler",
+    ("task_id",),
+)
+WORKER_QUEUE_ENQUEUE = TraceEventSpec(
+    "worker.queue_enqueue",
+    "worker/scheduler",
+    ("op_id", "step", "priority"),
+)
+WORKER_QUEUE_DEQUEUE = TraceEventSpec(
+    "worker.queue_dequeue",
+    "worker/scheduler",
+    ("op_id", "step", "priority"),
+)
+WORKER_BLOCKED_TASK = TraceEventSpec(
+    "worker.blocked_task",
+    "worker/scheduler",
+    ("op_id", "step"),
+)
+WORKER_FUTURE_TASK = TraceEventSpec(
+    "worker.future_task",
+    "worker/scheduler",
+    ("op_id", "step", "completed_count"),
+)
+WORKER_STALE_TASK = TraceEventSpec(
+    "worker.stale_task",
+    "worker/scheduler",
+    ("op_id", "step", "completed_count"),
+)
+WORKER_RUN_LOOP = TraceEventSpec(
+    "worker.run_loop",
+    "worker/scheduler",
+    EMPTY_PAYLOAD_FIELDS,
+)
+WORKER_ADVANCE_STEP = TraceEventSpec(
+    "worker.advance_step",
+    "worker/scheduler",
+    ("op_id", "step", "next_step"),
+)
+WORKER_DRAIN_WAIT = TraceEventSpec(
+    "worker.drain_wait",
+    "worker/scheduler",
+    ("op_id", "step", "target_step"),
+)
+WORKER_CHECKPOINT_SAVE = TraceEventSpec(
+    "checkpoint.async_save",
+    "checkpoint/worker",
+    ("step", "operator_count"),
+)
+WORKER_CHECKPOINT_LOAD = TraceEventSpec(
+    "checkpoint.async_load",
+    "checkpoint/worker",
+    ("operator_count", "has_rank_storage"),
+)
+WORKER_SNAPSHOT_HOOK = TraceEventSpec(
+    "worker.snapshot_hook",
+    "checkpoint/worker",
+    ("hook_id", "step"),
+)
+MAILBOX_DECLARE_STEP = TraceEventSpec(
+    "mailbox.declare_step",
+    "mailbox/barrier",
+    ("op_id", "step", "tensor_count", "state_count"),
+)
+MAILBOX_EXPECTED_COUNT_UPDATE = TraceEventSpec(
+    "mailbox.expected_count_update",
+    "mailbox/barrier",
+    ("op_id", "step", "tensor_count"),
+)
+MAILBOX_DEPOSIT_CONTROL = TraceEventSpec(
+    "mailbox.deposit_control",
+    "mailbox/deposit",
+    ("op_id", "step", "field_count"),
+)
+MAILBOX_DEPOSIT_FRAME = TraceEventSpec(
+    "mailbox.deposit_frame",
+    "mailbox/deposit",
+    ("op_id", "step", "edge_count", "payload_count"),
+)
+MAILBOX_READY_FIRE = TraceEventSpec(
+    "mailbox.ready_fire",
+    "mailbox/barrier",
+    ("op_id", "step"),
+)
+MAILBOX_WAIT_STEP_READY = TraceEventSpec(
+    "mailbox.wait_step_ready",
+    "mailbox/barrier",
+    ("op_id", "step"),
+)
+MAILBOX_CLEAR_STEP = TraceEventSpec(
+    "mailbox.clear_step",
+    "mailbox/barrier",
+    ("op_id", "step"),
+)
+
+
+class TraceRecorder:
+    def __init__(
+        self,
+        arena: TraceArena,
+        *,
+        run_id: str,
+        process_name: str,
+        clock_calibration: ClockCalibration | None = None,
+    ) -> None:
+        self._arena = arena
+        self._run_id = run_id
+        self._process_name = process_name
+        self._clock_calibration = clock_calibration or ClockCalibration(
+            monotonic_to_epoch_offset_ns=0,
+            uncertainty_ns=0,
+        )
+        self._interned: dict[str, int] = {}
+        self._names_by_id: dict[int, str] = {}
+        self._payload_fields_by_name_id: dict[int, tuple[str, ...]] = {}
+        self._root_carrier = TraceCarrier.root(run_id)
+
+    @property
+    def arena(self) -> TraceArena:
+        return self._arena
+
+    @property
+    def root_carrier(self) -> TraceCarrier:
+        return self._root_carrier
+
+    @property
+    def metadata(self) -> TraceMetadata:
+        return TraceMetadata(
+            names_by_id=dict(self._names_by_id),
+            payload_fields_by_name_id=dict(self._payload_fields_by_name_id),
+        )
+
+    def snapshot(self) -> ProfilerSnapshot:
+        return {
+            "records": self._arena.snapshot(),
+            "metadata": self.metadata,
+            "process_name": self._process_name,
+            "monotonic_to_epoch_offset_ns": self._clock_calibration.monotonic_to_epoch_offset_ns,
+            "clock_uncertainty_ns": self._clock_calibration.uncertainty_ns,
+        }
+
+    def intern(self, value: str) -> int:
+        existing = self._interned.get(value)
+        if existing is not None:
+            return existing
+        ident = stable_u64(self._run_id, self._process_name, value)
+        self._interned[value] = ident
+        self._names_by_id[ident] = value
+        return ident
+
+    def data_plane_hlc_receive(
+        self,
+        *,
+        carrier: TraceCarrier,
+        receiver_hlc_physical_ns: int,
+        receiver_hlc_logical: int,
+        clock_source: int,
+    ) -> None:
+        self._instant(
+            DATA_PLANE_HLC_RECEIVE,
+            carrier=carrier,
+            payload=(
+                receiver_hlc_physical_ns,
+                receiver_hlc_logical,
+                clock_source,
+            ),
+        )
+
+    def data_plane_receive_transport_frame(
+        self, *, carrier: TraceCarrier, remote_rank: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_RECEIVE_TRANSPORT_FRAME,
+            carrier=carrier,
+            payload=(remote_rank,),
+        )
+
+    def data_plane_receive_control(
+        self, *, carrier: TraceCarrier, step: int, field_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_RECEIVE_CONTROL,
+            carrier=carrier,
+            payload=(step, field_count),
+        )
+
+    def data_plane_send_step_frames(
+        self, *, rank: int, exec_step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_SEND_STEP_FRAMES,
+            payload=(rank, exec_step),
+        )
+
+    def data_plane_send_transport_frame(
+        self, *, source_rank: int, output_step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_SEND_TRANSPORT_FRAME,
+            payload=(source_rank, output_step),
+        )
+
+    def data_plane_build_frame_groups(
+        self,
+        *,
+        op_name: str,
+        rank: int,
+        step: int,
+        successor_count: int,
+        output_count: int,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_BUILD_FRAME_GROUPS,
+            payload=(
+                self.intern(op_name),
+                rank,
+                step,
+                successor_count,
+                output_count,
+            ),
+        )
+
+    def data_plane_tensor_split(
+        self,
+        *,
+        op_name: str,
+        rank: int,
+        step: int,
+        target_rank: int,
+        payload_count: int,
+    ) -> None:
+        self._instant(
+            DATA_PLANE_TENSOR_SPLIT,
+            payload=(
+                self.intern(op_name),
+                rank,
+                step,
+                target_rank,
+                payload_count,
+            ),
+        )
+
+    def worker_receive_transport_frame(
+        self,
+        *,
+        step: int,
+        sender_spmd_code: int,
+        edge_count: int,
+        payload_count: int,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_RECEIVE_TRANSPORT_FRAME,
+            payload=(step, sender_spmd_code, edge_count, payload_count),
+        )
+
+    def worker_deposit_transport_frame(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        edge_count: int,
+        watermark: int,
+    ) -> None:
+        self._instant(
+            WORKER_DEPOSIT_TRANSPORT_FRAME,
+            payload=(self.intern(op_name), step, edge_count, watermark),
+        )
+
+    def worker_assemble_input(
+        self, *, op_name: str, step: int, tuuid_count: int, state_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_ASSEMBLE_INPUT,
+            payload=(self.intern(op_name), step, tuuid_count, state_count),
+        )
+
+    def worker_assemble_tensor(
+        self,
+        *,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        sender_count: int,
+        shard_count: int,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_ASSEMBLE_TENSOR,
+            payload=(self.intern(op_name), tuuid, step, sender_count, shard_count),
+        )
+
+    def worker_send_output(
+        self, *, op_name: str, step: int, output_count: int, successor_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_SEND_OUTPUT,
+            payload=(self.intern(op_name), step, output_count, successor_count),
+        )
+
+    def local_step_plan_execute(
+        self, *, node_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            LOCAL_STEP_PLAN_EXECUTE,
+            payload=(node_count,),
+        )
+
+    def user_callable_execute(
+        self, *, callable_id: str, resource_id: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            USER_CALLABLE_EXECUTE,
+            payload=(self.intern(callable_id), resource_id),
+        )
+
+    def user_callable_lane_select(
+        self, *, callable_id: str, resource_id: int, lane: str
+    ) -> None:
+        self._instant(
+            USER_CALLABLE_LANE_SELECT,
+            payload=(self.intern(callable_id), resource_id, self.intern(lane)),
+        )
+
+    def user_callable_lane_span(
+        self, *, spec: TraceEventSpec, callable_id: str, resource_id: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            spec,
+            payload=(self.intern(callable_id), resource_id),
+        )
+
+    def user_callable_lane_sync_span(
+        self, *, spec: TraceEventSpec, callable_id: str, resource_id: int
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            spec,
+            payload=(self.intern(callable_id), resource_id),
+        )
+
+    def user_callable_snapshot_hook(
+        self, *, hook_name: str, operator_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            USER_CALLABLE_SNAPSHOT_HOOK,
+            payload=(self.intern(hook_name), operator_count),
+        )
+
+    def data_plane_send_semaphore_wait(
+        self, *, source_rank: int, output_step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_SEND_SEMAPHORE_WAIT,
+            payload=(source_rank, output_step),
+        )
+
+    def transport_distribute(
+        self, *, op_name: str, rank: int, step: int, target_spmd_id: str
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            TRANSPORT_DISTRIBUTE,
+            payload=(self.intern(op_name), rank, step, self.intern(target_spmd_id)),
+        )
+
+    def transport_distribute_sync(
+        self, *, op_name: str, rank: int, step: int, target_spmd_id: str
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            TRANSPORT_DISTRIBUTE,
+            payload=(self.intern(op_name), rank, step, self.intern(target_spmd_id)),
+        )
+
+    def transport_receiver_wait(
+        self, *, expected_slice_count: int, periodic: bool
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            TRANSPORT_RECEIVER_WAIT,
+            payload=(expected_slice_count, int(periodic)),
+        )
+
+    def controller_initialize(
+        self, *, spmd_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(CONTROLLER_INITIALIZE, payload=(spmd_count,))
+
+    def controller_topology_registration(
+        self, *, spmd_count: int, edge_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            CONTROLLER_TOPOLOGY_REGISTRATION,
+            payload=(spmd_count, edge_count),
+        )
+
+    def controller_drain(
+        self, *, target_step: int, spmd_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(CONTROLLER_DRAIN, payload=(target_step, spmd_count))
+
+    def controller_checkpoint(
+        self, *, target_step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(CONTROLLER_CHECKPOINT, payload=(target_step,))
+
+    def controller_restore(
+        self, *, checkpoint_id: str
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            CONTROLLER_RESTORE,
+            payload=(self.intern(checkpoint_id),),
+        )
+
+    def controller_backpressure(
+        self, *, busy_spmd_count: int, paused_reader_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            CONTROLLER_BACKPRESSURE,
+            payload=(busy_spmd_count, paused_reader_count),
+        )
+
+    def controller_completion(
+        self, *, spmd_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(CONTROLLER_COMPLETION, payload=(spmd_count,))
+
+    def controller_cleanup(
+        self, *, spmd_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(CONTROLLER_CLEANUP, payload=(spmd_count,))
+
+    def controller_profiler_export(
+        self, *, spmd_count: int, record_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            CONTROLLER_PROFILER_EXPORT,
+            payload=(spmd_count, record_count),
+        )
+
+    def controller_fsm_transition(
+        self, *, from_state: str, event: str, to_state: str
+    ) -> None:
+        self._instant(
+            CONTROLLER_FSM_TRANSITION,
+            payload=(
+                self.intern(from_state),
+                self.intern(event),
+                self.intern(to_state),
+            ),
+        )
+
+    def controller_fsm_entry_callback(
+        self, *, state: str
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            CONTROLLER_FSM_ENTRY_CALLBACK,
+            payload=(self.intern(state),),
+        )
+
+    def heartbeat_receive(
+        self, *, spmd_id: str, state: str, healthy_workers: int, num_workers: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            HEARTBEAT_RECEIVE,
+            payload=(
+                self.intern(spmd_id),
+                self.intern(state),
+                healthy_workers,
+                num_workers,
+            ),
+        )
+
+    def heartbeat_monitor_loop(
+        self, *, spmd_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(HEARTBEAT_MONITOR_LOOP, payload=(spmd_count,))
+
+    def heartbeat_timeout_check(self, *, spmd_id: str, elapsed_ms: int) -> None:
+        self._instant(
+            HEARTBEAT_TIMEOUT_CHECK,
+            payload=(self.intern(spmd_id), elapsed_ms),
+        )
+
+    def heartbeat_blocked_watchdog(
+        self, *, timeout_ms: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(HEARTBEAT_BLOCKED_WATCHDOG, payload=(timeout_ms,))
+
+    def spmd_manager_placement_group_create(
+        self, *, spmd_id: str, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            SPMD_MANAGER_PLACEMENT_GROUP_CREATE,
+            payload=(self.intern(spmd_id), worker_count),
+        )
+
+    def spmd_manager_driver_start(
+        self, *, spmd_id: str, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            SPMD_MANAGER_DRIVER_START,
+            payload=(self.intern(spmd_id), worker_count),
+        )
+
+    def spmd_manager_driver_stop(
+        self, *, spmd_id: str
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            SPMD_MANAGER_DRIVER_STOP,
+            payload=(self.intern(spmd_id),),
+        )
+
+    def spmd_manager_broadcast(
+        self, *, method: str, spmd_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            SPMD_MANAGER_BROADCAST,
+            payload=(self.intern(method), spmd_count),
+        )
+
+    def driver_initialize(
+        self, *, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DRIVER_INITIALIZE, payload=(worker_count,))
+
+    def driver_start_workers(
+        self, *, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DRIVER_START_WORKERS, payload=(worker_count,))
+
+    def driver_register_topology(
+        self, *, predecessor_count: int, successor_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DRIVER_REGISTER_TOPOLOGY,
+            payload=(predecessor_count, successor_count),
+        )
+
+    def driver_drain(
+        self, *, target_step: int, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DRIVER_DRAIN, payload=(target_step, worker_count))
+
+    def driver_snapshot(
+        self, *, snapshot_id: str, target_step: int, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DRIVER_SNAPSHOT,
+            payload=(self.intern(snapshot_id), target_step, worker_count),
+        )
+
+    def driver_restore(
+        self, *, snapshot_id: str, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DRIVER_RESTORE,
+            payload=(self.intern(snapshot_id), worker_count),
+        )
+
+    def driver_heartbeat_thread_join(
+        self, *, timeout_ms: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DRIVER_HEARTBEAT_THREAD_JOIN, payload=(timeout_ms,))
+
+    def driver_source_start(
+        self, *, worker_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DRIVER_SOURCE_START, payload=(worker_count,))
+
+    def driver_worker_heartbeat(
+        self, *, rank: int, status: str, completed_count: int, mailbox_full: bool
+    ) -> None:
+        self._instant(
+            DRIVER_WORKER_HEARTBEAT,
+            payload=(rank, self.intern(status), completed_count, int(mailbox_full)),
+        )
+
+    def driver_op_completion(self, *, rank: int, op_name: str, step: int) -> None:
+        self._instant(
+            DRIVER_OP_COMPLETION,
+            payload=(rank, self.intern(op_name), step),
+        )
+
+    def worker_scheduler_span(
+        self, *, spec: TraceEventSpec, payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(spec, payload=payload)
+
+    def worker_scheduler_instant(
+        self, *, spec: TraceEventSpec, payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD
+    ) -> None:
+        self._instant(spec, payload=payload)
+
+    def worker_op_payload(self, op_name: str, *values: int) -> tuple[int, ...]:
+        return (self.intern(op_name), *values)
+
+    def worker_checkpoint_save(
+        self, *, step: int, operator_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_CHECKPOINT_SAVE,
+            payload=(step, operator_count),
+        )
+
+    def worker_checkpoint_load(
+        self, *, operator_count: int, has_rank_storage: bool
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_CHECKPOINT_LOAD,
+            payload=(operator_count, int(has_rank_storage)),
+        )
+
+    def worker_snapshot_hook(
+        self, *, hook_name: str, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_SNAPSHOT_HOOK,
+            payload=(self.intern(hook_name), step),
+        )
+
+    def mailbox_declare_step(
+        self, *, op_name: str, step: int, tensor_count: int, state_count: int
+    ) -> None:
+        self._instant(
+            MAILBOX_DECLARE_STEP,
+            payload=(self.intern(op_name), step, tensor_count, state_count),
+        )
+
+    def mailbox_expected_count_update(
+        self, *, op_name: str, step: int, tensor_count: int
+    ) -> None:
+        self._instant(
+            MAILBOX_EXPECTED_COUNT_UPDATE,
+            payload=(self.intern(op_name), step, tensor_count),
+        )
+
+    def mailbox_deposit_control(
+        self, *, op_name: str, step: int, field_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            MAILBOX_DEPOSIT_CONTROL,
+            payload=(self.intern(op_name), step, field_count),
+        )
+
+    def mailbox_deposit_frame(
+        self, *, op_name: str, step: int, edge_count: int, payload_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            MAILBOX_DEPOSIT_FRAME,
+            payload=(self.intern(op_name), step, edge_count, payload_count),
+        )
+
+    def mailbox_ready_fire(self, *, op_name: str, step: int) -> None:
+        self._instant(
+            MAILBOX_READY_FIRE,
+            payload=(self.intern(op_name), step),
+        )
+
+    def mailbox_wait_step_ready(
+        self, *, op_name: str, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            MAILBOX_WAIT_STEP_READY,
+            payload=(self.intern(op_name), step),
+        )
+
+    def mailbox_clear_step(
+        self, *, op_name: str, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            MAILBOX_CLEAR_STEP,
+            payload=(self.intern(op_name), step),
+        )
+
+    def _instant(
+        self,
+        spec: TraceEventSpec,
+        *,
+        carrier: TraceCarrier | None = None,
+        payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
+    ) -> None:
+        active = self._root_carrier if carrier is None else carrier
+        track_id, name_id = self._register_spec(spec)
+        self._arena.append(
+            kind=TraceEventKind.INSTANT,
+            ts_ns=time.perf_counter_ns(),
+            dur_ns=0,
+            track_id=track_id,
+            name_id=name_id,
+            flow_id=active.flow_id,
+            task_id=active.task_id,
+            parent_task_id=active.parent_task_id,
+            payload=payload,
+        )
+
+    @contextmanager
+    def _span(
+        self,
+        spec: TraceEventSpec,
+        *,
+        carrier: TraceCarrier | None = None,
+        payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
+    ) -> Generator[None, None, None]:
+        active = self._root_carrier if carrier is None else carrier
+        track_id, name_id = self._register_spec(spec)
+        start = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            end = time.perf_counter_ns()
+            self._arena.append(
+                kind=TraceEventKind.SLICE_BEGIN,
+                ts_ns=start,
+                dur_ns=end - start,
+                track_id=track_id,
+                name_id=name_id,
+                flow_id=active.flow_id,
+                task_id=active.task_id,
+                parent_task_id=active.parent_task_id,
+                payload=payload,
+            )
+
+    @asynccontextmanager
+    async def _async_span(
+        self,
+        spec: TraceEventSpec,
+        *,
+        carrier: TraceCarrier | None = None,
+        payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
+    ) -> AsyncGenerator[None, None]:
+        with self._span(
+            spec,
+            carrier=carrier,
+            payload=payload,
+        ):
+            yield
+
+    def _register_spec(self, spec: TraceEventSpec) -> tuple[int, int]:
+        track_id = self.intern(f"{self._process_name}/{spec.track}")
+        name_id = self.intern(spec.name)
+        existing = self._payload_fields_by_name_id.get(name_id)
+        if existing is None:
+            self._payload_fields_by_name_id[name_id] = spec.payload_fields
+        elif existing != spec.payload_fields:
+            raise ValueError(
+                f"trace payload schema mismatch for event={spec.name!r}: "
+                f"{existing!r} != {spec.payload_fields!r}"
+            )
+        return track_id, name_id

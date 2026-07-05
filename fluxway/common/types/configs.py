@@ -183,6 +183,10 @@ class SPMDConfig(FluxwayBaseSchema):
     # Transport backend for data plane RPC (e.g. "ray", "axon")
     transport_type: str = "ray"
 
+    # Optional profiler runtime configuration. ``None`` is the zero-overhead path:
+    # workers construct the original executors and data-plane handlers directly.
+    profiler_config: Any | None = None
+
     # If True, when all received shards for a step are empty packets, the worker
     # will short-circuit: skip _assemble_input / user operator dispatch and
     # directly propagate empty packets downstream (an "empty fastpath").

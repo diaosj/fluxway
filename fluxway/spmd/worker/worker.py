@@ -85,11 +85,28 @@ from fluxway.spmd.worker.local_plan import (
     LocalStepPlanExecutor,
     MappingCallableRegistry,
 )
-from fluxway.spmd.worker.user_callable_executor import UserCallableSpec
+from fluxway.spmd.worker.user_callable_executor import (
+    UserCallableExecutor,
+    UserCallableSpec,
+)
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
     ExecutionResult,
+)
+from fluxway.profiler import ProfilerRuntimeFactory
+from fluxway.profiler.recorder import (
+    WORKER_ADVANCE_STEP,
+    WORKER_BACKGROUND_TASK,
+    WORKER_BLOCKED_TASK,
+    WORKER_DRAIN_WAIT,
+    WORKER_FUTURE_TASK,
+    WORKER_OUTBOUND_TASK,
+    WORKER_QUEUE_DEQUEUE,
+    WORKER_QUEUE_ENQUEUE,
+    WORKER_RUN_LOOP,
+    WORKER_SNAPSHOT_HOOK,
+    WORKER_STALE_TASK,
 )
 from typing import Any, Optional, get_type_hints, cast
 
@@ -324,8 +341,24 @@ class SPMDWorker:
         self._run_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
         self._outbound_tasks: set[asyncio.Task] = set()
-        self._data_plane_executor = RayDataPlaneBackendExecutor()
-        self._local_step_plan_executor = LocalStepPlanExecutor()
+        profiler_config = getattr(self.config, "__dict__", {}).get("profiler_config")
+        self._profiler_runtime = ProfilerRuntimeFactory.from_config(
+            profiler_config,
+            process_name=f"worker/{self.spmd_id}/rank:{self.rank}",
+        )
+        self._mailbox = self._profiler_runtime.worker_mailbox(self._mailbox)
+        self._mailbox.set_ready_callback(self._on_step_ready)
+        self._data_plane_executor = self._profiler_runtime.data_plane_backend_executor(
+            RayDataPlaneBackendExecutor()
+        )
+        user_callable_executor = self._profiler_runtime.user_callable_executor(
+            UserCallableExecutor()
+        )
+        self._local_step_plan_executor = (
+            self._profiler_runtime.local_step_plan_executor(
+                LocalStepPlanExecutor(user_callable_executor)
+            )
+        )
 
         # Source operator pause control
         self._source_pause_events: dict[str, asyncio.Event] = {}
@@ -643,7 +676,9 @@ class SPMDWorker:
             spmd_id: Predecessor SPMD ID
             handlers: {rank: DataPlaneCallable}
         """
-        self._predecessor_handlers[spmd_id] = handlers
+        self._predecessor_handlers[spmd_id] = (
+            self._profiler_runtime.wrap_data_plane_handlers(spmd_id, handlers)
+        )
         logger.debug(
             f"Registered predecessor handlers predecessor_spmd_id={spmd_id} "
             f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
@@ -665,7 +700,9 @@ class SPMDWorker:
             spmd_id: Successor SPMD ID
             handlers: {rank: DataPlaneCallable}
         """
-        self._successor_handlers[spmd_id] = handlers
+        self._successor_handlers[spmd_id] = (
+            self._profiler_runtime.wrap_data_plane_handlers(spmd_id, handlers)
+        )
         logger.debug(
             f"Registered successor handlers successor_spmd_id={spmd_id} "
             f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
@@ -757,6 +794,23 @@ class SPMDWorker:
 
     def _spawn_background_task(self, coro: Any) -> asyncio.Task:
         """Track detached tasks so stop() can await their shutdown."""
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            original_coro = coro
+            task_name = getattr(
+                getattr(original_coro, "cr_code", None),
+                "co_name",
+                type(original_coro).__name__,
+            )
+
+            async def traced_coro() -> Any:
+                async with recorder.worker_scheduler_span(
+                    spec=WORKER_BACKGROUND_TASK,
+                    payload=(recorder.intern(task_name),),
+                ):
+                    return await original_coro
+
+            coro = traced_coro()
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._on_background_task_done)
@@ -779,6 +833,23 @@ class SPMDWorker:
         )
 
     def _spawn_outbound_task(self, coro: Any) -> asyncio.Task:
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            original_coro = coro
+            task_name = getattr(
+                getattr(original_coro, "cr_code", None),
+                "co_name",
+                type(original_coro).__name__,
+            )
+
+            async def traced_coro() -> Any:
+                async with recorder.worker_scheduler_span(
+                    spec=WORKER_OUTBOUND_TASK,
+                    payload=(recorder.intern(task_name),),
+                ):
+                    return await original_coro
+
+            coro = traced_coro()
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         self._outbound_tasks.add(task)
@@ -938,6 +1009,11 @@ class SPMDWorker:
             )
         frame = header.to_frame(payload_iovs)
         sender_spmd_code = int(frame.frame_i32[FRAME_SENDER_SPMD_CODE])
+        step = int(frame.frame_i32[FRAME_STEP])
+        edge_count = int(frame.frame_i32[FRAME_EDGE_COUNT])
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
         try:
             sender_id = self._spmd_id_by_code[sender_spmd_code]
         except KeyError as exc:
@@ -953,45 +1029,66 @@ class SPMDWorker:
             for op_name in self.op_manager.get_operators_for_tuuid(tuuid):
                 op_to_edge_rows.setdefault(op_name, []).append(row_idx)
 
-        for op_name, rows in op_to_edge_rows.items():
-            self._ensure_step_declared(op_name, int(frame.frame_i32[FRAME_STEP]))
-            op_frame = TransportFrame(
-                frame_i32=frame.frame_i32.copy(),
-                edge_i32=frame.edge_i32[rows],
-                payload_i32=frame.payload_i32,
-                shape_i32=frame.shape_i32,
-                global_shape_i64=frame.global_shape_i64,
-                compact_i64=frame.compact_i64,
-                payload_segments=frame.payload_segments,
-            )
-            op_frame.frame_i32[FRAME_EDGE_COUNT] = len(rows)
-            expected_counts = {}
-            for edge in op_frame.edge_i32:
-                tuuid = int(edge[EDGE_TUUID])
-                expected_count = int(edge[EDGE_EXPECTED_COUNT])
-                if expected_count <= 0:
-                    raise ValueError(
-                        f"[SPMDWorker] Transport frame for op={op_name} "
-                        f"step={int(frame.frame_i32[FRAME_STEP])} tuuid={tuuid} "
-                        f"has invalid EDGE_EXPECTED_COUNT={expected_count}."
+        async def deposit_frame_rows() -> int:
+            deposited_watermark = 0
+            for op_name, rows in op_to_edge_rows.items():
+                self._ensure_step_declared(op_name, step)
+                op_frame = TransportFrame(
+                    frame_i32=frame.frame_i32.copy(),
+                    edge_i32=frame.edge_i32[rows],
+                    payload_i32=frame.payload_i32,
+                    shape_i32=frame.shape_i32,
+                    global_shape_i64=frame.global_shape_i64,
+                    compact_i64=frame.compact_i64,
+                    payload_segments=frame.payload_segments,
+                )
+                op_frame.frame_i32[FRAME_EDGE_COUNT] = len(rows)
+                expected_counts = {}
+                for edge in op_frame.edge_i32:
+                    tuuid = int(edge[EDGE_TUUID])
+                    expected_count = int(edge[EDGE_EXPECTED_COUNT])
+                    if expected_count <= 0:
+                        raise ValueError(
+                            f"[SPMDWorker] Transport frame for op={op_name} "
+                            f"step={step} tuuid={tuuid} "
+                            f"has invalid EDGE_EXPECTED_COUNT={expected_count}."
+                        )
+                    previous = expected_counts.get(tuuid)
+                    if previous is not None and previous != expected_count:
+                        raise ValueError(
+                            f"[SPMDWorker] Transport frame for op={op_name} "
+                            f"step={step} tuuid={tuuid} "
+                            f"contains conflicting EDGE_EXPECTED_COUNT values: "
+                            f"{previous} and {expected_count}."
+                        )
+                    expected_counts[tuuid] = expected_count
+                self._mailbox.configure_transport_expected_counts(
+                    op_name, step, expected_counts
+                )
+                deposited_watermark = await self._mailbox.deposit_transport_frame(
+                    op_name,
+                    sender_id,
+                    op_frame,
+                )
+                if profiler_recorder is not None:
+                    profiler_recorder.worker_deposit_transport_frame(
+                        op_name=op_name,
+                        step=step,
+                        edge_count=len(rows),
+                        watermark=deposited_watermark,
                     )
-                previous = expected_counts.get(tuuid)
-                if previous is not None and previous != expected_count:
-                    raise ValueError(
-                        f"[SPMDWorker] Transport frame for op={op_name} "
-                        f"step={int(frame.frame_i32[FRAME_STEP])} tuuid={tuuid} "
-                        f"contains conflicting EDGE_EXPECTED_COUNT values: "
-                        f"{previous} and {expected_count}."
-                    )
-                expected_counts[tuuid] = expected_count
-            self._mailbox.configure_transport_expected_counts(
-                op_name, int(frame.frame_i32[FRAME_STEP]), expected_counts
-            )
-            watermark = await self._mailbox.deposit_transport_frame(
-                op_name,
-                sender_id,
-                op_frame,
-            )
+            return deposited_watermark
+
+        if profiler_recorder is None:
+            watermark = await deposit_frame_rows()
+        else:
+            async with profiler_recorder.worker_receive_transport_frame(
+                step=step,
+                sender_spmd_code=sender_spmd_code,
+                edge_count=edge_count,
+                payload_count=len(payload_iovs),
+            ):
+                watermark = await deposit_frame_rows()
 
         return watermark
 
@@ -1065,7 +1162,15 @@ class SPMDWorker:
         )
         meta = self.op_manager._get_operator_metadata(op_name)
         priority = meta.priority if isinstance(meta, OperatorMeta) else 0
-        await self._execution_queue.put((-priority, step, op_name))
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            async with recorder.worker_scheduler_span(
+                spec=WORKER_QUEUE_ENQUEUE,
+                payload=recorder.worker_op_payload(op_name, step, priority),
+            ):
+                await self._execution_queue.put((-priority, step, op_name))
+        else:
+            await self._execution_queue.put((-priority, step, op_name))
         logger.debug(
             f"Task enqueued op={op_name} step={step} priority={priority} spmd_id={self.spmd_id} rank={self.rank}"
         )
@@ -1101,6 +1206,11 @@ class SPMDWorker:
         await self._start_event.wait()
 
         logger.debug(f"Execution loop started spmd_id={self.spmd_id} rank={self.rank}")
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
+        if profiler_recorder is not None:
+            profiler_recorder.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
 
         # Normal SPMD mode: data-driven execution loop
         while self._running:
@@ -1111,6 +1221,15 @@ class SPMDWorker:
                 )
                 priority, step, op_name = await self._execution_queue.get()
                 self._in_op_step_queue.discard((op_name, step))
+                if profiler_recorder is not None:
+                    profiler_recorder.worker_scheduler_instant(
+                        spec=WORKER_QUEUE_DEQUEUE,
+                        payload=profiler_recorder.worker_op_payload(
+                            op_name,
+                            step,
+                            -priority,
+                        ),
+                    )
                 logger.debug(
                     f"Execution loop picked up task op={op_name} step={step} priority={priority} "
                     f"spmd_id={self.spmd_id} rank={self.rank}"
@@ -1124,6 +1243,14 @@ class SPMDWorker:
                 if not self._op_runnable[op_name].is_set():
                     # Hold in pending queue instead of re-enqueueing
                     self._pending_blocked[op_name].append(step)
+                    if profiler_recorder is not None:
+                        profiler_recorder.worker_scheduler_instant(
+                            spec=WORKER_BLOCKED_TASK,
+                            payload=profiler_recorder.worker_op_payload(
+                                op_name,
+                                step,
+                            ),
+                        )
                     logger.debug(
                         f"Op blocked in queue op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
                     )
@@ -1144,6 +1271,15 @@ class SPMDWorker:
                     completed_count = self._completed_step_count[op_name]
                     if step < completed_count:
                         # Truly stale task (already executed), drop it
+                        if profiler_recorder is not None:
+                            profiler_recorder.worker_scheduler_instant(
+                                spec=WORKER_STALE_TASK,
+                                payload=profiler_recorder.worker_op_payload(
+                                    op_name,
+                                    step,
+                                    completed_count,
+                                ),
+                            )
                         logger.warning(
                             f"Stale task dropped op={op_name} "
                             f"task_step={step} completed_count={completed_count} spmd_id={self.spmd_id} rank={self.rank}"
@@ -1152,6 +1288,15 @@ class SPMDWorker:
                     elif step > completed_count:
                         # Future task (arrived early), hold for later execution
                         self._pending_future_steps[op_name].append(step)
+                        if profiler_recorder is not None:
+                            profiler_recorder.worker_scheduler_instant(
+                                spec=WORKER_FUTURE_TASK,
+                                payload=profiler_recorder.worker_op_payload(
+                                    op_name,
+                                    step,
+                                    completed_count,
+                                ),
+                            )
                         logger.debug(
                             f"Future task held op={op_name} "
                             f"task_step={step} completed_count={completed_count} spmd_id={self.spmd_id} rank={self.rank}"
@@ -1391,7 +1536,23 @@ class SPMDWorker:
                         f"Self-blocking due to drain target={self._drain_target_count} "
                         f"task_step={step} spmd_id={self.spmd_id} rank={self.rank}"
                     )
-                    await self._drain_cond.wait()
+                    profiler_recorder = (
+                        self._profiler_runtime.recorder
+                        if self._profiler_runtime.enabled
+                        else None
+                    )
+                    if profiler_recorder is None:
+                        await self._drain_cond.wait()
+                    else:
+                        async with profiler_recorder.worker_scheduler_span(
+                            spec=WORKER_DRAIN_WAIT,
+                            payload=profiler_recorder.worker_op_payload(
+                                op_name,
+                                step,
+                                self._drain_target_count,
+                            ),
+                        ):
+                            await self._drain_cond.wait()
 
             # Re-validate after drain wait: a checkpoint restore may have
             # happened while we were blocked, advancing completed_step_count
@@ -1604,13 +1765,28 @@ class SPMDWorker:
         tuuid_to_shards = dict(zip(unique_tuuids, all_shards_list, strict=True))  # type: ignore
         tuuid_to_arrivals = dict(zip(unique_tuuids, all_arrivals_list, strict=True))  # type: ignore
 
-        assemble_tasks = [
-            self._assemble_tensor(
-                op_name, u, step, tuuid_to_shards[u], tuuid_to_arrivals[u]
-            )
-            for u in unique_tuuids
-        ]
-        assembled_list = await asyncio.gather(*assemble_tasks)
+        async def assemble_tensors() -> list[Any]:
+            assemble_tasks = [
+                self._assemble_tensor(
+                    op_name, u, step, tuuid_to_shards[u], tuuid_to_arrivals[u]
+                )
+                for u in unique_tuuids
+            ]
+            return await asyncio.gather(*assemble_tasks)
+
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
+        if profiler_recorder is None:
+            assembled_list = await assemble_tensors()
+        else:
+            async with profiler_recorder.worker_assemble_input(
+                op_name=op_name,
+                step=step,
+                tuuid_count=len(unique_tuuids),
+                state_count=len(state_args),
+            ):
+                assembled_list = await assemble_tensors()
         tuuid_to_assembled = dict(zip(unique_tuuids, assembled_list, strict=True))  # type: ignore
 
         if step not in self._step_tuuid_cache:
@@ -1923,7 +2099,20 @@ class SPMDWorker:
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
     ) -> "TransportTensor":
-        return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
+        if profiler_recorder is None:
+            return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
+        shard_count = sum(len(items) for items in shards.values())
+        async with profiler_recorder.worker_assemble_tensor(
+            op_name=op_name,
+            tuuid=tuuid,
+            step=step,
+            sender_count=len(shards),
+            shard_count=shard_count,
+        ):
+            return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
 
     def _assemble_tensor_sync(
         self,
@@ -2629,6 +2818,16 @@ class SPMDWorker:
         # Schedule next task: The index of the next task equals the number of already finished tasks.
         # e.g., Finished Step Index 0 -> Completed Step Count 1 -> Next Task Index 1.
         next_step_index = completed_step_count
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            recorder.worker_scheduler_instant(
+                spec=WORKER_ADVANCE_STEP,
+                payload=recorder.worker_op_payload(
+                    op_name,
+                    completed_step_count - 1,
+                    next_step_index,
+                ),
+            )
 
         # If it's a source operator, automatically trigger the next step
         if self.op_manager.is_source_operator(op_name):
@@ -2732,6 +2931,9 @@ class SPMDWorker:
         output_sharding = self.op_manager.get_output_sharding(op_name)
         tuuid_to_name = self.op_manager.get_output_tuuid_to_name(op_name)
         step_tuuid_cache = dict(self._step_tuuid_cache.get(exec_step, {}))
+        profiler_recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
 
         # Extract state arguments
         state_data = {}
@@ -2779,7 +2981,9 @@ class SPMDWorker:
                 )
             )
 
-        if successor_contexts:
+        async def send_successor_frames() -> None:
+            if not successor_contexts:
+                return
             local_spmd_code = self._local_spmd_code
             assert local_spmd_code is not None
             await self._outbound_semaphore.acquire()
@@ -2797,6 +3001,17 @@ class SPMDWorker:
                     self._world_size,
                 )
             )
+
+        if profiler_recorder is None:
+            await send_successor_frames()
+        else:
+            async with profiler_recorder.worker_send_output(
+                op_name=op_name,
+                step=exec_step,
+                output_count=len(flat_results),
+                successor_count=len(successor_contexts),
+            ):
+                await send_successor_frames()
 
         for spmd_id in successor_ids:
             succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
@@ -3133,6 +3348,12 @@ class SPMDWorker:
         Trigger the snapshot begin hook for all operators on this worker.
         Called on Rank 0 by the Driver before parallel saving starts.
         """
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            recorder.worker_scheduler_instant(
+                spec=WORKER_SNAPSHOT_HOOK,
+                payload=(recorder.intern("on_snapshot_begin"), step),
+            )
         await self._drain_outbound_tasks()
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         await self._local_step_plan_executor.user_callable_executor.trigger_snapshot_begin(
@@ -3169,6 +3390,12 @@ class SPMDWorker:
         Trigger the snapshot commit hook for all operators on this worker.
         Called on Rank 0 by the Driver after all ranks have saved successfully.
         """
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            recorder.worker_scheduler_instant(
+                spec=WORKER_SNAPSHOT_HOOK,
+                payload=(recorder.intern("on_snapshot_commit"), step),
+            )
         await self._drain_outbound_tasks()
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
         await self._local_step_plan_executor.user_callable_executor.trigger_snapshot_commit(
@@ -3231,13 +3458,27 @@ class SPMDWorker:
         operator_states = await self._collect_operator_save_state(spmd_dir)
 
         if operator_states:
-            rank_storage = await self._get_checkpoint_backend().save(
-                {"operator_states": operator_states},
-                ckpt_dir,
-                self.spmd_id,
-                self.rank,
-                step,
-            )
+            if self._profiler_runtime.enabled:
+                recorder = self._profiler_runtime.recorder
+                async with recorder.worker_checkpoint_save(
+                    step=step,
+                    operator_count=len(operator_states),
+                ):
+                    rank_storage = await self._get_checkpoint_backend().save(
+                        {"operator_states": operator_states},
+                        ckpt_dir,
+                        self.spmd_id,
+                        self.rank,
+                        step,
+                    )
+            else:
+                rank_storage = await self._get_checkpoint_backend().save(
+                    {"operator_states": operator_states},
+                    ckpt_dir,
+                    self.spmd_id,
+                    self.rank,
+                    step,
+                )
         else:
             rank_storage = {}
 
@@ -3308,9 +3549,21 @@ class SPMDWorker:
             target_state["operator_states"] = self._call_operator_restore_target_state()
         elif shared_operator_states:
             target_state["operator_states"] = shared_operator_states
-        state = await self._get_checkpoint_backend().load(
-            rank_storage, target_state=target_state
-        )
+        if self._profiler_runtime.enabled:
+            recorder = self._profiler_runtime.recorder
+            async with recorder.worker_checkpoint_load(
+                operator_count=len(target_state.get("operator_states", {})),
+                has_rank_storage=True,
+            ):
+                state = await self._get_checkpoint_backend().load(
+                    rank_storage,
+                    target_state=target_state,
+                )
+        else:
+            state = await self._get_checkpoint_backend().load(
+                rank_storage,
+                target_state=target_state,
+            )
 
         ckpt_dir = rank_storage.get("ckpt_dir", "")
         operator_states = state.get("operator_states", shared_operator_states)
@@ -3590,6 +3843,10 @@ class SPMDWorker:
                 "tuuid_consumers": tuuid_consumers,
             },
         }
+
+    async def export_profiler_snapshot(self) -> dict[str, Any] | None:
+        await self._drain_outbound_tasks()
+        return self._profiler_runtime.snapshot()
 
     # =========================================================================
     # Utility

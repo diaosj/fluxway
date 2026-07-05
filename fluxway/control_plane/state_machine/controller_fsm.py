@@ -183,6 +183,13 @@ class ControllerStateMachine:
             # Perform state transition
             old_state = self._state
             self._state = next_state
+            profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
+            if profiler_runtime is not None and profiler_runtime.enabled:
+                profiler_runtime.recorder.controller_fsm_transition(
+                    from_state=old_state.name,
+                    event=event.name,
+                    to_state=next_state.name,
+                )
             logger.debug(
                 f"State transition: {old_state} -> {next_state} (event: {event})"
             )
@@ -208,7 +215,14 @@ class ControllerStateMachine:
         callback = callbacks.get(state)
         if callback:
             try:
-                await callback()
+                profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
+                if profiler_runtime is not None and profiler_runtime.enabled:
+                    async with profiler_runtime.recorder.controller_fsm_entry_callback(
+                        state=state.name,
+                    ):
+                        await callback()
+                else:
+                    await callback()
             except Exception as e:
                 logger.error(f"Error in entry callback for {state}: {e}")
 
@@ -370,7 +384,18 @@ class ControllerStateMachine:
         try:
             if hasattr(self._controller, "stop_checkpointer"):
                 await self._controller.stop_checkpointer()
+            capture_fn = getattr(
+                self._controller, "capture_profiler_snapshots_if_enabled", None
+            )
+            profiler_snapshots = None
+            if capture_fn is not None:
+                profiler_snapshots = await capture_fn()
             await self._controller._cleanup_all_spmds()
+            write_fn = getattr(
+                self._controller, "write_profiler_trace_if_enabled", None
+            )
+            if write_fn is not None:
+                await write_fn(profiler_snapshots)
             release_fn = getattr(
                 self._controller, "_release_stopped_spmd_handles", None
             )
@@ -434,7 +459,14 @@ class ControllerStateMachine:
 
     async def _blocked_timeout_watchdog(self) -> None:
         try:
-            await asyncio.sleep(self._blocked_timeout_secs)
+            heartbeat_observer = getattr(self._controller, "_heartbeat_observer", None)
+            if heartbeat_observer is not None:
+                async with heartbeat_observer.blocked_watchdog(
+                    timeout_ms=int(self._blocked_timeout_secs * 1000),
+                ):
+                    await asyncio.sleep(self._blocked_timeout_secs)
+            else:
+                await asyncio.sleep(self._blocked_timeout_secs)
             if self._state == ControllerState.BLOCKED:
                 logger.error(
                     f"BLOCKED state timed out after {self._blocked_timeout_secs}s, "

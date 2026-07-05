@@ -31,8 +31,8 @@ class GrainReader(BaseReader):
     Supports Elastic Sharding via Logical Shard Pools.
     """
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
         self._dataloader = None
         self._iterator = None
         self._output_type = None

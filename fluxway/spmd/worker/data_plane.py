@@ -16,6 +16,7 @@ from fluxway.common.types.sharding import (
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.transport.communication import AsyncDataDistributor
 from fluxway.transport.manifest import TransportFrameHeader
+from fluxway.profiler.recorder import TraceRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ def build_step_frame_groups(
     sender_spmd_code: int,
     sender_world_size: int,
     interleave_unit_size: int | None,
+    profiler_recorder: TraceRecorder | None = None,
 ) -> list[StepFrameGroup]:
     frame_groups: list[StepFrameGroup] = []
     wrapped_results: dict[int, TransportTensor] = {}
@@ -70,35 +72,51 @@ def build_step_frame_groups(
             continue
 
         distributor = AsyncDataDistributor(context.effective_rank)
-        for (source_spec, target_spec, _), batch in batches.items():
-            batch_target_uuids = [item[0] for item in batch]
-            batch_transport_tensors = [item[1] for item in batch]
 
-            if logger.isEnabledFor(logging.DEBUG):
-                for leaf_tuuid, leaf_val in batch:
-                    name = (
-                        tuuid_to_name.get(leaf_tuuid, "unknown")
-                        if tuuid_to_name
-                        else "unknown"
-                    )
-                    logger.debug(
-                        "Distributor plan name=%s tuuid=%s global_shape=%s "
-                        "origin_indices=%s routing_indices=%s rank=%s",
-                        name,
-                        leaf_tuuid,
-                        leaf_val.global_shape,
-                        leaf_val.origin_indices,
-                        leaf_val.routing_indices,
-                        rank,
-                    )
+        def plan_distribution(
+            distributor: AsyncDataDistributor,
+            batches: dict[Any, list[tuple[int, TransportTensor]]],
+        ) -> None:
+            for (source_spec, target_spec, _), batch in batches.items():
+                batch_target_uuids = [item[0] for item in batch]
+                batch_transport_tensors = [item[1] for item in batch]
 
-            distributor.plan_and_shard(
-                batch_transport_tensors,
-                source_spec,
-                target_spec,
-                tuuid=batch_target_uuids,
-                tuuid_to_name=tuuid_to_name,
-            )
+                if logger.isEnabledFor(logging.DEBUG):
+                    for leaf_tuuid, leaf_val in batch:
+                        name = (
+                            tuuid_to_name.get(leaf_tuuid, "unknown")
+                            if tuuid_to_name
+                            else "unknown"
+                        )
+                        logger.debug(
+                            "Distributor plan name=%s tuuid=%s global_shape=%s "
+                            "origin_indices=%s routing_indices=%s rank=%s",
+                            name,
+                            leaf_tuuid,
+                            leaf_val.global_shape,
+                            leaf_val.origin_indices,
+                            leaf_val.routing_indices,
+                            rank,
+                        )
+
+                distributor.plan_and_shard(
+                    batch_transport_tensors,
+                    source_spec,
+                    target_spec,
+                    tuuid=batch_target_uuids,
+                    tuuid_to_name=tuuid_to_name,
+                )
+
+        if profiler_recorder is None:
+            plan_distribution(distributor, batches)
+        else:
+            with profiler_recorder.transport_distribute_sync(
+                op_name=op_name,
+                rank=rank,
+                step=exec_step,
+                target_spmd_id=context.spmd_id,
+            ):
+                plan_distribution(distributor, batches)
 
         for frame_arg in distributor.build_transport_frame_args(
             step=exec_step,
@@ -106,6 +124,15 @@ def build_step_frame_groups(
             sender_world_size=sender_world_size,
             sender_rank=rank,
         ):
+            if profiler_recorder is not None:
+                target_rank, _header, payload_segments = frame_arg
+                profiler_recorder.data_plane_tensor_split(
+                    op_name=op_name,
+                    rank=rank,
+                    step=exec_step,
+                    target_rank=target_rank,
+                    payload_count=len(payload_segments),
+                )
             frame_groups.append((context.context_index, frame_arg))
 
     return frame_groups

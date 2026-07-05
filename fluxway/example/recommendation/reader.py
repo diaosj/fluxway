@@ -118,9 +118,6 @@ class RecommendationReader(GrainReader):
         out[perm] = p
         return out
 
-    def __init__(self):
-        super().__init__()
-
     @operator(
         "read",
         output_sharding={

@@ -66,6 +66,9 @@ cuda13 = [
 standard = [
     "cupy>=13.0.0",
 ]
+profiler = [
+    "perfetto==0.57.1",
+]
 
 
 [project.urls]

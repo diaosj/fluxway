@@ -15,6 +15,7 @@ from fluxway.spmd.worker.data_plane import (
     build_step_frame_groups,
 )
 from fluxway.transport.manifest import TransportFrameHeader
+from fluxway.profiler.recorder import TraceRecorder
 
 
 # pyrefly: ignore [no-matching-overload]
@@ -111,6 +112,7 @@ async def build_and_send_step_frames(
     successor_handlers: list[dict[int, Any]],
     source_spmd_id: str,
     max_in_flight_frames: int,
+    profiler_recorder: TraceRecorder | None = None,
     build_in_thread: bool = False,
 ) -> list[bool]:
     if len(successor_handlers) != len(successor_contexts):
@@ -140,7 +142,20 @@ async def build_and_send_step_frames(
     if build_in_thread:
         frame_groups = await asyncio.to_thread(build_step_frame_groups, **build_kwargs)
     else:
-        frame_groups = build_step_frame_groups(**build_kwargs)
+        if profiler_recorder is None:
+            frame_groups = build_step_frame_groups(**build_kwargs)
+        else:
+            async with profiler_recorder.data_plane_build_frame_groups(
+                op_name=op_name,
+                rank=rank,
+                step=exec_step,
+                successor_count=len(successor_contexts),
+                output_count=len(output_uuids),
+            ):
+                frame_groups = build_step_frame_groups(
+                    **build_kwargs,
+                    profiler_recorder=profiler_recorder,
+                )
     if not frame_groups:
         return []
     send_semaphore = asyncio.Semaphore(max_in_flight_frames)
@@ -153,6 +168,7 @@ async def build_and_send_step_frames(
                 source_rank=rank,
                 output_step=exec_step,
                 send_semaphore=send_semaphore,
+                profiler_recorder=profiler_recorder,
             )
             for context_index, frame_arg in frame_groups
         )
@@ -167,6 +183,7 @@ async def _send_transport_frame_to_handler(
     source_rank: int,
     output_step: int,
     send_semaphore: asyncio.Semaphore,
+    profiler_recorder: TraceRecorder | None = None,
 ) -> bool:
     (
         target_rank,
@@ -185,9 +202,23 @@ async def _send_transport_frame_to_handler(
             f"step={output_step}."
         )
 
-    await send_semaphore.acquire()
+    if profiler_recorder is None:
+        await send_semaphore.acquire()
+    else:
+        async with profiler_recorder.data_plane_send_semaphore_wait(
+            source_rank=source_rank,
+            output_step=output_step,
+        ):
+            await send_semaphore.acquire()
     try:
-        await handler.receive_transport_frame(header, *payload_segments)
+        if profiler_recorder is None:
+            await handler.receive_transport_frame(header, *payload_segments)
+        else:
+            async with profiler_recorder.data_plane_send_transport_frame(
+                source_rank=source_rank,
+                output_step=output_step,
+            ):
+                await handler.receive_transport_frame(header, *payload_segments)
     finally:
         send_semaphore.release()
     return True
@@ -201,7 +232,8 @@ def _validate_successor_handlers(
 ) -> None:
     for context_index, handlers in enumerate(successor_handlers):
         for target_rank, handler in handlers.items():
-            if not isinstance(handler, expected_type):
+            effective_handler = getattr(handler, "delegate", handler)
+            if not isinstance(effective_handler, expected_type):
                 raise TypeError(
                     f"{executor_name} requires {expected_type.__name__} "
                     f"handlers, got {type(handler).__name__} for "
@@ -229,6 +261,7 @@ class RayDataPlaneBackendExecutor:
         successor_handlers: list[dict[int, Any]],
         source_spmd_id: str,
         max_in_flight_frames: int,
+        profiler_recorder: TraceRecorder | None = None,
     ) -> list[bool]:
         if max_in_flight_frames <= 0:
             raise ValueError(
@@ -239,6 +272,26 @@ class RayDataPlaneBackendExecutor:
             expected_type=RayActorDataPlane,
             executor_name="Ray fused data-plane executor",
         )
+        if profiler_recorder is not None:
+            return await build_and_send_step_frames(
+                op_name=op_name,
+                rank=rank,
+                mesh=mesh,
+                flat_results=flat_results,
+                output_uuids=output_uuids,
+                output_sharding=output_sharding,
+                successor_contexts=successor_contexts,
+                tuuid_to_name=tuuid_to_name,
+                step_tuuid_cache=step_tuuid_cache,
+                exec_step=exec_step,
+                sender_spmd_code=sender_spmd_code,
+                sender_world_size=sender_world_size,
+                interleave_unit_size=interleave_unit_size,
+                successor_handlers=successor_handlers,
+                source_spmd_id=source_spmd_id,
+                max_in_flight_frames=max_in_flight_frames,
+                profiler_recorder=profiler_recorder,
+            )
         if _object_requires_cuda_visible((flat_results, step_tuuid_cache)):
             return await build_and_send_step_frames(
                 op_name=op_name,
@@ -320,6 +373,7 @@ class AxonDataPlaneBackendExecutor:
         successor_handlers: list[dict[int, Any]],
         source_spmd_id: str,
         max_in_flight_frames: int,
+        profiler_recorder: TraceRecorder | None = None,
     ) -> list[bool]:
         _validate_successor_handlers(
             successor_handlers,
@@ -343,4 +397,5 @@ class AxonDataPlaneBackendExecutor:
             successor_handlers=successor_handlers,
             source_spmd_id=source_spmd_id,
             max_in_flight_frames=max_in_flight_frames,
+            profiler_recorder=profiler_recorder,
         )

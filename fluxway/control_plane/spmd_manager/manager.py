@@ -93,7 +93,11 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
     Workers are managed by their respective drivers.
     """
 
-    def __init__(self, controller_handle: Any | None = None):
+    def __init__(
+        self,
+        controller_handle: Any | None = None,
+        profiler_recorder: Any | None = None,
+    ):
         """
         Initialize SPMDManager.
 
@@ -101,6 +105,7 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
             controller_handle: Reference to the Controller (for driver callbacks)
         """
         self._controller_handle = controller_handle
+        self._profiler_recorder = profiler_recorder
         self._spmd_handles: dict[str, SPMDHandle] = {}
         self._topology: dict[str, list[str]] = {}  # spmd_id -> downstream spmd_ids
         self._reverse_topology: dict[
@@ -422,7 +427,22 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         Returns:
             Dict mapping spmd_id to result (or exception)
         """
-        results = {}
+        if self._profiler_recorder is not None:
+            async with self._profiler_recorder.spmd_manager_broadcast(
+                method=method,
+                spmd_count=len(self._spmd_handles),
+            ):
+                return await self._broadcast_to_all_drivers_unprofiled(
+                    method,
+                    *args,
+                    **kwargs,
+                )
+        return await self._broadcast_to_all_drivers_unprofiled(method, *args, **kwargs)
+
+    async def _broadcast_to_all_drivers_unprofiled(
+        self, method: str, *args, **kwargs
+    ) -> dict[str, Any]:
+        results: dict[str, Any] = {}
         refs = {}
 
         for spmd_id, handle in self._spmd_handles.items():

@@ -3,12 +3,14 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import argparse
+import time
 
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import AsyncStepConfig
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.controller import create_controller
 from fluxway.common.types import CheckpointConfig
+from fluxway.profiler import ProfilerDiagnostic
 
 from fluxway.example.recommendation.reader import RecommendationReader
 from fluxway.example.recommendation.input_spmd import InputSPMD
@@ -33,6 +35,31 @@ async def _print_resource_allocation_summary(controller):
             f"total_memory_gb={item['total_memory_gb']} "
             f"driver={item['driver_bundle']} worker={item['worker_bundle']}"
         )
+
+
+def _build_profiler_config(args):
+    if args.profiler_trace_dir is None:
+        return None
+
+    from fluxway.profiler import ProfilerConfig
+
+    run_id = args.profiler_run_id
+    if run_id is None:
+        run_id = f"recommendation_{time.time_ns()}"
+
+    config = ProfilerConfig(
+        trace_dir=args.profiler_trace_dir,
+        run_id=run_id,
+        buffer_bytes_per_process=args.profiler_buffer_mib * 1024 * 1024,
+        clock_sync_rounds=args.profiler_clock_sync_rounds,
+        max_clock_uncertainty_ns=args.profiler_max_clock_uncertainty_us * 1000,
+        output_file=args.profiler_output_file,
+        diagnostics=frozenset(
+            ProfilerDiagnostic(item) for item in args.profiler_diagnostics
+        ),
+    )
+    config.run_dir.mkdir(parents=True, exist_ok=False)
+    return config
 
 
 async def run_training(args):
@@ -129,10 +156,16 @@ async def run_training(args):
         interval_steps=args.checkpoint_interval,
     )
 
+    profiler_config = _build_profiler_config(args)
+    if profiler_config is not None:
+        print(f"[Fluxway] Profiler trace run directory: {profiler_config.run_dir}")
+        print(f"[Fluxway] Profiler trace output file: {profiler_config.output_path}")
+
     controller = await create_controller(
         task_graph,
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
+        profiler_config=profiler_config,
     )
     await _print_resource_allocation_summary(controller)
 
@@ -144,7 +177,6 @@ async def run_training(args):
     completed = await controller.wait_for_completion.remote()
 
     await controller.stop_checkpointer.remote()
-
     if completed:
         print("[Fluxway] Training completed up to target steps.")
     else:
@@ -200,6 +232,46 @@ def main():
         "--clear-ckpt",
         action="store_true",
         help="Clear existing checkpoints before starting",
+    )
+    parser.add_argument(
+        "--profiler-trace-dir",
+        default=None,
+        help="Enable profiler and configure the MPMD trace output root directory",
+    )
+    parser.add_argument(
+        "--profiler-run-id",
+        default=None,
+        help="Profiler run id under --profiler-trace-dir",
+    )
+    parser.add_argument(
+        "--profiler-buffer-mib",
+        type=int,
+        default=64,
+        help="Profiler arena size per process in MiB",
+    )
+    parser.add_argument(
+        "--profiler-clock-sync-rounds",
+        type=int,
+        default=8,
+        help="Clock sync ping-pong rounds per controller/driver/worker edge",
+    )
+    parser.add_argument(
+        "--profiler-max-clock-uncertainty-us",
+        type=int,
+        default=1000,
+        help="Maximum accepted physical clock uncertainty in microseconds",
+    )
+    parser.add_argument(
+        "--profiler-output-file",
+        default=None,
+        help="Profiler Perfetto trace output path",
+    )
+    parser.add_argument(
+        "--profiler-diagnostics",
+        action="append",
+        choices=[item.value for item in ProfilerDiagnostic],
+        default=[],
+        help="Optional non-hot diagnostic trace domains to include",
     )
     args = parser.parse_args()
     if getattr(args, "clear_ckpt", False):

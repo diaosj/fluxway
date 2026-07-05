@@ -19,8 +19,11 @@ import asyncio
 import functools
 import inspect
 import os
+from pathlib import Path
 import time
 from typing import Any, TYPE_CHECKING
+
+import numpy as np
 
 if TYPE_CHECKING:
     import ray
@@ -56,6 +59,8 @@ from fluxway.control_plane.async_manager import AsyncStepManager
 from fluxway.common.types import CheckpointConfig
 from fluxway.common.types.drain import DrainStrategy, GraphModeDrainStrategy
 from fluxway.rpc.protocol import DataPlaneRegistry
+from fluxway.profiler import ProfilerRuntimeFactory
+from fluxway.profiler.record import ProfilerSnapshot
 
 logger = get_logger(__name__)
 
@@ -209,6 +214,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             checkpoint_config: CheckpointConfig | None = None,
             error_policy: ErrorPolicy | None = None,
             transport_config: dict[str, str] | None = None,
+            profiler_config: Any | None = None,
         ):
             """
             Initialize Controller with configuration.
@@ -220,6 +226,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 checkpoint_config: Configuration for checkpointer backend
                 error_policy: Error classification policy for fail-fast decisions
                 transport_config: Data plane transport backend per SPMD (e.g. {"*": "ray"})
+                profiler_config: Optional profiler runtime configuration
             """
             # Ray actors run in separate worker processes; ensure INFO logs are not dropped.
             ensure_logging_configured()
@@ -230,6 +237,12 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self._checkpoint_config = checkpoint_config
             self._error_policy = error_policy or ErrorPolicy()
             self._transport_config = transport_config or {}
+            self._profiler_config = profiler_config
+            self._profiler_runtime = ProfilerRuntimeFactory.from_config(
+                profiler_config,
+                process_name="controller",
+            )
+            self._heartbeat_observer = self._profiler_runtime.heartbeat_observer()
 
             self._monitor = Monitor()
             self._state_manager = StateManager()
@@ -309,10 +322,25 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             Returns:
                 True if initialization successful
             """
+            profiler_recorder = (
+                self._profiler_runtime.recorder
+                if self._profiler_runtime.enabled
+                else None
+            )
+            if profiler_recorder is not None:
+                span = profiler_recorder.controller_initialize(
+                    spmd_count=len(self._graph.nodes)
+                )
+                await span.__aenter__()
+            else:
+                span = None
             try:
                 # Create sub-components locally in the controller process
                 self_handle = ray.get_runtime_context().current_actor
-                self._spmd_manager = SPMDManager(controller_handle=self_handle)
+                self._spmd_manager = SPMDManager(
+                    controller_handle=self_handle,
+                    profiler_recorder=profiler_recorder,
+                )
                 self.scheduler.set_spmd_manager(
                     self.spmd_manager
                 )  # Set SPMDManager on scheduler
@@ -323,6 +351,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     on_all_workers_running=self._on_all_workers_running,
                     on_driver_error=self._on_driver_error,
                     on_driver_recovered=self._on_driver_recovered,
+                    observer=self._heartbeat_observer,
                 )
 
                 if self._checkpoint_config is not None:
@@ -349,6 +378,8 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
                 # Assign specific max_steps to each node based on global config and overrides
                 for node_id, node in self._graph.nodes.items():
+                    if node.spmd_config is not None:
+                        node.spmd_config.profiler_config = self._profiler_config
                     limit = self._async_step_config.node_max_steps.get(
                         node_id, self._async_step_config.max_steps
                     )
@@ -365,16 +396,43 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     self.heartbeat_manager.register_spmd(node_name)
 
                 # Allocate resources
-                if not await self.scheduler.allocate_resources(self._graph):
+                if profiler_recorder is None:
+                    allocated = await self.scheduler.allocate_resources(self._graph)
+                else:
+                    async with profiler_recorder.spmd_manager_placement_group_create(
+                        spmd_id="*",
+                        worker_count=sum(
+                            node.spmd_config.num_workers
+                            for node in self._graph.nodes.values()
+                            if node.spmd_config is not None
+                        ),
+                    ):
+                        allocated = await self.scheduler.allocate_resources(self._graph)
+                if not allocated:
                     logger.error("Failed to allocate resources")
                     return False
 
                 # Build and establish topology data structure
                 # (adjacency lists only, no remote calls to drivers)
-                self.scheduler.build_and_establish_topology(self._graph)
+                if profiler_recorder is None:
+                    self.scheduler.build_and_establish_topology(self._graph)
+                else:
+                    async with profiler_recorder.controller_topology_registration(
+                        spmd_count=len(self._graph.nodes),
+                        edge_count=len(self._graph.edges),
+                    ):
+                        self.scheduler.build_and_establish_topology(self._graph)
 
                 # Start SPMDs (fire-and-forget, readiness tracked via heartbeat)
-                if not await self.scheduler.init_spmds(self._graph):
+                if profiler_recorder is None:
+                    initialized = await self.scheduler.init_spmds(self._graph)
+                else:
+                    async with profiler_recorder.spmd_manager_driver_start(
+                        spmd_id="*",
+                        worker_count=len(self._graph.nodes),
+                    ):
+                        initialized = await self.scheduler.init_spmds(self._graph)
+                if not initialized:
                     logger.error("Failed to start SPMDs")
                     return False
 
@@ -391,6 +449,9 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             except Exception as e:
                 logger.error(f"Controller initialization failed: {e}")
                 return False
+            finally:
+                if span is not None:
+                    await span.__aexit__(None, None, None)
 
         # =====================================================================
         # Properties (as methods for Ray Actor)
@@ -446,6 +507,15 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             Args:
                 heartbeat: Driver heartbeat data
             """
+            if self._heartbeat_observer is not None:
+                async with self._heartbeat_observer.receive_driver_heartbeat(heartbeat):
+                    await self._receive_driver_heartbeat_unprofiled(heartbeat)
+                return
+            await self._receive_driver_heartbeat_unprofiled(heartbeat)
+
+        async def _receive_driver_heartbeat_unprofiled(
+            self, heartbeat: DriverHeartbeat
+        ) -> None:
             # Route to heartbeat manager
             await self.heartbeat_manager.receive_heartbeat(heartbeat)
 
@@ -515,6 +585,16 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 target = min(target, max_steps)
 
             self._last_requested_drain_target = target
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.controller_drain(
+                    target_step=target,
+                    spmd_count=len(self._graph.nodes),
+                ):
+                    await self._schedule_drain_unprofiled(target)
+                return
+            await self._schedule_drain_unprofiled(target)
+
+        async def _schedule_drain_unprofiled(self, target: int) -> None:
             driver_tasks = []
             for spmd_id in self._graph.nodes.keys():
                 driver = self.spmd_manager.get_driver_handle(spmd_id)
@@ -546,7 +626,13 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     logger.info(f"Checkpointer executing snapshot at count {boundary}")
                     try:
                         if self._checkpointer is not None:
-                            await self._checkpointer.save(boundary)
+                            if self._profiler_runtime.enabled:
+                                async with self._profiler_runtime.recorder.controller_checkpoint(
+                                    target_step=boundary,
+                                ):
+                                    await self._checkpointer.save(boundary)
+                            else:
+                                await self._checkpointer.save(boundary)
                     except Exception as e:
                         logger.error(f"Checkpoint save failed: {e}")
                     finally:
@@ -641,6 +727,20 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             - If downstream is busy (busy_worker_ratio > threshold), pause the reader
             - If downstream is no longer busy, resume the reader
             """
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.controller_backpressure(
+                    busy_spmd_count=sum(
+                        1
+                        for busy_ratio in self._busy_spmds.values()
+                        if busy_ratio >= self._backpressure_threshold
+                    ),
+                    paused_reader_count=len(self._paused_readers),
+                ):
+                    await self._check_and_enforce_backpressure_unprofiled()
+                return
+            await self._check_and_enforce_backpressure_unprofiled()
+
+        async def _check_and_enforce_backpressure_unprofiled(self) -> None:
             # Source nodes are candidates for backpressure (e.g., readers)
             reader_nodes = self._source_nodes
 
@@ -932,6 +1032,21 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 step:        The logical step count of this snapshot.
                 manifest:    {spmd_id: {"spmd_state": {...}, "rank_storage": {str(rank): {...}}}}
             """
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.controller_restore(
+                    checkpoint_id=snapshot_id,
+                ):
+                    await self._restore_snapshot_unprofiled(
+                        snapshot_id,
+                        step,
+                        manifest,
+                    )
+                return
+            await self._restore_snapshot_unprofiled(snapshot_id, step, manifest)
+
+        async def _restore_snapshot_unprofiled(
+            self, snapshot_id: str, step: int, manifest: dict[str, Any]
+        ) -> None:
             logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
 
             if self.heartbeat_manager is not None:
@@ -1043,6 +1158,128 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 return {}
             results = await asyncio.gather(*tasks.values())
             return dict(zip(tasks.keys(), results, strict=True))
+
+        @require_spmd_manager
+        async def capture_profiler_snapshots(
+            self,
+        ) -> dict[str, dict[int, ProfilerSnapshot | None]]:
+            tasks: dict[str, Any] = {}
+            for spmd_id in self.spmd_manager.get_all_spmd_ids():
+                driver = self.spmd_manager.get_driver_handle(spmd_id)
+                if driver is not None:
+                    tasks[spmd_id] = driver.export_profiler_snapshots.remote()
+            if not tasks:
+                raise RuntimeError("No SPMD drivers are available for profiler export.")
+
+            results = await asyncio.gather(*tasks.values())
+            return dict(zip(tasks.keys(), results, strict=True))
+
+        async def capture_profiler_snapshots_if_enabled(
+            self,
+        ) -> dict[str, dict[int, ProfilerSnapshot | None]] | None:
+            if self._profiler_config is None:
+                return None
+            return await self.capture_profiler_snapshots()
+
+        @require_spmd_manager
+        async def export_profiler_trace(self, path: str) -> str:
+            snapshots_by_spmd = await self.capture_profiler_snapshots()
+            return await self.write_profiler_trace(path, snapshots_by_spmd)
+
+        async def write_profiler_trace(
+            self,
+            path: str,
+            snapshots_by_spmd: dict[str, dict[int, ProfilerSnapshot | None]],
+        ) -> str:
+            records = []
+            names_by_id: dict[int, str] = {}
+            payload_fields_by_name_id: dict[int, tuple[str, ...]] = {}
+
+            for rank_snapshots in snapshots_by_spmd.values():
+                for snapshot in rank_snapshots.values():
+                    if snapshot is None:
+                        continue
+                    records_array = snapshot["records"].copy()
+                    records_array[:, 1] += snapshot["monotonic_to_epoch_offset_ns"]
+                    if len(records_array) > 0:
+                        records.append(records_array)
+                    metadata = snapshot["metadata"]
+                    names_by_id.update(metadata.names_by_id)
+                    payload_fields_by_name_id.update(metadata.payload_fields_by_name_id)
+
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.controller_profiler_export(
+                    spmd_count=len(snapshots_by_spmd),
+                    record_count=sum(len(record_array) for record_array in records),
+                ):
+                    pass
+                controller_snapshot = self._profiler_runtime.snapshot()
+                if controller_snapshot is not None:
+                    from fluxway.profiler.record import TraceMetadata
+
+                    records_obj = controller_snapshot["records"]
+                    assert isinstance(records_obj, np.ndarray)
+                    records_array = records_obj.copy()
+
+                    offset_obj = controller_snapshot["monotonic_to_epoch_offset_ns"]
+                    assert isinstance(offset_obj, int)
+                    records_array[:, 1] += offset_obj
+
+                    if len(records_array) > 0:
+                        records.append(records_array)
+
+                    metadata = controller_snapshot["metadata"]
+                    assert isinstance(metadata, TraceMetadata)
+                    names_by_id.update(metadata.names_by_id)
+                    payload_fields_by_name_id.update(metadata.payload_fields_by_name_id)
+
+            if not records:
+                raise RuntimeError(
+                    "Profiler is enabled but no trace records were captured."
+                )
+
+            from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
+            from fluxway.profiler.record import TraceMetadata
+
+            merged = np.vstack(records)
+            output = Path(path)
+            PerfettoTraceWriter().write(
+                merged,
+                output,
+                metadata=TraceMetadata(
+                    names_by_id=names_by_id,
+                    payload_fields_by_name_id=payload_fields_by_name_id,
+                ),
+            )
+            return str(output)
+
+        async def write_profiler_trace_if_enabled(
+            self, snapshots_by_spmd: dict[str, Any] | None
+        ) -> str | None:
+            if self._profiler_config is None:
+                return None
+            if snapshots_by_spmd is None:
+                snapshots_by_spmd = await self.capture_profiler_snapshots()
+            output_path = getattr(self._profiler_config, "output_path", None)
+            if output_path is None:
+                output_path = (
+                    Path(self._profiler_config.trace_dir)
+                    / str(self._profiler_config.run_id)
+                    / "trace.pftrace"
+                )
+            return await self.write_profiler_trace(str(output_path), snapshots_by_spmd)
+
+        async def export_profiler_trace_if_enabled(self) -> str | None:
+            if self._profiler_config is None:
+                return None
+            output_path = getattr(self._profiler_config, "output_path", None)
+            if output_path is None:
+                output_path = (
+                    Path(self._profiler_config.trace_dir)
+                    / str(self._profiler_config.run_id)
+                    / "trace.pftrace"
+                )
+            return await self.export_profiler_trace(str(output_path))
 
         # =====================================================================
         # SPMD Error Handling
@@ -1379,6 +1616,15 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
             Called when entering COMPLETING or FAILING state.
             """
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.controller_cleanup(
+                    spmd_count=len(self.spmd_manager.get_all_spmd_ids()),
+                ):
+                    await self._cleanup_all_spmds_unprofiled()
+                return
+            await self._cleanup_all_spmds_unprofiled()
+
+        async def _cleanup_all_spmds_unprofiled(self) -> None:
             logger.debug("Cleaning up all SPMDs")
 
             # Stop heartbeat monitoring
@@ -1387,9 +1633,23 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             # Stop all SPMDs
             for spmd_id in self.spmd_manager.get_all_spmd_ids():
                 try:
-                    await self.spmd_manager.stop_spmd(
-                        spmd_id, save_checkpoint=False, release_driver_handle=False
-                    )
+                    if self._profiler_runtime.enabled:
+                        async with (
+                            self._profiler_runtime.recorder.spmd_manager_driver_stop(
+                                spmd_id=spmd_id,
+                            )
+                        ):
+                            await self.spmd_manager.stop_spmd(
+                                spmd_id,
+                                save_checkpoint=False,
+                                release_driver_handle=False,
+                            )
+                    else:
+                        await self.spmd_manager.stop_spmd(
+                            spmd_id,
+                            save_checkpoint=False,
+                            release_driver_handle=False,
+                        )
                 except Exception as e:
                     logger.error(f"Error stopping SPMD {spmd_id}: {e}")
                 finally:
@@ -1453,6 +1713,16 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             Returns:
                 True if completed successfully, False if failed or timeout
             """
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.controller_completion(
+                    spmd_count=len(self._graph.nodes),
+                ):
+                    return await self._wait_for_completion_unprofiled(timeout)
+            return await self._wait_for_completion_unprofiled(timeout)
+
+        async def _wait_for_completion_unprofiled(
+            self, timeout: float | None = None
+        ) -> bool:
             start_time = time.time()
 
             while True:
@@ -1520,6 +1790,7 @@ async def create_controller(
     checkpoint_config: CheckpointConfig | None = None,
     runtime_env: dict[str, Any] | None = None,
     transport_config: dict[str, str] | None = None,
+    profiler_config: Any | None = None,
 ) -> Any:
     """
     Create and initialize a Controller actor.
@@ -1533,6 +1804,7 @@ async def create_controller(
         checkpoint_config: Optional checkpoint configuration
         runtime_env: Optional Ray runtime environment
         transport_config: Optional data plane transport backend per SPMD (e.g. {"*": "ray"})
+        profiler_config: Optional profiler runtime configuration
 
     Returns:
         Controller actor handle
@@ -1550,6 +1822,7 @@ async def create_controller(
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
         transport_config=transport_config,
+        profiler_config=profiler_config,
     )
 
     # Initialize the actor

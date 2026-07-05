@@ -45,6 +45,8 @@ from fluxway.spmd.driver.state_machine import DriverStateMachine
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 from fluxway.spmd.driver.monitor import SPMDMonitor
 from fluxway.spmd.worker import SPMDWorker
+from fluxway.profiler import ProfilerRuntimeFactory
+from fluxway.profiler.recorder import DRIVER_REGISTER_TOPOLOGY
 
 from fluxway.common.utils.logging import get_logger
 
@@ -155,6 +157,14 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self._pending_snapshot_id: str | None = None
             self._pending_target_step_count: int | None = None
             self._pending_ckpt_dir: str | None = None
+            profiler_config = getattr(config, "profiler_config", None)
+            self._profiler_runtime = ProfilerRuntimeFactory.from_config(
+                profiler_config,
+                process_name=f"driver/{self.spmd_id}",
+            )
+            self._profile_heartbeat = (
+                self._profiler_runtime.heartbeat_diagnostics_enabled()
+            )
 
             logger.debug(
                 f"Driver initialized spmd_id={spmd_id} num_workers={config.num_workers}"
@@ -183,6 +193,18 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             Returns:
                 True if workers were started successfully
             """
+            profiler_recorder = (
+                self._profiler_runtime.recorder
+                if self._profiler_runtime.enabled
+                else None
+            )
+            if profiler_recorder is not None:
+                span = profiler_recorder.driver_initialize(
+                    worker_count=self.config.num_workers
+                )
+                await span.__aenter__()
+            else:
+                span = None
             try:
                 logger.debug(f"Initializing SPMD spmd_id={self.spmd_id}")
 
@@ -222,6 +244,9 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 logger.error(f"Initialization failed error={e} spmd_id={self.spmd_id}")
                 self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
                 return False
+            finally:
+                if span is not None:
+                    await span.__aexit__(None, None, None)
 
         def _build_worker_opts(self, bundle_idx: int, name: str) -> dict[str, Any]:
             """Build .options() kwargs for a worker actor."""
@@ -244,52 +269,92 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
         async def _start_workers(self) -> None:
             """Start all worker actors."""
+            profiler_recorder = (
+                self._profiler_runtime.recorder
+                if self._profiler_runtime.enabled
+                else None
+            )
+            if profiler_recorder is not None:
+                span = profiler_recorder.driver_start_workers(
+                    worker_count=self.config.num_workers
+                )
+                await span.__aenter__()
+            else:
+                span = None
 
             # Get self handle for registering with workers
-            self_handle = ray.get_runtime_context().current_actor  # type: ignore
+            try:
+                self_handle = ray.get_runtime_context().current_actor  # type: ignore
 
-            for rank, bundle_idx in enumerate(self.worker_bundle_indices):
-                opts = self._build_worker_opts(
-                    bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}"
-                )
-                worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
-                    config=self.config,
-                    rank=rank,
-                    spmd_id=self.spmd_id,
-                    driver_handle=self_handle,
-                    checkpoint_backend=self._checkpoint_backend,
-                )
+                for rank, bundle_idx in enumerate(self.worker_bundle_indices):
+                    opts = self._build_worker_opts(
+                        bundle_idx, f"spmd_worker_{self.spmd_id}_{rank}"
+                    )
+                    worker = SPMDWorker.options(**opts).remote(  # type: ignore[attr-defined]
+                        config=self.config,
+                        rank=rank,
+                        spmd_id=self.spmd_id,
+                        driver_handle=self_handle,
+                        checkpoint_backend=self._checkpoint_backend,
+                    )
 
-                self._worker_handles[rank] = worker
-                self._recovery_attempts[rank] = 0
-                logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
+                    self._worker_handles[rank] = worker
+                    self._recovery_attempts[rank] = 0
+                    logger.debug(f"Started worker rank={rank} spmd_id={self.spmd_id}")
 
-            # Collect each worker's node_id concurrently without blocking the
-            # event loop.  ray.get(  # type: ignore[reportPossiblyUnboundVariable]) on an async actor would freeze the actor
-            # until all RPCs return, preventing heartbeat processing and
-            # incoming RPC handling during the wait.
-            node_id_refs = {
-                rank: worker.get_node_id.remote()
-                for rank, worker in self._worker_handles.items()
-            }
-            ranks = list(node_id_refs.keys())
-            node_id_values = await asyncio.gather(*node_id_refs.values())
-            node_ids = dict(zip(ranks, node_id_values, strict=True))
-            rank_info = self._compute_rank_info(node_ids)
+                # Collect each worker's node_id concurrently without blocking the
+                # event loop.  ray.get(  # type: ignore[reportPossiblyUnboundVariable]) on an async actor would freeze the actor
+                # until all RPCs return, preventing heartbeat processing and
+                # incoming RPC handling during the wait.
+                node_id_refs = {
+                    rank: worker.get_node_id.remote()
+                    for rank, worker in self._worker_handles.items()
+                }
+                ranks = list(node_id_refs.keys())
+                node_id_values = await asyncio.gather(*node_id_refs.values())
+                node_ids = dict(zip(ranks, node_id_values, strict=True))
+                rank_info = self._compute_rank_info(node_ids)
 
-            # Gather IP of rank 0 to act as rendezvous address
-            if 0 in self._worker_handles:
-                rank0_ip = await self._worker_handles[0].get_node_ip.remote()
-                if rank_info[0]["num_nodes"] == 1:
-                    rank0_ip = "127.0.0.1"
+                # Gather IP of rank 0 to act as rendezvous address
+                if 0 in self._worker_handles:
+                    rank0_ip = await self._worker_handles[0].get_node_ip.remote()
+                    if rank_info[0]["num_nodes"] == 1:
+                        rank0_ip = "127.0.0.1"
 
-                # All ranks must enter `setup_and_start` (and therefore the
-                # operator `__init__` invoked by `_pre_instantiate_operators`)
-                max_retries = 5
-                for attempt in range(max_retries):
-                    rank0_port = await self._worker_handles[0].find_free_port.remote()
-                    rank0_address = f"{rank0_ip}:{rank0_port}"
-                    try:
+                    # All ranks must enter `setup_and_start` (and therefore the
+                    # operator `__init__` invoked by `_pre_instantiate_operators`)
+                    max_retries = 5
+                    for attempt in range(max_retries):
+                        rank0_port = await self._worker_handles[
+                            0
+                        ].find_free_port.remote()
+                        rank0_address = f"{rank0_ip}:{rank0_port}"
+                        try:
+                            await asyncio.gather(
+                                *[
+                                    worker.setup_and_start.remote(
+                                        **rank_info[rank],
+                                        rank0_address=rank0_address,
+                                    )
+                                    for rank, worker in self._worker_handles.items()
+                                ]
+                            )
+                            break
+                        except Exception as e:
+                            if (
+                                "already in use" in str(e).lower()
+                                or "address already in use" in str(e).lower()
+                                or "eaddrinuse" in str(e).lower()
+                            ):
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(0.1 * (2**attempt))
+                                    continue
+                            raise
+                else:
+                    rank0_address = None
+                    # No rank 0 in this SPMD group (degenerate); still launch any
+                    # remaining workers concurrently.
+                    if self._worker_handles:
                         await asyncio.gather(
                             *[
                                 worker.setup_and_start.remote(
@@ -299,35 +364,13 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                                 for rank, worker in self._worker_handles.items()
                             ]
                         )
-                        break
-                    except Exception as e:
-                        if (
-                            "already in use" in str(e).lower()
-                            or "address already in use" in str(e).lower()
-                            or "eaddrinuse" in str(e).lower()
-                        ):
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(0.1 * (2**attempt))
-                                continue
-                        raise
-            else:
-                rank0_address = None
-                # No rank 0 in this SPMD group (degenerate); still launch any
-                # remaining workers concurrently.
-                if self._worker_handles:
-                    await asyncio.gather(
-                        *[
-                            worker.setup_and_start.remote(
-                                **rank_info[rank],
-                                rank0_address=rank0_address,  # type: ignore
-                            )
-                            for rank, worker in self._worker_handles.items()
-                        ]
-                    )
 
-            logger.debug(
-                f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"
-            )
+                logger.debug(
+                    f"All workers started worker_count={len(self._worker_handles)} spmd_id={self.spmd_id}"
+                )
+            finally:
+                if span is not None:
+                    await span.__aexit__(None, None, None)
 
         def _compute_rank_info(
             self, node_ids: dict[int, str]
@@ -371,6 +414,28 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             results = await asyncio.gather(*tasks.values())
             return dict(zip(tasks.keys(), results, strict=True))
 
+        async def export_profiler_snapshots(self) -> dict[Any, Any]:
+            tasks = {
+                rank: worker.export_profiler_snapshot.remote()
+                for rank, worker in self._worker_handles.items()
+            }
+            snapshots: dict[Any, Any] = {}
+            if self._profiler_runtime.enabled:
+                snapshots["driver"] = self._profiler_runtime.snapshot()
+            if not tasks:
+                return {
+                    key: value for key, value in snapshots.items() if value is not None
+                }
+            results = await asyncio.gather(*tasks.values())
+            snapshots.update(
+                {
+                    rank: snapshot
+                    for rank, snapshot in zip(tasks.keys(), results, strict=True)
+                    if snapshot is not None
+                }
+            )
+            return snapshots
+
         def register_topology(
             self,
             predecessor_handlers: dict[
@@ -401,6 +466,11 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 f"predecessor_count={predecessor_count} successor_count={successor_count} "
                 f"spmd_id={self.spmd_id}"
             )
+            if self._profiler_runtime.enabled:
+                self._profiler_runtime.recorder.worker_scheduler_instant(
+                    spec=DRIVER_REGISTER_TOPOLOGY,
+                    payload=(predecessor_count, successor_count),
+                )
 
             # Step 1: Notify workers of expected topology counts
             for worker in self._worker_handles.values():
@@ -488,6 +558,16 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     f"request_drain requires RUNNING state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.driver_drain(
+                    target_step=target_count,
+                    worker_count=len(self._worker_handles),
+                ):
+                    await self._request_drain_unprofiled(target_count)
+                return
+            await self._request_drain_unprofiled(target_count)
+
+        async def _request_drain_unprofiled(self, target_count: int) -> None:
             self._pending_target_step_count = target_count
             self.state_machine.trigger(DriverEvent.DRAIN_REQUESTED)
             await asyncio.gather(
@@ -508,6 +588,23 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     f"request_snapshot requires DRAINED state, "
                     f"got {self.state_machine.state} spmd_id={self.spmd_id}"
                 )
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.driver_snapshot(
+                    snapshot_id=snapshot_id,
+                    target_step=target_count,
+                    worker_count=len(self._worker_handles),
+                ):
+                    await self._request_snapshot_unprofiled(
+                        snapshot_id,
+                        target_count,
+                        ckpt_dir,
+                    )
+                return
+            await self._request_snapshot_unprofiled(snapshot_id, target_count, ckpt_dir)
+
+        async def _request_snapshot_unprofiled(
+            self, snapshot_id: str, target_count: int, ckpt_dir: str
+        ) -> None:
             self.state_machine.trigger(DriverEvent.SNAPSHOT_REQUESTED)
             self._pending_snapshot_id = snapshot_id
             self._pending_target_step_count = target_count
@@ -702,6 +799,20 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                               ``static_args``) shared by all ranks.
                 rank_storage: Per-rank physical storage paths keyed by integer rank.
             """
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.driver_restore(
+                    snapshot_id="restore_from_disk",
+                    worker_count=len(self._worker_handles),
+                ):
+                    await self._restore_from_disk_unprofiled(spmd_state, rank_storage)
+                return
+            await self._restore_from_disk_unprofiled(spmd_state, rank_storage)
+
+        async def _restore_from_disk_unprofiled(
+            self,
+            spmd_state: dict[str, Any],
+            rank_storage: dict[int, dict[str, Any]],
+        ) -> None:
             self.spmd_synchronizer.load_spmd_state(spmd_state)
 
             tasks = [
@@ -732,6 +843,15 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
             self._worker_heartbeats[rank] = heartbeat
             self._worker_heartbeat_times[rank] = time.time()
+            if self._profile_heartbeat:
+                self._profiler_runtime.recorder.driver_worker_heartbeat(
+                    rank=rank,
+                    status=heartbeat.status.name,
+                    completed_count=sum(heartbeat.completed_step_count.values()),
+                    mailbox_full=bool(
+                        heartbeat.mailbox_status and heartbeat.mailbox_status.is_full
+                    ),
+                )
             logger.heartbeat(
                 f"Received worker heartbeat rank={rank} "
                 f"status={heartbeat.status.name} completed_count={heartbeat.completed_step_count} "
@@ -825,6 +945,12 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 )
                 return
 
+            if self._profiler_runtime.enabled:
+                self._profiler_runtime.recorder.driver_op_completion(
+                    rank=rank,
+                    op_name=op_name,
+                    step=step,
+                )
             self.spmd_synchronizer.report_worker_op_completed(rank, op_name, step)
 
         def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
@@ -1005,10 +1131,16 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 and heartbeat_thread.is_alive()
                 and heartbeat_thread is not threading.current_thread()
             ):
-                await asyncio.to_thread(
-                    heartbeat_thread.join,
-                    self._heartbeat_config.heartbeat_interval + 1.0,
-                )
+                timeout = self._heartbeat_config.heartbeat_interval + 1.0
+                if self._profile_heartbeat:
+                    async with (
+                        self._profiler_runtime.recorder.driver_heartbeat_thread_join(
+                            timeout_ms=int(timeout * 1000),
+                        )
+                    ):
+                        await asyncio.to_thread(heartbeat_thread.join, timeout)
+                else:
+                    await asyncio.to_thread(heartbeat_thread.join, timeout)
                 if heartbeat_thread.is_alive():
                     logger.warning(
                         f"Heartbeat thread did not terminate within timeout spmd_id={self.spmd_id}"
@@ -1286,6 +1418,15 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     )
 
         async def start_source_operators(self) -> None:
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.driver_source_start(
+                    worker_count=len(self._worker_handles),
+                ):
+                    await self._start_source_operators_unprofiled()
+                return
+            await self._start_source_operators_unprofiled()
+
+        async def _start_source_operators_unprofiled(self) -> None:
             self._source_state = ReaderState.READING
             tasks = [
                 worker.start_source_operators.remote()

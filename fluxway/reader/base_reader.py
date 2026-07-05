@@ -15,7 +15,14 @@ class BaseReader:
     in the computational graph.
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        name: str = "",
+        mesh: Any = None,
+        runtime_env: Any = None,
+        resource: Any = None,
+        **kwargs: Any,
+    ):
         # Metadata injected by the framework:
         # self.spmd_id: str
         # self.rank: int

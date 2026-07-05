@@ -11,8 +11,10 @@ Uses asyncio for non-blocking monitoring loop.
 """
 
 import asyncio
+from contextlib import AbstractAsyncContextManager
 import time
 from collections.abc import Awaitable, Callable
+from typing import Protocol
 
 from fluxway.common.types import (
     DriverHeartbeat,
@@ -33,6 +35,12 @@ SyncRecoverCallback = Callable[[str], None]
 AsyncRecoverCallback = Callable[[str], Awaitable[None]]
 
 
+class HeartbeatObserver(Protocol):
+    def monitor_loop(self, *, spmd_count: int) -> AbstractAsyncContextManager[None]: ...
+
+    def timeout_check(self, *, spmd_id: str, elapsed_ms: int) -> None: ...
+
+
 class HeartbeatManager:
     """
     Manages heartbeats from all SPMD drivers.
@@ -48,6 +56,7 @@ class HeartbeatManager:
         on_all_workers_running: SyncCallback | AsyncCallback | None = None,
         on_driver_error: SyncErrorCallback | AsyncErrorCallback | None = None,
         on_driver_recovered: SyncRecoverCallback | AsyncRecoverCallback | None = None,
+        observer: HeartbeatObserver | None = None,
     ):
         """
         Initialize HeartbeatManager.
@@ -65,6 +74,7 @@ class HeartbeatManager:
         self._on_all_workers_running = on_all_workers_running
         self._on_driver_error = on_driver_error
         self._on_driver_recovered = on_driver_recovered
+        self._observer = observer
 
         # Registered SPMD IDs that we expect heartbeats from
         self._registered_spmds: set[str] = set()
@@ -421,7 +431,13 @@ class HeartbeatManager:
 
         while self._monitoring:
             try:
-                await self._check_heartbeat_timeouts()
+                if self._observer is None:
+                    await self._check_heartbeat_timeouts()
+                else:
+                    async with self._observer.monitor_loop(
+                        spmd_count=len(self._registered_spmds),
+                    ):
+                        await self._check_heartbeat_timeouts()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -450,6 +466,11 @@ class HeartbeatManager:
                         f"Heartbeat check spmd_id={spmd_id} result=no_heartbeat "
                         f"missed={missed}/{self._config.max_missed_heartbeats}"
                     )
+                    if self._observer is not None:
+                        self._observer.timeout_check(
+                            spmd_id=spmd_id,
+                            elapsed_ms=0,
+                        )
                 elif (
                     current_time - heartbeat.timestamp > self._config.heartbeat_timeout
                 ):
@@ -464,6 +485,11 @@ class HeartbeatManager:
                         f"age={age:.2f}s timeout={self._config.heartbeat_timeout}s "
                         f"missed={missed}/{self._config.max_missed_heartbeats}"
                     )
+                    if self._observer is not None:
+                        self._observer.timeout_check(
+                            spmd_id=spmd_id,
+                            elapsed_ms=int(age * 1000),
+                        )
                 else:
                     # Heartbeat is healthy
                     age = current_time - heartbeat.timestamp

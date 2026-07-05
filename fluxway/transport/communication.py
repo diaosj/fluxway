@@ -1882,11 +1882,18 @@ class TransportReceiver:
     Periodic:            async for count in receiver: ...  +  receiver.close()
     """
 
-    def __init__(self, wait_for_n_slices: int = 1, periodic: bool = False):
+    def __init__(
+        self,
+        wait_for_n_slices: int = 1,
+        periodic: bool = False,
+        profiler_recorder: Any | None = None,
+    ):
         from fluxway.common.sync import ArrivalBarrier
 
         self._barrier = ArrivalBarrier(wait_for_n_slices, periodic=periodic)
         self._periodic = periodic
+        self._wait_for_n_slices = wait_for_n_slices
+        self._profiler_recorder = profiler_recorder
 
         # Shared-buffer zero-copy (offset mode)
         self.target_buffers: list[Any] | None = None
@@ -2030,7 +2037,14 @@ class TransportReceiver:
 
     async def wait(self) -> None:
         """One-shot mode: block until all expected slices have arrived."""
-        await self._barrier.wait()
+        if self._profiler_recorder is None:
+            await self._barrier.wait()
+            return
+        async with self._profiler_recorder.transport_receiver_wait(
+            expected_slice_count=self._wait_for_n_slices,
+            periodic=self._periodic,
+        ):
+            await self._barrier.wait()
 
     async def wait_batch(self) -> int:
         """Periodic mode: block until the next batch fires."""
