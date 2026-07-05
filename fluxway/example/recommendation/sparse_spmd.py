@@ -14,6 +14,15 @@ from fluxway.example.recommendation.data_types import LookupOutput
 logger = get_logger(__name__)
 
 
+def _balanced_counts(total: int, shard_count: int) -> list[int]:
+    if total <= 0:
+        raise ValueError(f"total must be positive, got {total}")
+    if shard_count <= 0:
+        raise ValueError(f"shard_count must be positive, got {shard_count}")
+    base, rem = divmod(total, shard_count)
+    return [base + (1 if shard_id < rem else 0) for shard_id in range(shard_count)]
+
+
 @spmd(
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("shard",),
@@ -65,14 +74,21 @@ class SparseEmbeddingSPMD:
             initializer_config=se.Uniform(min_val=-0.01, max_val=0.01),
             optimizer_config=se.Adam(lr=0.01),
         )
+        internal_shard_count = self.store.internal_shard_count()
+        reserve_counts = _balanced_counts(vocab_size, internal_shard_count)
+        self.store.reserve_per_shard(reserve_counts, dim=embed_dim)
+        self._reserved_key_capacity = sum(reserve_counts)
+        self._internal_shard_count = internal_shard_count
         self._forward_keys_cache: dict[int, np.ndarray] = {}
 
         logger.debug(
-            "SparseEmbeddingSPMD_init rank=%s world_size=%s vocab_size=%s embed_dim=%s",
+            "SparseEmbeddingSPMD_init rank=%s world_size=%s vocab_size=%s embed_dim=%s reserve_capacity=%s internal_shards=%s",
             getattr(self, "rank", None),
             getattr(self, "world_size", None),
             vocab_size,
             embed_dim,
+            self._reserved_key_capacity,
+            self._internal_shard_count,
         )
 
     # ------------------------------------------------------------------

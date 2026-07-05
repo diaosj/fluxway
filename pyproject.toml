@@ -33,9 +33,9 @@ classifiers = [
 dependencies = [
     "pydantic",
     "uvloop",
-    "numpy>=1.20.0",
+    "numpy>=1.22,<2.5",
     "ray>=2.0.0",
-    "numba>=0.60.0",
+    "numba>=0.66.0",
 ]
 
 [project.optional-dependencies]

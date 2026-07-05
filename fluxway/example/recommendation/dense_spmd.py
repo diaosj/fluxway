@@ -7,7 +7,7 @@ from flax import nnx
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from numba import njit
 
-from fluxway.common.decorators import spmd, operator
+from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.types.tensor import TransportTensor
 from .data_types import DPFeatures
 
@@ -132,6 +132,7 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("dp",),
 )
+@requires_worker_process
 class DenseSPMD:
     rank: int
     world_size: int

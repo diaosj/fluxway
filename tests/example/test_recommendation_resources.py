@@ -83,3 +83,60 @@ def test_recommendation_train_prints_controller_resource_summary():
     assert any(
         _is_controller_resource_summary_remote_call(node) for node in ast.walk(module)
     ), "train.py should query controller.get_resource_allocation_summary.remote()"
+
+
+def test_sparse_spmd_reserves_embedding_store_capacity():
+    module = _load_module(EXAMPLE_DIR / "sparse_spmd.py")
+    init_fn = next(
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+
+    reserve_calls = [
+        node
+        for node in ast.walk(init_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "reserve_per_shard"
+    ]
+    shard_count_calls = [
+        node
+        for node in ast.walk(init_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "internal_shard_count"
+    ]
+
+    assert reserve_calls, "SparseEmbeddingSPMD should reserve sparse store capacity"
+    assert shard_count_calls, (
+        "SparseEmbeddingSPMD should size reserve counts from internal shard count"
+    )
+
+
+def test_sparse_spmd_balanced_counts_rejects_invalid_capacity():
+    module = _load_module(EXAMPLE_DIR / "sparse_spmd.py")
+    fn = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_balanced_counts"
+    )
+
+    raises = [node for node in ast.walk(fn) if isinstance(node, ast.Raise)]
+    assert len(raises) == 2, "_balanced_counts should reject invalid inputs directly"
+
+
+def test_dense_spmd_marks_jax_distributed_worker_process():
+    module = _load_module(EXAMPLE_DIR / "dense_spmd.py")
+    cls = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "DenseSPMD"
+    )
+
+    decorator_names = {
+        decorator.id
+        for decorator in cls.decorator_list
+        if isinstance(decorator, ast.Name)
+    }
+    assert "requires_worker_process" in decorator_names
