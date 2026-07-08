@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
+from typing import cast
+
 
 import numpy as np
 import pytest
 
+import fluxway as fw
 from fluxway.profiler import (
     CausalClockViolation,
     MissingAxonNativeHlc,
@@ -24,15 +27,19 @@ from fluxway.profiler.hierarchy import (
 from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
 from fluxway.profiler.record import (
     PAYLOAD_START_COLUMN,
+    ProfilerSnapshot,
     TraceArena,
     TraceCarrier,
     TraceEventKind,
+    TraceMetadata,
 )
 from fluxway.profiler.recorder import (
     LOCAL_STEP_WAIT_INPUTS,
     WORKER_RUN_LOOP,
     TraceRecorder,
 )
+from fluxway.profiler.user_api import activate_user_profiler
+from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.filtering import filter_steady_state_records
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
@@ -136,6 +143,7 @@ async def test_user_callable_execute_records_step_function_and_input_names(tmp_p
             resource_id=1,
             operator_name="lookup",
             operator_step=9,
+            operator_rank=0,
             debug_tensor_names=("ids", "weights"),
             debug_control_names=("lr",),
             debug_static_names=("training",),
@@ -203,6 +211,94 @@ async def test_trace_recorder_skips_step_level_records_below_threshold():
     ]
     assert names.count("worker.run_loop") == 1
     assert names.count("local_step.wait_inputs") == 1
+
+
+def test_user_profiler_disabled_is_noop_without_attr_validation():
+    assert fw.profiler.enabled() is False
+    fw.profiler.event("outside", payload=object())
+    with fw.profiler.scope("outside", payload=object()):
+        pass
+
+
+def test_user_profiler_scope_event_record_readable_payload():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    with activate_user_profiler(
+        recorder=recorder,
+        op_name="lookup",
+        step=3,
+        rank=2,
+        lane="inline_sync",
+    ):
+        assert fw.profiler.enabled() is True
+        with fw.profiler.scope("embedding_lookup", table="item", id_count=17):
+            pass
+        fw.profiler.event("cache_hit", hit=True)
+
+    metadata = recorder.metadata
+    rows = recorder.arena.snapshot()
+    names = [metadata.name_for(int(row[4])) for row in rows]
+    assert names == ["user.embedding_lookup", "user.cache_hit"]
+
+    event_id = recorder.intern("user.embedding_lookup")
+    fields = metadata.payload_fields_for(event_id)
+    row = rows[0]
+    payload = row[PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(fields)]
+    values = dict(zip(fields, payload, strict=True))
+    assert metadata.name_for(int(values["op_id"])) == "lookup"
+    assert int(values["step"]) == 3
+    assert int(values["rank"]) == 2
+    assert metadata.name_for(int(values["lane_id"])) == "inline_sync"
+    assert metadata.name_for(int(values["attrs_id"])) == (
+        '{"id_count":17,"table":"item"}'
+    )
+
+
+def test_user_profiler_enabled_rejects_invalid_inputs():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    with activate_user_profiler(
+        recorder=recorder,
+        op_name="lookup",
+        step=0,
+        rank=0,
+        lane="inline_sync",
+    ):
+        with pytest.raises(ValueError, match="non-empty"):
+            fw.profiler.event("")
+        with pytest.raises(ValueError, match="reserved"):
+            fw.profiler.event("bad", step=0)
+        with pytest.raises(TypeError, match="str, int, float, bool, or None"):
+            fw.profiler.event("bad", payload=object())
+
+
+def test_user_profiler_skip_initial_steps_applies_to_custom_records():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+        skip_initial_steps=2,
+    )
+    for step in (1, 2):
+        with activate_user_profiler(
+            recorder=recorder,
+            op_name="lookup",
+            step=step,
+            rank=0,
+            lane="inline_sync",
+        ):
+            fw.profiler.event("cache_hit", step_value=step)
+
+    names = [
+        recorder.metadata.name_for(int(row[4])) for row in recorder.arena.snapshot()
+    ]
+    assert names == ["user.cache_hit"]
 
 
 @pytest.mark.asyncio
@@ -475,6 +571,115 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
     assert annotations["control_names_id"] == "lr"
     assert annotations["static_names_id"] == "training"
     assert annotations["lane_id"] == "inline_async"
+
+
+def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    # pyrefly: ignore [missing-import]
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as proto
+
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    with activate_user_profiler(
+        recorder=recorder,
+        op_name="lookup",
+        step=4,
+        rank=1,
+        lane="inline_sync",
+    ):
+        with fw.profiler.scope(
+            "embedding_lookup",
+            table="item",
+            id_count=19,
+            hit=True,
+            ratio=0.5,
+            optional=None,
+        ):
+            pass
+
+    path = Path(tmp_path) / "trace.pftrace"
+    PerfettoTraceWriter().write(
+        recorder.arena.snapshot(),
+        path,
+        metadata=recorder.metadata,
+    )
+
+    trace = proto.Trace()
+    trace.ParseFromString(path.read_bytes())
+    annotations = {}
+    for packet in trace.packet:
+        event = packet.track_event
+        if event.name != "user.embedding_lookup":
+            continue
+        for annotation in event.debug_annotations:
+            if annotation.HasField("string_value"):
+                annotations[annotation.name] = annotation.string_value
+            elif annotation.HasField("int_value"):
+                annotations[annotation.name] = int(annotation.int_value)
+            elif annotation.HasField("bool_value"):
+                annotations[annotation.name] = bool(annotation.bool_value)
+            elif annotation.HasField("double_value"):
+                annotations[annotation.name] = float(annotation.double_value)
+        break
+
+    assert annotations["op_id"] == "lookup"
+    assert annotations["step"] == 4
+    assert annotations["rank"] == 1
+    assert annotations["lane_id"] == "inline_sync"
+    assert annotations["table"] == "item"
+    assert annotations["id_count"] == 19
+    assert annotations["hit"] is True
+    assert annotations["ratio"] == 0.5
+    assert annotations["optional"] == "null"
+    assert "attrs_id" not in annotations
+
+
+def test_merge_profiler_snapshots_applies_offsets_and_rejects_metadata_conflicts():
+    first = TraceRecorder(
+        TraceArena(buffer_bytes=4 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    second = TraceRecorder(
+        TraceArena(buffer_bytes=4 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    first.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
+    second.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
+    first_snapshot = first.snapshot()
+    second_snapshot = second.snapshot()
+    second_snapshot["monotonic_to_epoch_offset_ns"] = 100
+
+    merged = merge_profiler_snapshots(
+        (first_snapshot, second_snapshot),
+        process_name="worker/spmd/rank:0",
+    )
+
+    assert merged is not None
+    assert merged["monotonic_to_epoch_offset_ns"] == 0
+    assert len(merged["records"]) == 2
+    assert int(merged["records"][1, 1]) == int(second_snapshot["records"][0, 1]) + 100
+
+    conflict_a = cast(ProfilerSnapshot, dict(first_snapshot))
+    conflict_b = cast(ProfilerSnapshot, dict(second_snapshot))
+    conflict_a["metadata"] = TraceMetadata(
+        names_by_id={1: "first"},
+        payload_fields_by_name_id={},
+    )
+    conflict_b["metadata"] = TraceMetadata(
+        names_by_id={1: "second"},
+        payload_fields_by_name_id={},
+    )
+    with pytest.raises(ValueError, match="metadata name id conflict"):
+        merge_profiler_snapshots(
+            (conflict_a, conflict_b),
+            process_name="worker/spmd/rank:0",
+        )
 
 
 @dataclass

@@ -10,6 +10,7 @@ from fluxway.profiler.errors import (
 )
 from fluxway.profiler.record import TraceCarrier, TraceEventKind, TraceMetadata
 from fluxway.profiler.runtime import ProfilerRuntimeFactory
+from fluxway.profiler.user_api import enabled, event, scope
 
 __all__ = [
     "CausalClockViolation",
@@ -23,4 +24,7 @@ __all__ = [
     "TraceCarrier",
     "TraceEventKind",
     "TraceMetadata",
+    "enabled",
+    "event",
+    "scope",
 ]

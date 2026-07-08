@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -239,11 +240,42 @@ class PerfettoTraceWriter:
         if terminating_flow_id:
             event.terminating_flow_ids.append(terminating_flow_id)
         for name, value in zip(payload_fields, payload_values, strict=True):
+            payload_value = int(value)
+            if name == "attrs_id":
+                self._write_user_attrs(
+                    event.debug_annotations,
+                    metadata.name_for(payload_value),
+                )
+                continue
             annotation = event.debug_annotations.add()
             annotation.name = name
-            payload_value = int(value)
             if name in INTERNED_PAYLOAD_FIELDS:
                 annotation.string_value = metadata.name_for(payload_value)
             else:
                 annotation.int_value = payload_value
         builder.write_packet(packet)
+
+    @staticmethod
+    def _write_user_attrs(debug_annotations: Any, attrs_json: str) -> None:
+        attrs = json.loads(attrs_json)
+        if not isinstance(attrs, dict):
+            raise ValueError("profiler attrs_id metadata must decode to a JSON object.")
+        for key, value in attrs.items():
+            if not isinstance(key, str):
+                raise ValueError("profiler attrs JSON object keys must be strings.")
+            annotation = debug_annotations.add()
+            annotation.name = key
+            if value is None:
+                annotation.string_value = "null"
+            elif isinstance(value, bool):
+                annotation.bool_value = value
+            elif isinstance(value, int):
+                annotation.int_value = value
+            elif isinstance(value, float):
+                annotation.double_value = value
+            elif isinstance(value, str):
+                annotation.string_value = value
+            else:
+                raise ValueError(
+                    "profiler attrs JSON values must be str, int, float, bool, or null."
+                )

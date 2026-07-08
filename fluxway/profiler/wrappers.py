@@ -6,6 +6,7 @@ from typing import Any
 from fluxway.profiler.clock import AxonNativeHlcBridge, RayFluxwayHlcBridge
 from fluxway.profiler.record import TraceCarrier
 from fluxway.profiler.recorder import TraceRecorder
+from fluxway.profiler.user_api import activate_user_profiler
 from fluxway.rpc.protocol import AxonDataPlane, DataPlaneCallable, RayActorDataPlane
 from fluxway.transport.manifest import FRAME_EDGE_COUNT, FRAME_PAYLOAD_COUNT, FRAME_STEP
 
@@ -270,25 +271,38 @@ class TracingUserCallableExecutor:
     async def execute(self, spec: Any) -> Any:
         lane = self._delegate._lane_for(spec)
         lane_value = str(getattr(lane, "value", lane))
+        op_name = str(
+            getattr(spec, "operator_name", None) or getattr(spec, "callable_id", "")
+        )
+        step = self._operator_step(spec)
+        rank = self._operator_rank(spec)
         async with self._recorder.user_callable_execute(
             callable_id=str(getattr(spec, "callable_id", "")),
             function_name=self._function_name(spec),
-            op_name=str(
-                getattr(spec, "operator_name", None) or getattr(spec, "callable_id", "")
-            ),
-            step=self._operator_step(spec),
+            op_name=op_name,
+            step=step,
             tensor_names=self._joined_names(getattr(spec, "debug_tensor_names", ())),
             control_names=self._joined_names(getattr(spec, "debug_control_names", ())),
             static_names=self._joined_names(getattr(spec, "debug_static_names", ())),
             lane=lane_value,
         ):
-            return await self._execute_selected_lane(spec, lane_value)
+            with activate_user_profiler(
+                recorder=self._recorder,
+                op_name=op_name,
+                step=step,
+                rank=rank,
+                lane=lane_value,
+            ):
+                return await self._execute_selected_lane(spec, lane_value)
 
     def actor_owned_operator_names(self) -> set[str | None]:
         return self._delegate.actor_owned_operator_names()
 
     async def drain(self) -> None:
         return await self._delegate.drain()
+
+    async def export_profiler_snapshots(self) -> tuple[Any, ...]:
+        return await self._delegate.export_profiler_snapshots()
 
     async def trigger_snapshot_begin(self, spmd_dir: str) -> None:
         async with self._recorder.user_callable_snapshot_hook(
@@ -343,7 +357,16 @@ class TracingUserCallableExecutor:
     @staticmethod
     def _operator_step(spec: Any) -> int:
         step = getattr(spec, "operator_step", None)
-        return -1 if step is None else int(step)
+        if step is None:
+            raise ValueError("traced user callable execution requires operator_step.")
+        return int(step)
+
+    @staticmethod
+    def _operator_rank(spec: Any) -> int:
+        rank = getattr(spec, "operator_rank", None)
+        if rank is None:
+            raise ValueError("traced user callable execution requires operator_rank.")
+        return int(rank)
 
     @staticmethod
     def _function_name(spec: Any) -> str:

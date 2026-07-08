@@ -17,6 +17,8 @@ from typing import Any
 
 import ray
 
+from fluxway.profiler.runtime import ProfilerRuntimeFactory
+from fluxway.profiler.user_api import activate_user_profiler
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
 
 
@@ -117,16 +119,37 @@ class _RayFunctionExecutionActor:
         fn: Callable[..., Any],
         save_state: Callable[[str], Any] | None,
         restore_state: Callable[[Any, str], None] | None,
+        profiler_config: Any | None,
+        profiler_process_name: str,
     ) -> None:
         self._fn = fn
         self._save_state = save_state
         self._restore_state = restore_state
+        self._profiler_runtime = ProfilerRuntimeFactory.from_config(
+            profiler_config,
+            process_name=profiler_process_name,
+        )
 
-    async def execute(self) -> Any:
+    async def execute(self, op_name: str, step: int, rank: int) -> Any:
+        if self._profiler_runtime.enabled:
+            with activate_user_profiler(
+                recorder=self._profiler_runtime.recorder,
+                op_name=op_name,
+                step=step,
+                rank=rank,
+                lane=UserCallableLane.RAY_EXECUTION_ACTOR.value,
+            ):
+                return await self._execute_inner()
+        return await self._execute_inner()
+
+    async def _execute_inner(self) -> Any:
         result = self._fn()
         if inspect.isawaitable(result):
             result = await result
         return result
+
+    async def export_profiler_snapshot(self) -> Any:
+        return self._profiler_runtime.snapshot()
 
     async def on_snapshot_begin(self, spmd_dir: str) -> None:
         instance = self._bound_instance()
@@ -171,6 +194,8 @@ class _RayOperatorExecutionActor:
         num_nodes: int,
         rank0_address: str | None,
         owner_classes: tuple[tuple[str, str, type], ...],
+        profiler_config: Any | None,
+        profiler_process_name: str,
     ) -> None:
         from fluxway.spmd.worker.operator_manager import OperatorManager
         from fluxway.spmd.worker.worker import SPMDWorker
@@ -187,6 +212,11 @@ class _RayOperatorExecutionActor:
             rank0_address=rank0_address,
         )
         self._config = config
+        self._rank = rank
+        self._profiler_runtime = ProfilerRuntimeFactory.from_config(
+            profiler_config,
+            process_name=profiler_process_name,
+        )
         self._manager = OperatorManager(
             config,
             rank=rank,
@@ -204,7 +234,19 @@ class _RayOperatorExecutionActor:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Any:
+        if self._profiler_runtime.enabled:
+            with activate_user_profiler(
+                recorder=self._profiler_runtime.recorder,
+                op_name=op_name,
+                step=step,
+                rank=self._rank,
+                lane=UserCallableLane.RAY_EXECUTION_ACTOR.value,
+            ):
+                return await self._manager.execute_async(op_name, step, *args, **kwargs)
         return await self._manager.execute_async(op_name, step, *args, **kwargs)
+
+    async def export_profiler_snapshot(self) -> Any:
+        return self._profiler_runtime.snapshot()
 
     async def save_state(self, op_name: str, ckpt_dir: str) -> Any:
         instance = self._operator_instance(op_name)
@@ -248,9 +290,17 @@ class UserCallableExecutor:
         worker_process_runtime: WorkerProcessCallRuntime,
         sample_count: int = 3,
         sync_latency_threshold_sec: float = 0.010,
+        profiler_config: Any | None = None,
+        profiler_process_name: str | None = None,
     ) -> None:
+        if profiler_config is not None and not profiler_process_name:
+            raise ValueError(
+                "profiler_process_name is required when profiler_config is set."
+            )
         self._sample_count = sample_count
         self._sync_latency_threshold_sec = sync_latency_threshold_sec
+        self._profiler_config = profiler_config
+        self._profiler_process_name = profiler_process_name or ""
         self._profiles: dict[str, _CallableProfile] = defaultdict(
             lambda: _CallableProfile(samples=[])
         )
@@ -279,6 +329,16 @@ class UserCallableExecutor:
 
     async def drain(self) -> None:
         await self._worker_process_runtime.drain()
+
+    async def export_profiler_snapshots(self) -> tuple[Any, ...]:
+        refs = [
+            record.actor.export_profiler_snapshot.remote()
+            for record in self._ray_actors.values()
+        ]
+        if not refs:
+            return ()
+        results = await asyncio.gather(*refs)
+        return tuple(snapshot for snapshot in results if snapshot is not None)
 
     def actor_owned_operator_names(self) -> set[str | None]:
         return {
@@ -419,7 +479,11 @@ class UserCallableExecutor:
         elif spec.is_stateful and spec.operator_name is not None:
             record.operator_names.add(spec.operator_name)
         if record.operator_name is None:
-            return await record.actor.execute.remote()
+            return await record.actor.execute.remote(
+                self._profiler_op_name(spec),
+                self._profiler_step(spec),
+                self._profiler_rank(spec),
+            )
         step = spec.operator_step
         if step is None:
             raise ValueError("stateful operator execution requires operator_step.")
@@ -452,7 +516,11 @@ class UserCallableExecutor:
         if spec.is_stateful and spec.operator_name is not None:
             return self._create_operator_actor(spec)
         actor = _RayFunctionExecutionActor.remote(  # type: ignore
-            spec.fn, spec.save_state, spec.restore_state
+            spec.fn,
+            spec.save_state,
+            spec.restore_state,
+            self._profiler_config,
+            self._profiler_process_name,
         )
         return _ActorRecord(
             actor=actor,
@@ -476,6 +544,8 @@ class UserCallableExecutor:
             spec.num_nodes,
             spec.rank0_address,
             spec.operator_owner_classes,
+            self._profiler_config,
+            self._profiler_process_name,
         )
         return _ActorRecord(
             actor=actor,
@@ -483,3 +553,19 @@ class UserCallableExecutor:
             operator_name=spec.operator_name,
             operator_names={spec.operator_name},
         )
+
+    @staticmethod
+    def _profiler_op_name(spec: UserCallableSpec) -> str:
+        return spec.operator_name or spec.callable_id
+
+    @staticmethod
+    def _profiler_step(spec: UserCallableSpec) -> int:
+        if spec.operator_step is None:
+            raise ValueError("ray execution actor profiling requires operator_step.")
+        return spec.operator_step
+
+    @staticmethod
+    def _profiler_rank(spec: UserCallableSpec) -> int:
+        if spec.operator_rank is None:
+            raise ValueError("ray execution actor profiling requires operator_rank.")
+        return spec.operator_rank

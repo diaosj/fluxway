@@ -62,6 +62,7 @@ from fluxway.control_plane import GraphParser, Builder
 
 # Import runner
 from fluxway.runner import launch
+from fluxway import profiler
 
 __all__ = [
     # Version
@@ -72,6 +73,7 @@ __all__ = [
     "data_type",
     "spmd",
     "operator",
+    "profiler",
     "requires_worker_process",
     "bind_spmd",
     # Types

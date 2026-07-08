@@ -142,6 +142,13 @@ local-step span 和 data-plane span 分层显示：
 `send_output` 与 `await_send` 用 `(source_spmd_code, source_rank, op_id, step)` 关联；batch 级分析再加 `target_spmd_id`, `target_rank`, `batch_seq`。
 `user_callable.execute` 记录 callable/function/operator 名称、`ctx.step`、输入 tensor/control/static 名称和 lane，字段以 interned id 写入 trace metadata。
 
+用户函数内部的细分插桩使用 `fw.profiler.scope(name, **attrs)` 和
+`fw.profiler.event(name, **attrs)`。它们记录为 `user.<name>`，显示在
+`compute/user_custom/<lane>`，并继承当前 operator 的 `op_id`, `step`,
+`rank`, `lane_id` 关联信息。它们只用于标记 User CALL 内部子阶段，不替代
+外层自动记录的 `user_callable.execute`。详细用法见
+[`docs/user_profiler.md`](user_profiler.md)。
+
 ## Recommendation Training Pattern
 
 大规模稀疏 embedding 推荐训练的目标是：

@@ -4,6 +4,7 @@ import asyncio
 import numpy as np
 import sparse_embedding as se  # type: ignore
 
+import fluxway as fw
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.index_descriptor import ExplicitIndex
@@ -272,8 +273,19 @@ class InputSPMD:
             group_name="item",
         )
 
-        (u_user, inv_user), (u_item, inv_item) = await asyncio.gather(
-            user_task, item_task
+        with fw.profiler.scope(
+            "input_process.sparse_unique",
+            dp_rank=self.rank,
+            dp_world_size=self.world_size,
+        ):
+            (u_user, inv_user), (u_item, inv_item) = await asyncio.gather(
+                user_task, item_task
+            )
+
+        fw.profiler.event(
+            "input_process.unique_ready",
+            unique_user_count=int(u_user.flat_values.size),
+            unique_item_count=int(u_item.flat_values.size),
         )
 
         print(

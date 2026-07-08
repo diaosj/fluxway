@@ -109,6 +109,7 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
 )
 from fluxway.profiler import ProfilerRuntimeFactory
 from fluxway.profiler.record import ProfilerSnapshot
+from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.recorder import (
     LOCAL_STEP_AWAIT_SEND,
     LOCAL_STEP_CALL_USER,
@@ -507,9 +508,10 @@ class SPMDWorker:
         self._run_task: asyncio.Task | None = None
         self._background_tasks: set[asyncio.Task] = set()
         profiler_config = getattr(self.config, "__dict__", {}).get("profiler_config")
+        profiler_process_name = f"worker/{self.spmd_id}/rank:{self.rank}"
         self._profiler_runtime = ProfilerRuntimeFactory.from_config(
             profiler_config,
-            process_name=f"worker/{self.spmd_id}/rank:{self.rank}",
+            process_name=profiler_process_name,
         )
         self._mailbox = self._profiler_runtime.worker_mailbox(self._mailbox)
         self._mailbox.set_ready_callback(self._on_step_ready)
@@ -524,8 +526,11 @@ class SPMDWorker:
         user_callable_executor = self._profiler_runtime.user_callable_executor(
             UserCallableExecutor(
                 worker_process_runtime=self._worker_process_call_runtime,
+                profiler_config=profiler_config,
+                profiler_process_name=profiler_process_name,
             )
         )
+        self._user_callable_executor = user_callable_executor
         self._local_step_plan_executor = (
             self._profiler_runtime.local_step_plan_executor(
                 LocalStepPlanExecutor(user_callable_executor)
@@ -2548,7 +2553,7 @@ class SPMDWorker:
             operator_step=step,
             operator_args=operator_args,
             operator_kwargs=operator_kwargs,
-            operator_rank=self.rank if is_stateful else None,
+            operator_rank=self.rank,
             operator_spmd_id=self.spmd_id if is_stateful else "",
             local_rank=self.local_rank if is_stateful else None,
             local_world_size=self.local_world_size if is_stateful else None,
@@ -4883,7 +4888,11 @@ class SPMDWorker:
 
     async def export_profiler_snapshot(self) -> ProfilerSnapshot | None:
         await self._drain_outbound_tasks()
-        return self._profiler_runtime.snapshot()
+        actor_snapshots = await self._user_callable_executor.export_profiler_snapshots()
+        return merge_profiler_snapshots(
+            (self._profiler_runtime.snapshot(), *actor_snapshots),
+            process_name=f"worker/{self.spmd_id}/rank:{self.rank}",
+        )
 
     # =========================================================================
     # Utility

@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+import fluxway as fw
+from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.spmd.worker.user_callable_executor import (
     UserCallableExecutor,
     UserCallableLane,
@@ -18,6 +20,12 @@ def _make_executor(*, max_workers: int = 1) -> UserCallableExecutor:
     return UserCallableExecutor(
         worker_process_runtime=WorkerProcessCallRuntime(max_workers=max_workers),
     )
+
+
+def _recorded_event_names(factory: ProfilerRuntimeFactory) -> list[str]:
+    snapshot = factory.recorder.snapshot()
+    metadata = snapshot["metadata"]
+    return [metadata.name_for(int(row[4])) for row in snapshot["records"]]
 
 
 def test_ray_operator_execution_actor_accepts_rank0_address_context():
@@ -180,3 +188,100 @@ async def test_worker_process_runtime_parallel_when_thread_safe_resource_allows_
     runtime.close()
 
     assert started == 2
+
+
+@pytest.mark.asyncio
+async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
+    runtime = WorkerProcessCallRuntime(max_workers=1)
+    executor = UserCallableExecutor(worker_process_runtime=runtime)
+    factory = ProfilerRuntimeFactory.from_config(
+        ProfilerConfig(trace_dir=str(tmp_path), run_id="run"),
+        process_name="worker/spmd/rank:0",
+    )
+    wrapped = factory.user_callable_executor(executor)
+
+    async def inline_async() -> int:
+        with fw.profiler.scope("inline_async", lane="inline_async"):
+            return 1
+
+    def inline_sync() -> int:
+        with fw.profiler.scope("inline_sync", lane="inline_sync"):
+            return 2
+
+    def worker_process() -> int:
+        with fw.profiler.scope("worker_process", lane="worker_process"):
+            return 3
+
+    await wrapped.execute(
+        UserCallableSpec(
+            callable_id="inline_async",
+            fn=inline_async,
+            is_stateful=False,
+            resource_id=1,
+            operator_name="inline_async",
+            operator_step=1,
+            operator_rank=0,
+        )
+    )
+    await wrapped.execute(
+        UserCallableSpec(
+            callable_id="inline_sync",
+            fn=inline_sync,
+            is_stateful=False,
+            resource_id=1,
+            operator_name="inline_sync",
+            operator_step=1,
+            operator_rank=0,
+        )
+    )
+    await wrapped.execute(
+        UserCallableSpec(
+            callable_id="worker_process",
+            fn=worker_process,
+            is_stateful=False,
+            resource_id=1,
+            operator_name="worker_process",
+            operator_step=1,
+            operator_rank=0,
+            process_affine=True,
+        )
+    )
+
+    runtime.close()
+
+    names = _recorded_event_names(factory)
+    assert "user.inline_async" in names
+    assert "user.inline_sync" in names
+    assert "user.worker_process" in names
+
+
+@pytest.mark.asyncio
+async def test_user_profiler_context_propagates_to_local_free_thread_lane(tmp_path):
+    runtime = WorkerProcessCallRuntime(max_workers=1)
+    executor = UserCallableExecutor(worker_process_runtime=runtime)
+    executor._free_threading_enabled = True
+    factory = ProfilerRuntimeFactory.from_config(
+        ProfilerConfig(trace_dir=str(tmp_path), run_id="run"),
+        process_name="worker/spmd/rank:0",
+    )
+    wrapped = factory.user_callable_executor(executor)
+
+    def local_free_thread() -> int:
+        with fw.profiler.scope("local_free_thread", lane="local_free_thread"):
+            return 4
+
+    await wrapped.execute(
+        UserCallableSpec(
+            callable_id="local_free_thread",
+            fn=local_free_thread,
+            is_stateful=False,
+            resource_id=1,
+            operator_name="local_free_thread",
+            operator_step=1,
+            operator_rank=0,
+        )
+    )
+
+    runtime.close()
+
+    assert "user.local_free_thread" in _recorded_event_names(factory)

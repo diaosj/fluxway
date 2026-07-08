@@ -207,3 +207,9 @@ For short runs:
 
 Profiler filtering is centralized in the recorder/export layer. Call sites do
 not branch on step filters.
+
+For user-defined subregions inside an operator, use
+[`fw.profiler.scope/event`](user_profiler.md). These records appear below
+`compute/user_custom/<lane>` and are interpreted as subphases of the surrounding
+`user_callable.execute` span. Do not wrap the whole operator with a custom
+scope; Fluxway already records that outer call.

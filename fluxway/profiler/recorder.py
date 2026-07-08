@@ -312,6 +312,7 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
     ),
     "step",
 )
+USER_CUSTOM_PAYLOAD_FIELDS = ("op_id", "step", "rank", "lane_id", "attrs_id")
 WORKER_PROCESS_CALL_SUBMIT = TraceEventSpec(
     "worker_process_call.submit",
     "compute/user_callable_runtime",
@@ -1083,6 +1084,57 @@ class TraceRecorder:
                 self.intern(static_names),
                 self.intern(lane),
             ),
+        )
+
+    def user_custom_scope(
+        self,
+        *,
+        name: str,
+        op_name: str,
+        step: int,
+        rank: int,
+        lane: str,
+        attrs_json: str,
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            self._user_custom_spec(name=name, lane=lane),
+            payload=(
+                self.intern(op_name),
+                step,
+                rank,
+                self.intern(lane),
+                self.intern(attrs_json),
+            ),
+        )
+
+    def user_custom_event(
+        self,
+        *,
+        name: str,
+        op_name: str,
+        step: int,
+        rank: int,
+        lane: str,
+        attrs_json: str,
+    ) -> None:
+        self._instant(
+            self._user_custom_spec(name=name, lane=lane),
+            payload=(
+                self.intern(op_name),
+                step,
+                rank,
+                self.intern(lane),
+                self.intern(attrs_json),
+            ),
+        )
+
+    @staticmethod
+    def _user_custom_spec(*, name: str, lane: str) -> TraceEventSpec:
+        return TraceEventSpec(
+            name,
+            f"compute/user_custom/{lane}",
+            USER_CUSTOM_PAYLOAD_FIELDS,
+            "step",
         )
 
     def worker_process_submit(
