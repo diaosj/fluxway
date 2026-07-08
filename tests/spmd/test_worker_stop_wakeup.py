@@ -11,26 +11,39 @@ Uses lightweight stubs (no Ray actors) matching the pattern in test_drain_barrie
 
 import asyncio
 import types
+import typing
+from unittest.mock import AsyncMock
 
 import pytest
 
-from fluxway.spmd.worker.worker import SPMDWorker as _ActorCls
+from fluxway.spmd.worker.worker import LocalInputPrepareRuntime, SPMDWorker as _ActorCls
 
 
 def _make_worker_stub():
-    raw_cls = _ActorCls.__ray_actor_class__
+    raw_cls = _ActorCls.__ray_actor_class__  # type: ignore[reportAttributeAccessIssue]
     stub = types.SimpleNamespace(
         _running=True,
         _driver_handle=None,
-        _drain_target_count=5,
+        _drain_target_count=typing.cast(int | None, 5),
         _drain_cond=asyncio.Condition(),
         _execution_queue=asyncio.PriorityQueue(),
         _run_task=None,
         _heartbeat_task=None,
-        _background_tasks=[],
+        _background_tasks=set(),
         _outbound_tasks=set(),
+        _send_tasks=set(),
+        _plan_tasks=set(),
         spmd_id="test_spmd",
         rank=0,
+    )
+    stub._input_prepare_runtime = LocalInputPrepareRuntime(
+        background_tasks=stub._background_tasks,
+        on_task_done=lambda _task: None,
+    )
+    stub._delivery_runtime = types.SimpleNamespace(cancel_pending=AsyncMock())
+    stub._worker_process_call_runtime = types.SimpleNamespace(
+        cancel_pending=AsyncMock(),
+        close=lambda: None,
     )
     stub.stop = types.MethodType(raw_cls.stop, stub)
     return stub
@@ -48,7 +61,7 @@ class TestStopWakesDrainCondition:
 
         async def blocked_on_drain():
             async with stub._drain_cond:
-                while stub._drain_target_count is not None:
+                while stub._drain_target_count is not None:  # type: ignore[reportUnnecessaryComparison]
                     await stub._drain_cond.wait()
             woke_up.set()
 
@@ -60,7 +73,7 @@ class TestStopWakesDrainCondition:
 
         await asyncio.sleep(0.02)
         assert woke_up.is_set()
-        assert stub._drain_target_count is None
+        assert stub._drain_target_count is None  # type: ignore[reportUnnecessaryComparison]
 
         if not task.done():
             task.cancel()
@@ -76,7 +89,7 @@ class TestStopWakesDrainCondition:
 
         await stub.stop()
 
-        assert stub._drain_target_count is None
+        assert stub._drain_target_count is None  # type: ignore[reportUnnecessaryComparison]
 
     @pytest.mark.asyncio
     async def test_stop_sets_running_false(self):
@@ -85,7 +98,7 @@ class TestStopWakesDrainCondition:
 
         await stub.stop()
 
-        assert stub._running is False
+        assert stub._running is False  # type: ignore[reportUnnecessaryComparison]
 
 
 class TestStopSentinel:
@@ -111,8 +124,7 @@ class TestStopSentinel:
         await asyncio.sleep(0.02)
         assert received.is_set()
         assert sentinel_item is not None
-        # Sentinel is (999, 0, "__stop__")
-        assert sentinel_item[2] == "__stop__"
+        assert sentinel_item == (999, 0, 0, "__stop__")
 
         if not task.done():
             task.cancel()

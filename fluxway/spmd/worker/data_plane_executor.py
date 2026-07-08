@@ -1,63 +1,128 @@
-"""Data-plane backend executor boundary."""
+"""Data-plane frame build and batch enqueue boundary."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
-import ray
-
-from fluxway.common.types.sharding import ShardingSpec
-from fluxway.rpc.protocol import AxonDataPlane, RayActorDataPlane
+from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
 from fluxway.spmd.worker.data_plane import (
-    FrameArg,
-    SuccessorRouteContext,
+    CompiledSendPlan,
+    build_empty_step_frame_groups,
     build_step_frame_groups,
 )
-from fluxway.transport.manifest import TransportFrameHeader
+from fluxway.transport.communication import TransportBatchPlan, TransportFrameBatch
 from fluxway.profiler.recorder import TraceRecorder
 
 
-# pyrefly: ignore [no-matching-overload]
-@ray.remote
-def _ray_send_step_frames(
-    op_name: str,
-    rank: int,
-    mesh: Any,
-    flat_results: list[Any],
-    output_uuids: list[int],
-    output_sharding: dict[int, ShardingSpec],
-    successor_contexts: list[SuccessorRouteContext],
-    tuuid_to_name: dict[int, str] | None,
-    step_tuuid_cache: dict[int, Any],
-    exec_step: int,
-    sender_spmd_code: int,
-    sender_world_size: int,
-    interleave_unit_size: int | None,
-    successor_handlers: list[dict[int, Any]],
-    source_spmd_id: str,
-    max_in_flight_frames: int,
-) -> list[bool]:
-    return asyncio.run(
-        build_and_send_step_frames(
-            op_name=op_name,
-            rank=rank,
-            mesh=mesh,
-            flat_results=flat_results,
-            output_uuids=output_uuids,
-            output_sharding=output_sharding,
-            successor_contexts=successor_contexts,
-            tuuid_to_name=tuuid_to_name,
-            step_tuuid_cache=step_tuuid_cache,
-            exec_step=exec_step,
-            sender_spmd_code=sender_spmd_code,
-            sender_world_size=sender_world_size,
-            interleave_unit_size=interleave_unit_size,
-            successor_handlers=successor_handlers,
-            source_spmd_id=source_spmd_id,
-            max_in_flight_frames=max_in_flight_frames,
-        )
-    )
+SubmitDelivery = Callable[[Awaitable[Any]], Awaitable[asyncio.Task[Any]]]
+
+
+@dataclass(slots=True)
+class _QueuedBatch:
+    frames: tuple[TransportFrameEnvelope, ...]
+    future: asyncio.Future[Any]
+    compiled_plan: CompiledSendPlan
+    output_step: int
+    target_spmd_id: str
+    target_rank: int
+    batch_seq: int
+    profiler_recorder: TraceRecorder | None
+
+
+class _TargetBatchQueue:
+    def __init__(self, *, max_frames: int, flush_us: int) -> None:
+        if max_frames <= 0:
+            raise ValueError(f"batch_max_frames must be positive, got {max_frames}.")
+        if flush_us < 0:
+            raise ValueError(f"batch_flush_us must be non-negative, got {flush_us}.")
+        self._max_frames = max_frames
+        self._flush_s = flush_us / 1_000_000.0
+        self._items: list[_QueuedBatch] = []
+        self._flush_task: asyncio.Task[Any] | None = None
+        self._lock = asyncio.Lock()
+
+    async def enqueue(
+        self,
+        *,
+        handler: DataPlaneCallable,
+        frames: tuple[TransportFrameEnvelope, ...],
+        compiled_plan: CompiledSendPlan,
+        output_step: int,
+        target_spmd_id: str,
+        target_rank: int,
+        batch_seq: int,
+        profiler_recorder: TraceRecorder | None,
+    ) -> Any:
+        if not frames:
+            raise ValueError("transport frame batch must contain at least one frame.")
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        async with self._lock:
+            self._items.append(
+                _QueuedBatch(
+                    frames=frames,
+                    future=future,
+                    compiled_plan=compiled_plan,
+                    output_step=output_step,
+                    target_spmd_id=target_spmd_id,
+                    target_rank=target_rank,
+                    batch_seq=batch_seq,
+                    profiler_recorder=profiler_recorder,
+                )
+            )
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._flush_later(handler))
+        return await future
+
+    async def _flush_later(self, handler: DataPlaneCallable) -> None:
+        if self._flush_s > 0:
+            await asyncio.sleep(self._flush_s)
+        while True:
+            async with self._lock:
+                if not self._items:
+                    return
+                selected: list[_QueuedBatch] = []
+                frame_count = 0
+                while self._items:
+                    next_frame_count = len(self._items[0].frames)
+                    if selected and frame_count + next_frame_count > self._max_frames:
+                        break
+                    item = self._items.pop(0)
+                    selected.append(item)
+                    frame_count += next_frame_count
+                    if frame_count >= self._max_frames:
+                        break
+            await self._flush_selected(handler, selected)
+
+    async def _flush_selected(
+        self,
+        handler: DataPlaneCallable,
+        selected: list[_QueuedBatch],
+    ) -> None:
+        frames = tuple(frame for item in selected for frame in item.frames)
+        first = selected[0]
+        try:
+            result = await _send_transport_frame_batch_to_handler(
+                handler,
+                frames,
+                compiled_plan=first.compiled_plan,
+                output_step=first.output_step,
+                target_rank=first.target_rank,
+                target_spmd_id=first.target_spmd_id,
+                batch_seq=first.batch_seq,
+                profiler_recorder=first.profiler_recorder,
+            )
+        except Exception as exc:
+            for item in selected:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            return
+        for item in selected:
+            if not item.future.done():
+                item.future.set_result(result)
 
 
 def _object_requires_cuda_visible(obj: Any, seen: set[int] | None = None) -> bool:
@@ -96,306 +161,287 @@ def _object_requires_cuda_visible(obj: Any, seen: set[int] | None = None) -> boo
 
 async def build_and_send_step_frames(
     *,
-    op_name: str,
-    rank: int,
-    mesh: Any,
+    compiled_plan: CompiledSendPlan,
     flat_results: list[Any],
-    output_uuids: list[int],
-    output_sharding: dict[int, ShardingSpec],
-    successor_contexts: list[SuccessorRouteContext],
-    tuuid_to_name: dict[int, str] | None,
     step_tuuid_cache: dict[int, Any],
     exec_step: int,
-    sender_spmd_code: int,
-    sender_world_size: int,
-    interleave_unit_size: int | None,
-    successor_handlers: list[dict[int, Any]],
+    successor_handlers: tuple[dict[int, Any], ...],
     source_spmd_id: str,
-    max_in_flight_frames: int,
+    batch_max_frames: int,
+    submit_delivery: SubmitDelivery,
+    batch_delivery_factory: Callable[..., Awaitable[Any]] | None = None,
+    empty_values: Any | None = None,
     profiler_recorder: TraceRecorder | None = None,
-    build_in_thread: bool = False,
-) -> list[bool]:
-    if len(successor_handlers) != len(successor_contexts):
+) -> list[asyncio.Task[Any]]:
+    if len(successor_handlers) != len(compiled_plan.successor_routes):
         raise ValueError(
-            "successor_handlers must align with successor_contexts, "
-            f"got handlers={len(successor_handlers)} contexts={len(successor_contexts)}."
+            "successor_handlers must align with compiled successor routes, "
+            f"got handlers={len(successor_handlers)} "
+            f"routes={len(compiled_plan.successor_routes)}."
         )
-    if max_in_flight_frames <= 0:
-        raise ValueError(
-            f"max_in_flight_frames must be positive, got {max_in_flight_frames}."
-        )
-    build_kwargs = dict(
-        op_name=op_name,
-        rank=rank,
-        mesh=mesh,
-        flat_results=flat_results,
-        output_uuids=output_uuids,
-        output_sharding=output_sharding,
-        successor_contexts=successor_contexts,
-        tuuid_to_name=tuuid_to_name,
-        step_tuuid_cache=step_tuuid_cache,
-        exec_step=exec_step,
-        sender_spmd_code=sender_spmd_code,
-        sender_world_size=sender_world_size,
-        interleave_unit_size=interleave_unit_size,
-    )
-    if build_in_thread:
-        frame_groups = await asyncio.to_thread(build_step_frame_groups, **build_kwargs)
-    else:
+    if batch_max_frames <= 0:
+        raise ValueError(f"batch_max_frames must be positive, got {batch_max_frames}.")
+
+    def build_frame_groups_sync() -> list[Any]:
         if profiler_recorder is None:
-            frame_groups = build_step_frame_groups(**build_kwargs)
-        else:
-            async with profiler_recorder.data_plane_build_frame_groups(
-                op_name=op_name,
-                rank=rank,
-                step=exec_step,
-                successor_count=len(successor_contexts),
-                output_count=len(output_uuids),
-            ):
-                frame_groups = build_step_frame_groups(
-                    **build_kwargs,
+            if empty_values is None:
+                return build_step_frame_groups(
+                    compiled_plan=compiled_plan,
+                    flat_results=flat_results,
+                    step_tuuid_cache=step_tuuid_cache,
+                    exec_step=exec_step,
+                )
+            return build_empty_step_frame_groups(
+                compiled_plan=compiled_plan,
+                empty_values=empty_values,
+                exec_step=exec_step,
+            )
+        with profiler_recorder.data_plane_frame_build_sync(
+            op_name=compiled_plan.op_name,
+            rank=compiled_plan.rank,
+            step=exec_step,
+            successor_count=len(compiled_plan.successor_routes),
+            output_count=compiled_plan.output_count,
+        ):
+            if empty_values is None:
+                return build_step_frame_groups(
+                    compiled_plan=compiled_plan,
+                    flat_results=flat_results,
+                    step_tuuid_cache=step_tuuid_cache,
+                    exec_step=exec_step,
                     profiler_recorder=profiler_recorder,
                 )
+            return build_empty_step_frame_groups(
+                compiled_plan=compiled_plan,
+                empty_values=empty_values,
+                exec_step=exec_step,
+            )
+
+    frame_groups = await asyncio.to_thread(build_frame_groups_sync)
     if not frame_groups:
         return []
-    send_semaphore = asyncio.Semaphore(max_in_flight_frames)
-    return await asyncio.gather(
-        *(
-            _send_transport_frame_to_handler(
-                successor_handlers[context_index],
-                frame_arg,
-                source_spmd_id=source_spmd_id,
-                source_rank=rank,
-                output_step=exec_step,
-                send_semaphore=send_semaphore,
-                profiler_recorder=profiler_recorder,
-            )
-            for context_index, frame_arg in frame_groups
-        )
+
+    batches = TransportBatchPlan.from_frame_groups(frame_groups).batches(
+        batch_max_frames=batch_max_frames,
     )
+    delivery_tasks: list[asyncio.Task[Any]] = []
+    if profiler_recorder is None:
+        for batch in batches:
+            target_spmd_id = compiled_plan.successor_routes[batch.context_index].spmd_id
+            handler = _handler_for_batch(
+                batch,
+                successor_handlers=successor_handlers,
+                source_spmd_id=source_spmd_id,
+                source_rank=compiled_plan.rank,
+                output_step=exec_step,
+            )
+            frames = _batch_envelopes(batch)
+            delivery = (
+                batch_delivery_factory(
+                    handler=handler,
+                    frames=frames,
+                    compiled_plan=compiled_plan,
+                    output_step=exec_step,
+                    target_spmd_id=target_spmd_id,
+                    target_rank=batch.target_rank,
+                    batch_seq=batch.batch_seq,
+                    profiler_recorder=None,
+                )
+                if batch_delivery_factory is not None
+                else _send_transport_frame_batch_to_handler(
+                    handler,
+                    frames,
+                    compiled_plan=compiled_plan,
+                    output_step=exec_step,
+                    target_spmd_id=target_spmd_id,
+                    target_rank=batch.target_rank,
+                    batch_seq=batch.batch_seq,
+                )
+            )
+            delivery_tasks.append(await submit_delivery(delivery))
+        return delivery_tasks
+
+    async with profiler_recorder.data_plane_frame_submit(
+        source_rank=compiled_plan.rank,
+        output_step=exec_step,
+        frame_count=len(frame_groups),
+    ):
+        for batch in batches:
+            target_spmd_id = compiled_plan.successor_routes[batch.context_index].spmd_id
+            handler = _handler_for_batch(
+                batch,
+                successor_handlers=successor_handlers,
+                source_spmd_id=source_spmd_id,
+                source_rank=compiled_plan.rank,
+                output_step=exec_step,
+            )
+            frames = _batch_envelopes(batch)
+            async with profiler_recorder.data_plane_enqueue_batch(
+                op_name=compiled_plan.op_name,
+                step=exec_step,
+                source_spmd_code=compiled_plan.sender_spmd_code,
+                source_rank=compiled_plan.rank,
+                target_spmd_id=target_spmd_id,
+                target_rank=batch.target_rank,
+                batch_seq=batch.batch_seq,
+                frame_count=len(frames),
+            ):
+                delivery = (
+                    batch_delivery_factory(
+                        handler=handler,
+                        frames=frames,
+                        compiled_plan=compiled_plan,
+                        output_step=exec_step,
+                        target_spmd_id=target_spmd_id,
+                        target_rank=batch.target_rank,
+                        batch_seq=batch.batch_seq,
+                        profiler_recorder=profiler_recorder,
+                    )
+                    if batch_delivery_factory is not None
+                    else _send_transport_frame_batch_to_handler(
+                        handler,
+                        frames,
+                        compiled_plan=compiled_plan,
+                        output_step=exec_step,
+                        target_spmd_id=target_spmd_id,
+                        target_rank=batch.target_rank,
+                        batch_seq=batch.batch_seq,
+                        profiler_recorder=profiler_recorder,
+                    )
+                )
+                delivery_tasks.append(await submit_delivery(delivery))
+    return delivery_tasks
 
 
-async def _send_transport_frame_to_handler(
-    handlers: dict[int, Any],
-    frame_arg: FrameArg,
+def _handler_for_batch(
+    batch: TransportFrameBatch,
     *,
+    successor_handlers: tuple[dict[int, Any], ...],
     source_spmd_id: str,
     source_rank: int,
     output_step: int,
-    send_semaphore: asyncio.Semaphore,
-    profiler_recorder: TraceRecorder | None = None,
-) -> bool:
-    (
-        target_rank,
-        header,
-        payload_segments,
-    ) = frame_arg
-    if not isinstance(header, TransportFrameHeader):
-        raise TypeError(
-            f"frame_arg header must be TransportFrameHeader, got {type(header).__name__}."
-        )
-    handler = handlers.get(target_rank)
+) -> DataPlaneCallable:
+    handlers = successor_handlers[batch.context_index]
+    handler = handlers.get(batch.target_rank)
     if handler is None:
         raise ValueError(
             "[SPMDWorker] Missing successor handler for transport frame: "
-            f"source={source_spmd_id}:{source_rank} target_rank={target_rank} "
+            f"source={source_spmd_id}:{source_rank} target_rank={batch.target_rank} "
             f"step={output_step}."
         )
-
-    if profiler_recorder is None:
-        await send_semaphore.acquire()
-    else:
-        async with profiler_recorder.data_plane_send_semaphore_wait(
-            source_rank=source_rank,
-            output_step=output_step,
-        ):
-            await send_semaphore.acquire()
-    try:
-        if profiler_recorder is None:
-            await handler.receive_transport_frame(header, *payload_segments)
-        else:
-            async with profiler_recorder.data_plane_send_transport_frame(
-                source_rank=source_rank,
-                output_step=output_step,
-            ):
-                await handler.receive_transport_frame(header, *payload_segments)
-    finally:
-        send_semaphore.release()
-    return True
+    effective_handler = getattr(handler, "delegate", handler)
+    if not isinstance(effective_handler, DataPlaneCallable):
+        raise TypeError(
+            "Batching data-plane executor requires DataPlaneCallable handlers, "
+            f"got {type(handler).__name__} for context_index={batch.context_index} "
+            f"target_rank={batch.target_rank}."
+        )
+    return handler
 
 
-def _validate_successor_handlers(
-    successor_handlers: list[dict[int, Any]],
+def _batch_envelopes(
+    batch: TransportFrameBatch,
+) -> tuple[TransportFrameEnvelope, ...]:
+    return tuple(
+        TransportFrameEnvelope(header=header, payload_segments=payload_segments)
+        for header, payload_segments in batch.frames
+    )
+
+
+async def _send_transport_frame_batch_to_handler(
+    handler: DataPlaneCallable,
+    frames: tuple[TransportFrameEnvelope, ...],
     *,
-    expected_type: type,
-    executor_name: str,
-) -> None:
-    for context_index, handlers in enumerate(successor_handlers):
-        for target_rank, handler in handlers.items():
-            effective_handler = getattr(handler, "delegate", handler)
-            if not isinstance(effective_handler, expected_type):
-                raise TypeError(
-                    f"{executor_name} requires {expected_type.__name__} "
-                    f"handlers, got {type(handler).__name__} for "
-                    f"context_index={context_index} target_rank={target_rank}."
-                )
+    compiled_plan: CompiledSendPlan,
+    output_step: int,
+    target_spmd_id: str,
+    target_rank: int,
+    batch_seq: int,
+    profiler_recorder: TraceRecorder | None = None,
+) -> Any:
+    if not frames:
+        raise ValueError("transport frame batch must contain at least one frame.")
+    if profiler_recorder is None:
+        return await handler.receive_transport_frames(frames)
+    async with profiler_recorder.data_plane_batch_rpc(
+        op_name=compiled_plan.op_name,
+        step=output_step,
+        source_spmd_code=compiled_plan.sender_spmd_code,
+        source_rank=compiled_plan.rank,
+        target_spmd_id=target_spmd_id,
+        target_rank=target_rank,
+        batch_seq=batch_seq,
+        frame_count=len(frames),
+    ):
+        return await handler.receive_transport_frames(frames)
 
 
-class RayDataPlaneBackendExecutor:
+class BatchingDataPlaneExecutor:
+    def __init__(self) -> None:
+        self._queues: dict[tuple[int, int], _TargetBatchQueue] = {}
+
     async def send_step_frames(
         self,
         *,
-        op_name: str,
-        rank: int,
-        mesh: Any,
+        compiled_plan: CompiledSendPlan,
         flat_results: list[Any],
-        output_uuids: list[int],
-        output_sharding: dict[int, ShardingSpec],
-        successor_contexts: list[SuccessorRouteContext],
-        tuuid_to_name: dict[int, str] | None,
         step_tuuid_cache: dict[int, Any],
         exec_step: int,
-        sender_spmd_code: int,
-        sender_world_size: int,
-        interleave_unit_size: int | None,
-        successor_handlers: list[dict[int, Any]],
+        successor_handlers: tuple[dict[int, Any], ...],
         source_spmd_id: str,
-        max_in_flight_frames: int,
+        batch_max_frames: int,
+        batch_flush_us: int,
+        submit_delivery: SubmitDelivery,
+        empty_values: Any | None = None,
         profiler_recorder: TraceRecorder | None = None,
-    ) -> list[bool]:
-        if max_in_flight_frames <= 0:
-            raise ValueError(
-                f"max_in_flight_frames must be positive, got {max_in_flight_frames}."
-            )
-        _validate_successor_handlers(
-            successor_handlers,
-            expected_type=RayActorDataPlane,
-            executor_name="Ray fused data-plane executor",
-        )
-        if profiler_recorder is not None:
-            return await build_and_send_step_frames(
-                op_name=op_name,
-                rank=rank,
-                mesh=mesh,
-                flat_results=flat_results,
-                output_uuids=output_uuids,
-                output_sharding=output_sharding,
-                successor_contexts=successor_contexts,
-                tuuid_to_name=tuuid_to_name,
-                step_tuuid_cache=step_tuuid_cache,
-                exec_step=exec_step,
-                sender_spmd_code=sender_spmd_code,
-                sender_world_size=sender_world_size,
-                interleave_unit_size=interleave_unit_size,
-                successor_handlers=successor_handlers,
-                source_spmd_id=source_spmd_id,
-                max_in_flight_frames=max_in_flight_frames,
-                profiler_recorder=profiler_recorder,
-            )
-        if _object_requires_cuda_visible((flat_results, step_tuuid_cache)):
-            return await build_and_send_step_frames(
-                op_name=op_name,
-                rank=rank,
-                mesh=mesh,
-                flat_results=flat_results,
-                output_uuids=output_uuids,
-                output_sharding=output_sharding,
-                successor_contexts=successor_contexts,
-                tuuid_to_name=tuuid_to_name,
-                step_tuuid_cache=step_tuuid_cache,
-                exec_step=exec_step,
-                sender_spmd_code=sender_spmd_code,
-                sender_world_size=sender_world_size,
-                interleave_unit_size=interleave_unit_size,
-                successor_handlers=successor_handlers,
-                source_spmd_id=source_spmd_id,
-                max_in_flight_frames=max_in_flight_frames,
-                build_in_thread=True,
-            )
-        ray_task = _ray_send_step_frames
-        ref = ray_task.remote(
-            op_name,
-            rank,
-            mesh,
-            flat_results,
-            output_uuids,
-            output_sharding,
-            successor_contexts,
-            tuuid_to_name,
-            step_tuuid_cache,
-            exec_step,
-            sender_spmd_code,
-            sender_world_size,
-            interleave_unit_size,
-            successor_handlers,
-            source_spmd_id,
-            max_in_flight_frames,
-        )
-        return await ref
-
-    async def send_transport_frame(
-        self,
-        handlers: dict[int, Any],
-        frame_arg: FrameArg,
-        *,
-        source_spmd_id: str,
-        source_rank: int,
-        output_step: int,
-        send_semaphore: asyncio.Semaphore,
-    ) -> bool:
-        return await _send_transport_frame_to_handler(
-            handlers,
-            frame_arg,
-            source_spmd_id=source_spmd_id,
-            source_rank=source_rank,
-            output_step=output_step,
-            send_semaphore=send_semaphore,
-        )
-
-
-class AxonDataPlaneBackendExecutor:
-    async def send_step_frames(
-        self,
-        *,
-        op_name: str,
-        rank: int,
-        mesh: Any,
-        flat_results: list[Any],
-        output_uuids: list[int],
-        output_sharding: dict[int, ShardingSpec],
-        successor_contexts: list[SuccessorRouteContext],
-        tuuid_to_name: dict[int, str] | None,
-        step_tuuid_cache: dict[int, Any],
-        exec_step: int,
-        sender_spmd_code: int,
-        sender_world_size: int,
-        interleave_unit_size: int | None,
-        successor_handlers: list[dict[int, Any]],
-        source_spmd_id: str,
-        max_in_flight_frames: int,
-        profiler_recorder: TraceRecorder | None = None,
-    ) -> list[bool]:
-        _validate_successor_handlers(
-            successor_handlers,
-            expected_type=AxonDataPlane,
-            executor_name="Axon fused data-plane executor",
-        )
+    ) -> list[asyncio.Task[Any]]:
         return await build_and_send_step_frames(
-            op_name=op_name,
-            rank=rank,
-            mesh=mesh,
+            compiled_plan=compiled_plan,
             flat_results=flat_results,
-            output_uuids=output_uuids,
-            output_sharding=output_sharding,
-            successor_contexts=successor_contexts,
-            tuuid_to_name=tuuid_to_name,
             step_tuuid_cache=step_tuuid_cache,
             exec_step=exec_step,
-            sender_spmd_code=sender_spmd_code,
-            sender_world_size=sender_world_size,
-            interleave_unit_size=interleave_unit_size,
             successor_handlers=successor_handlers,
             source_spmd_id=source_spmd_id,
-            max_in_flight_frames=max_in_flight_frames,
+            batch_max_frames=batch_max_frames,
+            submit_delivery=submit_delivery,
+            batch_delivery_factory=lambda **kwargs: self._enqueue_batch_delivery(
+                batch_max_frames=batch_max_frames,
+                batch_flush_us=batch_flush_us,
+                **kwargs,
+            ),
+            empty_values=empty_values,
+            profiler_recorder=profiler_recorder,
+        )
+
+    async def _enqueue_batch_delivery(
+        self,
+        *,
+        handler: DataPlaneCallable,
+        frames: tuple[TransportFrameEnvelope, ...],
+        compiled_plan: CompiledSendPlan,
+        output_step: int,
+        target_spmd_id: str,
+        target_rank: int,
+        batch_seq: int,
+        profiler_recorder: TraceRecorder | None,
+        batch_max_frames: int,
+        batch_flush_us: int,
+    ) -> Any:
+        key = (id(handler), target_rank)
+        queue = self._queues.get(key)
+        if queue is None:
+            queue = _TargetBatchQueue(
+                max_frames=batch_max_frames,
+                flush_us=batch_flush_us,
+            )
+            self._queues[key] = queue
+        return await queue.enqueue(
+            handler=handler,
+            frames=frames,
+            compiled_plan=compiled_plan,
+            output_step=output_step,
+            target_spmd_id=target_spmd_id,
+            target_rank=target_rank,
+            batch_seq=batch_seq,
             profiler_recorder=profiler_recorder,
         )

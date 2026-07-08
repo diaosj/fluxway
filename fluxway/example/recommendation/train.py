@@ -57,19 +57,67 @@ def _build_profiler_config(args):
         diagnostics=frozenset(
             ProfilerDiagnostic(item) for item in args.profiler_diagnostics
         ),
+        skip_initial_steps=args.profiler_skip_initial_steps,
+        steady_state_only=args.profiler_steady_state_only,
     )
     config.run_dir.mkdir(parents=True, exist_ok=False)
     return config
 
 
+def _apply_data_plane_config(task_graph, args) -> None:
+    batch_max_frames = args.data_plane_batch_max_frames
+    batch_flush_us = args.data_plane_batch_flush_us
+    max_in_flight = args.data_plane_max_in_flight
+    if batch_max_frames is not None and batch_max_frames <= 0:
+        raise ValueError(
+            f"--data-plane-batch-max-frames must be positive, got {batch_max_frames}."
+        )
+    if batch_flush_us is not None and batch_flush_us < 0:
+        raise ValueError(
+            f"--data-plane-batch-flush-us must be non-negative, got {batch_flush_us}."
+        )
+    if max_in_flight is not None and max_in_flight <= 0:
+        raise ValueError(
+            f"--data-plane-max-in-flight must be positive, got {max_in_flight}."
+        )
+    for node in task_graph.nodes.values():
+        config = node.spmd_config
+        if batch_max_frames is not None:
+            config.data_plane_batch_max_frames = batch_max_frames
+        if batch_flush_us is not None:
+            config.data_plane_batch_flush_us = batch_flush_us
+        if max_in_flight is not None:
+            config.data_plane_max_in_flight = max_in_flight
+
+
+def _build_ray_init_kwargs(args):
+    ray_init_kwargs = {}
+    if args.disable_ray_dashboard:
+        ray_init_kwargs["include_dashboard"] = False
+    if args.ray_num_cpus is not None:
+        ray_init_kwargs["num_cpus"] = args.ray_num_cpus
+    if args.ray_num_gpus is not None:
+        ray_init_kwargs["num_gpus"] = args.ray_num_gpus
+    return ray_init_kwargs or None
+
+
 async def run_training(args):
+    if args.dense_step_delay_ms < 0:
+        raise ValueError(
+            f"--dense-step-delay-ms must be non-negative, got {args.dense_step_delay_ms}."
+        )
     cpu_runtime_env = {
         "env_vars": {
             "CUDA_VISIBLE_DEVICES": "",
             "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         }
     }
-    gpu_runtime_env = {"env_vars": {"XLA_PYTHON_CLIENT_PREALLOCATE": "false"}}
+    gpu_runtime_env = {
+        "env_vars": {
+            "JAX_PLATFORMS": "cuda",
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        }
+    }
 
     r"""
             reader
@@ -118,6 +166,7 @@ async def run_training(args):
             mesh=dense_mesh,
             embed_dim=16,
             dense_stats_dim=2,
+            diagnostic_step_delay_ms=args.dense_step_delay_ms,
             runtime_env=gpu_runtime_env,
             resource={"num_gpus": getattr(args, "num_gpus", 1)},
         )
@@ -146,6 +195,7 @@ async def run_training(args):
 
         task_graph = graph.compile()
 
+    _apply_data_plane_config(task_graph, args)
     print(f"[Fluxway] Graph compiled. Nodes: {list(task_graph.nodes.keys())}")
 
     async_step_config = AsyncStepConfig(max_steps=args.max_steps)
@@ -229,6 +279,12 @@ def main():
         help="Number of threads for SparseEmbedding store",
     )
     parser.add_argument(
+        "--dense-step-delay-ms",
+        type=int,
+        default=0,
+        help="Diagnostic delay inside DenseSPMD.step for overlap proof runs",
+    )
+    parser.add_argument(
         "--clear-ckpt",
         action="store_true",
         help="Clear existing checkpoints before starting",
@@ -273,6 +329,52 @@ def main():
         default=[],
         help="Optional non-hot diagnostic trace domains to include",
     )
+    parser.add_argument(
+        "--profiler-skip-initial-steps",
+        type=int,
+        default=1,
+        help="Drop step-level profiler events before this step index",
+    )
+    parser.add_argument(
+        "--profiler-steady-state-only",
+        action="store_true",
+        help="Drop lifecycle events from the exported profiler trace",
+    )
+    parser.add_argument(
+        "--data-plane-batch-max-frames",
+        type=int,
+        default=None,
+        help="Override max transport frames per batch RPC for this run",
+    )
+    parser.add_argument(
+        "--data-plane-batch-flush-us",
+        type=int,
+        default=None,
+        help="Override data-plane batch flush window in microseconds for this run",
+    )
+    parser.add_argument(
+        "--data-plane-max-in-flight",
+        type=int,
+        default=None,
+        help="Override max in-flight background delivery tasks per worker",
+    )
+    parser.add_argument(
+        "--disable-ray-dashboard",
+        action="store_true",
+        help="Start local Ray without the dashboard/agent HTTP server",
+    )
+    parser.add_argument(
+        "--ray-num-cpus",
+        type=int,
+        default=None,
+        help="Override local ray.init num_cpus for this example run",
+    )
+    parser.add_argument(
+        "--ray-num-gpus",
+        type=int,
+        default=None,
+        help="Override local ray.init num_gpus for this example run",
+    )
     args = parser.parse_args()
     if getattr(args, "clear_ckpt", False):
         import shutil
@@ -283,6 +385,7 @@ def main():
     launch(
         run_training,
         args,
+        ray_init_kwargs=_build_ray_init_kwargs(args),
     )
 
 

@@ -8,11 +8,21 @@ from fluxway.spmd.worker.local_plan import (
     LocalStepPlanExecutor,
     MappingCallableRegistry,
 )
+from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
+from fluxway.spmd.worker.user_callable_executor import UserCallableExecutor
+
+
+def _make_executor() -> LocalStepPlanExecutor:
+    return LocalStepPlanExecutor(
+        UserCallableExecutor(
+            worker_process_runtime=WorkerProcessCallRuntime(max_workers=1),
+        )
+    )
 
 
 @pytest.mark.asyncio
 async def test_single_call_plan_returns_result():
-    executor = LocalStepPlanExecutor()
+    executor = _make_executor()
     plan = LocalStepPlan.single_call("op")
     registry = MappingCallableRegistry({"op": lambda: 7})
 
@@ -21,7 +31,7 @@ async def test_single_call_plan_returns_result():
 
 @pytest.mark.asyncio
 async def test_same_resource_nodes_are_serialized():
-    executor = LocalStepPlanExecutor()
+    executor = _make_executor()
     events: list[str] = []
 
     async def first():
@@ -55,7 +65,7 @@ async def test_same_resource_nodes_are_serialized():
 
 @pytest.mark.asyncio
 async def test_different_resources_can_overlap():
-    executor = LocalStepPlanExecutor()
+    executor = _make_executor()
     started = asyncio.Event()
     release = asyncio.Event()
     overlap_seen = False
@@ -88,8 +98,8 @@ async def test_different_resources_can_overlap():
 
 
 @pytest.mark.asyncio
-async def test_unsupported_node_kind_raises():
-    executor = LocalStepPlanExecutor()
+async def test_missing_runtime_callable_raises():
+    executor = _make_executor()
     plan = LocalStepPlan(
         node_kinds=(int(LocalStepNodeKind.SEND),),
         callable_ids=("",),
@@ -99,13 +109,134 @@ async def test_unsupported_node_kind_raises():
         result_node=0,
     )
 
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(KeyError):
         await executor.execute(plan, MappingCallableRegistry({}))
 
 
 @pytest.mark.asyncio
+async def test_wait_call_send_barrier_dependency_chain():
+    executor = _make_executor()
+    events: list[str] = []
+
+    async def wait_inputs():
+        events.append("wait")
+        return {"x": 3}
+
+    async def call_user(inputs):
+        events.append("call")
+        return inputs["x"] * 2
+
+    async def send_output(value):
+        events.append("send")
+
+        async def sent():
+            events.append("send:future")
+            return value + 1
+
+        return asyncio.create_task(sent())
+
+    async def commit(send_future):
+        events.append("commit")
+        return await send_future
+
+    plan = LocalStepPlan(
+        node_kinds=(
+            int(LocalStepNodeKind.WAIT),
+            int(LocalStepNodeKind.CALL),
+            int(LocalStepNodeKind.SEND),
+            int(LocalStepNodeKind.BARRIER),
+        ),
+        callable_ids=("wait", "call", "send", "commit"),
+        resource_ids=(-1, -1, -1, -1),
+        dependency_offsets=(0, 0, 1, 2, 3),
+        dependencies=(0, 1, 2),
+        result_node=3,
+    )
+
+    result = await executor.execute(
+        plan,
+        MappingCallableRegistry(
+            {
+                "wait": wait_inputs,
+                "call": call_user,
+                "send": send_output,
+                "commit": commit,
+            }
+        ),
+    )
+
+    assert result == 7
+    assert events[:4] == ["wait", "call", "send", "commit"]
+    assert events[-1] == "send:future"
+
+
+@pytest.mark.asyncio
+async def test_same_resource_is_serialized_across_plans():
+    executor = _make_executor()
+    running = 0
+    max_running = 0
+    release = asyncio.Event()
+
+    async def shared_resource_call():
+        nonlocal running, max_running
+        running += 1
+        max_running = max(max_running, running)
+        await release.wait()
+        running -= 1
+        return "done"
+
+    plan = LocalStepPlan.single_call("op", resource_id=42)
+    registry = MappingCallableRegistry({"op": shared_resource_call})
+
+    first = asyncio.create_task(executor.execute(plan, registry))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(executor.execute(plan, registry))
+    await asyncio.sleep(0.01)
+    assert max_running == 1
+    release.set()
+
+    assert await first == "done"
+    assert await second == "done"
+    assert max_running == 1
+
+
+@pytest.mark.asyncio
+async def test_barrier_observes_send_future_exception():
+    executor = _make_executor()
+    observed = False
+
+    async def send_output():
+        async def fail_send():
+            raise RuntimeError("transport failed")
+
+        return asyncio.create_task(fail_send())
+
+    async def commit(send_future):
+        nonlocal observed
+        observed = True
+        await send_future
+
+    plan = LocalStepPlan(
+        node_kinds=(int(LocalStepNodeKind.SEND), int(LocalStepNodeKind.BARRIER)),
+        callable_ids=("send", "commit"),
+        resource_ids=(-1, -1),
+        dependency_offsets=(0, 0, 1),
+        dependencies=(0,),
+        result_node=1,
+    )
+
+    with pytest.raises(RuntimeError, match="transport failed"):
+        await executor.execute(
+            plan,
+            MappingCallableRegistry({"send": send_output, "commit": commit}),
+        )
+
+    assert observed
+
+
+@pytest.mark.asyncio
 async def test_drain_waits_for_active_plan():
-    executor = LocalStepPlanExecutor()
+    executor = _make_executor()
     release = asyncio.Event()
     finished = False
 

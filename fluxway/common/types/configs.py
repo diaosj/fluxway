@@ -183,6 +183,10 @@ class SPMDConfig(FluxwayBaseSchema):
     # Transport backend for data plane RPC (e.g. "ray", "axon")
     transport_type: str = "ray"
 
+    data_plane_batch_max_frames: int = 8
+    data_plane_batch_flush_us: int = 100
+    data_plane_max_in_flight: int = 50
+
     # Optional profiler runtime configuration. ``None`` is the zero-overhead path:
     # workers construct the original executors and data-plane handlers directly.
     profiler_config: Any | None = None
@@ -336,7 +340,6 @@ class BarrierType(StrEnum):
 
     STANDARD = "standard"  # Wait for all expected shards/states (default)
     PERIODIC = "periodic"  # Fire every 'n' arrivals; used for streaming
-    TOLERANT = "tolerant"  # Wait for bounded stale data, used for off-policy
 
 
 class BarrierConfig(FluxwayBaseSchema):
@@ -361,31 +364,216 @@ class PeriodicBarrierConfig(BarrierConfig):
     n: int = 1
 
 
-class TolerantBarrierConfig(BarrierConfig):
+class StatePolicy(FluxwayBaseSchema):
+    """State concurrency policy consumed by the worker resource-lock table."""
+
+    access: str = "exclusive"
+    resource: str | None = None
+
+    @classmethod
+    def exclusive(cls, resource: str | None = None) -> "StatePolicy":
+        return cls(access="exclusive", resource=resource)
+
+    @classmethod
+    def thread_safe(cls) -> "StatePolicy":
+        return cls(access="thread_safe", resource=None)
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.access not in ("exclusive", "thread_safe"):
+            raise ValueError(
+                f"StatePolicy.access must be 'exclusive' or 'thread_safe', got {self.access!r}."
+            )
+        if self.resource is not None and not isinstance(self.resource, str):
+            raise ValueError(
+                f"StatePolicy.resource must be a string or None, got {type(self.resource).__name__}."
+            )
+        if self.access == "thread_safe" and self.resource is not None:
+            raise ValueError(
+                "StatePolicy.thread_safe() cannot be combined with a serialized resource."
+            )
+
+
+class SchedulePolicy(FluxwayBaseSchema):
+    """Cross-operator scheduling policy lowered into the worker priority queue."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: str = "fifo"
+    base_priority: int = 0
+    boost_priority: int = 100
+    trigger: str = "staleness_limit"
+    phase: str | None = None
+    phase_ordering: tuple[str, ...] = Field(default=(), alias="phase_order")
+    micro_step_key: str = "step"
+
+    @classmethod
+    def fifo(cls, base_priority: int = 0) -> "SchedulePolicy":
+        return cls(kind="fifo", base_priority=base_priority)
+
+    @classmethod
+    def deadline_boost(
+        cls,
+        base_priority: int = 0,
+        boost_priority: int = 100,
+        trigger: str = "staleness_limit",
+    ) -> "SchedulePolicy":
+        return cls(
+            kind="deadline_boost",
+            base_priority=base_priority,
+            boost_priority=boost_priority,
+            trigger=trigger,
+        )
+
+    @classmethod
+    def phase_order(
+        cls,
+        *,
+        phase: str,
+        phase_order: tuple[str, ...],
+        micro_step_key: str = "step",
+        base_priority: int = 0,
+    ) -> "SchedulePolicy":
+        return cls(
+            kind="phase_order",
+            phase=phase,
+            phase_ordering=phase_order,
+            micro_step_key=micro_step_key,
+            base_priority=base_priority,
+        )
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.kind not in ("fifo", "deadline_boost", "phase_order"):
+            raise ValueError(f"Unsupported SchedulePolicy kind {self.kind!r}.")
+        if self.trigger != "staleness_limit":
+            raise ValueError(
+                f"SchedulePolicy.trigger must be 'staleness_limit', got {self.trigger!r}."
+            )
+        if self.micro_step_key != "step":
+            raise ValueError(
+                f"SchedulePolicy.micro_step_key must be 'step', got {self.micro_step_key!r}."
+            )
+        if self.kind == "phase_order":
+            if not self.phase:
+                raise ValueError("SchedulePolicy.phase_order requires a phase.")
+            if not self.phase_ordering:
+                raise ValueError("SchedulePolicy.phase_order requires phase_order.")
+            if self.phase not in self.phase_ordering:
+                raise ValueError(
+                    f"phase {self.phase!r} must be present in phase_order={self.phase_ordering!r}."
+                )
+
+
+class AsyncPolicy(FluxwayBaseSchema):
     """
-    Tolerant barrier: fires when data within allowable staleness window is available.
-    Commonly used for Off-Policy / SSP training.
+    User-facing operator execution policy.
+
+    Factories keep beginner-facing choices compact while lowering into existing
+    worker scheduler, LocalStepPlan, and state-lock fields.
+    ``bounded_stale`` limits how far an operator may run ahead of dependent
+    progress; it never substitutes tensors or state from another step.
     """
 
-    type: BarrierType = BarrierType.TOLERANT
-    tensor_staleness: dict[int, int] = Field(default_factory=dict)
-    state_staleness: dict[str, int] = Field(default_factory=dict)
-    debug_names: dict[int, str] = Field(default_factory=dict, exclude=True)
-    retrieval_policy: str = "latest"  # "latest", "oldest", "closest"
+    mode: str = "sync"
+    depth: int = 1
+    commit: str = "ordered"
+    state: StatePolicy = Field(default_factory=StatePolicy.exclusive)
+    schedule: SchedulePolicy = Field(default_factory=SchedulePolicy.fifo)
+    max_staleness: int | None = None
+    phases: tuple[str, ...] = ()
 
-    # Input field for logical paths (resolved during initialization)
-    staleness: dict[str, int] = Field(default_factory=dict, exclude=True)
+    @classmethod
+    def sync(cls) -> "AsyncPolicy":
+        return cls(mode="sync")
 
-    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
-        """Resolve all stale paths to TUUIDs or Control States."""
-        for key, val in self.staleness.items():
-            tuuid = resolver_fn(key)
-            if tuuid is not None:
-                self.tensor_staleness[tuuid] = val
-                self.debug_names[tuuid] = key
-            else:
-                # Might be a control state, preserve for runtime check in OperatorManager
-                self.state_staleness[key] = val
+    @classmethod
+    def pipelined(
+        cls,
+        depth: int,
+        commit: str = "ordered",
+        schedule: SchedulePolicy | None = None,
+        state: StatePolicy | None = None,
+    ) -> "AsyncPolicy":
+        return cls(
+            mode="pipelined",
+            depth=depth,
+            commit=commit,
+            schedule=schedule or SchedulePolicy.fifo(),
+            state=state or StatePolicy.exclusive(),
+        )
+
+    @classmethod
+    def bounded_stale(
+        cls,
+        depth: int,
+        max_staleness: int,
+        commit: str = "relaxed",
+        schedule: SchedulePolicy | None = None,
+        state: StatePolicy | None = None,
+    ) -> "AsyncPolicy":
+        return cls(
+            mode="bounded_stale",
+            depth=depth,
+            commit=commit,
+            max_staleness=max_staleness,
+            schedule=schedule or SchedulePolicy.deadline_boost(),
+            state=state or StatePolicy.thread_safe(),
+        )
+
+    @classmethod
+    def pipeline_parallel(
+        cls,
+        depth: int,
+        phases: tuple[str, ...],
+        schedule: SchedulePolicy,
+        commit: str = "ordered",
+    ) -> "AsyncPolicy":
+        return cls(
+            mode="pipeline_parallel",
+            depth=depth,
+            commit=commit,
+            phases=phases,
+            schedule=schedule,
+            state=StatePolicy.exclusive(),
+        )
+
+    def model_post_init(self, __context: Any) -> None:
+        if self.mode not in ("sync", "pipelined", "bounded_stale", "pipeline_parallel"):
+            raise ValueError(f"Unsupported AsyncPolicy mode {self.mode!r}.")
+        if self.depth <= 0:
+            raise ValueError(f"AsyncPolicy.depth must be positive, got {self.depth}.")
+        if self.commit not in ("ordered", "relaxed"):
+            raise ValueError(
+                f"AsyncPolicy.commit must be 'ordered' or 'relaxed', got {self.commit!r}."
+            )
+        if self.mode == "sync" and self.depth != 1:
+            raise ValueError("AsyncPolicy.sync() must use depth=1.")
+        if self.mode == "bounded_stale":
+            limit = self.max_staleness_limit()
+            if limit is None:
+                raise ValueError("AsyncPolicy.bounded_stale requires max_staleness.")
+            if limit < 0:
+                raise ValueError(
+                    f"AsyncPolicy.max_staleness must be non-negative, got {limit}."
+                )
+            if self.depth > limit + 1:
+                raise ValueError(
+                    "AsyncPolicy.bounded_stale requires depth <= max_staleness + 1, "
+                    f"got depth={self.depth} max_staleness={limit}."
+                )
+        elif self.max_staleness is not None:
+            raise ValueError(
+                f"AsyncPolicy mode {self.mode!r} cannot define max_staleness."
+            )
+        if self.mode == "pipeline_parallel":
+            if not self.phases:
+                raise ValueError("AsyncPolicy.pipeline_parallel requires phases.")
+            if self.schedule.kind != "phase_order":
+                raise ValueError(
+                    "AsyncPolicy.pipeline_parallel requires SchedulePolicy.phase_order()."
+                )
+
+    def max_staleness_limit(self) -> int | None:
+        return self.max_staleness
 
 
 class OperatorContext(FluxwayBaseSchema):
@@ -407,6 +595,7 @@ class OperatorMeta(FluxwayBaseSchema):
     name: str
     owner_class_qualname: str = ""
     owner_class_module: str = ""
+    requires_worker_process: bool = False
 
     is_source: bool | None = None  # Explicitly mark as source (producer)
     # Whether this is an interleaved source.
@@ -418,6 +607,16 @@ class OperatorMeta(FluxwayBaseSchema):
     max_inflight_steps: int = (
         0  # Max steps predecessors can lead (backpressure_threshold)
     )
+    async_policy: AsyncPolicy = Field(default_factory=AsyncPolicy.sync)
+    input_policy: str = "exact"
+    local_dag_policy: str = "inline"
+    state_policy: StatePolicy = Field(default_factory=StatePolicy.exclusive)
+    schedule_policy: SchedulePolicy = Field(default_factory=SchedulePolicy.fifo)
+    max_async_lag: int | None = None
+    local_pipeline_depth: int = 1
+    commit_policy: str = "ordered"
+    state_access: str = "exclusive"
+    state_resource: str | None = None
     # Keys use ArgumentType.value (i.e. "state" | "tensor" | "static") to avoid enum
     # serialization / circular import surprises across control-plane and worker.
     input_arguments: dict[str, list[str]] | None = None
@@ -439,9 +638,9 @@ class OperatorMeta(FluxwayBaseSchema):
     )
 
     # Execution barrier configuration
-    barrier_config: (
-        StandardBarrierConfig | PeriodicBarrierConfig | TolerantBarrierConfig
-    ) = Field(default_factory=StandardBarrierConfig)
+    barrier_config: StandardBarrierConfig | PeriodicBarrierConfig = Field(
+        default_factory=StandardBarrierConfig
+    )
 
     def resolve_sharding_topology(
         self, resolver_fn: Callable[[str], int | None]
@@ -451,10 +650,6 @@ class OperatorMeta(FluxwayBaseSchema):
                 # ShardingSpec handles both referential and algebraic logic
                 if hasattr(spec, "routing") and hasattr(spec.routing, "resolve"):
                     spec.routing.resolve(resolver_fn)
-
-    def resolve_async_strategy(self, resolver_fn: Callable[[str], int | None]) -> None:
-        if hasattr(self.barrier_config, "resolve"):
-            self.barrier_config.resolve(resolver_fn)  # type: ignore
 
     def get_arguments(self, is_output: bool, arg_type: "ArgumentType") -> list[str]:
         args_map = self.output_arguments if is_output else self.input_arguments

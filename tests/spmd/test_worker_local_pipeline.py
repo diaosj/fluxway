@@ -1,0 +1,897 @@
+import asyncio
+import time
+import types
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from fluxway.common.types import AsyncPolicy, SchedulePolicy
+from fluxway.common.types.configs import OperatorMeta
+from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
+from fluxway.spmd.worker.operator_manager.dispatcher import (
+    ExecutionResult,
+    ExecutionStatus,
+)
+from fluxway.spmd.worker.worker import (
+    LocalInputPrepareRuntime,
+    SPMDWorker,
+    _PreparedOperatorInput,
+)
+
+
+def _raw_worker_class():
+    # pyrefly: ignore [missing-attribute]
+    return SPMDWorker.__ray_actor_class__
+
+
+def _make_pipeline_stub(meta: OperatorMeta):
+    return _make_pipeline_stub_with_profiler(meta, profiler_enabled=False)
+
+
+def _make_pipeline_stub_with_profiler(
+    meta: OperatorMeta,
+    *,
+    profiler_enabled: bool,
+):
+    raw_cls = _raw_worker_class()
+    op_manager = MagicMock()
+    op_manager.get_operator_metadata.return_value = meta
+    op_manager._get_operator_metadata.return_value = meta
+    op_manager.is_periodic_trigger.return_value = False
+    op_manager.is_source_operator.return_value = False
+    profiler_runtime = (
+        ProfilerRuntimeFactory.from_config(
+            ProfilerConfig(trace_dir="tmp", run_id="worker_local_pipeline"),
+            process_name="worker/test/rank:0",
+        )
+        if profiler_enabled
+        else types.SimpleNamespace(enabled=False)
+    )
+
+    stub = types.SimpleNamespace(
+        _op_manager=op_manager,
+        op_manager=op_manager,
+        _running_plan_steps={"op": set()},
+        _finished_plan_steps={"op": {}},
+        _ready_pending_pipeline_steps={"op": []},
+        _pending_future_steps={"op": []},
+        _pending_async_lag_steps={"op": []},
+        _completed_step_count={"op": 0},
+        _scheduled_step_count={"op": 0},
+        _mailbox_ready_steps={"op": set()},
+        _barriers_declared={},
+        _in_op_step_queue=set(),
+        _execution_queue=asyncio.PriorityQueue(),
+        _running=True,
+        _drain_target_count=None,
+        _drain_cond=asyncio.Condition(),
+        _mailbox=MagicMock(),
+        _last_error=None,
+        _driver_handle=None,
+        _profiler_runtime=profiler_runtime,
+        config=types.SimpleNamespace(max_steps=None, operator_metas={"op": meta}),
+        spmd_id="test_spmd",
+        rank=0,
+        _local_spmd_code=7,
+        _background_tasks=set(),
+    )
+    stub._mailbox.clear_step = AsyncMock()
+    stub._operator_pipeline_depth = types.MethodType(
+        raw_cls._operator_pipeline_depth, stub
+    )
+    stub._can_start_local_plan = types.MethodType(raw_cls._can_start_local_plan, stub)
+    stub._record_local_plan_scheduled = types.MethodType(
+        raw_cls._record_local_plan_scheduled, stub
+    )
+    stub._move_future_steps_into_pipeline_queue = types.MethodType(
+        raw_cls._move_future_steps_into_pipeline_queue, stub
+    )
+    stub._start_pending_pipeline_steps = types.MethodType(
+        raw_cls._start_pending_pipeline_steps, stub
+    )
+    stub._commit_finished_steps = types.MethodType(raw_cls._commit_finished_steps, stub)
+    stub._commit_local_plan_result = types.MethodType(
+        raw_cls._commit_local_plan_result, stub
+    )
+    stub._local_plan_send_output = types.MethodType(
+        raw_cls._local_plan_send_output, stub
+    )
+    stub._local_plan_wait_inputs = types.MethodType(
+        raw_cls._local_plan_wait_inputs, stub
+    )
+    stub._send_local_plan_result = types.MethodType(
+        raw_cls._send_local_plan_result, stub
+    )
+    stub._local_plan_commit = types.MethodType(raw_cls._local_plan_commit, stub)
+    stub._spawn_send_task = types.MethodType(raw_cls._spawn_send_task, stub)
+    stub._register_local_send = types.MethodType(raw_cls._register_local_send, stub)
+    stub._step_tuuid_cache_from_prepared_input = types.MethodType(
+        raw_cls._step_tuuid_cache_from_prepared_input, stub
+    )
+    stub._normalize_local_plan_result = types.MethodType(
+        raw_cls._normalize_local_plan_result, stub
+    )
+    stub._result_requires_send = types.MethodType(raw_cls._result_requires_send, stub)
+    stub._observe_local_send_registration = types.MethodType(
+        raw_cls._observe_local_send_registration, stub
+    )
+    stub._require_local_spmd_code = types.MethodType(
+        raw_cls._require_local_spmd_code, stub
+    )
+    stub._on_background_task_done = types.MethodType(
+        raw_cls._on_background_task_done, stub
+    )
+    stub._spawn_background_task = types.MethodType(raw_cls._spawn_background_task, stub)
+    stub._on_prepare_ready = types.MethodType(raw_cls._on_prepare_ready, stub)
+    stub._input_prepare_runtime = LocalInputPrepareRuntime(
+        background_tasks=stub._background_tasks,
+        on_task_done=stub._on_background_task_done,
+        profiler_runtime=profiler_runtime,
+        on_prepare_ready=stub._on_prepare_ready,
+    )
+    stub._prepare_inputs_if_policy_allows = types.MethodType(
+        raw_cls._prepare_inputs_if_policy_allows,
+        stub,
+    )
+    stub._start_prepare_and_enqueue_token = types.MethodType(
+        raw_cls._start_prepare_and_enqueue_token,
+        stub,
+    )
+    stub._enqueue_prepare_ready_refresh = types.MethodType(
+        raw_cls._enqueue_prepare_ready_refresh,
+        stub,
+    )
+    stub._enqueue = types.MethodType(raw_cls._enqueue, stub)
+    stub._effective_schedule_key = types.MethodType(
+        raw_cls._effective_schedule_key,
+        stub,
+    )
+    stub._prepare_schedule_state = types.MethodType(
+        raw_cls._prepare_schedule_state,
+        stub,
+    )
+    stub._should_prepare_inputs_on_ready = types.MethodType(
+        raw_cls._should_prepare_inputs_on_ready,
+        stub,
+    )
+    stub._deadline_boost_active = types.MethodType(
+        raw_cls._deadline_boost_active,
+        stub,
+    )
+    stub._should_hold_prepare_pending_token = types.MethodType(
+        raw_cls._should_hold_prepare_pending_token,
+        stub,
+    )
+    stub._bounded_async_ops = types.MethodType(raw_cls._bounded_async_ops, stub)
+    stub._async_lag_limit_reached = types.MethodType(
+        raw_cls._async_lag_limit_reached,
+        stub,
+    )
+    stub._release_async_lag_steps = types.MethodType(
+        raw_cls._release_async_lag_steps,
+        stub,
+    )
+    stub.set_drain_target_count = types.MethodType(
+        raw_cls.set_drain_target_count,
+        stub,
+    )
+    stub._advance_step = types.MethodType(raw_cls._advance_step, stub)
+    stub._trigger_source_operators = types.MethodType(
+        raw_cls._trigger_source_operators,
+        stub,
+    )
+    stub._source_known_steps = types.MethodType(raw_cls._source_known_steps, stub)
+    stub._fill_source_pipeline = types.MethodType(raw_cls._fill_source_pipeline, stub)
+    stub._report_op_completed = MagicMock()
+    stub._send_tasks = set()
+    return stub
+
+
+def _prepared(cache=None):
+    return _PreparedOperatorInput(value={}, step_tuuid_cache=dict(cache or {}))
+
+
+def test_local_pipeline_depth_one_preserves_single_running_slot():
+    stub = _make_pipeline_stub(OperatorMeta(name="op", local_pipeline_depth=1))
+
+    assert stub._can_start_local_plan("op")
+    stub._running_plan_steps["op"].add(0)
+    assert not stub._can_start_local_plan("op")
+
+
+def test_local_pipeline_depth_allows_multiple_running_steps():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=8, commit_policy="relaxed")
+    )
+
+    for step in range(8):
+        assert stub._can_start_local_plan("op")
+        stub._record_local_plan_scheduled("op", step)
+        stub._running_plan_steps["op"].add(step)
+
+    assert stub._scheduled_step_count["op"] == 8
+    assert not stub._can_start_local_plan("op")
+
+
+def test_deadline_boost_schedule_prioritizes_stale_boundary_update():
+    raw_cls = _raw_worker_class()
+    lookup = OperatorMeta(
+        name="lookup",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=4,
+            max_staleness=3,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=100),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=100),
+        max_async_lag=3,
+    )
+    update = OperatorMeta(
+        name="update",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=4,
+            max_staleness=3,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=200),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=200),
+        max_async_lag=3,
+    )
+    op_manager = MagicMock()
+    op_manager._get_operator_metadata.side_effect = lambda name: {
+        "lookup": lookup,
+        "update": update,
+    }[name]
+    stub = types.SimpleNamespace(
+        op_manager=op_manager,
+        config=types.SimpleNamespace(
+            operator_metas={"lookup": lookup, "update": update}
+        ),
+        _completed_step_count={"lookup": 0, "update": 0},
+    )
+    stub._effective_schedule_key = types.MethodType(
+        raw_cls._effective_schedule_key, stub
+    )
+    stub._prepare_schedule_state = types.MethodType(
+        raw_cls._prepare_schedule_state, stub
+    )
+    stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
+
+    assert stub._effective_schedule_key("update", 3) < stub._effective_schedule_key(
+        "lookup",
+        3,
+    )
+    assert stub._effective_schedule_key("update", 2) == (0, 0, 2, "update")
+
+
+def test_bounded_stale_lookup_stops_at_lag_boundary_while_update_closes_lag():
+    raw_cls = _raw_worker_class()
+    lookup = OperatorMeta(
+        name="lookup",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=100),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=100),
+        max_async_lag=7,
+    )
+    update = OperatorMeta(
+        name="update",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=200),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=200),
+        max_async_lag=7,
+    )
+    metas = {"lookup": lookup, "update": update}
+    op_manager = MagicMock()
+    op_manager._get_operator_metadata.side_effect = lambda name: metas[name]
+    stub = types.SimpleNamespace(
+        op_manager=op_manager,
+        config=types.SimpleNamespace(operator_metas=metas),
+        _completed_step_count={"lookup": 7, "update": 1},
+    )
+    stub._bounded_async_ops = types.MethodType(raw_cls._bounded_async_ops, stub)
+    stub._async_lag_limit_reached = types.MethodType(
+        raw_cls._async_lag_limit_reached,
+        stub,
+    )
+
+    assert not stub._async_lag_limit_reached("lookup", 2)
+    assert stub._async_lag_limit_reached("lookup", 8)
+    assert not stub._async_lag_limit_reached("update", 1)
+
+
+@pytest.mark.asyncio
+async def test_bounded_stale_lag_release_requeues_lookup_after_update_progress():
+    lookup = OperatorMeta(
+        name="lookup",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=100),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=100),
+        max_async_lag=7,
+    )
+    update = OperatorMeta(
+        name="update",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=200),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=200),
+        max_async_lag=7,
+    )
+    stub = _make_pipeline_stub(lookup)
+    metas = {"lookup": lookup, "update": update}
+    stub.config.operator_metas = metas
+    stub.op_manager._get_operator_metadata.side_effect = lambda name: metas[name]
+    stub.op_manager.get_operator_metadata.side_effect = lambda name: metas[name]
+    stub._completed_step_count = {"lookup": 7, "update": 1}
+    stub._pending_async_lag_steps = {"lookup": [8], "update": []}
+    stub._in_op_step_queue = set()
+
+    await stub._release_async_lag_steps()
+    assert stub._pending_async_lag_steps["lookup"] == [8]
+    assert stub._execution_queue.empty()
+
+    stub._completed_step_count["update"] = 2
+    await stub._release_async_lag_steps()
+    assert stub._pending_async_lag_steps["lookup"] == []
+    queued = await stub._execution_queue.get()
+    assert queued == (0, 0, 8, "lookup")
+
+
+def test_phase_order_schedule_places_forward_before_backward_same_micro_step():
+    raw_cls = _raw_worker_class()
+    order = ("forward", "backward", "optimizer")
+    forward = OperatorMeta(
+        name="forward",
+        async_policy=AsyncPolicy.pipeline_parallel(
+            depth=2,
+            phases=order,
+            schedule=SchedulePolicy.phase_order(phase="forward", phase_order=order),
+        ),
+        schedule_policy=SchedulePolicy.phase_order(
+            phase="forward",
+            phase_order=order,
+        ),
+    )
+    backward = OperatorMeta(
+        name="backward",
+        async_policy=AsyncPolicy.pipeline_parallel(
+            depth=2,
+            phases=order,
+            schedule=SchedulePolicy.phase_order(phase="backward", phase_order=order),
+        ),
+        schedule_policy=SchedulePolicy.phase_order(
+            phase="backward",
+            phase_order=order,
+        ),
+    )
+    op_manager = MagicMock()
+    op_manager._get_operator_metadata.side_effect = lambda name: {
+        "forward": forward,
+        "backward": backward,
+    }[name]
+    stub = types.SimpleNamespace(
+        op_manager=op_manager,
+        config=types.SimpleNamespace(
+            operator_metas={"forward": forward, "backward": backward}
+        ),
+        _completed_step_count={"forward": 0, "backward": 0},
+    )
+    stub._effective_schedule_key = types.MethodType(
+        raw_cls._effective_schedule_key, stub
+    )
+    stub._prepare_schedule_state = types.MethodType(
+        raw_cls._prepare_schedule_state, stub
+    )
+    stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
+
+    assert stub._effective_schedule_key("forward", 4) < stub._effective_schedule_key(
+        "backward",
+        4,
+    )
+    assert stub._effective_schedule_key("backward", 4) < stub._effective_schedule_key(
+        "forward",
+        5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_relaxed_finish_does_not_report_non_contiguous_step():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=8, commit_policy="relaxed")
+    )
+    result = ExecutionResult(status=ExecutionStatus.SUCCESS, data="ok")
+
+    await stub._commit_local_plan_result("op", 1, result)
+    assert stub._completed_step_count["op"] == 0
+    stub._report_op_completed.assert_not_called()
+
+    await stub._commit_local_plan_result("op", 0, result)
+    assert stub._completed_step_count["op"] == 2
+    assert stub._report_op_completed.call_args_list[0].args == ("op", 1)
+    assert stub._report_op_completed.call_args_list[1].args == ("op", 2)
+
+
+@pytest.mark.asyncio
+async def test_future_steps_move_into_pipeline_window_by_scheduled_watermark():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+    started: list[int] = []
+
+    def start_local_step_plan(op_name: str, step: int) -> None:
+        assert op_name == "op"
+        stub._record_local_plan_scheduled(op_name, step)
+        stub._running_plan_steps[op_name].add(step)
+        started.append(step)
+
+    stub._start_local_step_plan = start_local_step_plan
+    stub._pending_future_steps["op"].extend([1, 2])
+
+    start_local_step_plan("op", 0)
+    await stub._start_pending_pipeline_steps("op")
+
+    assert started == [0, 1]
+    assert stub._ready_pending_pipeline_steps["op"] == [2]
+    assert stub._pending_future_steps["op"] == []
+
+
+@pytest.mark.asyncio
+async def test_pipelined_wait_consumes_completed_prepare_future():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+    prepared = asyncio.Event()
+    calls = 0
+
+    async def prepare_input(op_name: str, step: int):
+        nonlocal calls
+        calls += 1
+        assert op_name == "op"
+        assert step == 0
+        await asyncio.sleep(0.05)
+        prepared.set()
+        return {"x": 1}
+
+    stub._execute_operator_prepare_input = prepare_input
+
+    stub._prepare_inputs_if_policy_allows("op", 0)
+    await prepared.wait()
+
+    start = time.perf_counter()
+    result = await stub._local_plan_wait_inputs("op", 0)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    assert result == {"x": 1}
+    assert elapsed_ms < 20.0
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_start_prepare_and_enqueue_token_enqueues_before_prepare_done():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def prepare_input(op_name: str, step: int):
+        started.set()
+        await release.wait()
+        return {"x": 1}
+
+    stub._execute_operator_prepare_input = prepare_input
+
+    await stub._start_prepare_and_enqueue_token("op", 0)
+    await started.wait()
+
+    assert ("op", 0) in stub._input_prepare_runtime._tasks
+    assert ("op", 0) in stub._in_op_step_queue
+    queued = await stub._execution_queue.get()
+    assert queued == (0, 1, 0, "op")
+
+    release.set()
+    await stub._input_prepare_runtime.consume(
+        "op",
+        0,
+        lambda: prepare_input("op", 0),
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_trigger_fills_pipeline_window_from_async_policy_depth():
+    stub = _make_pipeline_stub(
+        OperatorMeta(
+            name="op",
+            async_policy=AsyncPolicy.pipelined(depth=3),
+            local_pipeline_depth=3,
+        )
+    )
+    stub.op_manager.get_source_operators.return_value = ["op"]
+    stub.op_manager.is_source_operator.return_value = True
+
+    await stub._trigger_source_operators()
+
+    queued = [await stub._execution_queue.get() for _ in range(3)]
+    assert queued == [
+        (0, 0, 0, "op"),
+        (0, 0, 1, "op"),
+        (0, 0, 2, "op"),
+    ]
+    assert stub._in_op_step_queue == {("op", 0), ("op", 1), ("op", 2)}
+
+
+@pytest.mark.asyncio
+async def test_source_trigger_window_respects_max_steps():
+    stub = _make_pipeline_stub(
+        OperatorMeta(
+            name="op",
+            async_policy=AsyncPolicy.pipelined(depth=4),
+            local_pipeline_depth=4,
+        )
+    )
+    stub.config.max_steps = 2
+    stub.op_manager.get_source_operators.return_value = ["op"]
+    stub.op_manager.is_source_operator.return_value = True
+
+    await stub._trigger_source_operators()
+
+    queued = [await stub._execution_queue.get() for _ in range(2)]
+    assert queued == [
+        (0, 0, 0, "op"),
+        (0, 0, 1, "op"),
+    ]
+    assert stub._execution_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_prepare_ready_refresh_adds_ready_queue_key():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+
+    async def prepare_input(op_name: str, step: int):
+        return {"x": 1}
+
+    stub._execute_operator_prepare_input = prepare_input
+
+    await stub._start_prepare_and_enqueue_token("op", 0)
+    first = await stub._execution_queue.get()
+    assert first == (0, 1, 0, "op")
+
+    await stub._input_prepare_runtime.await_ready(
+        "op",
+        0,
+        lambda: prepare_input("op", 0),
+    )
+    await asyncio.sleep(0)
+
+    refreshed = await stub._execution_queue.get()
+    assert refreshed == (0, 0, 0, "op")
+
+
+@pytest.mark.asyncio
+async def test_prepare_ready_tie_breaker_prefers_ready_same_priority():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+
+    async def pending_prepare():
+        await asyncio.sleep(10)
+
+    async def ready_prepare():
+        return {"x": 1}
+
+    stub._input_prepare_runtime.start("op", 0, pending_prepare)
+    ready_task = stub._input_prepare_runtime.start("op", 1, ready_prepare)
+    await ready_task
+
+    assert stub._effective_schedule_key("op", 1) < stub._effective_schedule_key("op", 0)
+    for task in list(stub._background_tasks):
+        task.cancel()
+    await asyncio.gather(*stub._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_prepare_pending_token_holds_until_ready_for_fifo_policy():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def prepare_input(op_name: str, step: int):
+        started.set()
+        await release.wait()
+        return {"x": 1}
+
+    stub._execute_operator_prepare_input = prepare_input
+    stub._prepare_inputs_if_policy_allows("op", 0)
+    await started.wait()
+
+    assert stub._should_hold_prepare_pending_token("op", 0)
+    release.set()
+    await stub._input_prepare_runtime.await_ready(
+        "op",
+        0,
+        lambda: prepare_input("op", 0),
+    )
+    assert not stub._should_hold_prepare_pending_token("op", 0)
+
+
+@pytest.mark.asyncio
+async def test_deadline_boosted_prepare_pending_token_does_not_hold():
+    meta = OperatorMeta(
+        name="op",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=4,
+            max_staleness=3,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=100),
+        ),
+        schedule_policy=SchedulePolicy.deadline_boost(boost_priority=100),
+        max_async_lag=3,
+    )
+    stub = _make_pipeline_stub(meta)
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def prepare_input(op_name: str, step: int):
+        started.set()
+        await release.wait()
+        return {"x": 1}
+
+    stub._execute_operator_prepare_input = prepare_input
+    stub._prepare_inputs_if_policy_allows("op", 3)
+    await started.wait()
+
+    assert not stub._should_hold_prepare_pending_token("op", 3)
+    release.set()
+    await stub._input_prepare_runtime.await_ready(
+        "op",
+        3,
+        lambda: prepare_input("op", 3),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sync_wait_does_not_start_background_prepare_future():
+    stub = _make_pipeline_stub(OperatorMeta(name="op", async_policy=AsyncPolicy.sync()))
+    calls = 0
+
+    async def prepare_input(op_name: str, step: int):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {"x": 1}
+
+    stub._execute_operator_prepare_input = prepare_input
+
+    stub._prepare_inputs_if_policy_allows("op", 0)
+    assert not stub._input_prepare_runtime._tasks
+
+    result = await stub._local_plan_wait_inputs("op", 0)
+    assert result == {"x": 1}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_skips_step_at_active_drain_target():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+    stub._drain_target_count = 1
+
+    async def prepare_input(op_name: str, step: int):
+        raise AssertionError("prepare should not start while drain target blocks step")
+
+    stub._execute_operator_prepare_input = prepare_input
+
+    stub._prepare_inputs_if_policy_allows("op", 1)
+    assert not stub._input_prepare_runtime._tasks
+
+
+@pytest.mark.asyncio
+async def test_setting_drain_target_cancels_speculative_prepare_past_target():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
+    )
+    started = asyncio.Event()
+
+    async def prepare_input(op_name: str, step: int):
+        started.set()
+        await asyncio.sleep(10)
+
+    stub._execute_operator_prepare_input = prepare_input
+
+    stub._prepare_inputs_if_policy_allows("op", 3)
+    await started.wait()
+    assert ("op", 3) in stub._input_prepare_runtime._tasks
+
+    await stub.set_drain_target_count(2)
+    assert ("op", 3) not in stub._input_prepare_runtime._tasks
+
+
+@pytest.mark.asyncio
+async def test_local_barrier_does_not_wait_frame_build_task():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+
+    frame_build_done = asyncio.Event()
+
+    async def fake_send_output(op_name, result, *, exec_step, step_tuuid_cache=None):
+        assert op_name == "op"
+        assert result.status is ExecutionStatus.SUCCESS
+        assert exec_step == 0
+        await asyncio.sleep(0.05)
+        frame_build_done.set()
+        return ()
+
+    stub._send_output = fake_send_output
+
+    start = time.perf_counter()
+    send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    await stub._local_plan_commit("op", 0, send_token)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    assert elapsed_ms < 20.0
+    assert send_token.send_task is not None
+    assert not frame_build_done.is_set()
+    await send_token.send_task
+    assert frame_build_done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_local_send_node_task_does_not_wait_delivery_future():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+
+    delivery_done = asyncio.Event()
+
+    async def slow_delivery():
+        await asyncio.sleep(0.05)
+        delivery_done.set()
+
+    async def fake_send_output(op_name, result, *, exec_step, step_tuuid_cache=None):
+        assert op_name == "op"
+        assert result.status is ExecutionStatus.SUCCESS
+        assert exec_step == 0
+        return (asyncio.create_task(slow_delivery()),)
+
+    stub._send_output = fake_send_output
+
+    send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    await send_token.send_task
+    assert not delivery_done.is_set()
+    await stub._local_plan_commit("op", 0, send_token)
+    assert not delivery_done.is_set()
+    await delivery_done.wait()
+
+
+@pytest.mark.asyncio
+async def test_local_barrier_observes_immediate_send_registration_failure():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+
+    async def failing_send_output(op_name, result, *, exec_step, step_tuuid_cache=None):
+        raise RuntimeError("frame build failed")
+
+    stub._send_output = failing_send_output
+
+    send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    await asyncio.sleep(0)
+    with pytest.raises(RuntimeError, match="frame build failed"):
+        await stub._local_plan_commit("op", 0, send_token)
+
+
+@pytest.mark.asyncio
+async def test_local_barrier_poisoned_by_late_send_failure_at_drain():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+
+    async def failing_send_output(op_name, result, *, exec_step, step_tuuid_cache=None):
+        await asyncio.sleep(0.01)
+        raise RuntimeError("late frame build failed")
+
+    stub._send_output = failing_send_output
+
+    send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    await stub._local_plan_commit("op", 0, send_token)
+    error_before_sleep = stub._last_error
+    assert error_before_sleep is None
+    await asyncio.sleep(0.02)
+    assert stub._last_error is not None
+    assert "late frame build failed" in stub._last_error
+
+
+@pytest.mark.asyncio
+async def test_skipped_local_send_token_has_no_send_task():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+
+    result = ExecutionResult(status=ExecutionStatus.SKIPPED)
+    send_token = await stub._local_plan_send_output("op", 0, result, result)
+    assert send_token.send_task is None
+    await stub._local_plan_commit("op", 0, send_token)
+
+
+@pytest.mark.asyncio
+async def test_local_send_uses_wait_cache_before_background_send_runs():
+    stub = _make_pipeline_stub(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed")
+    )
+    prepared = _prepared({16: "mirror-source"})
+    release = asyncio.Event()
+    observed = {}
+
+    async def fake_send_output(op_name, result, *, exec_step, step_tuuid_cache=None):
+        await release.wait()
+        observed.update(step_tuuid_cache or {})
+        return ()
+
+    stub._send_output = fake_send_output
+
+    send_token = await stub._local_plan_send_output("op", 0, prepared, "payload")
+    prepared.step_tuuid_cache.clear()
+    release.set()
+    await send_token.send_task
+
+    assert observed == {16: "mirror-source"}
+
+
+@pytest.mark.asyncio
+async def test_local_send_commit_profiler_spans_enqueue_wait_not_delivery_wait():
+    stub = _make_pipeline_stub_with_profiler(
+        OperatorMeta(name="op", local_pipeline_depth=2, commit_policy="relaxed"),
+        profiler_enabled=True,
+    )
+
+    delivery_done = asyncio.Event()
+
+    async def slow_outbound():
+        await asyncio.sleep(0.05)
+        delivery_done.set()
+
+    async def fake_send_output(op_name, result, *, exec_step, step_tuuid_cache=None):
+        assert op_name == "op"
+        assert result.status is ExecutionStatus.SUCCESS
+        assert exec_step == 0
+        return (asyncio.create_task(slow_outbound()),)
+
+    stub._send_output = fake_send_output
+
+    send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    await stub._local_plan_commit("op", 0, send_token)
+
+    recorder = stub._profiler_runtime.recorder
+
+    def durations(name: str) -> list[float]:
+        name_id = recorder.intern(name)
+        return [
+            int(row[2]) / 1e6
+            for row in recorder.arena.snapshot()
+            if int(row[4]) == name_id
+        ]
+
+    send_ms = durations("local_step.send_output")
+    await_ms = durations("local_step.await_send")
+    commit_ms = durations("local_step.commit")
+
+    assert len(send_ms) == 1
+    assert len(await_ms) == 1
+    assert len(commit_ms) == 1
+    assert send_ms[0] < 20.0
+    assert await_ms[0] < 20.0
+    assert commit_ms[0] < 20.0
+    await delivery_done.wait()

@@ -7,6 +7,7 @@ from fluxway.rpc.protocol import (
     DataPlaneRegistry,
     PayloadDeviceClass,
     RayActorDataPlane,
+    TransportFrameEnvelope,
     payload_device_class,
     validate_payload_iov_device_class,
 )
@@ -83,8 +84,8 @@ def test_registry_creates_axon_data_plane():
         payload_device_class = "cpu"
         completion_mode = "receiver_success"
 
-        async def invoke_transport_frame(
-            self, header, payload_device_class, sender_spmd_code, *payload_iovs
+        async def invoke_transport_frames(
+            self, frames, payload_device_class, sender_spmd_code
         ):
             return True
 
@@ -142,7 +143,7 @@ async def test_ray_actor_data_plane_sends_header_and_payload_buffers():
 
     class MockHandle:
         def __init__(self):
-            self.receive_transport_frame = RemoteMethod()
+            self.receive_transport_frames = RemoteMethod()
 
     handle = MockHandle()
     adapter = RayActorDataPlane(handle, sender_spmd_code=7)
@@ -150,20 +151,29 @@ async def test_ray_actor_data_plane_sends_header_and_payload_buffers():
     emb = np.arange(4, dtype=np.float32)
     header = _make_header()
 
-    await adapter.receive_transport_frame(
-        header,
-        ids,
-        emb,
+    await adapter.receive_transport_frames(
+        (
+            TransportFrameEnvelope(
+                header=header,
+                payload_segments=(ids, emb),
+            ),
+        )
     )
 
-    args = handle.receive_transport_frame.args
+    args = handle.receive_transport_frames.args
     assert args is not None
-    assert args[0] is header
-    assert isinstance(args[0], TransportFrameHeader)
-    assert isinstance(args[1], np.ndarray)
-    assert isinstance(args[2], np.ndarray)
-    assert args[1].dtype == np.uint64
-    assert not any(isinstance(arg, (str, list, dict)) for arg in args)
+    frames = args[0]
+    assert len(frames) == 1
+    assert frames[0].header is header
+    assert isinstance(frames[0].header, TransportFrameHeader)
+    assert isinstance(frames[0].payload_segments[0], np.ndarray)
+    assert isinstance(frames[0].payload_segments[1], np.ndarray)
+    assert frames[0].payload_segments[0].dtype == np.uint64
+    assert not any(
+        isinstance(arg, (str, list, dict))
+        for frame in frames
+        for arg in frame.payload_segments
+    )
 
 
 def test_payload_device_class_detects_cpu_cuda_and_dlpack_cpu():
@@ -201,10 +211,10 @@ async def test_axon_data_plane_validates_and_invokes_flat_payload_iovs():
         def __init__(self):
             self.args = None
 
-        async def invoke_transport_frame(
-            self, header, payload_device_class, sender_spmd_code, *payload_iovs
+        async def invoke_transport_frames(
+            self, frames, payload_device_class, sender_spmd_code
         ):
-            self.args = (header, payload_device_class, sender_spmd_code, *payload_iovs)
+            self.args = (frames, payload_device_class, sender_spmd_code)
             return True
 
     handle = MockHandle()
@@ -213,15 +223,17 @@ async def test_axon_data_plane_validates_and_invokes_flat_payload_iovs():
     ids = np.array([2**40], dtype=np.uint64)
     emb = np.arange(4, dtype=np.float32)
 
-    result = await adapter.receive_transport_frame(header, ids, emb)
+    result = await adapter.receive_transport_frames(
+        (TransportFrameEnvelope(header=header, payload_segments=(ids, emb)),)
+    )
 
     assert result is True
     assert handle.args is not None
-    assert handle.args[0] is header
+    assert handle.args[0][0].header is header
     assert handle.args[1] == "cpu"
     assert handle.args[2] == 11
-    assert handle.args[3] is ids
-    assert handle.args[4] is emb
+    assert handle.args[0][0].payload_segments[0] is ids
+    assert handle.args[0][0].payload_segments[1] is emb
 
 
 @pytest.mark.asyncio
@@ -233,8 +245,8 @@ async def test_axon_data_plane_rejects_payload_before_invoking_handle():
         def __init__(self):
             self.called = False
 
-        async def invoke_transport_frame(
-            self, header, payload_device_class, sender_spmd_code, *payload_iovs
+        async def invoke_transport_frames(
+            self, frames, payload_device_class, sender_spmd_code
         ):
             self.called = True
             return True
@@ -243,7 +255,15 @@ async def test_axon_data_plane_rejects_payload_before_invoking_handle():
     adapter = AxonDataPlane(handle, sender_spmd_code=0)
 
     with pytest.raises(ValueError, match="source=cpu destination=cuda"):
-        await adapter.receive_transport_frame(
-            _make_header(), np.zeros(1, dtype=np.float32), np.ones(1, dtype=np.float32)
+        await adapter.receive_transport_frames(
+            (
+                TransportFrameEnvelope(
+                    header=_make_header(),
+                    payload_segments=(
+                        np.zeros(1, dtype=np.float32),
+                        np.ones(1, dtype=np.float32),
+                    ),
+                ),
+            )
         )
     assert handle.called is False

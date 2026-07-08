@@ -17,6 +17,7 @@ Tests are split into:
 import asyncio
 import threading
 import types
+import typing
 
 import pytest
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
@@ -168,13 +169,20 @@ class TestWorkerDrainTarget:
 
     def _make_stub(self):
         from fluxway.spmd.worker.worker import SPMDWorker as _ActorCls
+        from fluxway.spmd.worker.worker import LocalInputPrepareRuntime
 
-        raw_cls = _ActorCls.__ray_actor_class__
+        raw_cls: typing.Any = getattr(_ActorCls, "__ray_actor_class__", _ActorCls)
         stub = types.SimpleNamespace(
             _drain_target_count=None,
             _drain_cond=asyncio.Condition(),
+            _running_plan_steps={},
+            _background_tasks=set(),
             spmd_id="test_spmd",
             rank=0,
+        )
+        stub._input_prepare_runtime = LocalInputPrepareRuntime(
+            background_tasks=stub._background_tasks,
+            on_task_done=lambda _task: None,
         )
         stub.set_drain_target_count = types.MethodType(
             raw_cls.set_drain_target_count, stub

@@ -8,6 +8,7 @@ from contextlib import (
     contextmanager,
 )
 import time
+import threading
 from collections.abc import AsyncGenerator, Generator
 
 from fluxway.profiler.record import (
@@ -30,17 +31,20 @@ class TraceEventSpec:
     name: str
     track: str
     payload_fields: tuple[str, ...] = EMPTY_PAYLOAD_FIELDS
+    step_payload_field: str | None = None
 
 
 DATA_PLANE_RECEIVE_TRANSPORT_FRAME = TraceEventSpec(
     "data_plane.receive_transport_frame",
     "transport/send",
-    ("remote_rank",),
+    ("remote_rank", "step"),
+    "step",
 )
 DATA_PLANE_RECEIVE_CONTROL = TraceEventSpec(
     "data_plane.receive_control",
     "control/send",
     ("step", "field_count"),
+    "step",
 )
 DATA_PLANE_HLC_RECEIVE = TraceEventSpec(
     "data_plane.hlc_receive",
@@ -49,88 +53,284 @@ DATA_PLANE_HLC_RECEIVE = TraceEventSpec(
 )
 DATA_PLANE_SEND_STEP_FRAMES = TraceEventSpec(
     "data_plane.send_step_frames",
-    "transport/build",
+    "data_plane/build",
     ("rank", "exec_step"),
+    "exec_step",
 )
-DATA_PLANE_SEND_TRANSPORT_FRAME = TraceEventSpec(
-    "data_plane.send_transport_frame",
-    "transport/send",
-    ("source_rank", "output_step"),
-)
-DATA_PLANE_BUILD_FRAME_GROUPS = TraceEventSpec(
-    "data_plane.build_frame_groups",
-    "transport/split",
+DATA_PLANE_FRAME_BUILD = TraceEventSpec(
+    "data_plane.frame_build",
+    "data_plane/build",
     ("op_id", "rank", "step", "successor_count", "output_count"),
+    "step",
+)
+DATA_PLANE_FRAME_SUBMIT = TraceEventSpec(
+    "data_plane.frame_submit",
+    "data_plane/enqueue",
+    ("source_rank", "output_step", "frame_count"),
+    "output_step",
+)
+DATA_PLANE_ENQUEUE_BATCH = TraceEventSpec(
+    "data_plane.enqueue_batch",
+    "data_plane/enqueue",
+    (
+        "op_id",
+        "step",
+        "source_spmd_code",
+        "source_rank",
+        "target_spmd_id",
+        "target_rank",
+        "batch_seq",
+        "frame_count",
+    ),
+    "step",
+)
+DATA_PLANE_BATCH_RPC = TraceEventSpec(
+    "data_plane.batch_rpc",
+    "data_plane/batch_rpc",
+    (
+        "op_id",
+        "step",
+        "source_spmd_code",
+        "source_rank",
+        "target_spmd_id",
+        "target_rank",
+        "batch_seq",
+        "frame_count",
+    ),
+    "step",
+)
+DATA_PLANE_DELIVERY_FENCE = TraceEventSpec(
+    "data_plane.delivery_fence",
+    "data_plane/delivery",
+    ("fence_id", "pending_delivery_count"),
+)
+DELIVERY_REGISTER_TOKEN = TraceEventSpec(
+    "delivery.register_token",
+    "data_plane/delivery",
+    ("pending_delivery_count",),
+)
+DELIVERY_SEMAPHORE_WAIT = TraceEventSpec(
+    "delivery.semaphore_wait",
+    "data_plane/delivery",
+    ("pending_delivery_count",),
+)
+DELIVERY_RUN = TraceEventSpec(
+    "delivery.run",
+    "data_plane/delivery",
+    ("pending_delivery_count",),
+)
+DELIVERY_POISON = TraceEventSpec(
+    "delivery.poison",
+    "data_plane/delivery",
+    ("error_id",),
+)
+DELIVERY_FENCE = TraceEventSpec(
+    "delivery.fence",
+    "data_plane/delivery",
+    ("fence_id", "pending_delivery_count"),
+)
+PREPARE_REGISTER = TraceEventSpec(
+    "prepare.register",
+    "compute/prepare",
+    ("op_id", "step", "pending_prepare_count"),
+    "step",
+)
+PREPARE_RUN = TraceEventSpec(
+    "prepare.run",
+    "compute/prepare",
+    ("op_id", "step"),
+    "step",
+)
+PREPARE_SNAPSHOT = TraceEventSpec(
+    "prepare.snapshot",
+    "compute/prepare",
+    ("op_id", "step"),
+    "step",
+)
+PREPARE_ASSEMBLE_THREAD = TraceEventSpec(
+    "prepare.assemble_thread",
+    "compute/prepare",
+    ("op_id", "step"),
+    "step",
+)
+PREPARE_CONSUME = TraceEventSpec(
+    "prepare.consume",
+    "compute/prepare",
+    ("op_id", "step"),
+    "step",
+)
+PREPARE_FENCE = TraceEventSpec(
+    "prepare.fence",
+    "compute/prepare",
+    ("pending_prepare_count",),
+)
+DATA_PLANE_RECEIVER_WAIT = TraceEventSpec(
+    "data_plane.receiver_wait",
+    "transport/recv",
+    ("remote_rank", "step"),
+    "step",
 )
 DATA_PLANE_TENSOR_SPLIT = TraceEventSpec(
     "data_plane.tensor_split",
-    "transport/split",
+    "data_plane/build",
     ("op_id", "rank", "step", "target_rank", "payload_count"),
+    "step",
 )
 WORKER_RECEIVE_TRANSPORT_FRAME = TraceEventSpec(
     "worker.receive_transport_frame",
     "transport/recv",
     ("step", "sender_spmd_code", "edge_count", "payload_count"),
+    "step",
 )
 WORKER_DEPOSIT_TRANSPORT_FRAME = TraceEventSpec(
     "worker.deposit_transport_frame",
     "mailbox/deposit",
     ("op_id", "step", "edge_count", "watermark"),
+    "step",
 )
 WORKER_ASSEMBLE_INPUT = TraceEventSpec(
     "worker.assemble_input",
     "tensor/reassemble",
     ("op_id", "step", "tuuid_count", "state_count"),
+    "step",
 )
 WORKER_ASSEMBLE_TENSOR = TraceEventSpec(
     "worker.assemble_tensor",
     "tensor/reassemble",
     ("op_id", "tuuid", "step", "sender_count", "shard_count"),
+    "step",
+)
+WORKER_ASSEMBLE_FILTER_SHARDS = TraceEventSpec(
+    "worker.assemble_tensor.filter_shards",
+    "tensor/reassemble/detail",
+    ("op_id", "tuuid", "step", "sender_count", "shard_count"),
+    "step",
+)
+WORKER_ASSEMBLE_CAT_VALUES = TraceEventSpec(
+    "worker.assemble_tensor.cat_values",
+    "tensor/reassemble/detail",
+    ("op_id", "tuuid", "step", "value_count"),
+    "step",
+)
+WORKER_ASSEMBLE_MERGE_METADATA = TraceEventSpec(
+    "worker.assemble_tensor.merge_metadata",
+    "tensor/reassemble/detail",
+    ("op_id", "tuuid", "step", "shard_count"),
+    "step",
+)
+WORKER_ASSEMBLE_SORT = TraceEventSpec(
+    "worker.assemble_tensor.sort",
+    "tensor/reassemble/detail",
+    ("op_id", "tuuid", "step", "actual_len", "capacity"),
+    "step",
+)
+WORKER_ASSEMBLE_SCATTER = TraceEventSpec(
+    "worker.assemble_tensor.scatter",
+    "tensor/reassemble/detail",
+    ("op_id", "tuuid", "step", "logical_len", "capacity"),
+    "step",
 )
 WORKER_SEND_OUTPUT = TraceEventSpec(
     "worker.send_output",
     "tensor/split",
     ("op_id", "step", "output_count", "successor_count"),
+    "step",
+)
+DATA_PLANE_RAY_PAYLOAD_SERIALIZE = TraceEventSpec(
+    "data_plane.ray_payload_serialize",
+    "data_plane/batch_rpc/detail",
+    ("frame_count", "payload_count"),
+)
+DATA_PLANE_RAY_RPC_SUBMIT = TraceEventSpec(
+    "data_plane.ray_rpc_submit",
+    "data_plane/batch_rpc/detail",
+    ("frame_count",),
+)
+DATA_PLANE_RAY_RPC_WAIT = TraceEventSpec(
+    "data_plane.ray_rpc_wait",
+    "data_plane/batch_rpc/detail",
+    ("frame_count",),
+)
+DATA_PLANE_RECEIVER_BATCH = TraceEventSpec(
+    "data_plane.receiver_batch",
+    "transport/recv/detail",
+    ("frame_count",),
+)
+DATA_PLANE_RECEIVER_DEPOSIT = TraceEventSpec(
+    "data_plane.receiver_deposit",
+    "transport/recv/detail",
+    ("step", "sender_spmd_code", "edge_count", "payload_count"),
+    "step",
 )
 LOCAL_STEP_PLAN_EXECUTE = TraceEventSpec(
     "local_step_plan.execute",
     "compute/local_plan",
     ("node_count",),
 )
+LOCAL_STEP_WAIT_INPUTS = TraceEventSpec(
+    "local_step.wait_inputs",
+    "compute/local_plan",
+    ("op_id", "step"),
+    "step",
+)
+LOCAL_STEP_CALL_USER = TraceEventSpec(
+    "local_step.call_user",
+    "compute/local_plan",
+    ("op_id", "step"),
+    "step",
+)
+LOCAL_STEP_SEND_OUTPUT = TraceEventSpec(
+    "local_step.send_output",
+    "compute/local_plan",
+    ("op_id", "step", "source_spmd_code", "source_rank"),
+    "step",
+)
+LOCAL_STEP_AWAIT_SEND = TraceEventSpec(
+    "local_step.await_send",
+    "compute/local_plan",
+    ("op_id", "step", "source_spmd_code", "source_rank"),
+    "step",
+)
+LOCAL_STEP_COMMIT = TraceEventSpec(
+    "local_step.commit",
+    "compute/local_plan",
+    ("op_id", "step"),
+    "step",
+)
 USER_CALLABLE_EXECUTE = TraceEventSpec(
     "user_callable.execute",
     "compute/user_callable",
+    (
+        "callable_id",
+        "function_id",
+        "op_id",
+        "step",
+        "tensor_names_id",
+        "control_names_id",
+        "static_names_id",
+        "lane_id",
+    ),
+    "step",
+)
+WORKER_PROCESS_CALL_SUBMIT = TraceEventSpec(
+    "worker_process_call.submit",
+    "compute/user_callable_runtime",
+    ("callable_id", "resource_id", "pending_call_count"),
+)
+WORKER_PROCESS_CALL_QUEUE_WAIT = TraceEventSpec(
+    "worker_process_call.queue_wait",
+    "compute/user_callable_runtime",
+    ("callable_id", "resource_id", "pending_call_count"),
+)
+WORKER_PROCESS_CALL_THREAD_RUN = TraceEventSpec(
+    "worker_process_call.thread_run",
+    "compute/user_callable_runtime",
     ("callable_id", "resource_id"),
 )
-USER_CALLABLE_LANE_SELECT = TraceEventSpec(
-    "user_callable.lane_select",
-    "compute/user_callable_lane",
-    ("callable_id", "resource_id", "lane_id"),
-)
-USER_CALLABLE_INLINE_ASYNC = TraceEventSpec(
-    "user_callable.inline_async",
-    "compute/user_callable_lane",
-    ("callable_id", "resource_id"),
-)
-USER_CALLABLE_INLINE_SYNC_SAMPLE = TraceEventSpec(
-    "user_callable.inline_sync_sample",
-    "compute/user_callable_lane",
-    ("callable_id", "resource_id"),
-)
-USER_CALLABLE_LOCAL_FREE_THREAD = TraceEventSpec(
-    "user_callable.local_free_thread",
-    "compute/user_callable_lane",
-    ("callable_id", "resource_id"),
-)
-USER_CALLABLE_WORKER_PROCESS = TraceEventSpec(
-    "user_callable.worker_process",
-    "compute/user_callable_lane",
-    ("callable_id", "resource_id"),
-)
-USER_CALLABLE_RAY_ACTOR_EXECUTE = TraceEventSpec(
-    "user_callable.ray_actor_execute",
-    "compute/user_callable_actor",
-    ("callable_id", "resource_id"),
+WORKER_PROCESS_CALL_FUTURE_WAIT = TraceEventSpec(
+    "worker_process_call.future_wait",
+    "compute/user_callable_runtime",
+    ("callable_id", "resource_id", "pending_call_count"),
 )
 USER_CALLABLE_SNAPSHOT_HOOK = TraceEventSpec(
     "user_callable.snapshot_hook",
@@ -141,11 +341,13 @@ DATA_PLANE_SEND_SEMAPHORE_WAIT = TraceEventSpec(
     "data_plane.send_semaphore_wait",
     "transport/send",
     ("source_rank", "output_step"),
+    "output_step",
 )
 TRANSPORT_DISTRIBUTE = TraceEventSpec(
     "transport.distribute",
     "transport/distribute",
     ("op_id", "rank", "step", "target_spmd_id"),
+    "step",
 )
 TRANSPORT_RECEIVER_WAIT = TraceEventSpec(
     "transport.receiver_wait",
@@ -166,11 +368,13 @@ CONTROLLER_DRAIN = TraceEventSpec(
     "controller.drain",
     "controller/drain",
     ("target_step", "spmd_count"),
+    "target_step",
 )
 CONTROLLER_CHECKPOINT = TraceEventSpec(
     "controller.checkpoint",
     "controller/checkpoint",
     ("target_step",),
+    "target_step",
 )
 CONTROLLER_RESTORE = TraceEventSpec(
     "controller.restore",
@@ -266,11 +470,13 @@ DRIVER_DRAIN = TraceEventSpec(
     "driver.drain",
     "driver/drain",
     ("target_step", "worker_count"),
+    "target_step",
 )
 DRIVER_SNAPSHOT = TraceEventSpec(
     "driver.snapshot",
     "driver/checkpoint",
     ("snapshot_id", "target_step", "worker_count"),
+    "target_step",
 )
 DRIVER_RESTORE = TraceEventSpec(
     "driver.restore",
@@ -291,11 +497,13 @@ DRIVER_WORKER_HEARTBEAT = TraceEventSpec(
     "driver.worker_heartbeat",
     "driver/heartbeat",
     ("rank", "status_id", "completed_count", "mailbox_full"),
+    "completed_count",
 )
 DRIVER_OP_COMPLETION = TraceEventSpec(
     "driver.op_completion",
     "driver/completion",
     ("rank", "op_id", "step"),
+    "step",
 )
 WORKER_BACKGROUND_TASK = TraceEventSpec(
     "worker.background_task",
@@ -311,26 +519,31 @@ WORKER_QUEUE_ENQUEUE = TraceEventSpec(
     "worker.queue_enqueue",
     "worker/scheduler",
     ("op_id", "step", "priority"),
+    "step",
 )
 WORKER_QUEUE_DEQUEUE = TraceEventSpec(
     "worker.queue_dequeue",
     "worker/scheduler",
     ("op_id", "step", "priority"),
+    "step",
 )
 WORKER_BLOCKED_TASK = TraceEventSpec(
     "worker.blocked_task",
     "worker/scheduler",
     ("op_id", "step"),
+    "step",
 )
 WORKER_FUTURE_TASK = TraceEventSpec(
     "worker.future_task",
     "worker/scheduler",
     ("op_id", "step", "completed_count"),
+    "step",
 )
 WORKER_STALE_TASK = TraceEventSpec(
     "worker.stale_task",
     "worker/scheduler",
     ("op_id", "step", "completed_count"),
+    "step",
 )
 WORKER_RUN_LOOP = TraceEventSpec(
     "worker.run_loop",
@@ -341,16 +554,19 @@ WORKER_ADVANCE_STEP = TraceEventSpec(
     "worker.advance_step",
     "worker/scheduler",
     ("op_id", "step", "next_step"),
+    "step",
 )
 WORKER_DRAIN_WAIT = TraceEventSpec(
     "worker.drain_wait",
     "worker/scheduler",
     ("op_id", "step", "target_step"),
+    "step",
 )
 WORKER_CHECKPOINT_SAVE = TraceEventSpec(
     "checkpoint.async_save",
     "checkpoint/worker",
     ("step", "operator_count"),
+    "step",
 )
 WORKER_CHECKPOINT_LOAD = TraceEventSpec(
     "checkpoint.async_load",
@@ -361,41 +577,49 @@ WORKER_SNAPSHOT_HOOK = TraceEventSpec(
     "worker.snapshot_hook",
     "checkpoint/worker",
     ("hook_id", "step"),
+    "step",
 )
 MAILBOX_DECLARE_STEP = TraceEventSpec(
     "mailbox.declare_step",
     "mailbox/barrier",
     ("op_id", "step", "tensor_count", "state_count"),
+    "step",
 )
 MAILBOX_EXPECTED_COUNT_UPDATE = TraceEventSpec(
     "mailbox.expected_count_update",
     "mailbox/barrier",
     ("op_id", "step", "tensor_count"),
+    "step",
 )
 MAILBOX_DEPOSIT_CONTROL = TraceEventSpec(
     "mailbox.deposit_control",
     "mailbox/deposit",
     ("op_id", "step", "field_count"),
+    "step",
 )
 MAILBOX_DEPOSIT_FRAME = TraceEventSpec(
     "mailbox.deposit_frame",
     "mailbox/deposit",
     ("op_id", "step", "edge_count", "payload_count"),
+    "step",
 )
 MAILBOX_READY_FIRE = TraceEventSpec(
     "mailbox.ready_fire",
     "mailbox/barrier",
     ("op_id", "step"),
+    "step",
 )
 MAILBOX_WAIT_STEP_READY = TraceEventSpec(
     "mailbox.wait_step_ready",
     "mailbox/barrier",
     ("op_id", "step"),
+    "step",
 )
 MAILBOX_CLEAR_STEP = TraceEventSpec(
     "mailbox.clear_step",
     "mailbox/barrier",
     ("op_id", "step"),
+    "step",
 )
 
 
@@ -407,10 +631,14 @@ class TraceRecorder:
         run_id: str,
         process_name: str,
         clock_calibration: ClockCalibration | None = None,
+        skip_initial_steps: int = 0,
     ) -> None:
+        if skip_initial_steps < 0:
+            raise ValueError("skip_initial_steps must be non-negative.")
         self._arena = arena
         self._run_id = run_id
         self._process_name = process_name
+        self._skip_initial_steps = skip_initial_steps
         self._clock_calibration = clock_calibration or ClockCalibration(
             monotonic_to_epoch_offset_ns=0,
             uncertainty_ns=0,
@@ -418,6 +646,7 @@ class TraceRecorder:
         self._interned: dict[str, int] = {}
         self._names_by_id: dict[int, str] = {}
         self._payload_fields_by_name_id: dict[int, tuple[str, ...]] = {}
+        self._intern_lock = threading.RLock()
         self._root_carrier = TraceCarrier.root(run_id)
 
     @property
@@ -430,10 +659,11 @@ class TraceRecorder:
 
     @property
     def metadata(self) -> TraceMetadata:
-        return TraceMetadata(
-            names_by_id=dict(self._names_by_id),
-            payload_fields_by_name_id=dict(self._payload_fields_by_name_id),
-        )
+        with self._intern_lock:
+            return TraceMetadata(
+                names_by_id=dict(self._names_by_id),
+                payload_fields_by_name_id=dict(self._payload_fields_by_name_id),
+            )
 
     def snapshot(self) -> ProfilerSnapshot:
         return {
@@ -445,13 +675,14 @@ class TraceRecorder:
         }
 
     def intern(self, value: str) -> int:
-        existing = self._interned.get(value)
-        if existing is not None:
-            return existing
-        ident = stable_u64(self._run_id, self._process_name, value)
-        self._interned[value] = ident
-        self._names_by_id[ident] = value
-        return ident
+        with self._intern_lock:
+            existing = self._interned.get(value)
+            if existing is not None:
+                return existing
+            ident = stable_u64(self._run_id, self._process_name, value)
+            self._interned[value] = ident
+            self._names_by_id[ident] = value
+            return ident
 
     def data_plane_hlc_receive(
         self,
@@ -472,12 +703,12 @@ class TraceRecorder:
         )
 
     def data_plane_receive_transport_frame(
-        self, *, carrier: TraceCarrier, remote_rank: int
+        self, *, carrier: TraceCarrier, remote_rank: int, step: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             DATA_PLANE_RECEIVE_TRANSPORT_FRAME,
             carrier=carrier,
-            payload=(remote_rank,),
+            payload=(remote_rank, step),
         )
 
     def data_plane_receive_control(
@@ -497,15 +728,7 @@ class TraceRecorder:
             payload=(rank, exec_step),
         )
 
-    def data_plane_send_transport_frame(
-        self, *, source_rank: int, output_step: int
-    ) -> AbstractAsyncContextManager[None]:
-        return self._async_span(
-            DATA_PLANE_SEND_TRANSPORT_FRAME,
-            payload=(source_rank, output_step),
-        )
-
-    def data_plane_build_frame_groups(
+    def data_plane_frame_build_sync(
         self,
         *,
         op_name: str,
@@ -513,9 +736,9 @@ class TraceRecorder:
         step: int,
         successor_count: int,
         output_count: int,
-    ) -> AbstractAsyncContextManager[None]:
-        return self._async_span(
-            DATA_PLANE_BUILD_FRAME_GROUPS,
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            DATA_PLANE_FRAME_BUILD,
             payload=(
                 self.intern(op_name),
                 rank,
@@ -523,6 +746,168 @@ class TraceRecorder:
                 successor_count,
                 output_count,
             ),
+        )
+
+    def data_plane_frame_submit(
+        self, *, source_rank: int, output_step: int, frame_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_FRAME_SUBMIT,
+            payload=(source_rank, output_step, frame_count),
+        )
+
+    def data_plane_enqueue_batch(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        source_spmd_code: int,
+        source_rank: int,
+        target_spmd_id: str,
+        target_rank: int,
+        batch_seq: int,
+        frame_count: int,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_ENQUEUE_BATCH,
+            payload=(
+                self.intern(op_name),
+                step,
+                source_spmd_code,
+                source_rank,
+                self.intern(target_spmd_id),
+                target_rank,
+                batch_seq,
+                frame_count,
+            ),
+        )
+
+    def data_plane_batch_rpc(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        source_spmd_code: int,
+        source_rank: int,
+        target_spmd_id: str,
+        target_rank: int,
+        batch_seq: int,
+        frame_count: int,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_BATCH_RPC,
+            payload=(
+                self.intern(op_name),
+                step,
+                source_spmd_code,
+                source_rank,
+                self.intern(target_spmd_id),
+                target_rank,
+                batch_seq,
+                frame_count,
+            ),
+        )
+
+    def data_plane_delivery_fence(
+        self, *, fence_id: str, pending_delivery_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_DELIVERY_FENCE,
+            payload=(self.intern(fence_id), pending_delivery_count),
+        )
+
+    def delivery_register_token(
+        self, *, pending_delivery_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DELIVERY_REGISTER_TOKEN,
+            payload=(pending_delivery_count,),
+        )
+
+    def delivery_semaphore_wait(
+        self, *, pending_delivery_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DELIVERY_SEMAPHORE_WAIT,
+            payload=(pending_delivery_count,),
+        )
+
+    def delivery_run(
+        self, *, pending_delivery_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DELIVERY_RUN,
+            payload=(pending_delivery_count,),
+        )
+
+    def delivery_poison(self, *, error: str) -> AbstractContextManager[None]:
+        return self._span(
+            DELIVERY_POISON,
+            payload=(self.intern(error),),
+        )
+
+    def delivery_fence(
+        self, *, fence_id: str, pending_delivery_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DELIVERY_FENCE,
+            payload=(self.intern(fence_id), pending_delivery_count),
+        )
+
+    def prepare_register(
+        self, *, op_name: str, step: int, pending_prepare_count: int
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            PREPARE_REGISTER,
+            payload=(self.intern(op_name), step, pending_prepare_count),
+        )
+
+    def prepare_run(
+        self, *, op_name: str, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            PREPARE_RUN,
+            payload=(self.intern(op_name), step),
+        )
+
+    def prepare_snapshot(
+        self, *, op_name: str, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            PREPARE_SNAPSHOT,
+            payload=(self.intern(op_name), step),
+        )
+
+    def prepare_assemble_thread(
+        self, *, op_name: str, step: int
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            PREPARE_ASSEMBLE_THREAD,
+            payload=(self.intern(op_name), step),
+        )
+
+    def prepare_consume(
+        self, *, op_name: str, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            PREPARE_CONSUME,
+            payload=(self.intern(op_name), step),
+        )
+
+    def prepare_fence(
+        self, *, pending_prepare_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            PREPARE_FENCE,
+            payload=(pending_prepare_count,),
+        )
+
+    def data_plane_receiver_wait(
+        self, *, remote_rank: int, step: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_RECEIVER_WAIT,
+            payload=(remote_rank, step),
         )
 
     def data_plane_tensor_split(
@@ -593,6 +978,44 @@ class TraceRecorder:
             payload=(self.intern(op_name), tuuid, step, sender_count, shard_count),
         )
 
+    def worker_assemble_tensor_sync(
+        self,
+        *,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        sender_count: int,
+        shard_count: int,
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            WORKER_ASSEMBLE_TENSOR,
+            payload=(self.intern(op_name), tuuid, step, sender_count, shard_count),
+        )
+
+    def worker_assemble_detail(
+        self,
+        *,
+        spec: TraceEventSpec,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        first_count: int,
+        second_count: int = 0,
+    ) -> AbstractContextManager[None]:
+        spec_name = spec.name
+        if spec_name == WORKER_ASSEMBLE_FILTER_SHARDS.name:
+            payload = (self.intern(op_name), tuuid, step, first_count, second_count)
+        elif spec_name in (
+            WORKER_ASSEMBLE_CAT_VALUES.name,
+            WORKER_ASSEMBLE_MERGE_METADATA.name,
+        ):
+            payload = (self.intern(op_name), tuuid, step, first_count)
+        elif spec_name in (WORKER_ASSEMBLE_SORT.name, WORKER_ASSEMBLE_SCATTER.name):
+            payload = (self.intern(op_name), tuuid, step, first_count, second_count)
+        else:
+            raise ValueError(f"Unsupported assemble detail spec {spec.name!r}.")
+        return self._span(spec, payload=payload)
+
     def worker_send_output(
         self, *, op_name: str, step: int, output_count: int, successor_count: int
     ) -> AbstractAsyncContextManager[None]:
@@ -609,36 +1032,89 @@ class TraceRecorder:
             payload=(node_count,),
         )
 
+    def local_step_node(
+        self,
+        *,
+        spec: TraceEventSpec,
+        op_name: str,
+        step: int,
+        source_spmd_code: int | None = None,
+        source_rank: int | None = None,
+    ) -> AbstractAsyncContextManager[None]:
+        if spec in (LOCAL_STEP_SEND_OUTPUT, LOCAL_STEP_AWAIT_SEND):
+            if source_spmd_code is None or source_rank is None:
+                raise ValueError(
+                    f"{spec.name} requires source_spmd_code and source_rank."
+                )
+            return self._async_span(
+                spec,
+                payload=(self.intern(op_name), step, source_spmd_code, source_rank),
+            )
+        if source_spmd_code is not None or source_rank is not None:
+            raise ValueError(
+                f"{spec.name} does not accept source_spmd_code/source_rank."
+            )
+        return self._async_span(
+            spec,
+            payload=(self.intern(op_name), step),
+        )
+
     def user_callable_execute(
-        self, *, callable_id: str, resource_id: int
+        self,
+        *,
+        callable_id: str,
+        function_name: str,
+        op_name: str,
+        step: int,
+        tensor_names: str,
+        control_names: str,
+        static_names: str,
+        lane: str,
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             USER_CALLABLE_EXECUTE,
-            payload=(self.intern(callable_id), resource_id),
+            payload=(
+                self.intern(callable_id),
+                self.intern(function_name),
+                self.intern(op_name),
+                step,
+                self.intern(tensor_names),
+                self.intern(control_names),
+                self.intern(static_names),
+                self.intern(lane),
+            ),
         )
 
-    def user_callable_lane_select(
-        self, *, callable_id: str, resource_id: int, lane: str
-    ) -> None:
-        self._instant(
-            USER_CALLABLE_LANE_SELECT,
-            payload=(self.intern(callable_id), resource_id, self.intern(lane)),
-        )
-
-    def user_callable_lane_span(
-        self, *, spec: TraceEventSpec, callable_id: str, resource_id: int
-    ) -> AbstractAsyncContextManager[None]:
-        return self._async_span(
-            spec,
-            payload=(self.intern(callable_id), resource_id),
-        )
-
-    def user_callable_lane_sync_span(
-        self, *, spec: TraceEventSpec, callable_id: str, resource_id: int
+    def worker_process_submit(
+        self, *, callable_id: str, resource_id: int, pending_call_count: int
     ) -> AbstractContextManager[None]:
         return self._span(
-            spec,
+            WORKER_PROCESS_CALL_SUBMIT,
+            payload=(self.intern(callable_id), resource_id, pending_call_count),
+        )
+
+    def worker_process_queue_wait(
+        self, *, callable_id: str, resource_id: int, pending_call_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_PROCESS_CALL_QUEUE_WAIT,
+            payload=(self.intern(callable_id), resource_id, pending_call_count),
+        )
+
+    def worker_process_thread_run(
+        self, *, callable_id: str, resource_id: int
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            WORKER_PROCESS_CALL_THREAD_RUN,
             payload=(self.intern(callable_id), resource_id),
+        )
+
+    def worker_process_future_wait(
+        self, *, callable_id: str, resource_id: int, pending_call_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            WORKER_PROCESS_CALL_FUTURE_WAIT,
+            payload=(self.intern(callable_id), resource_id, pending_call_count),
         )
 
     def user_callable_snapshot_hook(
@@ -655,6 +1131,42 @@ class TraceRecorder:
         return self._async_span(
             DATA_PLANE_SEND_SEMAPHORE_WAIT,
             payload=(source_rank, output_step),
+        )
+
+    def data_plane_ray_payload_serialize(
+        self, *, frame_count: int, payload_count: int
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            DATA_PLANE_RAY_PAYLOAD_SERIALIZE,
+            payload=(frame_count, payload_count),
+        )
+
+    def data_plane_ray_rpc_submit(
+        self, *, frame_count: int
+    ) -> AbstractContextManager[None]:
+        return self._span(DATA_PLANE_RAY_RPC_SUBMIT, payload=(frame_count,))
+
+    def data_plane_ray_rpc_wait(
+        self, *, frame_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DATA_PLANE_RAY_RPC_WAIT, payload=(frame_count,))
+
+    def data_plane_receiver_batch(
+        self, *, frame_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(DATA_PLANE_RECEIVER_BATCH, payload=(frame_count,))
+
+    def data_plane_receiver_deposit(
+        self,
+        *,
+        step: int,
+        sender_spmd_code: int,
+        edge_count: int,
+        payload_count: int,
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            DATA_PLANE_RECEIVER_DEPOSIT,
+            payload=(step, sender_spmd_code, edge_count, payload_count),
         )
 
     def transport_distribute(
@@ -980,6 +1492,8 @@ class TraceRecorder:
         carrier: TraceCarrier | None = None,
         payload: tuple[int, ...] = EMPTY_TRACE_PAYLOAD,
     ) -> None:
+        if self._skip_record(spec, payload):
+            return
         active = self._root_carrier if carrier is None else carrier
         track_id, name_id = self._register_spec(spec)
         self._arena.append(
@@ -1009,6 +1523,8 @@ class TraceRecorder:
             yield
         finally:
             end = time.perf_counter_ns()
+            if self._skip_record(spec, payload):
+                return
             self._arena.append(
                 kind=TraceEventKind.SLICE_BEGIN,
                 ts_ns=start,
@@ -1020,6 +1536,25 @@ class TraceRecorder:
                 parent_task_id=active.parent_task_id,
                 payload=payload,
             )
+
+    def _skip_record(self, spec: TraceEventSpec, payload: tuple[int, ...]) -> bool:
+        if self._skip_initial_steps <= 0:
+            return False
+        if spec.step_payload_field is None:
+            return False
+        try:
+            step_index = spec.payload_fields.index(spec.step_payload_field)
+        except ValueError as exc:
+            raise ValueError(
+                f"step_payload_field={spec.step_payload_field!r} is not present "
+                f"in payload schema for event={spec.name!r}."
+            ) from exc
+        if step_index >= len(payload):
+            raise ValueError(
+                f"event={spec.name!r} payload length {len(payload)} does not contain "
+                f"step field {spec.step_payload_field!r} at index {step_index}."
+            )
+        return payload[step_index] < self._skip_initial_steps
 
     @asynccontextmanager
     async def _async_span(
@@ -1039,12 +1574,13 @@ class TraceRecorder:
     def _register_spec(self, spec: TraceEventSpec) -> tuple[int, int]:
         track_id = self.intern(f"{self._process_name}/{spec.track}")
         name_id = self.intern(spec.name)
-        existing = self._payload_fields_by_name_id.get(name_id)
-        if existing is None:
-            self._payload_fields_by_name_id[name_id] = spec.payload_fields
-        elif existing != spec.payload_fields:
-            raise ValueError(
-                f"trace payload schema mismatch for event={spec.name!r}: "
-                f"{existing!r} != {spec.payload_fields!r}"
-            )
+        with self._intern_lock:
+            existing = self._payload_fields_by_name_id.get(name_id)
+            if existing is None:
+                self._payload_fields_by_name_id[name_id] = spec.payload_fields
+            elif existing != spec.payload_fields:
+                raise ValueError(
+                    f"trace payload schema mismatch for event={spec.name!r}: "
+                    f"{existing!r} != {spec.payload_fields!r}"
+                )
         return track_id, name_id

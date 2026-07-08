@@ -140,3 +140,37 @@ def test_dense_spmd_marks_jax_distributed_worker_process():
         if isinstance(decorator, ast.Name)
     }
     assert "requires_worker_process" in decorator_names
+
+
+def test_sparse_spmd_marks_embedding_worker_process():
+    module = _load_module(EXAMPLE_DIR / "sparse_spmd.py")
+    cls = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "SparseEmbeddingSPMD"
+    )
+
+    decorator_names = {
+        decorator.id
+        for decorator in cls.decorator_list
+        if isinstance(decorator, ast.Name)
+    }
+
+    assert "requires_worker_process" in decorator_names
+
+
+def test_input_spmd_marks_preprocessing_worker_process():
+    module = _load_module(EXAMPLE_DIR / "input_spmd.py")
+    cls = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "InputSPMD"
+    )
+
+    decorator_names = {
+        decorator.id
+        for decorator in cls.decorator_list
+        if isinstance(decorator, ast.Name)
+    }
+
+    assert "requires_worker_process" in decorator_names

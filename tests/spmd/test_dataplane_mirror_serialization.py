@@ -11,6 +11,7 @@ from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.spmd.worker.data_plane import (
     SuccessorRouteContext,
     build_step_frame_groups,
+    compile_send_plan,
 )
 from fluxway.transport.manifest import EDGE_EXPECTED_COUNT, EDGE_TUUID, FRAME_EDGE_COUNT
 
@@ -42,30 +43,35 @@ def test_mirror_dataplane_build_uses_serialized_step_tuuid_cache_receipt():
             interleave_unit_size=1,
         )
 
-        frame_groups = build_step_frame_groups(
+        route_contexts = (
+            SuccessorRouteContext(
+                context_index=0,
+                spmd_id="Dense",
+                info=successor,
+                effective_rank=1,
+            ),
+        )
+        compiled_plan = compile_send_plan(
             op_name="lookup",
             rank=1,
             mesh=mesh,
-            flat_results=[lookup_output],
-            output_uuids=[200],
+            output_uuids=(200,),
             output_sharding={200: mirror},
-            successor_contexts=[
-                SuccessorRouteContext(
-                    context_index=0,
-                    spmd_id="Dense",
-                    info=successor,
-                    effective_rank=1,
-                )
-            ],
+            successor_contexts=route_contexts,
             tuuid_to_name={
                 100: "lookup.unique_ids",
                 200: "lookup.sparse_features_dim_8",
             },
-            step_tuuid_cache=serialized_cache,
-            exec_step=0,
             sender_spmd_code=9,
             sender_world_size=4,
             interleave_unit_size=None,
+        )
+
+        frame_groups = build_step_frame_groups(
+            compiled_plan=compiled_plan,
+            flat_results=[lookup_output],
+            step_tuuid_cache=serialized_cache,
+            exec_step=0,
         )
 
         assert frame_groups

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from hashlib import blake2b
 import time
+import threading
 from collections.abc import Mapping
 from typing import TypedDict
 
@@ -150,6 +151,7 @@ class TraceArena:
             )
         self._records = np.zeros((capacity, record_width), dtype=np.int64)
         self._size = 0
+        self._lock = threading.Lock()
 
     @property
     def capacity(self) -> int:
@@ -176,27 +178,31 @@ class TraceArena:
             raise ValueError(
                 f"trace payload has {len(payload)} fields; max={MAX_PAYLOAD_FIELDS}"
             )
-        index = self._size
-        if index >= self.capacity:
-            raise ProfilerBufferExhausted(
-                capacity=self.capacity,
-                attempted_index=index,
+        with self._lock:
+            index = self._size
+            if index >= self.capacity:
+                raise ProfilerBufferExhausted(
+                    capacity=self.capacity,
+                    attempted_index=index,
+                )
+            row = self._records[index]
+            row[:PAYLOAD_START_COLUMN] = (
+                kind,
+                ts_ns,
+                dur_ns,
+                track_id,
+                name_id,
+                flow_id,
+                task_id,
+                parent_task_id,
             )
-        row = self._records[index]
-        row[:PAYLOAD_START_COLUMN] = (
-            kind,
-            ts_ns,
-            dur_ns,
-            track_id,
-            name_id,
-            flow_id,
-            task_id,
-            parent_task_id,
-        )
-        if payload:
-            row[PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(payload)] = payload
-        self._size = index + 1
-        return index
+            if payload:
+                row[PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(payload)] = (
+                    payload
+                )
+            self._size = index + 1
+            return index
 
     def snapshot(self) -> np.ndarray:
-        return self._records[: self._size].copy()
+        with self._lock:
+            return self._records[: self._size].copy()

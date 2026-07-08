@@ -1,143 +1,209 @@
-# Fluxway DataPlane Runtime
+# Fluxway Data-Plane Runtime
 
-Fluxway data-plane messages have one runtime ABI and one runtime build
-granularity:
+This document describes the current worker-local data-plane path. The important
+contract is that user `CALL` work and Fluxway tensor split/transfer/assemble work
+must not block each other on the SPMD worker actor event loop.
 
-- `TransportFrameHeader` is a host-side Python object. It carries frame, edge,
-  payload, shape, global-shape, and compact metadata tables.
-- Payload iovs are tensor objects passed separately from the header.
-- A worker submits one data-plane task per local logical step.
-- Data-plane executors build frames and send them to receivers before returning.
-- A sender emits one bundled frame per `(sender, step, successor target rank)`.
+## End-To-End Path
 
 ```mermaid
 flowchart LR
-  A["Sender local step"] --> B["Backend step data-plane task"]
-  B --> C["Shared route/build/send orchestration"]
-  C --> D["TransportFrameBuilder"]
-  D --> E["TransportFrameHeader (host object)"]
-  D --> F["Payload tensor iovs"]
-  E --> G["DataPlaneCallable receive"]
-  F --> G
-  G --> H["Receiver mailbox"]
+  A["LocalStepPlan SEND"] --> B["LocalSendToken"]
+  B --> C["OutboundDeliveryRuntime"]
+  C --> D["data_plane.frame_build"]
+  D --> E["TransportBatchPlan"]
+  E --> F["data_plane.enqueue_batch"]
+  F --> G["Ray/Axon batch RPC"]
+  G --> H["receive_transport_frames"]
+  H --> I["WorkerMailbox exact-step deposit"]
+  I --> J["LocalInputPrepareRuntime"]
+  J --> K["LocalStepPlan WAIT"]
 ```
 
-`per-target` and `per-successor` are benchmark strategies only. Runtime keeps
-the step-level fused build/send boundary so there is no parallel implementation
-of the same sender-side route/pack/send feature.
+`SEND` only registers a token and schedules delivery. It does not wait for frame
+build, batch RPC, receiver deposit, or downstream assemble. `BARRIER` observes
+the token registration and commits the local step watermark. Full delivery is
+fenced only by drain/checkpoint/export/stop.
 
-The route/build/send orchestration is shared by backend executors. Ray uses a
-remote task as the scheduling shell; Axon uses the same orchestration through
-its adapter boundary. Backend-specific executors validate handler type before
-submitting work, so a wrong P2P backend fails deterministically at the executor
-boundary.
+## Ownership
 
-## Transport Mapping
+| Layer | Owner | Responsibility |
+|---|---|---|
+| Worker scheduler | `SPMDWorker` | choose ready `(op, step)`, enforce pipeline depth, submit `LocalStepPlan` |
+| Local DAG | `LocalStepPlanExecutor` | execute `WAIT -> CALL -> SEND -> BARRIER` dependencies and resource ids |
+| Prepare runtime | `LocalInputPrepareRuntime` | own prepare tokens, background assemble execution, consume/cancel/drain |
+| Call runtime | `WorkerProcessCallRuntime` | run process-affine synchronous user code off the actor event loop |
+| Delivery runtime | `OutboundDeliveryRuntime` | own `LocalSendToken`, delivery tasks, semaphore, poison, delivery fence |
+| Assembly | `CompiledAssemblePlan` | cache worker-local input topology and static assemble metadata |
+| Transport | `TransportFrameTemplate`, `TransportBatchPlan` | own frame schema/template, routing batch plan, target grouping |
+| Data-plane executor | `DataPlaneBackendExecutor` | consume compiled send plan and transport batches, call Ray/Axon backend |
 
-Ray and Axon implement the same Fluxway ABI.
+The worker must not duplicate transport target grouping or frame construction.
+The data-plane executor must not duplicate sharding/split logic. Both normal
+send and empty propagation use the same compiled send plan and transport frame
+builder path.
 
-```mermaid
-flowchart TB
-  H["TransportFrameHeader"] --> R0["Ray remote Python object"]
-  P["Payload tensor iovs"] --> R1["Ray remote serialized payload"]
-  H --> A0["Axon UCX active-message header"]
-  P --> A1["Axon UCX buffer iovs via DLPack"]
+## AsyncPolicy Quickstart
+
+`AsyncPolicy` describes algorithm semantics; runtime backpressure and lifecycle
+remain framework-internal.
+
+```python
+from fluxway import AsyncPolicy, SchedulePolicy, StatePolicy
+
+
+class SparseEmbeddingSPMD:
+    @operator(
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            schedule=SchedulePolicy.deadline_boost(),
+            state=StatePolicy.thread_safe(),
+        ),
+    )
+    def lookup(...): ...
+
+    @operator(
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            schedule=SchedulePolicy.deadline_boost(boost_priority=200),
+            state=StatePolicy.thread_safe(),
+        ),
+    )
+    def update(...): ...
+
+
+class DenseSPMD:
+    @operator(async_policy=AsyncPolicy.sync())
+    def step(...): ...
 ```
 
-For Axon, metadata must stay in the Python-object/header lane even when a host
-metadata array exposes `__dlpack__`. Only payload iovs are candidates for Axon
-DLPack buffers. All DLPack payload iovs in one transfer must be valid for the
-same source and destination device class.
+Rules for algorithm users:
 
-`AxonDataPlane` does not import Axon directly. It adapts to a narrow handle
-contract:
+- Use `AsyncPolicy.sync()` when unsure.
+- Use `AsyncPolicy.pipelined(depth=N)` for exact-step operators whose local
+  steps may overlap.
+- Use `AsyncPolicy.bounded_stale(depth=N, max_staleness=M)` for bounded operator
+  lag, such as sparse embedding lookup/update.
+- `max_staleness` is not a tensor version selector. Tensors, state, and control
+  arguments remain exact-step.
+- Use `StatePolicy.thread_safe()` only when the underlying state/store supports
+  concurrent access for the called methods.
 
-- `payload_device_class`: the destination iov class, currently `cpu` or `cuda`.
-- `completion_mode`: must be `receiver_success`.
-- `invoke_transport_frame(header, payload_device_class, sender_spmd_code, *payload_iovs)`.
-- `invoke_control(op_name, step, names, values, sender_spmd_code)`.
+## LocalStepPlan Semantics
 
-The adapter validates the host header first, then validates that all payload
-iovs share one source device class and match the destination class. Unsupported
-or unverifiable payload objects raise immediately; they are never copied through
-a Python copy path.
+Fluxway lowers one ready operator step to:
 
-`send_enqueued` completion is rejected even though it has lower call latency in
-the synthetic benchmark. It can hide receiver deposit or eager-assemble failures
-from the current step, so it violates Fluxway's Local Deposit Boundary.
-
-The Ray fused step executor accepts only `RayActorDataPlane` handlers. Passing
-another data-plane implementation to the Ray fused executor is a deterministic
-type error. The Axon fused step executor accepts only `AxonDataPlane` handlers
-and reuses the same shared route/build/send orchestration without importing the
-Axon package.
-
-```mermaid
-flowchart LR
-  H["TransportFrameHeader"] --> A["AxonDataPlane"]
-  P["Payload iovs"] --> A
-  A --> V["Header validation + iov device-class validation"]
-  V --> X["Axon handle invoke_transport_frame"]
+```text
+WAIT -> CALL -> SEND -> BARRIER
 ```
 
-## Local DAG
+- `WAIT` consumes prepared kwargs. For async policies, mailbox ready starts a
+  prepare token before the step reaches the front of the scheduler.
+- `CALL` executes user code through `UserCallableExecutor`.
+- `SEND` registers `LocalSendToken` and starts background delivery.
+- `BARRIER` observes token registration, clears exact-step mailbox data, and
+  advances committed watermark when previous steps are committed.
 
-Fluxway does not encode training semantics such as gradient accumulation,
-forward/backward phases, or optimizer steps. User code or a planner emits a
-worker-local flat DAG. Fluxway executes opaque `callable_id` nodes and enforces
-only dependency order plus local `resource_id` serialization.
+Local DAG does not encode forward/backward/update algorithm ordering. Cross
+operator scheduling lives in `SchedulePolicy`, worker priority keys, and
+`AsyncStepManager`.
 
-```mermaid
-flowchart LR
-  A["Worker execution queue"] --> B["LocalStepPlan"]
-  B --> C["CALL callable_id"]
-  B --> D["Dependency offsets"]
-  B --> E["Opaque resource_id"]
-  C --> F["UserCallableExecutor"]
-  F --> G["Execution lane"]
-  G --> H["ExecutionResult"]
+## Input Prepare And Assemble
+
+`LocalInputPrepareRuntime` is the only prepare lifecycle owner. It starts
+mailbox-triggered prepare for non-sync operators, runs heavy assemble work in
+its thread runtime, exposes ready/pending state to the scheduler, and fences on
+drain/checkpoint/export/stop.
+
+`CompiledAssemblePlan` caches:
+
+- input layout
+- predecessor topology
+- provider SPMD ids
+- dynamic-to-static provider flags
+
+The hot path still consumes only step-local shards, arrivals, routing/origin
+indices, counts, receipt metadata, and `TransportTensor` payloads. Dynamic
+unique/inverse/grad data is never reused across steps.
+
+## Frame Build And Batch
+
+`CompiledSendPlan` is built per operator and cached by the worker. It stores
+static successor routes, sharding specs, output tuuid/name metadata, sender
+rank/world, and a transport template cache.
+
+The transport layer owns:
+
+- `TransportFrameTemplate` for reusable header/table skeletons.
+- `TransportBatchPlan` for batch grouping from frame groups.
+- `build_step_frame_groups()` and `build_empty_step_frame_groups()` as the
+  single frame-building path.
+
+static-to-static paths patch step and payload refs. Dynamic paths cache only
+stable schema/tuuid/role skeletons; shape/count/routing/origin/inverse/payload
+remain step-local inputs. Unsupported plan states raise directly.
+
+## Ray And Axon ABI
+
+Ray and Axon both use batch-first delivery:
+
+```python
+receive_transport_frames(frames: tuple[TransportFrameEnvelope, ...])
 ```
 
-Cross-worker ordering is carried by P2P frames, mailbox slots, barriers, and
-`step + tuuid + sender_spmd_code + sender_rank + expected_count` validation.
+The backend adapter is responsible for invoking the physical endpoint. The
+transport/data-plane layer decides batch contents by successor context and
+target rank; it does not merge frames across different concrete endpoints.
 
-The local DAG executor is event-loop friendly for async callables: dependency
-waits, resource locks, and data-plane awaits yield to the actor event loop.
+Axon payload iovs may use DLPack-compatible buffers when the adapter validates
+device class and payload shape. Header metadata stays in the host/object lane.
 
-User callables and data-plane work use separate executors. `CALL` nodes never
-invoke synchronous user code directly on the worker actor event loop after lane
-selection:
+## Commit And Fence
 
-- async callables run in the inline async lane
-- free-threaded Python may use a local free-thread lane when the interpreter
-  reports `Py_GIL_DISABLED` and `sys._is_gil_enabled() == False`
-- stateful synchronous operators run in Ray execution actors and keep their
-  checkpoint state in the actor process
-- heavy stateless synchronous callables migrate to Ray execution actors after
-  the fixed sampling window
-- native/backend callables are an extension lane and must fail clearly when no
-  native executor is installed
+`LocalSendToken` means delivery was registered. It does not mean delivery
+finished.
 
-Execution actors are keyed by `(callable_id, resource_id)`. The `resource_id`
-still controls local serialization; different resource ids may overlap. Actor
-creation registers the operator owner class in the actor process, then reuses
-the normal `OperatorManager.execute_async` path so Fluxway has one operator
-invocation implementation.
+- `local_step.send_output`: foreground token registration.
+- `local_step.await_send`: BARRIER token observation.
+- `local_step.commit`: mailbox clear, watermark advance, driver report.
+- `data_plane.delivery_fence`: drain/checkpoint/export/stop waiting on registered
+  delivery.
 
-## Validation Contract
+Delivery task failures poison the worker through `OutboundDeliveryRuntime`.
+Drain/checkpoint/export/stop re-raise the failure through the same fence path.
 
-The data-plane runtime is validated against these invariants:
+## Profiler
 
-- same-target multi-tensor outputs remain one bundled frame per target rank
-- route/build/send orchestration exists once and is reused by backend executors
-- unsupported or wrong-backend handlers fail before transport submission
-- Axon payload iovs are not copied by the adapter
-- Axon source and destination device classes must match
-- `send_enqueued` completion is rejected because it can hide receiver failures
-- awaiting data-plane completion does not block the actor event loop
-- user DAG async callables can await data-plane work without blocking the actor
-  event loop
-- stateful sync operators execute in actor-owned lanes and checkpoint through
-  the same owner
-- runtime hot paths do not keep a second direct synchronous operator execution
-  lane
+Use these spans to verify nonblocking overlap:
+
+- `local_step.call_user`
+- `user_callable.execute`
+- `local_step.wait_inputs`
+- `local_step.send_output`
+- `local_step.await_send`
+- `data_plane.frame_build`
+- `data_plane.enqueue_batch`
+- `data_plane.batch_rpc`
+- `data_plane.receiver_wait`
+- `delivery.register_token`
+- `delivery.semaphore_wait`
+- `delivery.run`
+- `delivery.fence`
+
+`send_output` and `await_send` correlate by
+`(source_spmd_code, source_rank, op_id, step)`. Batch spans add
+`target_spmd_id`, `target_rank`, and `batch_seq`.
+`user_callable.execute` includes interned ids for callable/function/operator
+names, `ctx.step`, input tensor names, control names, static names, and selected
+lane.
+
+For short runs:
+
+- `--profiler-skip-initial-steps N` drops step-level events before `N`.
+- `--profiler-steady-state-only` hides driver/controller lifecycle tracks in the
+  exported trace.
+
+Profiler filtering is centralized in the recorder/export layer. Call sites do
+not branch on step filters.

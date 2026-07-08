@@ -587,7 +587,7 @@ class TorchBackend(TensorBackend):
         # (or any tracing/JIT path).  Communication will then bucket
         # send/receive shapes to capacity so the compiled graph is
         # reused across batches.  Default is False (pure eager).
-        self._compile_enabled = bool(compile)
+        self._compile_enabled = compile
 
     def name(self) -> str:
         return "torch"
@@ -1742,7 +1742,20 @@ class HybridBackend(TensorBackend):
         return self._lib_for(x).mod(x, y)
 
     def where(self, condition: Any, x: Any, y: Any) -> Any:
-        return self._lib_for(condition).where(condition, x, y)
+        if self._cp is not None and (
+            isinstance(condition, self._cp.ndarray)
+            or isinstance(x, self._cp.ndarray)
+            or isinstance(y, self._cp.ndarray)
+        ):
+            condition_arg = (
+                condition
+                if isinstance(condition, self._cp.ndarray)
+                else self._cp.asarray(condition)
+            )
+            x_arg = x if not isinstance(x, np.ndarray) else self._cp.asarray(x)
+            y_arg = y if not isinstance(y, np.ndarray) else self._cp.asarray(y)
+            return self._cp.where(condition_arg, x_arg, y_arg)
+        return np.where(condition, x, y)
 
     # ------------------------------------------------------------------
     # Reduction

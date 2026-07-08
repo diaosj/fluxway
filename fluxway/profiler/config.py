@@ -19,6 +19,8 @@ class ProfilerConfig:
     fail_on_buffer_exhaustion: bool = True
     output_file: str | None = None
     diagnostics: frozenset[ProfilerDiagnostic | str] = frozenset()
+    skip_initial_steps: int = 0
+    steady_state_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.trace_dir:
@@ -35,6 +37,8 @@ class ProfilerConfig:
             raise ValueError(
                 "ProfilerConfig.max_clock_uncertainty_ns must be non-negative."
             )
+        if self.skip_initial_steps < 0:
+            raise ValueError("ProfilerConfig.skip_initial_steps must be non-negative.")
         object.__setattr__(
             self,
             "diagnostics",

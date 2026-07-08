@@ -3,13 +3,35 @@ import pathlib
 import numpy as np
 from typing import Any
 
-from fluxway.common.decorators import spmd_source, operator
+from fluxway.common.decorators import spmd_source, operator, requires_worker_process
 from fluxway.common.index_descriptor import ContinuousIndex
+from fluxway.common.types import AsyncPolicy
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.reader import GrainReader
 from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
 
 
+def _row_partitioned_int_tensor(
+    rows: list[list[int]],
+    *,
+    global_shape: tuple[int, int],
+    origin_indices: Any,
+) -> TransportTensor:
+    flat = [value for row in rows for value in row]
+    splits = [0]
+    offset = 0
+    for row in rows:
+        offset += len(row)
+        splits.append(offset)
+    return TransportTensor(
+        flat_values=np.asarray(flat, dtype=np.int64),
+        nested_splits=[np.asarray(splits, dtype=np.int32)],
+        global_shape=global_shape,
+        origin_indices=origin_indices,
+    )
+
+
+@requires_worker_process
 @spmd_source(
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("worker",),
@@ -81,8 +103,8 @@ class RecommendationReader(GrainReader):
                         "target_item_id": [int(target_item_ids[i])],
                         "target_item_category": [int(rng.integers(0, 10))],
                         "target_item_stats": [
-                            float(rng.random()),
-                            float(rng.random() * 20),
+                            rng.random(),
+                            (rng.random() * 20),
                         ],
                         "is_click": [int(rng.integers(0, 2))],
                     }
@@ -120,6 +142,7 @@ class RecommendationReader(GrainReader):
 
     @operator(
         "read",
+        async_policy=AsyncPolicy.pipelined(depth=4),
         output_sharding={
             "active": {"type": "static", "axis": ["worker"]},
             "passive": {"type": "static", "axis": ["worker"]},
@@ -150,6 +173,15 @@ class RecommendationReader(GrainReader):
         logical_world = self.world_size if hasattr(self, "world_size") else 1
         global_batch_size = batch_size * logical_world
         g_shape = (global_batch_size,)
+        g_shape_one_sparse = (global_batch_size, 1)
+        g_shape_item_sparse = (
+            global_batch_size,
+            int(static_args.get("max_seq_len", 5)) + 1,
+        )
+        g_shape_hist_sparse = (
+            global_batch_size,
+            int(static_args.get("max_seq_len", 5)),
+        )
         origins = ContinuousIndex.chunk(0, global_batch_size)
 
         # -- Invariants on per-sample structure --
@@ -184,10 +216,9 @@ class RecommendationReader(GrainReader):
         g_shape_stats = (global_batch_size, stats_dim)
 
         active = ActiveFeatures(
-            user_id=TransportTensor.from_lists(
-                [s["user_id"][0] for s in samples],
-                dtype=np.int64,
-                global_shape=g_shape,
+            user_id=_row_partitioned_int_tensor(
+                [[s["user_id"][0]] for s in samples],
+                global_shape=g_shape_one_sparse,
                 origin_indices=origins,
             ),
             user_age_level=TransportTensor.from_lists(
@@ -205,7 +236,7 @@ class RecommendationReader(GrainReader):
             hist_click_item_seq=TransportTensor.from_lists(
                 [s["hist_click_item_seq"] for s in samples],
                 dtype=np.int32,
-                global_shape=g_shape,
+                global_shape=g_shape_hist_sparse,
                 origin_indices=origins,
             ),
             hist_seq_length=TransportTensor.from_lists(
@@ -217,10 +248,9 @@ class RecommendationReader(GrainReader):
         )
 
         passive = PassiveFeatures(
-            target_item_id=TransportTensor.from_lists(
-                [s["target_item_id"][0] for s in samples],
-                dtype=np.int64,
-                global_shape=g_shape,
+            target_item_id=_row_partitioned_int_tensor(
+                [[s["target_item_id"][0], *s["hist_click_item_seq"]] for s in samples],
+                global_shape=g_shape_item_sparse,
                 origin_indices=origins,
             ),
             target_item_category=TransportTensor.from_lists(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 from typing import Any
 
@@ -14,7 +14,10 @@ from fluxway.common.types.sharding import (
     ShardingSpec,
 )
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.transport.communication import AsyncDataDistributor
+from fluxway.transport.communication import (
+    AsyncDataDistributor,
+    TransportFrameTemplateCache,
+)
 from fluxway.transport.manifest import TransportFrameHeader
 from fluxway.profiler.recorder import TraceRecorder
 
@@ -33,40 +36,180 @@ class SuccessorRouteContext:
     effective_rank: int
 
 
-def build_step_frame_groups(
+@dataclass(frozen=True, slots=True)
+class CompiledTensorRoute:
+    output_index: int
+    tuuid: int
+    source_spec: Any
+    target_spec: Any
+    tensor_name: str
+    empty_targets: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledSuccessorRoute:
+    context_index: int
+    spmd_id: str
+    effective_rank: int
+    tensor_routes: tuple[CompiledTensorRoute, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledSendPlan:
+    op_name: str
+    rank: int
+    sender_spmd_code: int
+    sender_world_size: int
+    successor_routes: tuple[CompiledSuccessorRoute, ...]
+    output_count: int
+    tuuid_to_name: dict[int, str] | None
+    frame_template_cache: TransportFrameTemplateCache = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+
+
+def compile_send_plan(
     *,
     op_name: str,
     rank: int,
     mesh: Any,
-    flat_results: list[Any],
-    output_uuids: list[int],
+    output_uuids: tuple[int, ...],
     output_sharding: dict[int, ShardingSpec],
-    successor_contexts: list[SuccessorRouteContext],
+    successor_contexts: tuple[SuccessorRouteContext, ...],
     tuuid_to_name: dict[int, str] | None,
-    step_tuuid_cache: dict[int, Any],
-    exec_step: int,
     sender_spmd_code: int,
     sender_world_size: int,
     interleave_unit_size: int | None,
+) -> CompiledSendPlan:
+    successor_routes: list[CompiledSuccessorRoute] = []
+    for context in successor_contexts:
+        tensor_routes: list[CompiledTensorRoute] = []
+        succ_info = context.info
+        for output_index, tuuid in enumerate(output_uuids):
+            if tuuid not in succ_info.tuuid_sharding:
+                continue
+            source_logical = output_sharding.get(tuuid)
+            target_logical = succ_info.tuuid_sharding.get(tuuid)
+            if source_logical is None or target_logical is None:
+                raise ValueError(
+                    f"[SPMDWorker] Missing sharding for output tuuid={tuuid} "
+                    f"op={op_name} successor={context.spmd_id} "
+                    f"source_has={source_logical is not None} "
+                    f"target_has={target_logical is not None}."
+                )
+            source_spec = _bind_source_spec(
+                source_logical=source_logical,
+                mesh=mesh,
+                rank=rank,
+                interleave_unit_size=interleave_unit_size,
+            )
+            target_spec = target_logical.bind(succ_info.mesh or mesh)
+            empty_targets = tuple(
+                (
+                    target_rank,
+                    len(source_spec.resolve_producers(target_spec, target_rank)),
+                )
+                for target_rank in source_spec.resolve_consumers(
+                    target_spec,
+                    context.effective_rank,
+                )
+            )
+            for target_rank, expected_count in empty_targets:
+                if expected_count <= 0:
+                    raise ValueError(
+                        f"[SPMDWorker] Compiled invalid expected_count={expected_count} "
+                        f"target_rank={target_rank} op={op_name} successor={context.spmd_id} "
+                        f"tuuid={tuuid}."
+                    )
+            tensor_routes.append(
+                CompiledTensorRoute(
+                    output_index=output_index,
+                    tuuid=tuuid,
+                    source_spec=source_spec,
+                    target_spec=target_spec,
+                    tensor_name=(
+                        tuuid_to_name.get(tuuid, f"TUUID:{tuuid}")
+                        if tuuid_to_name
+                        else f"TUUID:{tuuid}"
+                    ),
+                    empty_targets=empty_targets,
+                )
+            )
+        successor_routes.append(
+            CompiledSuccessorRoute(
+                context_index=context.context_index,
+                spmd_id=context.spmd_id,
+                effective_rank=context.effective_rank,
+                tensor_routes=tuple(tensor_routes),
+            )
+        )
+    return CompiledSendPlan(
+        op_name=op_name,
+        rank=rank,
+        sender_spmd_code=sender_spmd_code,
+        sender_world_size=sender_world_size,
+        successor_routes=tuple(successor_routes),
+        output_count=len(output_uuids),
+        tuuid_to_name=tuuid_to_name,
+    )
+
+
+def _bind_source_spec(
+    *,
+    source_logical: ShardingSpec,
+    mesh: Any,
+    rank: int,
+    interleave_unit_size: int | None,
+) -> Any:
+    source_spec = source_logical.bind(mesh)
+    if not isinstance(interleave_unit_size, int):
+        return source_spec
+    unit_idx = rank // interleave_unit_size
+    unit_ranks = list(
+        range(
+            unit_idx * interleave_unit_size,
+            (unit_idx + 1) * interleave_unit_size,
+        )
+    )
+    if source_spec.mesh is None:
+        return source_spec
+    base_mesh = source_spec.mesh
+    other_dims_size = 1
+    for size in base_mesh.shape[1:]:
+        other_dims_size *= size
+    if interleave_unit_size % other_dims_size != 0:
+        return source_spec
+    first_axis_size = interleave_unit_size // other_dims_size
+    return source_logical.bind(
+        DeviceMesh(
+            device_shape=(first_axis_size,) + base_mesh.shape[1:],
+            axis_names=base_mesh.axis_names,
+            device_ids=unit_ranks,
+        )
+    )
+
+
+def build_step_frame_groups(
+    *,
+    compiled_plan: CompiledSendPlan,
+    flat_results: list[Any],
+    step_tuuid_cache: dict[int, Any],
+    exec_step: int,
     profiler_recorder: TraceRecorder | None = None,
 ) -> list[StepFrameGroup]:
     frame_groups: list[StepFrameGroup] = []
     wrapped_results: dict[int, TransportTensor] = {}
 
-    for context in successor_contexts:
+    for context in compiled_plan.successor_routes:
         batches = build_successor_batches(
-            op_name=op_name,
-            rank=rank,
-            mesh=mesh,
+            compiled_plan=compiled_plan,
             flat_results=flat_results,
-            output_uuids=output_uuids,
-            output_sharding=output_sharding,
             context=context,
-            tuuid_to_name=tuuid_to_name,
             step_tuuid_cache=step_tuuid_cache,
             exec_step=exec_step,
             wrapped_results=wrapped_results,
-            interleave_unit_size=interleave_unit_size,
         )
         if not batches:
             continue
@@ -84,8 +227,8 @@ def build_step_frame_groups(
                 if logger.isEnabledFor(logging.DEBUG):
                     for leaf_tuuid, leaf_val in batch:
                         name = (
-                            tuuid_to_name.get(leaf_tuuid, "unknown")
-                            if tuuid_to_name
+                            compiled_plan.tuuid_to_name.get(leaf_tuuid, "unknown")
+                            if compiled_plan.tuuid_to_name
                             else "unknown"
                         )
                         logger.debug(
@@ -96,7 +239,7 @@ def build_step_frame_groups(
                             leaf_val.global_shape,
                             leaf_val.origin_indices,
                             leaf_val.routing_indices,
-                            rank,
+                            compiled_plan.rank,
                         )
 
                 distributor.plan_and_shard(
@@ -104,15 +247,15 @@ def build_step_frame_groups(
                     source_spec,
                     target_spec,
                     tuuid=batch_target_uuids,
-                    tuuid_to_name=tuuid_to_name,
+                    tuuid_to_name=compiled_plan.tuuid_to_name,
                 )
 
         if profiler_recorder is None:
             plan_distribution(distributor, batches)
         else:
             with profiler_recorder.transport_distribute_sync(
-                op_name=op_name,
-                rank=rank,
+                op_name=compiled_plan.op_name,
+                rank=compiled_plan.rank,
                 step=exec_step,
                 target_spmd_id=context.spmd_id,
             ):
@@ -120,15 +263,16 @@ def build_step_frame_groups(
 
         for frame_arg in distributor.build_transport_frame_args(
             step=exec_step,
-            sender_spmd_code=sender_spmd_code,
-            sender_world_size=sender_world_size,
-            sender_rank=rank,
+            sender_spmd_code=compiled_plan.sender_spmd_code,
+            sender_world_size=compiled_plan.sender_world_size,
+            sender_rank=compiled_plan.rank,
+            template_cache=compiled_plan.frame_template_cache,
         ):
             if profiler_recorder is not None:
                 target_rank, _header, payload_segments = frame_arg
                 profiler_recorder.data_plane_tensor_split(
-                    op_name=op_name,
-                    rank=rank,
+                    op_name=compiled_plan.op_name,
+                    rank=compiled_plan.rank,
                     step=exec_step,
                     target_rank=target_rank,
                     payload_count=len(payload_segments),
@@ -138,102 +282,83 @@ def build_step_frame_groups(
     return frame_groups
 
 
+def build_empty_step_frame_groups(
+    *,
+    compiled_plan: CompiledSendPlan,
+    empty_values: Any,
+    exec_step: int,
+) -> list[StepFrameGroup]:
+    frame_groups: list[StepFrameGroup] = []
+    for context in compiled_plan.successor_routes:
+        distributor = AsyncDataDistributor(context.effective_rank)
+        for route in context.tensor_routes:
+            for target_rank, expected_count in route.empty_targets:
+                distributor.plan_protocol_empty(
+                    target_rank=target_rank,
+                    expected_count=expected_count,
+                    tuuid=route.tuuid,
+                    payload=empty_values,
+                )
+        for frame_arg in distributor.build_transport_frame_args(
+            step=exec_step,
+            sender_spmd_code=compiled_plan.sender_spmd_code,
+            sender_world_size=compiled_plan.sender_world_size,
+            sender_rank=compiled_plan.rank,
+            template_cache=compiled_plan.frame_template_cache,
+        ):
+            frame_groups.append((context.context_index, frame_arg))
+    return frame_groups
+
+
 def build_successor_batches(
     *,
-    op_name: str,
-    rank: int,
-    mesh: Any,
+    compiled_plan: CompiledSendPlan,
     flat_results: list[Any],
-    output_uuids: list[int],
-    output_sharding: dict[int, ShardingSpec],
-    context: SuccessorRouteContext,
-    tuuid_to_name: dict[int, str] | None,
+    context: CompiledSuccessorRoute,
     step_tuuid_cache: dict[int, Any],
     exec_step: int,
     wrapped_results: dict[int, TransportTensor],
-    interleave_unit_size: int | None,
 ) -> dict[Any, list[tuple[int, TransportTensor]]]:
     batches: dict[Any, list[tuple[int, TransportTensor]]] = defaultdict(list)
-    succ_info = context.info
-    for index, raw_leaf in enumerate(flat_results):
-        if raw_leaf is None or index >= len(output_uuids):
+    for route in context.tensor_routes:
+        if route.output_index >= len(flat_results):
+            continue
+        raw_leaf = flat_results[route.output_index]
+        if raw_leaf is None:
             continue
 
-        tuuid = output_uuids[index]
-        if tuuid not in succ_info.tuuid_sharding:
-            continue
-
-        leaf_tensor = wrapped_results.get(index)
+        leaf_tensor = wrapped_results.get(route.output_index)
         if leaf_tensor is None:
             if isinstance(raw_leaf, TransportTensor):
                 leaf_tensor = raw_leaf
             else:
                 leaf_tensor = TransportTensor.from_tensor(raw_leaf)
-            wrapped_results[index] = leaf_tensor
+            wrapped_results[route.output_index] = leaf_tensor
 
-        source_logical = output_sharding.get(tuuid)
-        target_logical = succ_info.tuuid_sharding.get(tuuid)
-        if source_logical is None or target_logical is None:
-            raise ValueError(
-                f"[SPMDWorker] Missing sharding for output tuuid={tuuid} "
-                f"op={op_name} successor={context.spmd_id} "
-                f"source_has={source_logical is not None} "
-                f"target_has={target_logical is not None}."
-            )
-
-        source_spec = source_logical.bind(mesh)
-        target_spec = target_logical.bind(succ_info.mesh or mesh)
-        if isinstance(interleave_unit_size, int):
-            unit_idx = rank // interleave_unit_size
-            unit_ranks = list(
-                range(
-                    unit_idx * interleave_unit_size,
-                    (unit_idx + 1) * interleave_unit_size,
-                )
-            )
-            if source_spec.mesh is not None:
-                base_mesh = source_spec.mesh
-                other_dims_size = 1
-                for size in base_mesh.shape[1:]:
-                    other_dims_size *= size
-                if interleave_unit_size % other_dims_size == 0:
-                    first_axis_size = interleave_unit_size // other_dims_size
-                    source_spec = source_logical.bind(
-                        DeviceMesh(
-                            device_shape=(first_axis_size,) + base_mesh.shape[1:],
-                            axis_names=base_mesh.axis_names,
-                            device_ids=unit_ranks,
-                        )
-                    )
-
-        if isinstance(source_spec, PhysicalLayout) and isinstance(
-            source_spec.spec.routing, ReferentialRouting
+        if isinstance(route.source_spec, PhysicalLayout) and isinstance(
+            route.source_spec.spec.routing, ReferentialRouting
         ):
             leaf_tensor = inherit_mirror_metadata(
-                op_name=op_name,
-                tuuid=tuuid,
+                op_name=compiled_plan.op_name,
+                tuuid=route.tuuid,
                 leaf_tensor=leaf_tensor,
-                source_spec=source_spec,
-                tuuid_to_name=tuuid_to_name,
+                source_spec=route.source_spec,
+                tuuid_to_name=compiled_plan.tuuid_to_name,
                 step_tuuid_cache=step_tuuid_cache,
                 exec_step=exec_step,
                 spmd_id=context.spmd_id,
-                rank=rank,
+                rank=compiled_plan.rank,
             )
 
-        if target_spec is not None and target_spec.is_content_addressable:
+        if route.target_spec is not None and route.target_spec.is_content_addressable:
             if (
                 leaf_tensor.routing_indices is None
                 and leaf_tensor.receipt is None
                 and leaf_tensor.flat_values is None
             ):
-                output_name = (
-                    tuuid_to_name.get(tuuid, f"TUUID:{tuuid}")
-                    if tuuid_to_name
-                    else f"TUUID:{tuuid}"
-                )
                 raise ValueError(
-                    f"[Fluxway Routing Error] Operator '{op_name}' output '{output_name}' "
+                    f"[Fluxway Routing Error] Operator '{compiled_plan.op_name}' "
+                    f"output '{route.tensor_name}' "
                     "is destined for a dynamic routing edge, but its TransportTensor "
                     "lacks routing metadata (routing_indices, receipt, or flat_values). "
                     "If you returned a TransportTensor manually, ensure you provide explicit routing metadata."
@@ -247,7 +372,9 @@ def build_successor_batches(
             routing_id = id(leaf_tensor.receipt)
         else:
             routing_id = 0
-        batches[(source_spec, target_spec, routing_id)].append((tuuid, leaf_tensor))
+        batches[(route.source_spec, route.target_spec, routing_id)].append(
+            (route.tuuid, leaf_tensor)
+        )
     return batches
 
 

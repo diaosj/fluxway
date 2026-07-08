@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
+from fluxway.spmd.worker.assembly import compile_assemble_plan
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
 
@@ -42,7 +43,8 @@ async def test_dynamic_assemble_accepts_complete_protocol_empty_arrivals():
         builder.add_payload(edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int64), 0)
         await mailbox.deposit_transport_frame("lookup", "Input", builder.build())
 
-    WorkerClass = SPMDWorker.__ray_metadata__.modified_class
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    WorkerClass = cls.modified_class if cls else SPMDWorker  # type: ignore[reportAttributeAccessIssue]
     worker = WorkerClass.__new__(WorkerClass)
     worker.rank = 0
     worker.spmd_id = "Embedding_geek_id"
@@ -58,6 +60,11 @@ async def test_dynamic_assemble_accepts_complete_protocol_empty_arrivals():
         shards,
         arrivals,
         worker.op_manager.get_predecessor_topology("lookup"),
+        assemble_plan=compile_assemble_plan(
+            op_manager=worker.op_manager,
+            op_name="lookup",
+            tuuid=52,
+        ),
     )
 
     assert shards == {}

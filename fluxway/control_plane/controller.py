@@ -26,6 +26,7 @@ from typing import Any, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
+    # pyrefly: ignore [missing-import]
     import ray
 
     RAY_AVAILABLE = True
@@ -380,16 +381,18 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 for node_id, node in self._graph.nodes.items():
                     if node.spmd_config is not None:
                         node.spmd_config.profiler_config = self._profiler_config
-                    limit = self._async_step_config.node_max_steps.get(
-                        node_id, self._async_step_config.max_steps
-                    )
-                    if limit is not None:
-                        node.spmd_config.max_steps = limit
-                        logger.debug(f"Assigned max_steps={limit} to node {node_id}")
+                        limit = self._async_step_config.node_max_steps.get(
+                            node_id, self._async_step_config.max_steps
+                        )
+                        if limit is not None:
+                            node.spmd_config.max_steps = limit
+                            logger.debug(
+                                f"Assigned max_steps={limit} to node {node_id}"
+                            )
 
-                    if self._drain_strategy is not None:
-                        node.spmd_config.requires_drain_at_startup = True
-                        node.spmd_config.auto_start_source_operators = False
+                        if self._drain_strategy is not None:
+                            node.spmd_config.requires_drain_at_startup = True
+                            node.spmd_config.auto_start_source_operators = False
 
                 # Register SPMDs for heartbeat monitoring
                 for node_name in self._graph.nodes:
@@ -545,6 +548,14 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 spmd_id, op_name, completed_count
             )
             await self._check_and_enforce_step_limits()
+            if (
+                self._drain_strategy is None
+                and self.async_step_manager.is_all_completed()
+                and self.state_machine.is_running()
+            ):
+                await self.state_machine.trigger_event(
+                    ControllerEvent.ALL_DRIVERS_COMPLETED
+                )
 
         async def _check_and_enforce_step_limits(self) -> None:
             """Check step differences and apply lock/unlock actions."""
@@ -1240,16 +1251,24 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
             from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
             from fluxway.profiler.record import TraceMetadata
+            from fluxway.profiler.filtering import filter_steady_state_records
 
             merged = np.vstack(records)
+            metadata = TraceMetadata(
+                names_by_id=names_by_id,
+                payload_fields_by_name_id=payload_fields_by_name_id,
+            )
+            if bool(getattr(self._profiler_config, "steady_state_only", False)):
+                merged = filter_steady_state_records(merged, metadata)
+                if len(merged) == 0:
+                    raise RuntimeError(
+                        "Profiler steady-state filtering removed all trace records."
+                    )
             output = Path(path)
             PerfettoTraceWriter().write(
                 merged,
                 output,
-                metadata=TraceMetadata(
-                    names_by_id=names_by_id,
-                    payload_fields_by_name_id=payload_fields_by_name_id,
-                ),
+                metadata=metadata,
             )
             return str(output)
 

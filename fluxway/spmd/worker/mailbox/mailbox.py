@@ -24,7 +24,7 @@ from fluxway.common.tensor_backend import get_backend
 from fluxway.common.index_descriptor import ContinuousIndex, ExplicitIndex
 from fluxway.common.ragged import ragged_level_count
 from fluxway.common.sync import ArrivalBarrier
-from fluxway.common.types.configs import BarrierConfig, TolerantBarrierConfig
+from fluxway.common.types.configs import BarrierConfig
 from fluxway.common.types.tensor import Scalar
 from fluxway.transport.communication import TransportReceiver
 from fluxway.transport.manifest import (
@@ -339,28 +339,6 @@ class StepBarrier:
         elif not self._periodic:
             barrier._event.clear()
 
-    def satisfy_tensor(self, tuuid: int, current_step: int | None = None) -> bool:
-        """Force a tensor barrier to be satisfied (e.g., via staleness fallback)."""
-        barrier = self._tensor_barriers.get(tuuid)
-        if barrier is not None and not barrier.is_done():
-            # Force the ArrivalBarrier to be done by simulating arrivals
-            remaining = barrier._n - barrier._count
-            for _ in range(remaining):
-                barrier.arrive()
-            return self._check(current_step=current_step)
-        return False
-
-    def satisfy_control_arg(self, name: str, current_step: int | None = None) -> bool:
-        """Force a state barrier to be satisfied."""
-        barrier = self._control_arg_barriers.get(name)
-        if barrier is not None and not barrier.is_done():
-            # Force the ArrivalBarrier to be done by simulating arrivals
-            remaining = barrier._n - barrier._count
-            for _ in range(remaining):
-                barrier.arrive()
-            return self._check(current_step=current_step)
-        return False
-
     # ------------------------------------------------------------------
     # Completion query
     # ------------------------------------------------------------------
@@ -451,16 +429,9 @@ class WorkerMailbox:
         # Mapping from periodic op to its perpetual barrier
         self._periodic_barriers: dict[str, StepBarrier] = {}
 
-        # Tolerant mode (staleness) config: {op_name: {name_or_uuid: staleness_value}}
-        self._staleness_config: dict[str, dict[Any, int]] = {}
         # Expected counts for satisfying staleness: {op_name: {name_or_uuid: expected_count}}
         self._expected_tensor_counts: dict[str, dict[int, int]] = {}
         self._expected_control_arg_names: dict[str, list[str]] = {}
-        # Retrieval policy for tolerant params: {op_name: {name_or_uuid: policy_string}}
-        self._retrieval_policy: dict[str, dict[Any, str]] = {}
-
-        # Barrier configurations: {op_name: BarrierConfig}
-        self._barrier_configs: dict[str, BarrierConfig] = {}
 
         self._lock = asyncio.Lock()
 
@@ -508,30 +479,8 @@ class WorkerMailbox:
             barrier_config.type == BarrierType.PERIODIC if barrier_config else False
         )
 
-        staleness_dict = {}
-        if barrier_config and barrier_config.type == BarrierType.TOLERANT:
-            from fluxway.common.types.configs import TolerantBarrierConfig
-
-            if isinstance(barrier_config, TolerantBarrierConfig):
-                # Merge tensor and state staleness for internal lookback
-                staleness_dict = {
-                    **barrier_config.tensor_staleness,
-                    **barrier_config.state_staleness,
-                }
-                policy = barrier_config.retrieval_policy
-            else:
-                staleness_dict = {}
-                policy = "latest"
-
-            self._staleness_config[op_name] = staleness_dict
-            self._expected_tensor_counts[op_name] = expected_tensors
-            self._expected_control_arg_names[op_name] = expected_states
-            self._barrier_configs[op_name] = barrier_config
-
-            # Currently apply one policy per operator for all its staleness configs
-            self._retrieval_policy.setdefault(op_name, {})
-            for name in staleness_dict:
-                self._retrieval_policy[op_name][name] = policy
+        self._expected_tensor_counts[op_name] = expected_tensors
+        self._expected_control_arg_names[op_name] = expected_states
 
         if is_periodic:
             if op_name not in self._periodic_barriers:
@@ -571,42 +520,6 @@ class WorkerMailbox:
         logger.debug(
             f"[WorkerMailbox] declare_step: op={op_name}, step={step}, expected_tensors={expected_tensors}, expected_states={expected_states}"
         )
-
-        # Check if we can satisfy any tolerant dependencies using cached older data
-        for ident, max_staleness in staleness_dict.items():
-            if max_staleness <= 0:
-                continue
-
-            # For tensors: TUUIDs are ints
-            if isinstance(ident, int) and ident in expected_tensors:
-                expected = expected_tensors[ident]
-                if expected > 0:
-                    found_valid = False
-                    for k in range(step, max(-1, step - max_staleness - 1), -1):
-                        cached_shards = (
-                            self._tensor_slots.get(op_name, {})
-                            .get(ident, {})
-                            .get(k, {})
-                        )
-                        # Count total SHARDS across all senders, not just the number of senders
-                        shards_count = sum(
-                            len(s_list) for s_list in cached_shards.values()
-                        )
-                        if shards_count >= expected:
-                            found_valid = True
-                            break
-                    if found_valid:
-                        barrier.satisfy_tensor(ident)
-
-            # For control states: Names are strings
-            elif isinstance(ident, str) and ident in expected_states:
-                found_valid = False
-                for k in range(step, max(-1, step - max_staleness - 1), -1):
-                    if k in self._control_arg_data.get(op_name, {}).get(ident, {}):
-                        found_valid = True
-                        break
-                if found_valid:
-                    barrier.satisfy_control_arg(ident)
 
         # Check if any data for THIS EXACT step has already arrived.
         # This prevents progress loss if declare_step is called after some deposit_* calls.
@@ -679,18 +592,6 @@ class WorkerMailbox:
                     if barrier.control_arg_arrived(name, current_step=actual_step):
                         any_fired = True
 
-                # Check if this state satisfies any FUTURE barriers that tolerate staleness
-                staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-                if staleness > 0:
-                    for s in range(actual_step + 1, actual_step + staleness + 1):
-                        future_barrier = self._barriers.get(op_name, {}).get(s)
-                        if future_barrier is not None:
-                            fired_future = future_barrier.satisfy_control_arg(
-                                name, current_step=s
-                            )
-                            if fired_future and self._on_ready:
-                                self._on_ready(op_name, s)
-
             if any_fired:
                 if op_name in self._periodic_barriers:
                     self._periodic_steps[op_name] += 1
@@ -707,19 +608,6 @@ class WorkerMailbox:
         self, op_name: str, name: str, step: int
     ) -> Any | None:
         async with self._lock:
-            staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-            if staleness > 0:
-                policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
-                step_dict = self._control_arg_data.get(op_name, {}).get(name, {})
-                valid_steps = [
-                    k
-                    for k in range(max(0, step - staleness), step + 1)
-                    if k in step_dict
-                ]
-                if valid_steps:
-                    best_k = valid_steps[0] if policy == "oldest" else valid_steps[-1]
-                    return step_dict[best_k]
-
             return self._control_arg_data.get(op_name, {}).get(name, {}).get(step)
 
     async def get_all_control_arguments(
@@ -728,21 +616,6 @@ class WorkerMailbox:
         async with self._lock:
             result = {}
             for name, step_dict in self._control_arg_data.get(op_name, {}).items():
-                staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-                if staleness > 0:
-                    policy = self._retrieval_policy.get(op_name, {}).get(name, "latest")
-                    valid_steps = [
-                        k
-                        for k in range(max(0, step - staleness), step + 1)
-                        if k in step_dict
-                    ]
-                    if valid_steps:
-                        best_k = (
-                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
-                        )
-                        result[name] = step_dict[best_k]
-                        continue
-
                 if step in step_dict:
                     result[name] = step_dict[step]
             return result
@@ -906,25 +779,6 @@ class WorkerMailbox:
                 if barrier is not None:
                     if barrier.tensor_arrived(u, current_step=actual_step):
                         any_fired = True
-
-                # Check if this tensor satisfies any FUTURE barriers that tolerate staleness
-                staleness = self._staleness_config.get(op_name, {}).get(u, 0)
-                if staleness > 0:
-                    expected = self._expected_tensor_counts.get(op_name, {}).get(u, 0)
-                    current_slot = (
-                        self._tensor_slots.get(op_name, {})
-                        .get(u, {})
-                        .get(actual_step, {})
-                    )
-                    if expected > 0 and len(current_slot) >= expected:
-                        for s in range(actual_step + 1, actual_step + staleness + 1):
-                            future_barrier = self._barriers.get(op_name, {}).get(s)
-                            if future_barrier is not None:
-                                fired_future = future_barrier.satisfy_tensor(
-                                    u, current_step=s
-                                )
-                                if fired_future and self._on_ready:
-                                    self._on_ready(op_name, s)
 
             # Fire readiness ONCE per bundle if any barrier satisfied
             if any_fired:
@@ -1179,29 +1033,6 @@ class WorkerMailbox:
                     result[tuuid] = dict(slotted)
                     continue
 
-                barrier_config = self._get_barrier_config(op_name)
-                max_staleness = 0
-                if isinstance(barrier_config, TolerantBarrierConfig):
-                    max_staleness = barrier_config.tensor_staleness.get(tuuid, 0)
-
-                if max_staleness > 0:
-                    policy = self._retrieval_policy.get(op_name, {}).get(
-                        tuuid, "latest"
-                    )
-                    step_slots = self._tensor_slots.get(op_name, {}).get(tuuid, {})
-                    target_count = expected_counts.get(tuuid, 0)
-                    valid_steps = [
-                        k
-                        for k in range(max(0, step - max_staleness), step + 1)
-                        if k in step_slots and len(step_slots[k]) >= target_count
-                    ]
-                    if valid_steps:
-                        best_k = (
-                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
-                        )
-                        result[tuuid] = dict(step_slots[best_k])
-                        continue
-
                 if slotted:
                     target_count = expected_counts.get(tuuid, 0)
                     if target_count > 0 and len(slotted) < target_count:
@@ -1218,10 +1049,6 @@ class WorkerMailbox:
         if op_name in self._periodic_barriers:
             return self._periodic_barriers[op_name]
         return self._barriers.get(op_name, {}).get(step)
-
-    def _get_barrier_config(self, op_name: str) -> Optional["BarrierConfig"]:
-        """Internal helper to get barrier config."""
-        return self._barrier_configs.get(op_name)
 
     async def get_tensor_shard_views_for_rank(
         self,
@@ -1246,25 +1073,6 @@ class WorkerMailbox:
         self, op_name: str, tuuid: int, step: int
     ) -> dict[tuple[str, int], list[TransportShardView]]:
         async with self._lock:
-            staleness = self._staleness_config.get(op_name, {}).get(tuuid, 0)
-            if staleness > 0:
-                expected = self._expected_tensor_counts.get(op_name, {}).get(tuuid, 0)
-                if expected > 0:
-                    policy = self._retrieval_policy.get(op_name, {}).get(
-                        tuuid, "latest"
-                    )
-                    step_dict = self._tensor_slots.get(op_name, {}).get(tuuid, {})
-                    valid_steps = [
-                        k
-                        for k in range(max(0, step - staleness), step + 1)
-                        if len(step_dict.get(k, {})) >= expected
-                    ]
-                    if valid_steps:
-                        best_k = (
-                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
-                        )
-                        return dict(step_dict[best_k])
-
             return dict(
                 self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
             )
@@ -1277,33 +1085,21 @@ class WorkerMailbox:
                 self._tensor_arrivals.get(op_name, {}).get(tuuid, {}).get(step, {})
             )
 
-    async def get_all_tensor_shard_views_with_staleness(
-        self, op_name: str, step: int
-    ) -> dict[int, dict[tuple[str, int], list[TransportShardView]]]:
+    async def get_tensor_shard_views_and_arrivals(
+        self, op_name: str, tuuid: int, step: int
+    ) -> tuple[
+        int,
+        dict[tuple[str, int], list[TransportShardView]],
+        dict[tuple[str, int], dict[str, Any]],
+    ]:
         async with self._lock:
-            result = {}
-            for tuuid, step_dict in self._tensor_slots.get(op_name, {}).items():
-                staleness = self._staleness_config.get(op_name, {}).get(tuuid, 0)
-                expected = self._expected_tensor_counts.get(op_name, {}).get(tuuid, 0)
-                if staleness > 0 and expected > 0:
-                    policy = self._retrieval_policy.get(op_name, {}).get(
-                        tuuid, "latest"
-                    )
-                    valid_steps = [
-                        k
-                        for k in range(max(0, step - staleness), step + 1)
-                        if len(step_dict.get(k, {})) >= expected
-                    ]
-                    if valid_steps:
-                        best_k = (
-                            valid_steps[0] if policy == "oldest" else valid_steps[-1]
-                        )
-                        result[tuuid] = dict(step_dict[best_k])
-                        continue
-
-                if step in step_dict:
-                    result[tuuid] = dict(step_dict[step])
-            return result
+            shards = dict(
+                self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
+            )
+            arrivals = dict(
+                self._tensor_arrivals.get(op_name, {}).get(tuuid, {}).get(step, {})
+            )
+            return step, shards, arrivals
 
     async def get_tensor_shard_count(self, op_name: str, tuuid: int, step: int) -> int:
         async with self._lock:
@@ -1408,29 +1204,23 @@ class WorkerMailbox:
     # ------------------------------------------------------------------
 
     async def clear_step(self, op_name: str, step: int) -> None:
-        """Release all data for a completed step, respecting staleness retention."""
+        """Release all data for a completed step."""
         async with self._lock:
             if op_name in self._tensor_slots:
                 for name, step_dict in list(self._tensor_slots[op_name].items()):
-                    staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-                    clear_target = step - staleness
-                    step_dict.pop(clear_target, None)
+                    step_dict.pop(step, None)
                     if not step_dict:
                         del self._tensor_slots[op_name][name]
 
             if op_name in self._zc_receivers:
                 for name, step_dict in list(self._zc_receivers[op_name].items()):
-                    staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-                    clear_target = step - staleness
-                    step_dict.pop(clear_target, None)
+                    step_dict.pop(step, None)
                     if not step_dict:
                         del self._zc_receivers[op_name][name]
 
             if op_name in self._control_arg_data:
                 for name, step_dict in list(self._control_arg_data[op_name].items()):
-                    staleness = self._staleness_config.get(op_name, {}).get(name, 0)
-                    clear_target = step - staleness
-                    step_dict.pop(clear_target, None)
+                    step_dict.pop(step, None)
                     if not step_dict:
                         del self._control_arg_data[op_name][name]
 

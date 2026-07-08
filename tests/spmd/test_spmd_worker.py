@@ -60,7 +60,8 @@ def apply_fn(state, grad):
 
 
 def _worker_cls():
-    return SPMDWorker.__ray_metadata__.modified_class
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    return cls.modified_class if cls else SPMDWorker
 
 
 # ===========================================================================
@@ -309,7 +310,7 @@ async def test_worker_stop_clears_driver_handle_and_waits_for_tasks():
     assert worker._heartbeat_task.cancelled()
     assert worker._background_tasks == set()
     sentinel = await worker._execution_queue.get()
-    assert sentinel == (999, 0, "__stop__")
+    assert sentinel == (999, 0, 0, "__stop__")
 
 
 def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
@@ -362,12 +363,12 @@ def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
 def test_step_barrier_fires_on_completion():
     """Fires when all tensor shards AND all states have arrived."""
     b = StepBarrier(
-        "test", 0, expected_tensors={"emb": 2, "attn": 1}, expected_states=["lr"]
+        "test", 0, expected_tensors={101: 2, 102: 1}, expected_states=["lr"]
     )
     assert not b.is_ready()
-    b.tensor_arrived("emb")
-    b.tensor_arrived("emb")
-    b.tensor_arrived("attn")
+    b.tensor_arrived(101)
+    b.tensor_arrived(101)
+    b.tensor_arrived(102)
     assert not b.is_ready()  # state "lr" still missing
     b.control_arg_arrived("lr")
     assert b.is_ready()
@@ -375,9 +376,9 @@ def test_step_barrier_fires_on_completion():
 
 def test_step_barrier_partial_not_ready():
     """Partial arrivals do not fire the barrier."""
-    b = StepBarrier("test", 0, expected_tensors={"x": 3}, expected_states=[])
-    b.tensor_arrived("x")
-    b.tensor_arrived("x")
+    b = StepBarrier("test", 0, expected_tensors={103: 3}, expected_states=[])
+    b.tensor_arrived(103)
+    b.tensor_arrived(103)
     assert not b.is_ready()
 
 
@@ -389,10 +390,10 @@ def test_step_barrier_no_expectations_fires_immediately():
 
 def test_step_barrier_unknown_name_ignored():
     """Arrivals for unexpected names are silently ignored."""
-    b = StepBarrier("test", 0, expected_tensors={"x": 1}, expected_states=[])
-    assert b.tensor_arrived("unknown_tensor") is False
+    b = StepBarrier("test", 0, expected_tensors={103: 1}, expected_states=[])
+    assert b.tensor_arrived(999) is False
     assert not b.is_ready()
-    b.tensor_arrived("x")
+    b.tensor_arrived(103)
     assert b.is_ready()
 
 
@@ -401,25 +402,25 @@ async def test_step_barrier_periodic():
     """Verify StepBarrier in periodic mode fires for every arrival."""
     # Eager op expects 1 shard for 'x'
     b = StepBarrier(
-        "test", 0, expected_tensors={"x": 1}, expected_states=[], periodic=True
+        "test", 0, expected_tensors={103: 1}, expected_states=[], periodic=True
     )
 
     # First arrival
-    fired = b.tensor_arrived("x")
+    fired = b.tensor_arrived(103)
     assert fired is True
 
     # Second arrival
-    fired = b.tensor_arrived("x")
+    fired = b.tensor_arrived(103)
     assert fired is True
 
 
 @pytest.mark.asyncio
 async def test_step_barrier_async_wait():
-    b = StepBarrier("test", 0, expected_tensors={"x": 1}, expected_states=["s"])
+    b = StepBarrier("test", 0, expected_tensors={103: 1}, expected_states=["s"])
 
     async def arrive():
         await asyncio.sleep(0)
-        b.tensor_arrived("x")
+        b.tensor_arrived(103)
         await asyncio.sleep(0)
         b.control_arg_arrived("s")
 
@@ -836,7 +837,7 @@ async def test_spmd_worker_init():
     worker = cls(config, rank=0)
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
     assert worker._mesh is mesh
-    assert worker._op_manager._mesh is mesh
+    assert worker.op_manager._mesh is mesh
 
 
 def test_replicate_operator_manager():
@@ -856,7 +857,7 @@ def test_replicate_operator_manager():
     def dummy_op(a):
         pass
 
-    dummy_op._flux_operator_meta = meta
+    dummy_op._flux_operator_meta = meta  # type: ignore
 
     from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
 
@@ -951,31 +952,36 @@ async def test_send_output_none_mesh():
 
     data = [np.array([1, 2, 3])]
     result = ExecutionResult(status=ExecutionStatus.SUCCESS, data=data)
-    await worker._send_output("compute", result, exec_step=0)
+    await worker._send_output("compute", result, exec_step=0, step_tuuid_cache={})
     await worker._drain_outbound_tasks()
 
     assert len(recorder.calls) == 1
     call = recorder.calls[0]
-    assert call["op_name"] == "compute"
+    assert call["compiled_plan"].op_name == "compute"
     assert call["exec_step"] == 0
-    assert call["successor_handlers"] == [{0: worker._successor_handlers["succ"][0]}]
+    assert call["successor_handlers"] == ({0: worker._successor_handlers["succ"][0]},)
 
 
 @pytest.mark.asyncio
 async def test_trigger_snapshot_hooks():
     from pathlib import Path
 
-    worker_cls = SPMDWorker.__ray_metadata__.modified_class
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
 
     config = MagicMock()
 
-    op_meta1 = MagicMock()
-    op_meta1.owner_class_qualname = "MockClass1"
-    op_meta1.owner_class_module = "mock_module"
+    op_meta1 = OperatorMeta(
+        name="op1",
+        owner_class_qualname="MockClass1",
+        owner_class_module="mock_module",
+    )
 
-    op_meta2 = MagicMock()
-    op_meta2.owner_class_qualname = "MockClass2"
-    op_meta2.owner_class_module = "mock_module"
+    op_meta2 = OperatorMeta(
+        name="op2",
+        owner_class_qualname="MockClass2",
+        owner_class_module="mock_module",
+    )
 
     config.operator_metas = {"op1": op_meta1, "op2": op_meta2}
 

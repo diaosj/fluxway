@@ -7,6 +7,9 @@ import fluxway
 from fluxway.common.decorators import (
     _is_worker_process_required,
     _validate_worker_process_marker,
+    operator,
+    requires_worker_process,
+    spmd,
 )
 
 
@@ -16,6 +19,19 @@ def test_requires_worker_process_marks_class_for_worker_process_lane():
         pass
 
     assert _is_worker_process_required(Trainer) is True
+
+
+def test_requires_worker_process_lowers_to_operator_meta():
+    @spmd()
+    @requires_worker_process
+    class Trainer:
+        @operator()
+        def step(self):
+            return None
+
+    config = Trainer.get_spmd_config()  # type: ignore
+
+    assert config.operator_metas["step"].requires_worker_process is True
 
 
 def test_missing_worker_process_marker_fails_for_jax_distributed_initialize(tmp_path):
@@ -38,8 +54,8 @@ def test_missing_worker_process_marker_fails_for_jax_distributed_initialize(tmp_
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("missing_marker", module_path)
-    module = importlib.util.module_from_spec(spec)
     assert spec is not None
+    module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
 

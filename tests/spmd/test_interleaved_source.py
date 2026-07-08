@@ -17,7 +17,44 @@ from fluxway.common.decorators import spmd, operator as fw_operator
 from fluxway.spmd.worker.data_plane import (
     SuccessorRouteContext,
     build_step_frame_groups,
+    compile_send_plan,
 )
+
+
+def _build_frame_groups_with_plan(
+    *,
+    op_name,
+    rank,
+    mesh,
+    flat_results,
+    output_uuids,
+    output_sharding,
+    successor_contexts,
+    tuuid_to_name,
+    step_tuuid_cache,
+    exec_step,
+    sender_spmd_code,
+    sender_world_size,
+    interleave_unit_size,
+):
+    compiled_plan = compile_send_plan(
+        op_name=op_name,
+        rank=rank,
+        mesh=mesh,
+        output_uuids=tuple(output_uuids),
+        output_sharding=output_sharding,
+        successor_contexts=tuple(successor_contexts),
+        tuuid_to_name=tuuid_to_name,
+        sender_spmd_code=sender_spmd_code,
+        sender_world_size=sender_world_size,
+        interleave_unit_size=interleave_unit_size,
+    )
+    return build_step_frame_groups(
+        compiled_plan=compiled_plan,
+        flat_results=flat_results,
+        step_tuuid_cache=step_tuuid_cache,
+        exec_step=exec_step,
+    )
 
 
 @spmd(mesh_axis_names=("data", "mp"), mesh_axis_shapes=(2, 2))
@@ -30,7 +67,7 @@ class _LoaderOp:
 @spmd(mesh_axis_names=("data",), mesh_axis_shapes=(2,))
 class _ProcessorOp:
     @fw_operator(name="processor")
-    def processor(self, t1: np.ndarray = None):
+    def processor(self, t1: np.ndarray | None = None):
         pass
 
 
@@ -143,6 +180,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         w.setup_and_start(local_rank=rank, local_world_size=2, node_rank=0, num_nodes=1)
         processor_workers.append(w)
 
+    assert processor_workers[0]._op_manager is not None
     shards_dict = processor_workers[0]._op_manager.get_expected_tensor_shards(
         "processor"
     )
@@ -158,7 +196,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         for w in loader_workers[:2]:
             succ_info = w.op_manager.get_successor_info("loader", "processor")
             assert succ_info is not None
-            build_step_frame_groups(
+            _build_frame_groups_with_plan(
                 op_name="loader",
                 rank=w.rank,
                 mesh=w._mesh,
@@ -204,7 +242,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
         for w in loader_workers[2:]:
             succ_info = w.op_manager.get_successor_info("loader", "processor")
             assert succ_info is not None
-            build_step_frame_groups(
+            _build_frame_groups_with_plan(
                 op_name="loader",
                 rank=w.rank,
                 mesh=w._mesh,
@@ -290,7 +328,7 @@ async def test_single_worker_interleaved_unit():
         w = loader_workers[0]
         succ_info = w.op_manager.get_successor_info("loader", "processor")
         assert succ_info is not None
-        build_step_frame_groups(
+        _build_frame_groups_with_plan(
             op_name="loader",
             rank=w.rank,
             mesh=w._mesh,

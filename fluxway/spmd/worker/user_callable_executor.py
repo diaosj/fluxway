@@ -17,6 +17,8 @@ from typing import Any
 
 import ray
 
+from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
+
 
 class UserCallableLane(str, Enum):
     INLINE_ASYNC = "inline_async"
@@ -49,6 +51,9 @@ class UserCallableSpec:
     rank0_address: str | None = None
     operator_owner_classes: tuple[tuple[str, str, type], ...] = ()
     process_affine: bool = False
+    debug_tensor_names: tuple[str, ...] = ()
+    debug_control_names: tuple[str, ...] = ()
+    debug_static_names: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -240,6 +245,7 @@ class UserCallableExecutor:
     def __init__(
         self,
         *,
+        worker_process_runtime: WorkerProcessCallRuntime,
         sample_count: int = 3,
         sync_latency_threshold_sec: float = 0.010,
     ) -> None:
@@ -251,6 +257,7 @@ class UserCallableExecutor:
         self._ray_actors: dict[tuple[Any, ...], _ActorRecord] = {}
         self._local_free_thread_locks: dict[int, asyncio.Lock] = {}
         self._free_threading_enabled = python_free_threading_enabled()
+        self._worker_process_runtime = worker_process_runtime
 
     async def execute(self, spec: UserCallableSpec) -> Any:
         lane = self._lane_for(spec)
@@ -271,7 +278,7 @@ class UserCallableExecutor:
         raise ValueError(f"unsupported user callable lane {lane!r}.")
 
     async def drain(self) -> None:
-        return None
+        await self._worker_process_runtime.drain()
 
     def actor_owned_operator_names(self) -> set[str | None]:
         return {
@@ -397,10 +404,11 @@ class UserCallableExecutor:
             return await asyncio.to_thread(spec.fn)
 
     async def _execute_worker_process(self, spec: UserCallableSpec) -> Any:
-        result = spec.fn()
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        return await self._worker_process_runtime.submit(
+            spec.fn,
+            callable_id=spec.callable_id,
+            resource_id=spec.resource_id,
+        )
 
     async def _execute_ray_actor(self, spec: UserCallableSpec) -> Any:
         key = self._ray_actor_key(spec)

@@ -135,6 +135,7 @@ class TransportTensor:
         global_shape: tuple[int, ...] | None = None,
         receipt: SymmetryReceipt | None = None,
         routing_axes: tuple[int, ...] = (0,),
+        source_step: int | None = None,
     ):
         self._routing_axes: tuple[int, ...] = tuple(a for a in routing_axes)
         if len(self._routing_axes) != len(set(self._routing_axes)):
@@ -170,6 +171,7 @@ class TransportTensor:
         self._routing_indices = self._routing.indices
         self._origin_indices = self._lineage.origin.indices
         self._receipt = self._lineage.receipt
+        self._source_step = source_step
         validate_metadata_lengths(
             self._payload,
             self._layout,
@@ -470,6 +472,18 @@ class TransportTensor:
     def receipt(self, value: SymmetryReceipt | None):
         self._lineage.receipt = value
         self._receipt = value
+
+    @property
+    def source_step(self) -> int | None:
+        return self._source_step
+
+    @source_step.setter
+    def source_step(self, value: int | None):
+        if value is not None and not isinstance(value, int):
+            raise TypeError(
+                f"TransportTensor.source_step must be an int or None, got {type(value).__name__}."
+            )
+        self._source_step = value
 
     @property
     def routing_axes(self) -> tuple[int, ...]:

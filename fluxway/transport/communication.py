@@ -47,11 +47,111 @@ from fluxway.transport.manifest import (
     SenderEmissionMode,
     TransportFrameBuilder,
     TransportFrameHeader,
+    TransportFrameTemplate,
     TransportPlanManifest,
+    dtype_code,
 )
 from fluxway.transport.kernels import FrameTableCapacity
 
 logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TransportFrameBatch:
+    context_index: int
+    target_rank: int
+    batch_seq: int
+    frames: tuple[tuple[TransportFrameHeader, tuple[Any, ...]], ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TransportBatchPlan:
+    frame_groups: tuple[
+        tuple[int, tuple[int, TransportFrameHeader, tuple[Any, ...]]], ...
+    ]
+
+    @classmethod
+    def from_frame_groups(
+        cls,
+        frame_groups: list[
+            tuple[int, tuple[int, TransportFrameHeader, tuple[Any, ...]]]
+        ],
+    ) -> TransportBatchPlan:
+        return cls(frame_groups=tuple(frame_groups))
+
+    def batches(self, *, batch_max_frames: int) -> list[TransportFrameBatch]:
+        return build_transport_frame_batches(
+            frame_groups=list(self.frame_groups),
+            batch_max_frames=batch_max_frames,
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TransportPayloadPlan:
+    role: PayloadRole
+    segment: Any
+    valid_count: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TransportFrameEdgePlan:
+    tuuid: int
+    meta_state: int
+    empty_kind: EmptyKind
+    expected_count: int
+    compact_params: tuple[int, ...] | None
+    global_shape: tuple[int, ...] | None
+    payloads: tuple[TransportPayloadPlan, ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TransportFrameTemplateKey:
+    target_rank: int
+    sender_spmd_code: int
+    sender_rank: int
+    sender_world_size: int
+    edges: tuple[tuple[Any, ...], ...]
+
+
+TransportFrameTemplateCache = dict[TransportFrameTemplateKey, TransportFrameTemplate]
+
+
+def build_transport_frame_batches(
+    frame_groups: list[tuple[int, tuple[int, TransportFrameHeader, tuple[Any, ...]]]],
+    *,
+    batch_max_frames: int,
+) -> list[TransportFrameBatch]:
+    if batch_max_frames <= 0:
+        raise ValueError(f"batch_max_frames must be positive, got {batch_max_frames}.")
+    frames_by_target: dict[
+        tuple[int, int],
+        list[tuple[TransportFrameHeader, tuple[Any, ...]]],
+    ] = {}
+    for context_index, frame_arg in frame_groups:
+        target_rank, header, payload_segments = frame_arg
+        if not isinstance(header, TransportFrameHeader):
+            raise TypeError(
+                f"frame_arg header must be TransportFrameHeader, got {type(header).__name__}."
+            )
+        key = (context_index, target_rank)
+        frames_by_target.setdefault(key, []).append((header, tuple(payload_segments)))
+
+    batches: list[TransportFrameBatch] = []
+    for key in sorted(frames_by_target):
+        context_index, target_rank = key
+        frames = frames_by_target[key]
+        batch_seq = 0
+        for start in range(0, len(frames), batch_max_frames):
+            batches.append(
+                TransportFrameBatch(
+                    context_index=context_index,
+                    target_rank=target_rank,
+                    batch_seq=batch_seq,
+                    frames=tuple(frames[start : start + batch_max_frames]),
+                )
+            )
+            batch_seq += 1
+    return batches
 
 
 # ============================================================
@@ -641,6 +741,53 @@ class BaseDataDistributor:
         if manifest is None:
             return src_world_size
         return manifest.expected_count_for(dst_rank)
+
+    def plan_protocol_empty(
+        self,
+        *,
+        target_rank: int,
+        expected_count: int,
+        tuuid: int,
+        payload: Any,
+    ) -> None:
+        if target_rank < 0:
+            raise ValueError(f"target_rank must be non-negative, got {target_rank}.")
+        if expected_count <= 0:
+            raise ValueError(f"expected_count must be positive, got {expected_count}.")
+        target_world_size = target_rank + 1
+        manifest = self._current_plan_manifest
+        if manifest is not None:
+            target_world_size = max(target_world_size, manifest.target_world_size)
+        expected = [0] * target_world_size
+        sender_has_data = [False] * target_world_size
+        if manifest is not None:
+            expected[: manifest.target_world_size] = manifest.expected_senders_per_dst
+            sender_has_data[: manifest.target_world_size] = (
+                manifest.sender_has_data_per_dst
+            )
+        existing = expected[target_rank]
+        if existing not in (0, expected_count):
+            raise ValueError(
+                f"Conflicting protocol-empty expected_count for target_rank={target_rank}: "
+                f"existing={existing} new={expected_count}."
+            )
+        expected[target_rank] = expected_count
+        self._current_plan_manifest = TransportPlanManifest(
+            expected_senders_per_dst=tuple(expected),
+            sender_has_data_per_dst=tuple(sender_has_data),
+            emission_mode=SenderEmissionMode.ALL_SENDERS_WITH_PROTOCOL_EMPTY,
+        )
+        self._dest_agg[target_rank].append(
+            (
+                tuuid,
+                [payload],
+                [0],
+                [None],
+                [0],
+                [None],
+                [int(EmptyKind.PROTOCOL_EMPTY)],
+            )
+        )
 
     def _plan_mirror_group(
         self,
@@ -1551,6 +1698,7 @@ class AsyncDataDistributor(BaseDataDistributor):
         sender_spmd_code: int,
         sender_world_size: int,
         sender_rank: int,
+        template_cache: TransportFrameTemplateCache | None = None,
     ) -> list[tuple[int, TransportFrameHeader, tuple[Any, ...]]]:
         frame_args = []
         for target_id in sorted(self._dest_agg.keys()):
@@ -1561,6 +1709,7 @@ class AsyncDataDistributor(BaseDataDistributor):
                 sender_spmd_code=sender_spmd_code,
                 sender_rank=sender_rank,
                 sender_world_size=sender_world_size,
+                template_cache=template_cache,
             )
             if logger.isEnabledFor(logging.DEBUG):
                 edge_summary = []
@@ -1645,6 +1794,36 @@ class AsyncDataDistributor(BaseDataDistributor):
         sender_spmd_code: int,
         sender_rank: int,
         sender_world_size: int,
+        template_cache: TransportFrameTemplateCache | None = None,
+    ):
+        if template_cache is not None:
+            return self._build_transport_frame_for_target_from_template(
+                target_id=target_id,
+                groups=groups,
+                step=step,
+                sender_spmd_code=sender_spmd_code,
+                sender_rank=sender_rank,
+                sender_world_size=sender_world_size,
+                template_cache=template_cache,
+            )
+        return self._build_transport_frame_for_target_with_builder(
+            target_id=target_id,
+            groups=groups,
+            step=step,
+            sender_spmd_code=sender_spmd_code,
+            sender_rank=sender_rank,
+            sender_world_size=sender_world_size,
+        )
+
+    def _build_transport_frame_for_target_with_builder(
+        self,
+        *,
+        target_id: int,
+        groups: list[tuple],
+        step: int,
+        sender_spmd_code: int,
+        sender_rank: int,
+        sender_world_size: int,
     ):
         builder = TransportFrameBuilder(
             step=step,
@@ -1654,69 +1833,217 @@ class AsyncDataDistributor(BaseDataDistributor):
             capacity=_frame_table_capacity_for_groups(groups),
         )
         expected_count = self.expected_n_for_dst(target_id, sender_world_size)
-        for (
-            tuuids,
-            tensors,
-            counts,
-            g_shapes,
-            h_states,
-            c_params,
-            empty_kinds,
-        ) in groups:
-            if isinstance(tuuids, list | tuple):
-                tuuid_seq = list(tuuids)
-            else:
-                tuuid_seq = [tuuids]
-            if len(empty_kinds) != len(tuuid_seq):
-                raise ValueError(
-                    f"empty_kinds length {len(empty_kinds)} does not match "
-                    f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
-                )
-            cursor = 0
-            for edge_idx, u in enumerate(tuuid_seq):
-                meta_state = h_states[edge_idx]
-                component_count = 1 + ragged_level_count(meta_state)
-                if meta_state & 2:
-                    component_count += 1
-                edge_counts = counts[cursor : cursor + component_count]
-                compact_params = (
-                    c_params[edge_idx]
-                    if c_params is not None and edge_idx < len(c_params)
-                    else None
-                )
-                edge = builder.add_edge(
-                    tuuid=int(u),
-                    meta_state=int(meta_state),
-                    empty_kind=EmptyKind(int(empty_kinds[edge_idx])),
-                    min_rows=0,
-                    expected_count=expected_count,
-                    compact_params=compact_params,
-                    global_shape=g_shapes[edge_idx],
-                )
+        for edge_plan in _iter_transport_frame_edge_plans(
+            groups,
+            expected_count=expected_count,
+            target_id=target_id,
+        ):
+            edge = builder.add_edge(
+                tuuid=edge_plan.tuuid,
+                meta_state=edge_plan.meta_state,
+                empty_kind=edge_plan.empty_kind,
+                min_rows=0,
+                expected_count=edge_plan.expected_count,
+                compact_params=edge_plan.compact_params,
+                global_shape=edge_plan.global_shape,
+            )
+            for payload in edge_plan.payloads:
                 builder.add_payload(
                     edge,
-                    PayloadRole.VALUES,
-                    tensors[cursor],
-                    int(edge_counts[0]),
+                    payload.role,
+                    payload.segment,
+                    payload.valid_count,
+                )
+        return builder.build()
+
+    def _build_transport_frame_for_target_from_template(
+        self,
+        *,
+        target_id: int,
+        groups: list[tuple],
+        step: int,
+        sender_spmd_code: int,
+        sender_rank: int,
+        sender_world_size: int,
+        template_cache: TransportFrameTemplateCache,
+    ):
+        expected_count = self.expected_n_for_dst(target_id, sender_world_size)
+        edge_plans = tuple(
+            _iter_transport_frame_edge_plans(
+                groups,
+                expected_count=expected_count,
+                target_id=target_id,
+            )
+        )
+        key = _transport_frame_template_key(
+            target_rank=target_id,
+            sender_spmd_code=sender_spmd_code,
+            sender_rank=sender_rank,
+            sender_world_size=sender_world_size,
+            edge_plans=edge_plans,
+        )
+        template = template_cache.get(key)
+        if template is None:
+            frame = self._build_transport_frame_for_target_with_builder(
+                target_id=target_id,
+                groups=groups,
+                step=step,
+                sender_spmd_code=sender_spmd_code,
+                sender_rank=sender_rank,
+                sender_world_size=sender_world_size,
+            )
+            template_cache[key] = TransportFrameTemplate.from_frame(frame)
+            return frame
+        return template.instantiate(
+            step=step,
+            payload_segments=tuple(
+                payload.segment for edge in edge_plans for payload in edge.payloads
+            ),
+            payload_valid_counts=tuple(
+                payload.valid_count for edge in edge_plans for payload in edge.payloads
+            ),
+            global_shapes=tuple(edge.global_shape for edge in edge_plans),
+        )
+
+
+def _iter_transport_frame_edge_plans(
+    groups: list[tuple],
+    *,
+    expected_count: int,
+    target_id: int,
+) -> tuple[TransportFrameEdgePlan, ...]:
+    edges: list[TransportFrameEdgePlan] = []
+    for group_index, (
+        tuuids,
+        tensors,
+        counts,
+        global_shapes,
+        meta_states,
+        compact_params,
+        empty_kinds,
+    ) in enumerate(groups):
+        if isinstance(tuuids, list | tuple):
+            tuuid_seq = tuple(int(u) for u in tuuids)
+        else:
+            tuuid_seq = (int(tuuids),)
+        if len(empty_kinds) != len(tuuid_seq):
+            raise ValueError(
+                f"empty_kinds length {len(empty_kinds)} does not match "
+                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+            )
+        if len(meta_states) != len(tuuid_seq):
+            raise ValueError(
+                f"meta_states length {len(meta_states)} does not match "
+                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+            )
+        if len(global_shapes) != len(tuuid_seq):
+            raise ValueError(
+                f"global_shapes length {len(global_shapes)} does not match "
+                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+            )
+        cursor = 0
+        for edge_idx, tuuid in enumerate(tuuid_seq):
+            meta_state = int(meta_states[edge_idx])
+            component_count = 1 + ragged_level_count(meta_state)
+            if meta_state & 2:
+                component_count += 1
+            if cursor + component_count > len(tensors):
+                raise ValueError(
+                    f"group_index={group_index} edge_index={edge_idx} requires "
+                    f"{component_count} payload components from cursor={cursor}, "
+                    f"but tensors length is {len(tensors)}."
+                )
+            edge_counts = counts[cursor : cursor + component_count]
+            compact = (
+                compact_params[edge_idx]
+                if compact_params is not None and edge_idx < len(compact_params)
+                else None
+            )
+            if compact is not None:
+                compact = tuple(int(value) for value in compact)
+            payloads = [
+                TransportPayloadPlan(
+                    role=PayloadRole.VALUES,
+                    segment=tensors[cursor],
+                    valid_count=int(edge_counts[0]),
+                )
+            ]
+            cursor += 1
+            for _ in range(ragged_level_count(meta_state)):
+                payloads.append(
+                    TransportPayloadPlan(
+                        role=PayloadRole.RAGGED_LENGTHS,
+                        segment=tensors[cursor],
+                        valid_count=int(counts[cursor]),
+                    )
                 )
                 cursor += 1
-                for _ in range(ragged_level_count(meta_state)):
-                    builder.add_payload(
-                        edge,
-                        PayloadRole.RAGGED_LENGTHS,
-                        tensors[cursor],
-                        int(counts[cursor]),
+            if meta_state & 2:
+                payloads.append(
+                    TransportPayloadPlan(
+                        role=PayloadRole.ORIGIN,
+                        segment=tensors[cursor],
+                        valid_count=int(counts[cursor]),
                     )
-                    cursor += 1
-                if meta_state & 2:
-                    builder.add_payload(
-                        edge,
-                        PayloadRole.ORIGIN,
-                        tensors[cursor],
-                        int(counts[cursor]),
+                )
+                cursor += 1
+            shape = global_shapes[edge_idx]
+            edges.append(
+                TransportFrameEdgePlan(
+                    tuuid=tuuid,
+                    meta_state=meta_state,
+                    empty_kind=EmptyKind(int(empty_kinds[edge_idx])),
+                    expected_count=expected_count,
+                    compact_params=compact,
+                    global_shape=tuple(int(value) for value in shape)
+                    if shape is not None
+                    else None,
+                    payloads=tuple(payloads),
+                )
+            )
+        if cursor != len(tensors):
+            raise ValueError(
+                f"group_index={group_index} consumed {cursor} payload components, "
+                f"but tensors length is {len(tensors)}."
+            )
+    return tuple(edges)
+
+
+def _transport_frame_template_key(
+    *,
+    target_rank: int,
+    sender_spmd_code: int,
+    sender_rank: int,
+    sender_world_size: int,
+    edge_plans: tuple[TransportFrameEdgePlan, ...],
+) -> TransportFrameTemplateKey:
+    return TransportFrameTemplateKey(
+        target_rank=target_rank,
+        sender_spmd_code=sender_spmd_code,
+        sender_rank=sender_rank,
+        sender_world_size=sender_world_size,
+        edges=tuple(
+            (
+                edge.tuuid,
+                edge.meta_state,
+                int(edge.empty_kind),
+                edge.expected_count,
+                edge.compact_params,
+                0 if edge.global_shape is None else len(edge.global_shape),
+                tuple(
+                    (
+                        int(payload.role),
+                        dtype_code(payload.segment.dtype),
+                        len(
+                            tuple(int(x) for x in getattr(payload.segment, "shape", ()))
+                        ),
                     )
-                    cursor += 1
-        return builder.build()
+                    for payload in edge.payloads
+                ),
+            )
+            for edge in edge_plans
+        ),
+    )
 
 
 def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:

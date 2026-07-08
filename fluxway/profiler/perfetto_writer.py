@@ -16,6 +16,31 @@ from fluxway.profiler.record import (
 
 FLUXWAY_TRACE_PACKET_SEQUENCE_ID = 1
 
+INTERNED_PAYLOAD_FIELDS = frozenset(
+    {
+        "callable_id",
+        "checkpoint_id",
+        "control_names_id",
+        "error_id",
+        "event_id",
+        "fence_id",
+        "from_state_id",
+        "function_id",
+        "hook_id",
+        "lane_id",
+        "method_id",
+        "op_id",
+        "snapshot_id",
+        "spmd_id",
+        "state_id",
+        "static_names_id",
+        "status_id",
+        "target_spmd_id",
+        "tensor_names_id",
+        "to_state_id",
+    }
+)
+
 
 class PerfettoTraceWriter:
     def __init__(self) -> None:
@@ -89,6 +114,7 @@ class PerfettoTraceWriter:
                 flow_id=int(row[5]),
                 payload_fields=payload_fields,
                 payload_values=payload_values,
+                metadata=metadata,
             )
             self._write_track_event(
                 builder,
@@ -99,6 +125,7 @@ class PerfettoTraceWriter:
                 flow_id=0,
                 payload_fields=payload_fields,
                 payload_values=payload_values,
+                metadata=metadata,
             )
             return
         if kind == int(TraceEventKind.FLOW_END):
@@ -111,6 +138,7 @@ class PerfettoTraceWriter:
                 terminating_flow_id=int(row[5]),
                 payload_fields=payload_fields,
                 payload_values=payload_values,
+                metadata=metadata,
             )
             return
         if kind == int(TraceEventKind.COUNTER):
@@ -123,6 +151,7 @@ class PerfettoTraceWriter:
                 counter_value=int(row[PAYLOAD_START_COLUMN]),
                 payload_fields=payload_fields,
                 payload_values=payload_values,
+                metadata=metadata,
             )
             return
         self._write_track_event(
@@ -134,6 +163,7 @@ class PerfettoTraceWriter:
             flow_id=int(row[5]),
             payload_fields=payload_fields,
             payload_values=payload_values,
+            metadata=metadata,
         )
 
     def _write_track_descriptor(
@@ -189,6 +219,7 @@ class PerfettoTraceWriter:
         counter_value: int | None = None,
         payload_fields: tuple[str, ...],
         payload_values: np.ndarray,
+        metadata: TraceMetadata,
     ) -> None:
         if len(payload_fields) > MAX_PAYLOAD_FIELDS:
             raise ValueError(
@@ -210,5 +241,9 @@ class PerfettoTraceWriter:
         for name, value in zip(payload_fields, payload_values, strict=True):
             annotation = event.debug_annotations.add()
             annotation.name = name
-            annotation.int_value = int(value)
+            payload_value = int(value)
+            if name in INTERNED_PAYLOAD_FIELDS:
+                annotation.string_value = metadata.name_for(payload_value)
+            else:
+                annotation.int_value = payload_value
         builder.write_packet(packet)

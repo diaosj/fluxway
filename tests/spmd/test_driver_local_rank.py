@@ -5,7 +5,8 @@ import pytest
 
 
 def _driver_cls():
-    return SPMDDriver.__ray_metadata__.modified_class
+    cls = getattr(SPMDDriver, "__ray_metadata__", None)
+    return cls.modified_class if cls else SPMDDriver
 
 
 def _make_driver():

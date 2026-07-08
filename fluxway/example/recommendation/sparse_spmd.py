@@ -6,7 +6,8 @@ import sparse_embedding as se  # type: ignore
 import sparse_embedding.checkpoint  # type: ignore
 
 from fluxway.common.tensor_backend import get_backend
-from fluxway.common.decorators import spmd, operator
+from fluxway.common.decorators import spmd, operator, requires_worker_process
+from fluxway.common.types import AsyncPolicy, SchedulePolicy, StatePolicy
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.example.recommendation.data_types import LookupOutput
@@ -27,6 +28,7 @@ def _balanced_counts(total: int, shard_count: int) -> list[int]:
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("shard",),
 )
+@requires_worker_process
 class SparseEmbeddingSPMD:
     rank: int
     world_size: int
@@ -135,6 +137,13 @@ class SparseEmbeddingSPMD:
 
     @operator(
         name="lookup",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            commit="relaxed",
+            schedule=SchedulePolicy.deadline_boost(),
+            state=StatePolicy.thread_safe(),
+        ),
         data_argument=["unique_ids"],
         input_sharding={
             "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
@@ -202,6 +211,13 @@ class SparseEmbeddingSPMD:
 
     @operator(
         name="update",
+        async_policy=AsyncPolicy.bounded_stale(
+            depth=8,
+            max_staleness=7,
+            commit="relaxed",
+            schedule=SchedulePolicy.deadline_boost(boost_priority=200),
+            state=StatePolicy.thread_safe(),
+        ),
         data_argument=["grads"],
         input_sharding={
             "grads": {"type": "mirror", "reference": "lookup.sparse_features"}
@@ -209,12 +225,18 @@ class SparseEmbeddingSPMD:
     )
     def update(self, grads: TransportTensor) -> None:
         step = self.ctx.step
-        keys_np = self._forward_keys_cache.pop(step, None)
+        grad_step = grads.source_step
+        if grad_step is None:
+            raise ValueError(
+                f"SparseEmbeddingSPMD rank={self.rank}: "
+                "grads.source_step is required for bounded-stale update"
+            )
+        keys_np = self._forward_keys_cache.pop(grad_step, None)
 
         if keys_np is None:
             raise ValueError(
                 f"SparseEmbeddingSPMD rank={self.rank}: "
-                f"missing forward cache for step {step}"
+                f"missing forward cache for gradient source step {grad_step}"
             )
 
         grads_np = grads.flat_values.reshape(keys_np.size, self.embed_dim)

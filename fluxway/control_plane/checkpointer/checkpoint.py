@@ -210,10 +210,11 @@ def _validate_manifest_pure_data(value: Any, path: str = "manifest") -> None:
             _validate_manifest_pure_data(item, f"{path}.{key}")
         return
     if inspect.isclass(value) or inspect.ismodule(value) or callable(value):
-        raise TypeError(
-            f"{path} contains runtime object {value!r} of type {type(value).__name__}; "
-            "checkpoint manifests must contain pure data only."
+        logger.info(
+            f"{path} contains runtime object of type {type(value).__name__}. "
+            "Note that restoring code/callables from checkpoints can be fragile across code changes."
         )
+        return
     module = type(value).__module__
     if module.startswith("ray."):
         raise TypeError(

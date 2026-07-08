@@ -836,7 +836,6 @@ class Builder:
 
         for meta, res in [(src_meta, resolver_src), (dst_meta, resolver_dst)]:
             meta.resolve_sharding_topology(res)
-            meta.resolve_async_strategy(res)
 
     def _infer_interleave_params(
         self, spmd_config: SPMDConfig, meta: OperatorMeta

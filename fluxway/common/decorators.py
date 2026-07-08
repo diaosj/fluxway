@@ -628,11 +628,23 @@ def operator(
     static_argument: list[str] | None = None,
     periodic_barrier: int | None = None,
     max_inflight_steps: int = 0,
+    local_pipeline_depth: int = 1,
+    commit_policy: str = "ordered",
+    state_access: str = "exclusive",
+    state_resource: str | None = None,
     is_source: bool | None = None,
     barrier_config: Any | None = None,
+    async_policy: Any | None = None,
 ) -> "Any":
     """
     Mark a function as a Fluxway operator with automatic metadata inference.
+
+    The recommended async interface is ``async_policy``.  Use
+    ``AsyncPolicy.sync()`` for dense/default synchronous training,
+    ``AsyncPolicy.pipelined(...)`` for exact-input local pipelining, and
+    ``AsyncPolicy.bounded_stale(max_staleness=N)`` for bounded-lag async
+    execution.  Tensors and state remain exact-step inputs; bounded stale never
+    substitutes data from another step.
     """
     if callable(name):
         func = name
@@ -646,8 +658,13 @@ def operator(
             static_argument,
             periodic_barrier,
             max_inflight_steps,
+            local_pipeline_depth,
+            commit_policy,
+            state_access,
+            state_resource,
             is_source,
             barrier_config,
+            async_policy,
         )
 
     name_str: str | None = name
@@ -663,8 +680,13 @@ def operator(
             static_argument,
             periodic_barrier,
             max_inflight_steps,
+            local_pipeline_depth,
+            commit_policy,
+            state_access,
+            state_resource,
             is_source,
             barrier_config,
+            async_policy,
         )
 
     return decorator
@@ -680,14 +702,22 @@ def _create_operator_wrapper(
     static_argument,
     periodic_barrier,
     max_inflight_steps,
+    local_pipeline_depth,
+    commit_policy,
+    state_access,
+    state_resource,
     is_source,
     barrier_config=None,
+    async_policy=None,
 ):
     from fluxway.common.types.configs import (
         ArgumentType,
+        AsyncPolicy,
         OperatorMeta,
         StandardBarrierConfig,
         PeriodicBarrierConfig,
+        SchedulePolicy,
+        StatePolicy,
     )
 
     sig = inspect.signature(func)
@@ -749,6 +779,119 @@ def _create_operator_wrapper(
             f"(Data or Control), but found {len(final_tensors)} Data fields and {len(final_states)} "
             f"Control fields.\nFix: Use a @data_type with exactly one field for streaming/periodic processing."
         )
+    if async_policy is None:
+        if local_pipeline_depth <= 0:
+            raise ValueError(
+                f"Fluxway Operator Error: local_pipeline_depth for operator '{name}' "
+                f"must be positive, got {local_pipeline_depth}."
+            )
+        if commit_policy not in ("ordered", "relaxed"):
+            raise ValueError(
+                f"Fluxway Operator Error: commit_policy for operator '{name}' must be "
+                f"'ordered' or 'relaxed', got {commit_policy!r}."
+            )
+        if state_access not in ("exclusive", "thread_safe"):
+            raise ValueError(
+                f"Fluxway Operator Error: state_access for operator '{name}' must be "
+                f"'exclusive' or 'thread_safe', got {state_access!r}."
+            )
+    if async_policy is not None:
+        if not isinstance(async_policy, AsyncPolicy):
+            raise ValueError(
+                f"Fluxway Operator Error: async_policy for operator '{name}' must be an AsyncPolicy, "
+                f"got {type(async_policy).__name__}."
+            )
+        legacy_overrides = []
+        if max_inflight_steps != 0:
+            legacy_overrides.append("max_inflight_steps")
+        if local_pipeline_depth != 1:
+            legacy_overrides.append("local_pipeline_depth")
+        if commit_policy != "ordered":
+            legacy_overrides.append("commit_policy")
+        if state_access != "exclusive":
+            legacy_overrides.append("state_access")
+        if state_resource is not None:
+            legacy_overrides.append("state_resource")
+        if periodic_barrier is not None:
+            legacy_overrides.append("periodic_barrier")
+        if barrier_config is not None:
+            legacy_overrides.append("barrier_config")
+        if legacy_overrides:
+            raise ValueError(
+                f"Fluxway Operator Error: operator '{name}' cannot combine async_policy "
+                f"with legacy async arguments: {', '.join(legacy_overrides)}."
+            )
+        normalized_async_policy = async_policy
+        normalized_state_policy = async_policy.state
+        normalized_schedule_policy = async_policy.schedule
+        max_async_lag = async_policy.max_staleness_limit()
+        if async_policy.mode in ("pipelined", "pipeline_parallel"):
+            max_async_lag = async_policy.depth - 1
+        local_pipeline_depth = async_policy.depth
+        commit_policy = async_policy.commit
+        state_access = normalized_state_policy.access
+        state_resource = normalized_state_policy.resource
+        max_inflight_steps = max_async_lag or 0
+        local_dag_policy = "inline" if async_policy.mode == "sync" else "prepare_ready"
+        input_policy = "exact"
+    else:
+        normalized_state_policy = StatePolicy(
+            access=state_access,
+            resource=state_resource,
+        )
+        normalized_schedule_policy = SchedulePolicy.fifo()
+        if local_pipeline_depth == 1 and commit_policy == "ordered":
+            normalized_async_policy = AsyncPolicy.sync()
+        else:
+            normalized_async_policy = AsyncPolicy.pipelined(
+                depth=local_pipeline_depth,
+                commit=commit_policy,
+                state=normalized_state_policy,
+                schedule=normalized_schedule_policy,
+            )
+        max_async_lag = max_inflight_steps if max_inflight_steps > 0 else None
+        local_dag_policy = "inline"
+        input_policy = "exact"
+    if local_pipeline_depth <= 0:
+        raise ValueError(
+            f"Fluxway Operator Error: local_pipeline_depth for operator '{name}' "
+            f"must be positive, got {local_pipeline_depth}."
+        )
+    if commit_policy not in ("ordered", "relaxed"):
+        raise ValueError(
+            f"Fluxway Operator Error: commit_policy for operator '{name}' must be "
+            f"'ordered' or 'relaxed', got {commit_policy!r}."
+        )
+    if state_access not in ("exclusive", "thread_safe"):
+        raise ValueError(
+            f"Fluxway Operator Error: state_access for operator '{name}' must be "
+            f"'exclusive' or 'thread_safe', got {state_access!r}."
+        )
+    if state_resource is not None and not isinstance(state_resource, str):
+        raise ValueError(
+            f"Fluxway Operator Error: state_resource for operator '{name}' must be "
+            f"a string or None, got {type(state_resource).__name__}."
+        )
+    if state_access == "thread_safe" and state_resource is not None:
+        raise ValueError(
+            f"Fluxway Operator Error: state_resource for operator '{name}' cannot "
+            f"be combined with state_access='thread_safe'. Use "
+            f"state_access='exclusive' when a named serialized resource is needed."
+        )
+    if normalized_schedule_policy.kind == "deadline_boost" and max_async_lag is None:
+        raise ValueError(
+            f"Fluxway Operator Error: SchedulePolicy.deadline_boost for operator "
+            f"'{name}' requires bounded stale max_async_lag."
+        )
+    _is_class_method = "." in func.__qualname__
+    if state_access == "thread_safe" and (
+        not _is_class_method or "<locals>" in func.__qualname__
+    ):
+        raise ValueError(
+            f"Fluxway Operator Error: state_access='thread_safe' for operator "
+            f"'{name}' is only valid on import-stable class methods with an "
+            f"explicit state owner."
+        )
 
     if _is_fluxway_data_type(return_tp):
         output_args: dict | None = {
@@ -760,7 +903,6 @@ def _create_operator_wrapper(
     else:
         output_args = None
 
-    _is_class_method = "." in func.__qualname__
     meta = OperatorMeta(
         name=name,
         owner_class_qualname=func.__qualname__.rsplit(".", 1)[0]
@@ -768,7 +910,18 @@ def _create_operator_wrapper(
         else "",
         owner_class_module=func.__module__ if _is_class_method else "",
         is_source=is_source,
+        priority=normalized_schedule_policy.base_priority,
         max_inflight_steps=max_inflight_steps,
+        async_policy=normalized_async_policy,
+        input_policy=input_policy,
+        local_dag_policy=local_dag_policy,
+        state_policy=normalized_state_policy,
+        schedule_policy=normalized_schedule_policy,
+        max_async_lag=max_async_lag,
+        local_pipeline_depth=local_pipeline_depth,
+        commit_policy=commit_policy,
+        state_access=state_access,
+        state_resource=state_resource,
         input_arguments={
             ArgumentType.CONTROL.value: final_states,
             ArgumentType.DATA.value: final_tensors,
@@ -939,8 +1092,8 @@ def spmd(
             # (if any) wins, but we never discard metadata just because the attr was already
             # seen as a plain function in a more-derived class.
             wrapper_meta: dict[
-                str, tuple[str, OperatorMeta]
-            ] = {}  # attr_name -> (op_name, meta)
+                str, tuple[str, OperatorMeta, type]
+            ] = {}  # attr_name -> (op_name, meta, owner_cls)
             for klass in reversed(c.__mro__):
                 for attr_name, attr in klass.__dict__.items():
                     if not isinstance(attr, _OperatorWrapper):
@@ -948,14 +1101,15 @@ def spmd(
                     meta = attr._fluxway_operator_meta
                     if not isinstance(meta, OperatorMeta):
                         continue
-                    wrapper_meta[attr_name] = (meta.name, copy.deepcopy(meta))
+                    wrapper_meta[attr_name] = (meta.name, copy.deepcopy(meta), klass)
 
             # Pass 2: for each discovered operator, resolve the attr_name that the final
             # class actually exposes (may be a plain override — that is fine, the framework
             # only needs to know the correct attr_name for dispatch and the metadata).
             operators, metas = {}, {}
-            for attr_name, (op_name, meta) in wrapper_meta.items():
+            for attr_name, (op_name, meta, owner_cls) in wrapper_meta.items():
                 operators[op_name] = attr_name
+                meta.requires_worker_process = _is_worker_process_required(owner_cls)
                 metas[op_name] = meta
 
             return SPMDConfig(

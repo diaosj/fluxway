@@ -5,10 +5,47 @@ import numpy as np
 import sparse_embedding as se  # type: ignore
 
 from fluxway.common.tensor_backend import get_backend
-from fluxway.common.decorators import spmd, operator
+from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.index_descriptor import ExplicitIndex
+from fluxway.common.types import AsyncPolicy, StatePolicy
+from fluxway.common.tensor_components import (
+    dense_path_strides,
+    nested_global_positions_kernel,
+    nested_path_position_maps,
+)
 from fluxway.common.types.tensor import TransportTensor
 from .data_types import UserBatch, InputNodeOutput, DPFeatures
+
+
+def _unique_global_flat_positions(
+    nested_splits,
+    flat_first_indices,
+    widths,
+    origin_indices,
+    group_name,
+):
+    if len(nested_splits) != len(widths):
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] nested levels "
+            f"{len(nested_splits)} != dense widths {len(widths)}."
+        )
+    local_rows, path_offsets = nested_path_position_maps(
+        nested_splits, flat_first_indices, widths
+    )
+    if local_rows.size and int(local_rows.max()) >= origin_indices.shape[0]:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] local row index "
+            f"{int(local_rows.max())} exceeds origin length {origin_indices.shape[0]}."
+        )
+    out = np.empty(flat_first_indices.shape[0], dtype=np.int64)
+    nested_global_positions_kernel(
+        local_rows.astype(np.int64, copy=False),
+        path_offsets,
+        origin_indices,
+        dense_path_strides(widths),
+        out,
+    )
+    return out
 
 
 def hash_routing(tensor, mesh):
@@ -26,70 +63,85 @@ async def _sparse_unique(
     tt: TransportTensor,
     rank: int,
     world_size: int,
+    group_name: str = "",
 ) -> tuple[TransportTensor, TransportTensor]:
     """Deduplicate ids via sparse_embedding.async_unique (C++ high-perf).
 
     Returns ``(unique_tt, inv_tt)`` carrying the *minimum* metadata required
     for correct cross-mesh reassembly:
 
-    * ``unique_tt`` carries a per-row ``ExplicitIndex`` whose value
-      ``first_indices[i] * world_size + rank`` is the absolute position
-      of ``unique[i]`` in the conceptual *round-robin interleaved* global
-      ravel ``global_ravel[k*D + d] = rank_d.ravel()[k]`` (with
-      ``D = world_size``).  This expression is the truly global,
-      coordination-free address: it occupies exactly the
-      ``[0, batch_total * D)`` range with no gaps, and ``origin % D == rank``
-      makes inter-rank disjointness a structural property rather than an
-      assumption about a magic upper bound.
-
-      ``first_indices`` comes from ``async_unique(return_first_indices=True)``
-      and, because ``unique`` is emitted in first-occurrence order, is
-      *strictly monotonic* per rank.  Multiplying by ``world_size`` and
-      adding ``rank`` preserves monotonicity within each rank, which is
-      the only property the destination needs: an argsort over
-      origin_indices restores input rank d's local unique sequence
-      regardless of how Mirror-back interleaves shards from multiple
-      sparse ranks, so dense d's local ``inv`` reconstructs the original
-      batch byte-for-byte.
+    * ``unique_tt`` carries a per-row ``ExplicitIndex`` inherited from the
+      source tensor's origin lineage at each unique row's first occurrence.
+      This keeps dynamic unique ids, embedding lookup output, and the inverse
+      tensor tied to the same logical input rows across steps.
     * ``inv_tt`` keeps ``global_shape`` only; the framework's static-DP
       path handles its placement deterministically, no extra meta required.
     """
     ids_np = tt.flat_values
 
     # -- Invariants on input layout --
-    assert ids_np is not None and ids_np.size > 0, (
-        f"[InputSPMD._sparse_unique] ids_np must be non-empty, got "
+    assert ids_np is not None, (
+        f"[InputSPMD._sparse_unique:{group_name}] ids_np must not be None, got "
         f"shape={getattr(ids_np, 'shape', None)}"
     )
     assert isinstance(world_size, int) and world_size >= 1, (
-        f"[InputSPMD._sparse_unique] world_size must be a positive int, "
+        f"[InputSPMD._sparse_unique:{group_name}] world_size must be a positive int, "
         f"got {world_size!r}"
     )
     assert isinstance(rank, int) and 0 <= rank < world_size, (
-        f"[InputSPMD._sparse_unique] rank {rank!r} out of range "
+        f"[InputSPMD._sparse_unique:{group_name}] rank {rank!r} out of range "
         f"[0, world_size={world_size})"
     )
 
-    unique_dlm, inv_dlm, first_dlm = await se.async_unique(
-        ids_np.ravel(),
-        return_inverse=True,
-        return_first_indices=True,
-    )
+    source_origins = tt.origin_indices_materialized
+    if source_origins is None or len(source_origins) == 0:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] sparse ids require non-empty "
+            "input origin_indices."
+        )
+    if not tt.nested_splits:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] sparse ids must use the "
+            "row-partitioned contract: flat_values is an occurrence stream and "
+            "nested_splits[0] maps batch rows to occurrence ranges."
+        )
+    if not tt.global_shape or len(tt.global_shape) != len(tt.nested_splits) + 1:
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] row-partitioned sparse ids "
+            f"require global_shape=(global_rows, *nested_widths), got {tt.global_shape}."
+        )
+    if len(tt.nested_splits[0]) - 1 != len(source_origins):
+        raise ValueError(
+            f"[InputSPMD._sparse_unique:{group_name}] origin length "
+            f"{len(source_origins)} != sparse row count {len(tt.nested_splits[0]) - 1}."
+        )
+    nested_splits = tuple(np.asarray(s, dtype=np.int64) for s in tt.nested_splits)
 
-    backend = get_backend()
-    unique_np = backend.from_dlpack(unique_dlm).astype(np.int64)
-    inv_1d = backend.from_dlpack(inv_dlm).astype(np.int32).reshape(-1)
-    first_local = backend.from_dlpack(first_dlm).astype(np.int64).reshape(-1)
+    if ids_np.size == 0:
+        unique_np = np.empty((0,), dtype=np.int64)
+        inv_1d = np.empty((0,), dtype=np.int32)
+        first_local = np.empty((0,), dtype=np.int64)
+    else:
+        unique_dlm, inv_dlm, first_dlm = await se.async_unique(
+            ids_np.ravel(),
+            return_inverse=True,
+            return_first_indices=True,
+        )
+
+        backend = get_backend()
+        unique_np = backend.from_dlpack(unique_dlm).astype(np.int64)
+        inv_1d = backend.from_dlpack(inv_dlm).astype(np.int32).reshape(-1)
+        first_local = backend.from_dlpack(first_dlm).astype(np.int64).reshape(-1)
 
     # -- Invariants on async_unique outputs --
     assert unique_np.ndim == 1, (
-        f"[InputSPMD._sparse_unique] unique must be 1D, got shape={unique_np.shape}"
+        f"[InputSPMD._sparse_unique:{group_name}] unique must be 1D, got shape={unique_np.shape}"
     )
     assert np.unique(unique_np).size == unique_np.size, (
-        "[InputSPMD._sparse_unique] async_unique output contains duplicates"
+        f"[InputSPMD._sparse_unique:{group_name}] async_unique output contains duplicates"
     )
     assert first_local.shape == unique_np.shape, (
-        f"[InputSPMD._sparse_unique] first_indices shape {first_local.shape} "
+        f"[InputSPMD._sparse_unique:{group_name}] first_indices shape {first_local.shape} "
         f"!= unique shape {unique_np.shape}"
     )
     # async_unique emits unique in first-occurrence order, so first_indices
@@ -97,7 +149,7 @@ async def _sparse_unique(
     # rank d use argsort(origin_indices) to recover the producer's order.
     if first_local.size > 1:
         assert bool(np.all(np.diff(first_local) > 0)), (
-            "[InputSPMD._sparse_unique] first_indices not strictly monotonic; "
+            f"[InputSPMD._sparse_unique:{group_name}] first_indices not strictly monotonic; "
             "async_unique's first-occurrence ordering contract was violated"
         )
 
@@ -105,19 +157,19 @@ async def _sparse_unique(
     # invariant: original_ids[i] == unique_ids[inv[i]] for all i
     original_ids = ids_np.ravel()
     assert inv_1d.shape[0] == original_ids.shape[0], (
-        f"[InputSPMD._sparse_unique] inv length {inv_1d.shape[0]} "
+        f"[InputSPMD._sparse_unique:{group_name}] inv length {inv_1d.shape[0]} "
         f"!= original length {original_ids.shape[0]}"
     )
     if inv_1d.size > 0:
         assert int(inv_1d.min()) >= 0 and int(inv_1d.max()) < unique_np.size, (
-            f"[InputSPMD._sparse_unique] inv out of range: "
+            f"[InputSPMD._sparse_unique:{group_name}] inv out of range: "
             f"min={int(inv_1d.min())}, max={int(inv_1d.max())}, "
             f"unique_size={unique_np.size}"
         )
     np.testing.assert_array_equal(
         unique_np[inv_1d],
         original_ids,
-        err_msg="[InputSPMD] unique+inv reconstruction failed: unique[inv] != original",
+        err_msg=f"[InputSPMD:{group_name}] unique+inv reconstruction failed",
     )
 
     # Numerical correctness check: first_indices points to first occurrence.
@@ -125,24 +177,27 @@ async def _sparse_unique(
     np.testing.assert_array_equal(
         original_ids[first_local],
         unique_np,
-        err_msg=(
-            "[InputSPMD] first_indices contract violated: ids[first_indices] != unique"
-        ),
+        err_msg=(f"[InputSPMD:{group_name}] first_indices contract violated"),
     )
 
-    # Map per-rank first-occurrence positions into the round-robin
-    # interleaved global ravel.  origin_indices[i] is now the *absolute*
-    # position of unique[i] in that global ravel; inter-rank disjointness
-    # is structural (origin % world_size == rank) rather than reliant on a
-    # magic capacity constant.
-    origins = first_local * int(world_size) + int(rank)
+    widths = tuple(w for w in tt.global_shape[1:])
+    origins = _unique_global_flat_positions(
+        nested_splits,
+        first_local,
+        widths,
+        np.asarray(source_origins, dtype=np.int64),
+        group_name,
+    )
+    unique_global_shape = (int(np.prod(tt.global_shape, dtype=np.int64)),)
 
     unique_tt = TransportTensor(
         flat_values=unique_np,
         origin_indices=ExplicitIndex(origins),
+        global_shape=unique_global_shape,
     )
     inv_tt = TransportTensor(
-        flat_values=inv_1d.reshape(ids_np.shape),
+        flat_values=inv_1d.astype(np.int64, copy=False),
+        nested_splits=list(nested_splits),
         global_shape=tt.global_shape,
     )
     return unique_tt, inv_tt
@@ -152,6 +207,7 @@ async def _sparse_unique(
     resource={"num_cpus": 1, "memory_gb": 1},
     mesh_axis_names=("dp",),
 )
+@requires_worker_process
 class InputSPMD:
     rank: int
     world_size: int
@@ -170,6 +226,10 @@ class InputSPMD:
 
     @operator(
         name="process",
+        async_policy=AsyncPolicy.pipelined(
+            depth=4,
+            state=StatePolicy.thread_safe(),
+        ),
         input_sharding={"data": {"type": "static", "axis": ["dp"]}},
         output_sharding={
             "unique_user_ids": {
@@ -203,11 +263,13 @@ class InputSPMD:
             data.active.user_id,
             rank=self.rank,
             world_size=self.world_size,
+            group_name="user",
         )
         item_task = _sparse_unique(
             data.passive.target_item_id,
             rank=self.rank,
             world_size=self.world_size,
+            group_name="item",
         )
 
         (u_user, inv_user), (u_item, inv_item) = await asyncio.gather(

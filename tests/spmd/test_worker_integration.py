@@ -15,6 +15,7 @@ from fluxway.common.types.configs import (
     SPMDTopologyInfo,
 )
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
+from fluxway.rpc.protocol import TransportFrameEnvelope
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
 
@@ -52,6 +53,7 @@ async def test_worker_receive_transport_frame_dispatches_to_mailbox(worker_confi
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
     worker.register_spmd_code_map(1, {1: "src_spmd"})
 
+    assert worker._op_manager is not None
     worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["test_op"])
     worker._op_manager.get_expected_tensor_shards = MagicMock(return_value={42: 1})
     worker._op_manager.get_expected_control_arg_names = MagicMock(return_value=[])
@@ -70,7 +72,14 @@ async def test_worker_receive_transport_frame_dispatches_to_mailbox(worker_confi
     )
     builder.add_payload(edge, PayloadRole.VALUES, test_data, 2)
     frame = builder.build()
-    await worker.receive_transport_frame(frame.header, *frame.payload_segments)
+    await worker.receive_transport_frames(
+        (
+            TransportFrameEnvelope(
+                header=frame.header,
+                payload_segments=tuple(frame.payload_segments),
+            ),
+        )
+    )
 
     stored = await worker._mailbox.get_tensor_shard_views("test_op", 42, 0)
     assert ("src_spmd", 0) in stored
@@ -134,7 +143,14 @@ async def test_worker_receive_bundled_frame_dispatches_all_edges_to_mailbox():
     builder.add_payload(second_edge, PayloadRole.VALUES, second, 2)
     frame = builder.build()
 
-    await worker.receive_transport_frame(frame.header, *frame.payload_segments)
+    await worker.receive_transport_frames(
+        (
+            TransportFrameEnvelope(
+                header=frame.header,
+                payload_segments=tuple(frame.payload_segments),
+            ),
+        )
+    )
 
     first_stored = await worker._mailbox.get_tensor_shard_views("compute", 998, 1)
     second_stored = await worker._mailbox.get_tensor_shard_views("compute", 999, 1)

@@ -40,6 +40,9 @@ from fluxway.common.bind import bind_spmd
 # Import common types
 from fluxway.common.types import (
     SPMDConfig,
+    AsyncPolicy,
+    StatePolicy,
+    SchedulePolicy,
     Graph,
     Node,
     Edge,
@@ -74,6 +77,9 @@ __all__ = [
     # Types
     "PartitionSpec",
     "SPMDConfig",
+    "AsyncPolicy",
+    "StatePolicy",
+    "SchedulePolicy",
     "Graph",
     "Node",
     "Edge",

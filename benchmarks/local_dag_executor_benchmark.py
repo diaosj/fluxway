@@ -14,6 +14,8 @@ from fluxway.spmd.worker.local_plan import (
     LocalStepPlanExecutor,
     MappingCallableRegistry,
 )
+from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
+from fluxway.spmd.worker.user_callable_executor import UserCallableExecutor
 
 
 @dataclass(frozen=True)
@@ -114,7 +116,11 @@ def build_registry(config: BenchConfig) -> MappingCallableRegistry:
 async def run_mode(
     config: BenchConfig, *, mode: str, lanes: int, serial: bool
 ) -> dict[str, Any]:
-    executor = LocalStepPlanExecutor()
+    executor = LocalStepPlanExecutor(
+        UserCallableExecutor(
+            worker_process_runtime=WorkerProcessCallRuntime(max_workers=1),
+        )
+    )
     plan = build_micro_pipeline_plan(config, lanes=lanes, serial=serial)
     registry = build_registry(config)
     stop = asyncio.Event()

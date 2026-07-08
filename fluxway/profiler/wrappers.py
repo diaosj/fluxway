@@ -1,18 +1,12 @@
 from __future__ import annotations
 
+from contextlib import AsyncExitStack
 from typing import Any
 
 from fluxway.profiler.clock import AxonNativeHlcBridge, RayFluxwayHlcBridge
 from fluxway.profiler.record import TraceCarrier
-from fluxway.profiler.recorder import (
-    USER_CALLABLE_INLINE_ASYNC,
-    USER_CALLABLE_INLINE_SYNC_SAMPLE,
-    USER_CALLABLE_LOCAL_FREE_THREAD,
-    USER_CALLABLE_RAY_ACTOR_EXECUTE,
-    USER_CALLABLE_WORKER_PROCESS,
-    TraceRecorder,
-)
-from fluxway.rpc.protocol import AxonDataPlane, DataPlaneCallable
+from fluxway.profiler.recorder import TraceRecorder
+from fluxway.rpc.protocol import AxonDataPlane, DataPlaneCallable, RayActorDataPlane
 from fluxway.transport.manifest import FRAME_EDGE_COUNT, FRAME_PAYLOAD_COUNT, FRAME_STEP
 
 
@@ -36,19 +30,38 @@ class TracingDataPlaneCallable(DataPlaneCallable):
     def delegate(self) -> DataPlaneCallable:
         return self._delegate
 
-    async def receive_transport_frame(
+    async def receive_transport_frames(
         self,
-        header: Any,
-        *payload_iovs: Any,
+        frames: tuple[Any, ...],
     ) -> Any:
+        if not frames:
+            raise ValueError("receive_transport_frames requires at least one frame.")
         carrier = self._recorder.root_carrier.child(
             "transport_frame", self._remote_spmd_id, self._remote_rank
         )
-        async with self._recorder.data_plane_receive_transport_frame(
-            carrier=carrier,
-            remote_rank=self._remote_rank,
-        ):
-            result = await self._delegate.receive_transport_frame(header, *payload_iovs)
+        async with AsyncExitStack() as stack:
+            for frame in frames:
+                step = int(frame.header.frame_i32[FRAME_STEP])
+                await stack.enter_async_context(
+                    self._recorder.data_plane_receive_transport_frame(
+                        carrier=carrier,
+                        remote_rank=self._remote_rank,
+                        step=step,
+                    )
+                )
+                await stack.enter_async_context(
+                    self._recorder.data_plane_receiver_wait(
+                        remote_rank=self._remote_rank,
+                        step=step,
+                    )
+                )
+            if isinstance(self._delegate, RayActorDataPlane):
+                result = await self._delegate.receive_transport_frames_profiled(
+                    frames,
+                    profiler_recorder=self._recorder,
+                )
+            else:
+                result = await self._delegate.receive_transport_frames(frames)
         self._record_receive_clock(carrier, result)
         return result
 
@@ -98,13 +111,6 @@ class TracingDataPlaneBackendExecutor:
         ):
             kwargs["profiler_recorder"] = self._recorder
             return await self._delegate.send_step_frames(**kwargs)
-
-    async def send_transport_frame(self, *args: Any, **kwargs: Any) -> Any:
-        async with self._recorder.data_plane_send_transport_frame(
-            source_rank=int(kwargs.get("source_rank", 0)),
-            output_step=int(kwargs.get("output_step", 0)),
-        ):
-            return await self._delegate.send_transport_frame(*args, **kwargs)
 
 
 class TracingWorkerMailbox:
@@ -215,6 +221,13 @@ class TracingWorkerMailbox:
     ) -> dict[Any, Any]:
         return await self._delegate.get_tensor_arrivals(op_name, tuuid, step)
 
+    async def get_tensor_shard_views_and_arrivals(
+        self, op_name: str, tuuid: int, step: int
+    ) -> tuple[int, dict[Any, Any], dict[Any, Any]]:
+        return await self._delegate.get_tensor_shard_views_and_arrivals(
+            op_name, tuuid, step
+        )
+
     async def snapshot(self) -> dict[str, Any]:
         return await self._delegate.snapshot()
 
@@ -230,11 +243,13 @@ class TracingLocalStepPlanExecutor:
         self._delegate = delegate
         self._recorder = recorder
 
-    async def execute(self, plan: Any, registry: Any) -> Any:
+    async def execute(self, plan: Any, registry: Any, step_context: Any = None) -> Any:
         async with self._recorder.local_step_plan_execute(
             node_count=len(getattr(plan, "node_kinds", ())),
         ):
-            return await self._delegate.execute(plan, registry)
+            if step_context is None:
+                return await self._delegate.execute(plan, registry)
+            return await self._delegate.execute(plan, registry, step_context)
 
     async def drain_user_callables(self) -> None:
         return await self._delegate.drain_user_callables()
@@ -251,32 +266,23 @@ class TracingUserCallableExecutor:
     def __init__(self, delegate: Any, recorder: TraceRecorder) -> None:
         self._delegate = delegate
         self._recorder = recorder
-        self._install_lane_wrappers()
 
     async def execute(self, spec: Any) -> Any:
         lane = self._delegate._lane_for(spec)
         lane_value = str(getattr(lane, "value", lane))
-        self._recorder.user_callable_lane_select(
-            callable_id=spec.callable_id,
-            resource_id=int(spec.resource_id),
-            lane=lane_value,
-        )
-        if lane_value == "inline_async":
-            async with self._recorder.user_callable_lane_span(
-                spec=USER_CALLABLE_INLINE_ASYNC,
-                callable_id=spec.callable_id,
-                resource_id=int(spec.resource_id),
-            ):
-                async with self._recorder.user_callable_execute(
-                    callable_id=getattr(spec, "callable_id", ""),
-                    resource_id=int(getattr(spec, "resource_id", 0)),
-                ):
-                    return await spec.fn()
         async with self._recorder.user_callable_execute(
-            callable_id=getattr(spec, "callable_id", ""),
-            resource_id=int(getattr(spec, "resource_id", 0)),
+            callable_id=str(getattr(spec, "callable_id", "")),
+            function_name=self._function_name(spec),
+            op_name=str(
+                getattr(spec, "operator_name", None) or getattr(spec, "callable_id", "")
+            ),
+            step=self._operator_step(spec),
+            tensor_names=self._joined_names(getattr(spec, "debug_tensor_names", ())),
+            control_names=self._joined_names(getattr(spec, "debug_control_names", ())),
+            static_names=self._joined_names(getattr(spec, "debug_static_names", ())),
+            lane=lane_value,
         ):
-            return await self._delegate.execute(spec)
+            return await self._execute_selected_lane(spec, lane_value)
 
     def actor_owned_operator_names(self) -> set[str | None]:
         return self._delegate.actor_owned_operator_names()
@@ -317,45 +323,38 @@ class TracingUserCallableExecutor:
         ):
             return await self._delegate.restore_state(states, ckpt_dir)
 
-    def _install_lane_wrappers(self) -> None:
-        sync_sampled = self._delegate._execute_sync_sampled
-        local_free_thread = self._delegate._execute_local_free_thread
-        worker_process = self._delegate._execute_worker_process
-        ray_actor = self._delegate._execute_ray_actor
+    async def _execute_selected_lane(self, spec: Any, lane_value: str) -> Any:
+        if lane_value == "inline_async":
+            return await spec.fn()
+        if lane_value == "inline_sync":
+            return self._delegate._execute_sync_sampled(spec)
+        if lane_value == "worker_process":
+            return await self._delegate._execute_worker_process(spec)
+        if lane_value == "local_free_thread":
+            return await self._delegate._execute_local_free_thread(spec)
+        if lane_value == "ray_execution_actor":
+            return await self._delegate._execute_ray_actor(spec)
+        if lane_value == "native_backend":
+            raise NotImplementedError(
+                "native_backend user callable lane is not installed."
+            )
+        raise ValueError(f"unsupported user callable lane {lane_value!r}.")
 
-        def traced_sync_sampled(spec: Any) -> Any:
-            with self._recorder.user_callable_lane_sync_span(
-                spec=USER_CALLABLE_INLINE_SYNC_SAMPLE,
-                callable_id=spec.callable_id,
-                resource_id=int(spec.resource_id),
-            ):
-                return sync_sampled(spec)
+    @staticmethod
+    def _operator_step(spec: Any) -> int:
+        step = getattr(spec, "operator_step", None)
+        return -1 if step is None else int(step)
 
-        async def traced_local_free_thread(spec: Any) -> Any:
-            async with self._recorder.user_callable_lane_span(
-                spec=USER_CALLABLE_LOCAL_FREE_THREAD,
-                callable_id=spec.callable_id,
-                resource_id=int(spec.resource_id),
-            ):
-                return await local_free_thread(spec)
+    @staticmethod
+    def _function_name(spec: Any) -> str:
+        op_name = getattr(spec, "operator_name", None)
+        if op_name:
+            return str(op_name)
+        fn = getattr(spec, "fn", None)
+        return str(getattr(fn, "__qualname__", getattr(spec, "callable_id", "")))
 
-        async def traced_worker_process(spec: Any) -> Any:
-            async with self._recorder.user_callable_lane_span(
-                spec=USER_CALLABLE_WORKER_PROCESS,
-                callable_id=spec.callable_id,
-                resource_id=int(spec.resource_id),
-            ):
-                return await worker_process(spec)
-
-        async def traced_ray_actor(spec: Any) -> Any:
-            async with self._recorder.user_callable_lane_span(
-                spec=USER_CALLABLE_RAY_ACTOR_EXECUTE,
-                callable_id=spec.callable_id,
-                resource_id=int(spec.resource_id),
-            ):
-                return await ray_actor(spec)
-
-        self._delegate._execute_sync_sampled = traced_sync_sampled
-        self._delegate._execute_local_free_thread = traced_local_free_thread
-        self._delegate._execute_worker_process = traced_worker_process
-        self._delegate._execute_ray_actor = traced_ray_actor
+    @staticmethod
+    def _joined_names(names: Any) -> str:
+        if not names:
+            return ""
+        return ",".join(str(name) for name in names)

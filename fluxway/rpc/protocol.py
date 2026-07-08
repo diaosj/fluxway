@@ -5,6 +5,7 @@ Control plane operations (scheduling, heartbeats) still use native Ray.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 from inspect import isawaitable
 from typing import Any, ClassVar
@@ -13,6 +14,12 @@ import numpy as np
 
 from fluxway.common.tensor_backend import ensure_cpu_serializable
 from fluxway.transport.manifest import TransportFrameHeader
+
+
+@dataclass(frozen=True, slots=True)
+class TransportFrameEnvelope:
+    header: TransportFrameHeader
+    payload_segments: tuple[Any, ...]
 
 
 class PayloadDeviceClass(str, Enum):
@@ -132,12 +139,11 @@ class DataPlaneCallable(ABC):
         pass
 
     @abstractmethod
-    async def receive_transport_frame(
+    async def receive_transport_frames(
         self,
-        header: TransportFrameHeader,
-        *payload_iovs: Any,
+        frames: tuple[TransportFrameEnvelope, ...],
     ) -> Any:
-        """Data Plane: host metadata header plus tensor payload buffers."""
+        """Data Plane: batched host metadata headers plus tensor payload buffers."""
         pass
 
     @abstractmethod
@@ -163,17 +169,49 @@ class RayActorDataPlane(DataPlaneCallable):
             )
         self._sender_spmd_code = sender_spmd_code
 
-    async def receive_transport_frame(
+    async def receive_transport_frames(
         self,
-        header: TransportFrameHeader,
-        *payload_iovs: Any,
+        frames: tuple[TransportFrameEnvelope, ...],
     ) -> Any:
-        header = _validated_transport_header(header)
-        cpu_segments = tuple(ensure_cpu_serializable(p) for p in payload_iovs)
-        return await self._handle.receive_transport_frame.remote(
-            header,
-            *cpu_segments,
+        return await self.receive_transport_frames_profiled(
+            frames, profiler_recorder=None
         )
+
+    async def receive_transport_frames_profiled(
+        self,
+        frames: tuple[TransportFrameEnvelope, ...],
+        *,
+        profiler_recorder: Any | None,
+    ) -> Any:
+        if not frames:
+            raise ValueError("receive_transport_frames requires at least one frame.")
+        payload_count = sum(len(frame.payload_segments) for frame in frames)
+
+        def serialize_frames() -> tuple[TransportFrameEnvelope, ...]:
+            return tuple(
+                TransportFrameEnvelope(
+                    header=_validated_transport_header(frame.header),
+                    payload_segments=tuple(
+                        ensure_cpu_serializable(payload)
+                        for payload in frame.payload_segments
+                    ),
+                )
+                for frame in frames
+            )
+
+        if profiler_recorder is None:
+            cpu_frames = serialize_frames()
+            return await self._handle.receive_transport_frames.remote(cpu_frames)
+
+        with profiler_recorder.data_plane_ray_payload_serialize(
+            frame_count=len(frames),
+            payload_count=payload_count,
+        ):
+            cpu_frames = serialize_frames()
+        with profiler_recorder.data_plane_ray_rpc_submit(frame_count=len(frames)):
+            ref = self._handle.receive_transport_frames.remote(cpu_frames)
+        async with profiler_recorder.data_plane_ray_rpc_wait(frame_count=len(frames)):
+            return await ref
 
     async def receive_control(
         self, op_name: str, step: int, names: list[str], values: list[Any]
@@ -215,21 +253,40 @@ class AxonDataPlane(DataPlaneCallable):
                 "deposit/assemble failures from the current step."
             )
 
-    async def receive_transport_frame(
+    async def receive_transport_frames(
         self,
-        header: TransportFrameHeader,
-        *payload_iovs: Any,
+        frames: tuple[TransportFrameEnvelope, ...],
     ) -> Any:
-        header = _validated_transport_header(header)
-        payload_class = validate_payload_iov_device_class(
-            payload_iovs, expected_device_class=self._payload_device_class
+        if not frames:
+            raise ValueError("receive_transport_frames requires at least one frame.")
+        validated_frames = tuple(
+            TransportFrameEnvelope(
+                header=_validated_transport_header(frame.header),
+                payload_segments=tuple(frame.payload_segments),
+            )
+            for frame in frames
         )
-        invoke = getattr(self._handle, "invoke_transport_frame", None)
+        payload_class = validate_payload_iov_device_class(
+            tuple(
+                payload
+                for frame in validated_frames
+                for payload in frame.payload_segments
+            ),
+            expected_device_class=self._payload_device_class,
+        )
+        invoke = getattr(self._handle, "invoke_transport_frames", None)
         if invoke is None:
-            raise TypeError("AxonDataPlane handle must expose invoke_transport_frame.")
+            raise TypeError("AxonDataPlane handle must expose invoke_transport_frames.")
+        assert payload_class is not None, (
+            "payload_class must not be None when expected_device_class is provided"
+        )
         return await _await_required(
-            invoke(header, payload_class.value, self._sender_spmd_code, *payload_iovs),
-            "invoke_transport_frame",
+            invoke(
+                validated_frames,
+                payload_class.value,
+                self._sender_spmd_code,
+            ),
+            "invoke_transport_frames",
         )
 
     async def receive_control(

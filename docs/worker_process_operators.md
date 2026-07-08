@@ -1,11 +1,12 @@
-# Worker-process operators
+# Worker-Process Operators
 
-Most Fluxway stateful operators do not need special execution settings. Fluxway
-runs them in an isolated Ray execution actor so user code is separated from the
-SPMD worker process.
+Fluxway normally keeps user code away from the `SPMDWorker` actor event loop.
+The scheduler, mailbox receiver, prepare runtime, and delivery runtime must keep
+making progress while user operators run.
 
-Some operators must run inside the SPMD worker process itself. The common case is
-JAX distributed setup:
+Some classes still must execute inside the SPMD worker process. Use
+`@fluxway.requires_worker_process` only when the class initializes or owns
+process-local runtime state.
 
 ```python
 import jax
@@ -22,25 +23,62 @@ class Trainer:
         )
 ```
 
-Use `@fluxway.requires_worker_process` when the operator initializes or owns
-process-local runtime state, for example:
+Common reasons:
 
 - `jax.distributed.initialize`
 - process-local GPU or accelerator runtime state
-- libraries that must be initialized in the same process that executes the SPMD
-  worker
+- libraries that must be initialized in the same process as the SPMD worker
+- native handles that cannot move to a separate Ray execution actor
 
-Do not add it to ordinary stateful operators. Keeping ordinary operators in an
-isolated execution actor protects the worker process from blocking calls, global
-state changes, and library initialization side effects.
+Do not add it to ordinary stateful operators. `@requires_worker_process` keeps
+state in the worker process, so the class must be designed for that lifecycle.
 
-Fluxway fails fast for the most common beginner mistake. If a class calls
-`jax.distributed.initialize` but is not decorated, worker startup raises:
+## Runtime Semantics
+
+`@requires_worker_process` does not mean synchronous inline execution on the
+Ray actor event loop. Fluxway submits process-affine `CALL` nodes to
+`WorkerProcessCallRuntime`:
+
+- the actor event loop submits work and awaits a future
+- synchronous user code runs in the same process on a worker-local thread
+- if the callable returns an awaitable, the runtime completes it inside the
+  worker thread
+- `contextvars` such as rank/world/step are propagated
+- exceptions propagate back to the LocalStepPlan and poison the worker normally
+
+This preserves event-loop progress for:
+
+- `receive_transport_frames`
+- mailbox deposit and ready callbacks
+- `LocalInputPrepareRuntime`
+- `OutboundDeliveryRuntime`
+- scheduler wakeups and drain fences
+
+Pure Python CPU-heavy user code still competes for the CPython GIL. The runtime
+is an event-loop isolation mechanism, not a promise of CPU parallel speedup.
+JAX, CuPy, native kernels, Ray RPC waits, and many I/O paths can still overlap
+because they release the GIL or are backend driven.
+
+## State And Resource Rules
+
+`AsyncPolicy` controls concurrency:
+
+- `StatePolicy.exclusive()` serializes access through LocalStepPlan resource ids.
+- `StatePolicy.thread_safe()` removes the class-instance lock and requires the
+  underlying state/store to be safe for concurrent calls.
+- `local_pipeline_depth` comes from `AsyncPolicy.depth`.
+
+If a process-affine class has mutable Python state and is not explicitly
+thread-safe, use the default `AsyncPolicy.sync()` or `StatePolicy.exclusive()`.
+
+## Failure Mode
+
+Fluxway fails fast when a class calls `jax.distributed.initialize` but is not
+decorated:
 
 ```text
 Fluxway Worker Process Error: ... calls jax.distributed.initialize but is not marked with @fluxway.requires_worker_process.
 ```
 
-The old internal protocol field `__fluxway_process_affine__` is intentionally
-hidden behind the decorator. User code should use the decorator instead of
-writing internal Fluxway attributes.
+The internal protocol field `__fluxway_process_affine__` is intentionally hidden
+behind the decorator. User code should use `@fluxway.requires_worker_process`.

@@ -18,17 +18,22 @@ from __future__ import annotations
 
 import typing
 import unittest
+from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
 
-from fluxway.common.tensor_backend import get_backend
+from fluxway.common.tensor_backend import get_backend, use_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.types.sharding import AlgebraicRouting, ChunkPartition
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
-from fluxway.spmd.worker.worker import SPMDWorker as RaySPMDWorker
+from fluxway.spmd.worker.worker import (
+    SPMDWorker as RaySPMDWorker,
+    _nonzero_1d_indices,
+)
+from fluxway.spmd.worker.assembly import AssembleProviderPlan, CompiledAssemblePlan
 
 SPMDWorker = getattr(RaySPMDWorker, "__ray_actor_class__", RaySPMDWorker)  # type: ignore
 # ─── Helper: build a minimal TransportTensor ─────────────────────────────────
@@ -236,6 +241,7 @@ class _DirectWorker:
     rank: int = 0
     spmd_id: str = ""
     _filter_shards_by_routing: typing.Any = None
+    _flatten_shards: typing.Any = None
     _get_values: typing.Any = None
     _get_routing_indices: typing.Any = None
     _normalize_and_cat_shards: typing.Any = None
@@ -246,6 +252,24 @@ class _DirectWorker:
 # =============================================================================
 # Tests
 # =============================================================================
+
+
+def _dynamic_to_static_assemble_plan(
+    *,
+    op_name: str,
+    tuuid: int,
+    input_layout,
+    predecessor_spmd_id: str,
+) -> CompiledAssemblePlan:
+    topology = {predecessor_spmd_id: SimpleNamespace(tuuid_sharding={tuuid: object()})}
+    return CompiledAssemblePlan(
+        op_name=op_name,
+        tuuid=tuuid,
+        input_layout=input_layout,
+        predecessor_topology=topology,
+        providers=(AssembleProviderPlan(predecessor_spmd_id, True),),
+        has_dynamic_predecessor=True,
+    )
 
 
 class TestSymmetryReceiptHelpers(unittest.TestCase):
@@ -386,9 +410,13 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         worker: typing.Any = _DirectWorker()
         worker.rank = 1
         worker.spmd_id = "Dense"
-        worker._filter_shards_by_routing = lambda op, tuuid, step, shards, topo: [
-            packet[0] for packet in shards.values()
-        ]
+        worker.op_manager = None
+        worker._flatten_shards = SPMDWorker._flatten_shards.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
+        worker._filter_shards_by_routing = SPMDWorker._filter_shards_by_routing.__get__(  # type: ignore
+            worker, _DirectWorker
+        )
         worker._get_values = SPMDWorker._get_values.__get__(worker, _DirectWorker)  # type: ignore
         worker._get_routing_indices = SPMDWorker._get_routing_indices.__get__(  # type: ignore
             worker, _DirectWorker
@@ -413,7 +441,21 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             receipt=SymmetryReceipt(4, np.array([0, 1, 1], dtype=np.int32)),
         )
 
-        result = assemble("step", 7, 0, {("Sparse", 0): [shard]}, input_layout, {})
+        assemble_plan = _dynamic_to_static_assemble_plan(
+            op_name="step",
+            tuuid=7,
+            input_layout=input_layout,
+            predecessor_spmd_id="Sparse",
+        )
+        result = assemble(
+            "step",
+            7,
+            0,
+            {("Sparse", 0): [shard]},
+            input_layout,
+            assemble_plan.predecessor_topology,
+            assemble_plan=assemble_plan,
+        )
         data = np.asarray(result.flat_values)
 
         self.assertEqual(data.shape, (8, 2))
@@ -425,6 +467,32 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             np.asarray(result.receipt.sender_rank_tags),
             [0, 4, 1, 4, 4, 1, 4, 4],
         )
+
+    def test_hybrid_routing_dim_one_dynamic_to_static_uses_unpadded_nonzero(self):
+        with use_backend("hybrid"):
+            backend = get_backend()
+            mask = backend.tensor([True, True, False, False])
+            indices_to_take = _nonzero_1d_indices(backend, mask)
+            all_values = backend.tensor(
+                [
+                    [10, 11, 12, 13],
+                    [20, 21, 22, 23],
+                ],
+                dtype=backend.float32(),
+            )
+
+            idx_tuple = [slice(None), indices_to_take]
+            local_values = all_values[tuple(idx_tuple)]
+            assembled_data = backend.zeros((2, 2), dtype=all_values.dtype)
+            assembled_data = backend.index_update(
+                assembled_data,
+                (slice(None), backend.tensor([0, 1], dtype=backend.int32())),
+                local_values,
+            )
+
+            data = np.asarray(assembled_data)
+            self.assertEqual(data.shape, (2, 2))
+            np.testing.assert_array_equal(data, [[10, 11], [20, 21]])
 
     def test_unequal_shard_sizes(self):
         """
@@ -816,9 +884,15 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
             worker: typing.Any = _DirectWorker()
             worker.rank = r
             worker.spmd_id = "Dense"
-            worker._filter_shards_by_routing = lambda op, tuuid, step, shards, topo: [
-                packet[0] for packet in shards.values()
-            ]
+            worker.op_manager = None
+            worker._flatten_shards = SPMDWorker._flatten_shards.__get__(  # type: ignore
+                worker, _DirectWorker
+            )
+            worker._filter_shards_by_routing = (
+                SPMDWorker._filter_shards_by_routing.__get__(  # type: ignore
+                    worker, _DirectWorker
+                )
+            )
             worker._get_values = SPMDWorker._get_values.__get__(worker, _DirectWorker)  # type: ignore
             worker._get_routing_indices = SPMDWorker._get_routing_indices.__get__(  # type: ignore
                 worker, _DirectWorker
@@ -836,7 +910,21 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                 ("Sparse", sender_rank): [shard]
                 for sender_rank, shard in enumerate(network_mailbox[r])
             }
-            assembled = assemble("step", 1, 0, shards, target_spec, {})
+            assemble_plan = _dynamic_to_static_assemble_plan(
+                op_name="step",
+                tuuid=1,
+                input_layout=target_spec,
+                predecessor_spmd_id="Sparse",
+            )
+            assembled = assemble(
+                "step",
+                1,
+                0,
+                shards,
+                target_spec,
+                assemble_plan.predecessor_topology,
+                assemble_plan=assemble_plan,
+            )
             final_results.append(assembled)
 
         # 5. Verification

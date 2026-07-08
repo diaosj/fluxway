@@ -2,8 +2,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import numba
-from numba import njit
+from numba import njit, prange
 
 from fluxway.common.index_descriptor import (
     ContinuousIndex,
@@ -504,7 +503,7 @@ def nested_global_positions_kernel(
     strides: np.ndarray,
     out: np.ndarray,
 ) -> None:
-    for i in numba.prange(local_rows.shape[0]):  # type: ignore
+    for i in prange(local_rows.shape[0]):  # type: ignore
         slot = origin_indices[local_rows[i]] * strides[0]
         for level in range(path_offsets.shape[1]):
             slot += path_offsets[i, level] * strides[level + 1]
@@ -518,7 +517,7 @@ def scatter_inv_local_kernel(
     global_start: int,
     out: np.ndarray,
 ) -> None:
-    for i in numba.prange(inv_1d.shape[0]):  # type: ignore
+    for i in prange(inv_1d.shape[0]):  # type: ignore
         out[i] = global_positions[inv_1d[i]] - global_start
 
 

@@ -394,6 +394,125 @@ class TransportFrame:
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class TransportFrameTemplate:
+    frame_i32: np.ndarray
+    edge_i32: np.ndarray
+    payload_i32: np.ndarray
+    shape_i32: np.ndarray
+    global_shape_i64: np.ndarray
+    compact_i64: np.ndarray
+
+    @classmethod
+    def from_frame(cls, frame: TransportFrame) -> TransportFrameTemplate:
+        frame.validate()
+        return cls(
+            frame_i32=frame.frame_i32.copy(),
+            edge_i32=frame.edge_i32.copy(),
+            payload_i32=frame.payload_i32.copy(),
+            shape_i32=frame.shape_i32.copy(),
+            global_shape_i64=frame.global_shape_i64.copy(),
+            compact_i64=frame.compact_i64.copy(),
+        )
+
+    def instantiate(
+        self,
+        *,
+        step: int,
+        payload_segments: tuple[Any, ...],
+        payload_valid_counts: tuple[int, ...],
+        global_shapes: tuple[tuple[int, ...] | None, ...],
+    ) -> TransportFrame:
+        if len(payload_segments) != self.payload_i32.shape[0]:
+            raise ValueError(
+                "payload segment count does not match template payload rows: "
+                f"segments={len(payload_segments)} rows={self.payload_i32.shape[0]}."
+            )
+        if len(payload_valid_counts) != self.payload_i32.shape[0]:
+            raise ValueError(
+                "payload valid count length does not match template payload rows: "
+                f"counts={len(payload_valid_counts)} rows={self.payload_i32.shape[0]}."
+            )
+        if len(global_shapes) != self.edge_i32.shape[0]:
+            raise ValueError(
+                "global shape length does not match template edge rows: "
+                f"shapes={len(global_shapes)} rows={self.edge_i32.shape[0]}."
+            )
+
+        frame_i32 = self.frame_i32.copy()
+        edge_i32 = self.edge_i32.copy()
+        payload_i32 = self.payload_i32.copy()
+        shape_i32 = self.shape_i32.copy()
+        global_shape_i64 = self.global_shape_i64.copy()
+        frame_i32[FRAME_STEP] = _as_i32(step, "step")
+
+        for payload_index, segment in enumerate(payload_segments):
+            if not hasattr(segment, "dtype"):
+                raise TypeError(
+                    f"payload segment {payload_index} must expose dtype metadata, "
+                    f"got {type(segment).__name__}."
+                )
+            row = payload_i32[payload_index]
+            actual_dtype_code = dtype_code(segment.dtype)
+            expected_dtype_code = int(row[PAYLOAD_DTYPE])
+            if actual_dtype_code != expected_dtype_code:
+                raise ValueError(
+                    f"payload row {payload_index} dtype_code={expected_dtype_code} "
+                    f"does not match segment dtype_code={actual_dtype_code}."
+                )
+            shape = tuple(int(x) for x in getattr(segment, "shape", ()))
+            shape_count = int(row[PAYLOAD_SHAPE_COUNT])
+            if len(shape) != shape_count:
+                raise ValueError(
+                    f"payload row {payload_index} ndim={shape_count} does not match "
+                    f"segment ndim={len(shape)}."
+                )
+            shape_begin = int(row[PAYLOAD_SHAPE_BEGIN])
+            for offset, value in enumerate(shape):
+                shape_i32[shape_begin + offset] = _as_i32(
+                    value, f"payload shape dim {offset}"
+                )
+            row[PAYLOAD_VALID_COUNT] = _as_i32(
+                payload_valid_counts[payload_index], "valid_count"
+            )
+            row[PAYLOAD_SEGMENT_ARG_INDEX] = _as_i32(
+                payload_index, "payload segment index"
+            )
+
+        for edge_index, shape in enumerate(global_shapes):
+            row = edge_i32[edge_index]
+            shape_count = int(row[EDGE_GLOBAL_SHAPE_COUNT])
+            shape_begin = int(row[EDGE_GLOBAL_SHAPE_BEGIN])
+            if shape is None:
+                if shape_count != 0:
+                    raise ValueError(
+                        f"edge row {edge_index} expected global_shape rank "
+                        f"{shape_count}, got None."
+                    )
+                continue
+            if len(shape) != shape_count:
+                raise ValueError(
+                    f"edge row {edge_index} expected global_shape rank "
+                    f"{shape_count}, got {len(shape)}."
+                )
+            for offset, value in enumerate(shape):
+                global_shape_i64[shape_begin + offset] = _as_i64(
+                    value, f"global_shape[{offset}]"
+                )
+
+        frame = TransportFrame(
+            frame_i32=frame_i32,
+            edge_i32=edge_i32,
+            payload_i32=payload_i32,
+            shape_i32=shape_i32,
+            global_shape_i64=global_shape_i64,
+            compact_i64=self.compact_i64.copy(),
+            payload_segments=payload_segments,
+        )
+        frame.validate()
+        return frame
+
+
 class TransportFrameBuilder:
     _EDGE_STRUCT = struct.Struct("=" + "i" * EDGE_WIDTH)
     _PAYLOAD_STRUCT = struct.Struct("=" + "i" * PAYLOAD_WIDTH)

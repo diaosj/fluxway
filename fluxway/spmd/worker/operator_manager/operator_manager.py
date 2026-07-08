@@ -630,10 +630,6 @@ class OperatorManager:
             for succ_info in self._successor_topology.get(op_name, {}).values():
                 self._resolve_referential_uuids_in_map(succ_info.tuuid_sharding, res_fn)
 
-            meta = self._get_operator_metadata(op_name)
-            if meta:
-                meta.resolve_async_strategy(res_fn)
-
         # Phase 4: Strategy Inheritance
         for op_name in self._operators:
             self._resolve_referential_strategies_in_map(

@@ -13,6 +13,8 @@ import pytest
 
 class TopologyAwareOperator:
     seen_in_init = None
+    rank: int
+    world_size: int
 
     def __init__(self):
         type(self).seen_in_init = (
@@ -85,7 +87,9 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
         operator_metas={"inspect": meta},
     )
 
-    SPMDWorker.__ray_metadata__.modified_class._pre_instantiate_operators(
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+    worker_cls._pre_instantiate_operators(  # type: ignore
         config, 3, local_rank=1, local_world_size=4, node_rank=0, num_nodes=2
     )
 

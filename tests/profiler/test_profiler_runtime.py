@@ -22,9 +22,25 @@ from fluxway.profiler.hierarchy import (
     TraceTrackHierarchy,
 )
 from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
-from fluxway.profiler.record import TraceArena, TraceCarrier, TraceEventKind
-from fluxway.profiler.recorder import TraceRecorder
-from fluxway.rpc.protocol import DataPlaneCallable
+from fluxway.profiler.record import (
+    PAYLOAD_START_COLUMN,
+    TraceArena,
+    TraceCarrier,
+    TraceEventKind,
+)
+from fluxway.profiler.recorder import (
+    LOCAL_STEP_WAIT_INPUTS,
+    WORKER_RUN_LOOP,
+    TraceRecorder,
+)
+from fluxway.profiler.filtering import filter_steady_state_records
+from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
+from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
+from fluxway.spmd.worker.user_callable_executor import (
+    UserCallableExecutor,
+    UserCallableSpec,
+)
+from fluxway.transport.manifest import TransportFrameHeader
 
 
 def test_disabled_factory_returns_original_objects():
@@ -60,6 +76,25 @@ def test_enabled_factory_wraps_without_replacing_delegate_behavior(tmp_path):
     assert wrapped_handlers[0] is not handlers[0]
 
 
+def test_tracing_mailbox_declare_step_forwards_exact_barrier_metadata(tmp_path):
+    config = ProfilerConfig(trace_dir=str(tmp_path), run_id="run")
+    factory = ProfilerRuntimeFactory.from_config(
+        config, process_name="worker/spmd/rank:0"
+    )
+    mailbox = _MailboxLike()
+    wrapped = factory.worker_mailbox(mailbox)
+
+    wrapped.declare_step("op", 3, {11: 1}, ["state"])
+
+    assert mailbox.declared == {
+        "op_name": "op",
+        "step": 3,
+        "expected_tensors": {11: 1},
+        "expected_states": ["state"],
+        "barrier_config": None,
+    }
+
+
 def test_heartbeat_diagnostics_are_opt_in(tmp_path):
     default_runtime = ProfilerRuntimeFactory.from_config(
         ProfilerConfig(trace_dir=str(tmp_path), run_id="default"),
@@ -78,6 +113,114 @@ def test_heartbeat_diagnostics_are_opt_in(tmp_path):
     assert default_runtime.heartbeat_diagnostics_enabled() is False
     assert diagnostic_runtime.heartbeat_observer() is not None
     assert diagnostic_runtime.heartbeat_diagnostics_enabled() is True
+
+
+@pytest.mark.asyncio
+async def test_user_callable_execute_records_step_function_and_input_names(tmp_path):
+    runtime = WorkerProcessCallRuntime(max_workers=1)
+    executor = UserCallableExecutor(worker_process_runtime=runtime)
+    factory = ProfilerRuntimeFactory.from_config(
+        ProfilerConfig(trace_dir=str(tmp_path), run_id="run"),
+        process_name="worker/spmd/rank:0",
+    )
+    wrapped = factory.user_callable_executor(executor)
+
+    async def fn() -> int:
+        return 11
+
+    result = await wrapped.execute(
+        UserCallableSpec(
+            callable_id="lookup",
+            fn=fn,
+            is_stateful=False,
+            resource_id=1,
+            operator_name="lookup",
+            operator_step=9,
+            debug_tensor_names=("ids", "weights"),
+            debug_control_names=("lr",),
+            debug_static_names=("training",),
+        )
+    )
+    await runtime.drain()
+    runtime.close()
+    assert result == 11
+
+    snapshot = factory.recorder.snapshot()
+    metadata = snapshot["metadata"]
+    execute_name_id = next(
+        ident
+        for ident, name in metadata.names_by_id.items()
+        if name == "user_callable.execute"
+    )
+    row = next(row for row in snapshot["records"] if int(row[4]) == execute_name_id)
+    fields = metadata.payload_fields_for(execute_name_id)
+    payload = row[PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(fields)]
+    values = dict(zip(fields, payload, strict=True))
+
+    assert metadata.name_for(int(values["function_id"])) == "lookup"
+    assert metadata.name_for(int(values["op_id"])) == "lookup"
+    assert int(values["step"]) == 9
+    assert metadata.name_for(int(values["tensor_names_id"])) == "ids,weights"
+    assert metadata.name_for(int(values["control_names_id"])) == "lr"
+    assert metadata.name_for(int(values["static_names_id"])) == "training"
+    assert metadata.name_for(int(values["lane_id"])) == "inline_async"
+
+
+def test_profiler_config_rejects_negative_skip_initial_steps(tmp_path):
+    with pytest.raises(ValueError, match="skip_initial_steps"):
+        ProfilerConfig(
+            trace_dir=str(tmp_path),
+            run_id="bad",
+            skip_initial_steps=-1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trace_recorder_skips_step_level_records_below_threshold():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+        skip_initial_steps=2,
+    )
+
+    recorder.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
+    async with recorder.local_step_node(
+        spec=LOCAL_STEP_WAIT_INPUTS,
+        op_name="op",
+        step=1,
+    ):
+        pass
+    async with recorder.local_step_node(
+        spec=LOCAL_STEP_WAIT_INPUTS,
+        op_name="op",
+        step=2,
+    ):
+        pass
+
+    names = [
+        recorder.metadata.name_for(int(row[4])) for row in recorder.arena.snapshot()
+    ]
+    assert names.count("worker.run_loop") == 1
+    assert names.count("local_step.wait_inputs") == 1
+
+
+@pytest.mark.asyncio
+async def test_steady_state_filter_removes_lifecycle_records():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="driver/spmd/driver",
+    )
+    async with recorder.driver_initialize(worker_count=1):
+        pass
+    async with recorder.driver_drain(target_step=3, worker_count=1):
+        pass
+
+    filtered = filter_steady_state_records(recorder.arena.snapshot(), recorder.metadata)
+    names = [recorder.metadata.name_for(int(row[4])) for row in filtered]
+
+    assert names == ["driver.drain"]
 
 
 def test_trace_arena_fixed_capacity_exhaustion():
@@ -182,8 +325,18 @@ async def test_tracing_data_plane_callable_delegates_and_records(tmp_path):
     )
     delegate = _RayLikeDataPlane()
     wrapped = factory.wrap_data_plane_handlers("remote", {3: delegate})[3]
+    header = TransportFrameHeader(
+        frame_i32=np.array([1, 4, 0, 0, 1, 0, 0, 0], dtype=np.int32),
+        edge_i32=np.zeros((0, 11), dtype=np.int32),
+        payload_i32=np.zeros((0, 8), dtype=np.int32),
+        shape_i32=np.zeros((0,), dtype=np.int32),
+        global_shape_i64=np.zeros((0,), dtype=np.int64),
+        compact_i64=np.zeros((0,), dtype=np.int64),
+    )
 
-    result = await wrapped.receive_transport_frame("header", np.ones(2))
+    result = await wrapped.receive_transport_frames(
+        (TransportFrameEnvelope(header=header, payload_segments=(np.ones(2),)),)
+    )
 
     assert result is True
     assert delegate.transport_calls == 1
@@ -269,6 +422,61 @@ def test_perfetto_writer_dependency_contract(tmp_path):
     assert path.stat().st_size > 0
 
 
+@pytest.mark.asyncio
+async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    # pyrefly: ignore [missing-import]
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as proto
+
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    async with recorder.user_callable_execute(
+        callable_id="lookup_callable",
+        function_name="lookup",
+        op_name="lookup",
+        step=4,
+        tensor_names="ids,weights",
+        control_names="lr",
+        static_names="training",
+        lane="inline_async",
+    ):
+        pass
+
+    path = Path(tmp_path) / "trace.pftrace"
+    PerfettoTraceWriter().write(
+        recorder.arena.snapshot(),
+        path,
+        metadata=recorder.metadata,
+    )
+
+    trace = proto.Trace()
+    trace.ParseFromString(path.read_bytes())
+    annotations = {}
+    for packet in trace.packet:
+        event = packet.track_event
+        if event.name != "user_callable.execute":
+            continue
+        for annotation in event.debug_annotations:
+            if annotation.HasField("string_value"):
+                annotations[annotation.name] = annotation.string_value
+            elif annotation.HasField("int_value"):
+                annotations[annotation.name] = int(annotation.int_value)
+        break
+
+    assert annotations["callable_id"] == "lookup_callable"
+    assert annotations["function_id"] == "lookup"
+    assert annotations["op_id"] == "lookup"
+    assert annotations["step"] == 4
+    assert annotations["tensor_names_id"] == "ids,weights"
+    assert annotations["control_names_id"] == "lr"
+    assert annotations["static_names_id"] == "training"
+    assert annotations["lane_id"] == "inline_async"
+
+
 @dataclass
 class _AxonResult:
     native_hlc_physical_ns: int
@@ -280,10 +488,31 @@ class _RayLikeDataPlane(DataPlaneCallable):
         self.transport_calls = 0
         self.control_calls = 0
 
-    async def receive_transport_frame(self, header, *payload_iovs):
+    async def receive_transport_frames(self, frames):
         self.transport_calls += 1
         return True
 
     async def receive_control(self, op_name, step, names, values):
         self.control_calls += 1
         return True
+
+
+class _MailboxLike:
+    def __init__(self) -> None:
+        self.declared = None
+
+    def declare_step(
+        self,
+        op_name,
+        step,
+        expected_tensors,
+        expected_states,
+        barrier_config=None,
+    ):
+        self.declared = {
+            "op_name": op_name,
+            "step": step,
+            "expected_tensors": expected_tensors,
+            "expected_states": expected_states,
+            "barrier_config": barrier_config,
+        }
