@@ -33,7 +33,9 @@ def _make_controller(
 ) -> MagicMock:
     node = Node(
         name="dense_spmd",
-        spmd_config=SPMDConfig(spmd_id="dense_spmd", fail_fast=fail_fast),
+        spmd_config=SPMDConfig(
+            spmd_id="dense_spmd", fail_fast=fail_fast, active_operator_names=()
+        ),
     )
     graph = Graph(nodes={"dense_spmd": node})
 
@@ -151,11 +153,15 @@ class TestFailFastMultiNode:
     async def test_mixed_nodes_fail_fast_wins(self):
         reader_node = Node(
             name="reader",
-            spmd_config=SPMDConfig(spmd_id="reader", fail_fast=False),
+            spmd_config=SPMDConfig(
+                spmd_id="reader", fail_fast=False, active_operator_names=()
+            ),
         )
         dense_node = Node(
             name="dense_spmd",
-            spmd_config=SPMDConfig(spmd_id="dense_spmd", fail_fast=True),
+            spmd_config=SPMDConfig(
+                spmd_id="dense_spmd", fail_fast=True, active_operator_names=()
+            ),
         )
         graph = Graph(nodes={"reader": reader_node, "dense_spmd": dense_node})
 
@@ -182,7 +188,9 @@ class TestFailFastMultiNode:
     async def test_non_fail_fast_node_error_attempts_recovery(self):
         reader_node = Node(
             name="reader",
-            spmd_config=SPMDConfig(spmd_id="reader", fail_fast=False),
+            spmd_config=SPMDConfig(
+                spmd_id="reader", fail_fast=False, active_operator_names=()
+            ),
         )
         graph = Graph(nodes={"reader": reader_node})
 
@@ -280,11 +288,11 @@ class TestFailFastConfig:
     """fail_fast config defaults and overrides."""
 
     def test_default_fail_fast_is_true(self):
-        config = SPMDConfig()
+        config = SPMDConfig(active_operator_names=())
         assert config.fail_fast is True
 
     def test_fail_fast_override_false(self):
-        config = SPMDConfig(fail_fast=False)
+        config = SPMDConfig(fail_fast=False, active_operator_names=())
         assert config.fail_fast is False
 
 
@@ -388,11 +396,15 @@ class TestRepeatedDriverError:
     async def test_second_driver_error_stays_blocked(self):
         reader_node = Node(
             name="reader",
-            spmd_config=SPMDConfig(spmd_id="reader", fail_fast=False),
+            spmd_config=SPMDConfig(
+                spmd_id="reader", fail_fast=False, active_operator_names=()
+            ),
         )
         dense_node = Node(
             name="dense",
-            spmd_config=SPMDConfig(spmd_id="dense", fail_fast=False),
+            spmd_config=SPMDConfig(
+                spmd_id="dense", fail_fast=False, active_operator_names=()
+            ),
         )
         graph = Graph(nodes={"reader": reader_node, "dense": dense_node})
 
@@ -422,11 +434,15 @@ class TestRepeatedDriverError:
     async def test_partial_recovery_stays_blocked(self):
         reader_node = Node(
             name="reader",
-            spmd_config=SPMDConfig(spmd_id="reader", fail_fast=False),
+            spmd_config=SPMDConfig(
+                spmd_id="reader", fail_fast=False, active_operator_names=()
+            ),
         )
         dense_node = Node(
             name="dense",
-            spmd_config=SPMDConfig(spmd_id="dense", fail_fast=False),
+            spmd_config=SPMDConfig(
+                spmd_id="dense", fail_fast=False, active_operator_names=()
+            ),
         )
         graph = Graph(nodes={"reader": reader_node, "dense": dense_node})
 

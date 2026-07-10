@@ -57,6 +57,20 @@ def _local_only_config():
     return builder.build("local_only_transport").nodes["A"].spmd_config
 
 
+def _bind_direct_local_fast_path(stub, raw_cls):
+    stub._assemble_plan_cache = {}
+    stub._direct_local_input_slots = {}
+    stub._direct_local_ready_steps = {"produce": set(), "consume": set()}
+    stub._on_step_ready = lambda _op_name, _step: None
+    for name in (
+        "_compiled_assemble_plan",
+        "_direct_local_input_tuuids",
+        "_uses_direct_local_input_fast_path",
+        "_deposit_direct_local_input",
+    ):
+        setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
+
+
 def test_local_only_successor_uses_direct_worker_data_plane():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
@@ -171,6 +185,7 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
         raw_cls._deposit_local_only_outputs,
         stub,
     )
+    _bind_direct_local_fast_path(stub, raw_cls)
 
     send_context = stub._operator_send_context("produce")
     original = TransportTensor(
@@ -186,8 +201,7 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
     )
 
     tuuid = op_manager.get_expected_tuuids("consume")[0]
-    shards = await mailbox.get_tensor_shard_views("consume", tuuid, 0)
-    stored = shards[("A", 1)][0]
+    stored = stub._direct_local_input_slots["consume"][0][tuuid].tensor
     assert isinstance(stored, TransportTensor)
     assert stored.receipt is not None
     assert stored.receipt.world_size == 7
@@ -241,6 +255,7 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         "_ensure_step_declared",
     ):
         setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
+    _bind_direct_local_fast_path(stub, raw_cls)
 
     result = ExecutionResult(
         status=ExecutionStatus.SUCCESS,
@@ -255,6 +270,6 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
     )
 
     tuuid = op_manager.get_expected_tuuids("consume")[0]
-    shards = await mailbox.get_tensor_shard_views("consume", tuuid, 0)
+    stored = stub._direct_local_input_slots["consume"][0][tuuid].tensor
     assert send_tasks == ()
-    assert isinstance(shards[("A", 1)][0], TransportTensor)
+    assert isinstance(stored, TransportTensor)

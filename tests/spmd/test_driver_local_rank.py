@@ -11,7 +11,9 @@ def _driver_cls():
 
 def _make_driver():
     mesh = DeviceMesh(axis_names=("dp",), device_shape=(4,))
-    config = SPMDConfig(mesh=mesh, operators={}, operator_metas={})
+    config = SPMDConfig(
+        mesh=mesh, operators={}, operator_metas={}, active_operator_names=()
+    )
     driver_cls = _driver_cls()
     return driver_cls(
         spmd_id="spmd-a",

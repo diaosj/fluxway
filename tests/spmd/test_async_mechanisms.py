@@ -146,11 +146,21 @@ def test_async_manager_edge_limit():
 
     # Node A
     meta_a = OperatorMeta(name=op_a)
-    node_a = Node(name="A", spmd_config=SPMDConfig(operator_metas={op_a: meta_a}))
+    node_a = Node(
+        name="A",
+        spmd_config=SPMDConfig(
+            operator_metas={op_a: meta_a}, active_operator_names=(op_a,)
+        ),
+    )
 
     # Node B with max_inflight_steps = 2
     meta_b = OperatorMeta(name=op_b, max_inflight_steps=2)
-    node_b = Node(name="B", spmd_config=SPMDConfig(operator_metas={op_b: meta_b}))
+    node_b = Node(
+        name="B",
+        spmd_config=SPMDConfig(
+            operator_metas={op_b: meta_b}, active_operator_names=(op_b,)
+        ),
+    )
 
     edge = Edge(source_node="A", target_node="B", source_op=op_a, target_op=op_b)
     graph = Graph(nodes={"A": node_a, "B": node_b}, edges=[edge])
@@ -197,7 +207,10 @@ def test_async_manager_ignores_local_only_edges_for_flow_control():
     meta_b = OperatorMeta(name=op_b, max_inflight_steps=0)
     node = Node(
         name="Dense",
-        spmd_config=SPMDConfig(operator_metas={op_a: meta_a, op_b: meta_b}),
+        spmd_config=SPMDConfig(
+            operator_metas={op_a: meta_a, op_b: meta_b},
+            active_operator_names=(op_a, op_b),
+        ),
     )
     edge = Edge(
         source_node="Dense",
@@ -220,7 +233,12 @@ def test_async_manager_ignores_local_only_edges_for_flow_control():
 def test_async_manager_global_limit():
     """Verify that AsyncStepManager locks all ops when max_steps is reached."""
     meta = OperatorMeta(name="run")
-    node = Node(name="N", spmd_config=SPMDConfig(operator_metas={"run": meta}))
+    node = Node(
+        name="N",
+        spmd_config=SPMDConfig(
+            operator_metas={"run": meta}, active_operator_names=("run",)
+        ),
+    )
     graph = Graph(nodes={"N": node})
 
     config = AsyncStepConfig(max_steps=5)
@@ -245,10 +263,20 @@ def test_async_manager_reports_all_completed_at_max_steps():
     op_a = "produce"
     op_b = "consume"
     node_a = Node(
-        name="A", spmd_config=SPMDConfig(operator_metas={op_a: OperatorMeta(name=op_a)})
+        name="A",
+        spmd_config=SPMDConfig(
+            operator_metas={
+                op_a: OperatorMeta(name=op_a, active_operator_names=(op_a,))
+            }
+        ),
     )
     node_b = Node(
-        name="B", spmd_config=SPMDConfig(operator_metas={op_b: OperatorMeta(name=op_b)})
+        name="B",
+        spmd_config=SPMDConfig(
+            operator_metas={
+                op_b: OperatorMeta(name=op_b, active_operator_names=(op_b,))
+            }
+        ),
     )
     graph = Graph(nodes={"A": node_a, "B": node_b})
     manager = AsyncStepManager(graph=graph, config=AsyncStepConfig(max_steps=3))

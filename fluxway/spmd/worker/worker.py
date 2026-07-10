@@ -83,6 +83,7 @@ from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
     SuccessorRouteContext,
     compile_send_plan,
+    ensure_transport_source_step,
     inherit_mirror_metadata,
 )
 from fluxway.spmd.worker.data_plane_executor import BatchingDataPlaneExecutor
@@ -326,6 +327,14 @@ class _PreparedOperatorInput:
     step_tuuid_cache: dict[int, Any]
 
 
+@dataclass(frozen=True)
+class _DirectLocalInputSlot:
+    tensor: TransportTensor
+    source_step: int
+    sender_id: str
+    rank: int
+
+
 @ray.remote
 class SPMDWorker:
     """
@@ -509,6 +518,13 @@ class SPMDWorker:
         self._successor_handlers = {}
         self._operator_send_context_cache = {}
         self._assemble_plan_cache: dict[tuple[str, int], CompiledAssemblePlan] = {}
+        self._direct_local_input_slots: dict[
+            str, dict[int, dict[int, _DirectLocalInputSlot]]
+        ] = {}
+        self._direct_local_ready_steps: dict[str, set[int]] = {
+            op_name: set()
+            for op_name in (self.config.operators if self.config is not None else {})
+        }
         self._local_spmd_code: int | None = None
         self._spmd_id_by_code: dict[int, str] = {}
 
@@ -1399,6 +1415,103 @@ class SPMDWorker:
             )
         else:
             self._spawn_background_task(self._enqueue(op_name, step))
+
+    def _direct_local_input_tuuids(self, op_name: str) -> set[int]:
+        expected = self.op_manager.get_expected_tensor_shards(op_name)
+        if not expected:
+            return set()
+        if any(count != 1 for count in expected.values()):
+            return set()
+        if self.op_manager.get_expected_control_arg_names(op_name):
+            return set()
+        predecessor_topology = self.op_manager.get_predecessor_topology(op_name)
+        if not predecessor_topology:
+            return set()
+        if any(
+            not bool(getattr(info, "local_only", False))
+            or pre_spmd_id != self.spmd_id
+            or int(getattr(info, "world_size", self._world_size)) != self._world_size
+            for pre_spmd_id, info in predecessor_topology.items()
+        ):
+            return set()
+        direct_tuuids = set()
+        for tuuid in expected:
+            providers = [
+                pre_spmd_id
+                for pre_spmd_id, info in predecessor_topology.items()
+                if tuuid in info.tuuid_sharding
+            ]
+            if providers != [self.spmd_id]:
+                return set()
+            plan = self._compiled_assemble_plan(op_name, tuuid)
+            if (
+                plan.assembles_to_dynamic
+                or plan.has_dynamic_predecessor
+                or len(plan.providers) != 1
+                or plan.providers[0].spmd_id != self.spmd_id
+                or plan.providers[0].dynamic_to_static
+            ):
+                return set()
+            direct_tuuids.add(tuuid)
+        return direct_tuuids
+
+    def _uses_direct_local_input_fast_path(self, op_name: str) -> bool:
+        return bool(self._direct_local_input_tuuids(op_name))
+
+    def _deposit_direct_local_input(
+        self,
+        *,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        sender_id: str,
+        rank: int,
+        tensor: TransportTensor,
+    ) -> None:
+        direct_tuuids = self._direct_local_input_tuuids(op_name)
+        if tuuid not in direct_tuuids:
+            raise ValueError(
+                "Direct local input fast path received a tensor outside the "
+                f"compiled local-only contract: op={op_name} tuuid={tuuid} "
+                f"expected={sorted(direct_tuuids)}."
+            )
+        ensure_transport_source_step(
+            op_name=op_name,
+            tensor_name=f"TUUID:{tuuid}",
+            tensor=tensor,
+            exec_step=step,
+        )
+        step_slots = self._direct_local_input_slots.setdefault(op_name, {}).setdefault(
+            step, {}
+        )
+        if tuuid in step_slots:
+            existing = step_slots[tuuid]
+            raise ValueError(
+                "Duplicate direct local tensor deposit: "
+                f"op={op_name} tuuid={tuuid} step={step} "
+                f"existing={existing.sender_id}:{existing.rank} "
+                f"new={sender_id}:{rank}."
+            )
+        step_slots[tuuid] = _DirectLocalInputSlot(
+            tensor=tensor,
+            source_step=step,
+            sender_id=sender_id,
+            rank=rank,
+        )
+        if direct_tuuids.issubset(step_slots.keys()):
+            self._direct_local_ready_steps.setdefault(op_name, set()).add(step)
+            self._on_step_ready(op_name, step)
+
+    def _direct_local_slots_ready(self, op_name: str, step: int) -> bool:
+        direct_tuuids = self._direct_local_input_tuuids(op_name)
+        if not direct_tuuids:
+            return False
+        step_slots = self._direct_local_input_slots.get(op_name, {}).get(step, {})
+        return direct_tuuids.issubset(step_slots.keys())
+
+    def _clear_direct_local_step(self, op_name: str, step: int) -> None:
+        self._direct_local_input_slots.get(op_name, {}).pop(step, None)
+        self._direct_local_ready_steps.get(op_name, set()).discard(step)
 
     def _should_start_prepare_on_ready(self, op_name: str, step: int) -> bool:
         if not self._should_prepare_inputs_on_ready(op_name):
@@ -2764,6 +2877,14 @@ class SPMDWorker:
             self._barriers_declared.pop((op_name, step), None)
             return ExecutionResult(status=ExecutionStatus.SKIPPED)
 
+        if self._uses_direct_local_input_fast_path(op_name):
+            if not self._direct_local_slots_ready(op_name, step):
+                raise ValueError(
+                    "Direct local input fast path selected but inputs are not ready: "
+                    f"op={op_name} step={step}."
+                )
+            return self._assemble_direct_local_input(op_name, step)
+
         if self.config.enable_empty_fastpath:
             all_empty = await self._check_all_empty(op_name, step)
             if all_empty:
@@ -2786,6 +2907,7 @@ class SPMDWorker:
             step = self._completed_step_count[op_name]
             result = pending.pop(step)
             await self._mailbox.clear_step(op_name, step)
+            self._clear_direct_local_step(op_name, step)
             self._barriers_declared.pop((op_name, step), None)
             await self._advance_step(op_name, result=result)
 
@@ -2975,6 +3097,65 @@ class SPMDWorker:
             if p_name in static_args:
                 final_args[p_name] = static_args[p_name]
         final_args.update(state_args)
+        final_args.update(input_kwargs)
+        return _PreparedOperatorInput(
+            value=final_args,
+            step_tuuid_cache=dict(tuuid_to_assembled),
+        )
+
+    def _assemble_direct_local_input(
+        self, op_name: str, step: int
+    ) -> _PreparedOperatorInput:
+        static_args = self.op_manager.get_static_args()
+        meta = self.op_manager.get_operator_metadata(op_name)
+        input_types = self.op_manager.get_operator_input_types(op_name)
+        pre_topo = self.op_manager.get_predecessor_topology(op_name)
+        direct_tuuids = self._direct_local_input_tuuids(op_name)
+        step_slots = self._direct_local_input_slots.get(op_name, {}).get(step, {})
+        if not direct_tuuids.issubset(step_slots.keys()):
+            raise ValueError(
+                "Direct local input fast path missing tensors: "
+                f"op={op_name} step={step} expected={sorted(direct_tuuids)} "
+                f"available={sorted(step_slots.keys())}."
+            )
+
+        p_to_tuuids = {}
+        for p_name in input_types:
+            if p_name in static_args:
+                continue
+            p_paths = meta.input_param_map.get(p_name, [p_name])
+            p_tuuids = []
+            for path in p_paths:
+                tuuid = None
+                for info in pre_topo.values():
+                    if path in info.tuuid_map:
+                        tuuid = info.tuuid_map[path]
+                        break
+                p_tuuids.append(tuuid)
+            p_to_tuuids[p_name] = p_tuuids
+
+        tuuid_to_assembled = {tuuid: slot.tensor for tuuid, slot in step_slots.items()}
+        input_kwargs = {}
+        for p_name, p_tuuids in p_to_tuuids.items():
+            if not p_tuuids or p_tuuids[0] is None:
+                continue
+            missing = [tuuid for tuuid in p_tuuids if tuuid not in tuuid_to_assembled]
+            if missing:
+                raise ValueError(
+                    "Direct local input fast path cannot satisfy operator input: "
+                    f"op={op_name} step={step} param={p_name} missing={missing}."
+                )
+            p_leaves = [tuuid_to_assembled[u] for u in p_tuuids]
+            tdef = meta.input_treedefs.get(p_name)
+            if tdef:
+                input_kwargs[p_name] = tree_unflatten(tdef, p_leaves)
+            else:
+                input_kwargs[p_name] = p_leaves[0]
+
+        final_args = {}
+        for p_name in input_types:
+            if p_name in static_args:
+                final_args[p_name] = static_args[p_name]
         final_args.update(input_kwargs)
         return _PreparedOperatorInput(
             value=final_args,
@@ -4476,7 +4657,20 @@ class SPMDWorker:
                         leaf_tensor = raw_leaf
                     else:
                         leaf_tensor = TransportTensor.from_tensor(raw_leaf)
+                    ensure_transport_source_step(
+                        op_name=send_context.compiled_plan.op_name,
+                        tensor_name=tensor_route.tensor_name,
+                        tensor=leaf_tensor,
+                        exec_step=exec_step,
+                    )
                     wrapped_results[tensor_route.output_index] = leaf_tensor
+                else:
+                    ensure_transport_source_step(
+                        op_name=send_context.compiled_plan.op_name,
+                        tensor_name=tensor_route.tensor_name,
+                        tensor=leaf_tensor,
+                        exec_step=exec_step,
+                    )
                 leaf_tensor = inherit_mirror_metadata(
                     op_name=send_context.compiled_plan.op_name,
                     tuuid=tensor_route.tuuid,
@@ -4496,15 +4690,25 @@ class SPMDWorker:
                         f"source={self.spmd_id}:{self.rank}."
                     )
                 for target_op in target_ops:
-                    self._ensure_step_declared(target_op, exec_step)
-                    await self._mailbox.deposit_local_tensor(
-                        target_op,
-                        tensor_route.tuuid,
-                        exec_step,
-                        self.spmd_id,
-                        self.rank,
-                        leaf_tensor,
-                    )
+                    if self._uses_direct_local_input_fast_path(target_op):
+                        self._deposit_direct_local_input(
+                            op_name=target_op,
+                            tuuid=tensor_route.tuuid,
+                            step=exec_step,
+                            sender_id=self.spmd_id,
+                            rank=self.rank,
+                            tensor=leaf_tensor,
+                        )
+                    else:
+                        self._ensure_step_declared(target_op, exec_step)
+                        await self._mailbox.deposit_local_tensor(
+                            target_op,
+                            tensor_route.tuuid,
+                            exec_step,
+                            self.spmd_id,
+                            self.rank,
+                            leaf_tensor,
+                        )
 
     def _reconstruct_data_type_from_dict(self, cls: type, data: dict[str, Any]) -> Any:
         """Reconstruct a @data_type or dataclass from a nested dictionary of fields."""

@@ -70,6 +70,10 @@ class AsyncStepManager:
                 spmd_progress.completed_step_count.get(op_name, 0), completed_count
             )
 
+    @staticmethod
+    def _active_operator_names(node) -> tuple[str, ...]:
+        return node.spmd_config.require_active_operator_names()
+
     def check_and_enforce_limits(self) -> list[tuple[str, str, int]]:
         """
         Calculate the allowed step for each operator based on topology and limits.
@@ -119,11 +123,7 @@ class AsyncStepManager:
             for node_id, node in self._graph.nodes.items():
                 if node.spmd_config is None:
                     continue
-                # Use both to ensure we find all defined ops even in mock/partial configs
-                all_ops = set(node.spmd_config.operators.keys()) | set(
-                    node.spmd_config.operator_metas.keys()
-                )
-                for op_name in all_ops:
+                for op_name in self._active_operator_names(node):
                     # Start with topological limit if any
                     allowed_step = op_topo_limits.get(
                         (node_id, op_name), 999999999
@@ -209,18 +209,13 @@ class AsyncStepManager:
                 if node_max_steps is None:
                     return False
 
-                all_ops = (
-                    node.spmd_config.operators.keys()
-                    | node.spmd_config.operator_metas.keys()
-                )
-                if not all_ops:
-                    continue
+                active_ops = self._active_operator_names(node)
 
                 spmd_progress = self._spmd_steps.get(node_id)
                 if spmd_progress is None:
                     return False
 
-                for op_name in all_ops:
+                for op_name in active_ops:
                     if (
                         spmd_progress.completed_step_count.get(op_name, 0)
                         < node_max_steps

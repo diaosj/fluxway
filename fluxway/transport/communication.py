@@ -99,6 +99,7 @@ class TransportFrameEdgePlan:
     meta_state: int
     empty_kind: EmptyKind
     expected_count: int
+    source_step: int
     compact_params: tuple[int, ...] | None
     global_shape: tuple[int, ...] | None
     payloads: tuple[TransportPayloadPlan, ...]
@@ -749,6 +750,7 @@ class BaseDataDistributor:
         expected_count: int,
         tuuid: int,
         payload: Any,
+        source_step: int,
     ) -> None:
         if target_rank < 0:
             raise ValueError(f"target_rank must be non-negative, got {target_rank}.")
@@ -786,6 +788,7 @@ class BaseDataDistributor:
                 [0],
                 [None],
                 [int(EmptyKind.PROTOCOL_EMPTY)],
+                [source_step],
             )
         )
 
@@ -796,6 +799,7 @@ class BaseDataDistributor:
         has_meta_tensor_state_list,
         compact_desc_info,
         global_shapes_list,
+        source_steps_list,
     ):
         """Internal logic for Mirror Backflow (using physical receipts)."""
         backend = get_backend()
@@ -849,6 +853,7 @@ class BaseDataDistributor:
                     slice_params,
                     [int(EmptyKind.DATA_EMPTY_ALLOWED)]
                     * len(has_meta_tensor_state_list),
+                    source_steps_list,
                 )
             return
 
@@ -898,6 +903,7 @@ class BaseDataDistributor:
                     )
                 ]
                 * len(has_meta_tensor_state_list),
+                source_steps_list,
             )
 
     def _plan_single_tensor_group(
@@ -925,6 +931,15 @@ class BaseDataDistributor:
         tensors_to_pack = (
             [local_data] if isinstance(local_data, TransportTensor) else local_data
         )
+        source_steps_list = []
+        for tt_idx, tt in enumerate(tensors_to_pack):
+            if tt.source_step is None:
+                raise ValueError(
+                    "[Fluxway Distributor Error] TransportTensor.source_step is "
+                    f"required before frame planning for tuuid(s)="
+                    f"{self._format_tuuids(tuuid, tuuid_to_name)} tt_idx={tt_idx}."
+                )
+            source_steps_list.append(tt.source_step)
 
         # Primary tensor drives routing
         primary = tensors_to_pack[0]
@@ -1050,6 +1065,7 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list=has_meta_tensor_state_list,
                 compact_desc_info=compact_desc_info,
                 global_shapes_list=global_shapes_list,
+                source_steps_list=source_steps_list,
             )
             return
 
@@ -1241,6 +1257,7 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list,
                 [None] * len(has_meta_tensor_state_list),
                 [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
+                source_steps_list,
             )
             return
 
@@ -1275,6 +1292,7 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list,
                 direct_compact_params,
                 [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
+                source_steps_list,
             )
             return
 
@@ -1285,6 +1303,7 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list,
                 compact_desc_info,
                 global_shapes_list,
+                source_steps_list,
             )
             return
 
@@ -1655,6 +1674,7 @@ class BaseDataDistributor:
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
                     empty_kind_list,
+                    source_steps_list,
                 )
         else:
             # Scatter-send
@@ -1685,6 +1705,7 @@ class BaseDataDistributor:
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
                     empty_kind_list,
+                    source_steps_list,
                 )
 
     def plan_and_shard(
@@ -1721,6 +1742,7 @@ class BaseDataDistributor:
             has_meta_tensor_state_list,
             slice_compact_desc_params,
             empty_kind_list,
+            source_steps_list,
         ) in self._plan_single_tensor_group(
             local_data, source, target, capacity, tuuid, tuuid_to_name
         ):
@@ -1739,6 +1761,7 @@ class BaseDataDistributor:
                     has_meta_tensor_state_list,
                     slice_compact_desc_params,
                     empty_kind_list,
+                    source_steps_list,
                 )
             if self._meta_sort_indices is None:
                 self._meta_sort_indices = sort_idx
@@ -1753,6 +1776,7 @@ class BaseDataDistributor:
                         has_meta_tensor_state_list,
                         slice_compact_desc_params,
                         empty_kind_list,
+                        source_steps_list,
                     )
                 )
 
@@ -1913,6 +1937,7 @@ class AsyncDataDistributor(BaseDataDistributor):
                 empty_kind=edge_plan.empty_kind,
                 min_rows=0,
                 expected_count=edge_plan.expected_count,
+                source_step=edge_plan.source_step,
                 compact_params=edge_plan.compact_params,
                 global_shape=edge_plan.global_shape,
             )
@@ -1972,6 +1997,7 @@ class AsyncDataDistributor(BaseDataDistributor):
                 payload.valid_count for edge in edge_plans for payload in edge.payloads
             ),
             global_shapes=tuple(edge.global_shape for edge in edge_plans),
+            source_steps=tuple(edge.source_step for edge in edge_plans),
         )
 
 
@@ -1990,6 +2016,7 @@ def _iter_transport_frame_edge_plans(
         meta_states,
         compact_params,
         empty_kinds,
+        source_steps,
     ) in enumerate(groups):
         if isinstance(tuuids, list | tuple):
             tuuid_seq = tuple(int(u) for u in tuuids)
@@ -2008,6 +2035,11 @@ def _iter_transport_frame_edge_plans(
         if len(global_shapes) != len(tuuid_seq):
             raise ValueError(
                 f"global_shapes length {len(global_shapes)} does not match "
+                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+            )
+        if len(source_steps) != len(tuuid_seq):
+            raise ValueError(
+                f"source_steps length {len(source_steps)} does not match "
                 f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
             )
         cursor = 0
@@ -2063,6 +2095,7 @@ def _iter_transport_frame_edge_plans(
                     meta_state=meta_state,
                     empty_kind=EmptyKind(int(empty_kinds[edge_idx])),
                     expected_count=expected_count,
+                    source_step=int(source_steps[edge_idx]),
                     compact_params=compact,
                     global_shape=tuple(int(value) for value in shape)
                     if shape is not None
@@ -2146,7 +2179,7 @@ def _static_identity_target_rank(
     consumers = source.resolve_consumers(target, local_rank)
     if len(consumers) != 1:
         return None
-    target_rank = int(consumers[0])
+    target_rank = consumers[0]
     producers = source.resolve_producers(target, target_rank)
     if producers != [local_rank]:
         return None
@@ -2236,6 +2269,7 @@ def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
         meta_states,
         compact_params,
         empty_kinds,
+        _source_steps,
     ) in enumerate(groups):
         if isinstance(tuuids, list | tuple):
             tuuid_seq = tuple(tuuids)
@@ -2254,6 +2288,11 @@ def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
         if len(global_shapes) != len(tuuid_seq):
             raise ValueError(
                 f"global_shapes length {len(global_shapes)} does not match "
+                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+            )
+        if len(_source_steps) != len(tuuid_seq):
+            raise ValueError(
+                f"source_steps length {len(_source_steps)} does not match "
                 f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
             )
 

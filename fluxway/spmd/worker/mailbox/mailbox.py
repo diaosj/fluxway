@@ -37,6 +37,7 @@ from fluxway.transport.manifest import (
     EDGE_META_STATE,
     EDGE_PAYLOAD_BEGIN,
     EDGE_PAYLOAD_COUNT,
+    EDGE_SOURCE_STEP,
     EDGE_TUUID,
     EmptyKind,
     FRAME_SENDER_RANK,
@@ -383,6 +384,18 @@ class StepBarrier:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class MailboxStepState:
+    control_args: dict[str, Any] = field(default_factory=dict)
+    tensor_slots: dict[
+        int, dict[tuple[str, int], list[TransportShardView | TransportTensor]]
+    ] = field(default_factory=dict)
+    tensor_arrivals: dict[int, dict[tuple[str, int], dict[str, Any]]] = field(
+        default_factory=dict
+    )
+    zc_receivers: dict[int, TransportReceiver] = field(default_factory=dict)
+
+
 class WorkerMailbox:
     """
     Mailbox for caching incoming data in an SPMD Worker.
@@ -404,22 +417,10 @@ class WorkerMailbox:
     """
 
     def __init__(self) -> None:
-        # Control plane
-        self._control_arg_data: dict[str, dict[str, dict[int, Any]]] = {}
-
-        # Data plane (buffered path)
-        self._tensor_slots: dict[
-            str, dict[int, dict[int, dict[tuple[str, int], list[TransportShardView]]]]
-        ] = {}
-        self._tensor_arrivals: dict[
-            str, dict[int, dict[int, dict[tuple[str, int], dict[str, Any]]]]
-        ] = {}
+        self._states: dict[str, dict[int, MailboxStepState]] = {}
 
         # Completion barriers: {op_name: {step: StepBarrier}}
         self._barriers: dict[str, dict[int, StepBarrier]] = {}
-
-        # Zero-copy receivers (activated on demand)
-        self._zc_receivers: dict[str, dict[int, dict[int, TransportReceiver]]] = {}
 
         # Called with (op_name, step) when a step barrier fires
         self._on_ready: Callable[[str, int], None] | None = None
@@ -438,6 +439,9 @@ class WorkerMailbox:
     # ------------------------------------------------------------------
     # Step barrier lifecycle
     # ------------------------------------------------------------------
+
+    def _get_step_state(self, op_name: str, step: int) -> MailboxStepState:
+        return self._states.setdefault(op_name, {}).setdefault(step, MailboxStepState())
 
     def set_ready_callback(self, callback: Callable[[str, int], None]) -> None:
         """
@@ -525,15 +529,15 @@ class WorkerMailbox:
         # This prevents progress loss if declare_step is called after some deposit_* calls.
         if expected_tensors:
             for tuuid, target in expected_tensors.items():
-                arrived_shards = (
-                    self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
-                )
+                state = self._states.get(op_name, {}).get(step)
+                arrived_shards = state.tensor_slots.get(tuuid, {}) if state else {}
                 for sender_shard_list in arrived_shards.values():
                     for _ in range(len(sender_shard_list)):
                         barrier.tensor_arrived(tuuid)
         # Check for states
         for name in expected_states:
-            if step in self._control_arg_data.get(op_name, {}).get(name, {}):
+            state = self._states.get(op_name, {}).get(step)
+            if state and name in state.control_args:
                 barrier.control_arg_arrived(name)
 
         # In case expected counts are all zero the barrier is already ready
@@ -585,9 +589,8 @@ class WorkerMailbox:
 
             any_fired = False
             for name, data in zip(names, values, strict=True):  # type: ignore
-                self._control_arg_data.setdefault(op_name, {}).setdefault(name, {})[
-                    actual_step
-                ] = data
+                state = self._get_step_state(op_name, actual_step)
+                state.control_args[name] = data
                 if barrier is not None:
                     if barrier.control_arg_arrived(name, current_step=actual_step):
                         any_fired = True
@@ -608,21 +611,20 @@ class WorkerMailbox:
         self, op_name: str, name: str, step: int
     ) -> Any | None:
         async with self._lock:
-            return self._control_arg_data.get(op_name, {}).get(name, {}).get(step)
+            state = self._states.get(op_name, {}).get(step)
+            return state.control_args.get(name) if state else None
 
     async def get_all_control_arguments(
         self, op_name: str, step: int
     ) -> dict[str, Any]:
         async with self._lock:
-            result = {}
-            for name, step_dict in self._control_arg_data.get(op_name, {}).items():
-                if step in step_dict:
-                    result[name] = step_dict[step]
-            return result
+            state = self._states.get(op_name, {}).get(step)
+            return dict(state.control_args) if state else {}
 
     async def has_control_argument(self, op_name: str, name: str, step: int) -> bool:
         async with self._lock:
-            return step in self._control_arg_data.get(op_name, {}).get(name, {})
+            state = self._states.get(op_name, {}).get(step)
+            return name in state.control_args if state else False
 
     # ------------------------------------------------------------------
     # Data plane — tensor shards
@@ -630,21 +632,15 @@ class WorkerMailbox:
 
     def _buffered_slot(
         self, op_name: str, tuuid: int, step: int
-    ) -> dict[tuple[str, int], list[TransportShardView]]:
-        return (
-            self._tensor_slots.setdefault(op_name, {})
-            .setdefault(tuuid, {})
-            .setdefault(step, {})
-        )
+    ) -> dict[tuple[str, int], list[TransportShardView | TransportTensor]]:
+        state = self._get_step_state(op_name, step)
+        return state.tensor_slots.setdefault(tuuid, {})
 
     def _arrival_slot(
         self, op_name: str, tuuid: int, step: int
     ) -> dict[tuple[str, int], dict[str, Any]]:
-        return (
-            self._tensor_arrivals.setdefault(op_name, {})
-            .setdefault(tuuid, {})
-            .setdefault(step, {})
-        )
+        state = self._get_step_state(op_name, step)
+        return state.tensor_arrivals.setdefault(tuuid, {})
 
     async def deposit_shards(
         self,
@@ -656,6 +652,7 @@ class WorkerMailbox:
         sender_world_size: int,
         payloads: list[Any],
         counts: list[int],
+        source_step: int,
         global_shapes: list[tuple[int, ...] | None] | None = None,
         meta_tensor_state_list: list[int] | None = None,
         slice_compact_desc_params: list[list[int] | None] | None = None,
@@ -753,10 +750,12 @@ class WorkerMailbox:
                     "expected_count": self._expected_tensor_counts.get(op_name, {}).get(
                         u, 0
                     ),
+                    "source_step": source_step,
                 }
 
                 # Route to Zero-Copy or Buffered path
-                zc = self._zc_receivers.get(op_name, {}).get(u, {}).get(actual_step)
+                state = self._states.get(op_name, {}).get(actual_step)
+                zc = state.zc_receivers.get(u) if state else None
                 if zc is not None:
                     # Note: Zero-copy bundling is not yet implemented; use flat sub-lists
                     zc.receive_slices(rank, sub_payloads, sub_counts)
@@ -817,6 +816,7 @@ class WorkerMailbox:
                 meta_state = int(edge[EDGE_META_STATE])
                 empty_kind = EmptyKind(int(edge[EDGE_EMPTY_KIND]))
                 expected_count = int(edge[EDGE_EXPECTED_COUNT])
+                source_step = int(edge[EDGE_SOURCE_STEP])
                 if expected_count <= 0:
                     raise ValueError(
                         f"[WorkerMailbox Error] Invalid EDGE_EXPECTED_COUNT={expected_count}: "
@@ -916,6 +916,7 @@ class WorkerMailbox:
                     "compact_params": compact_params,
                     "sender_world_size": sender_world_size,
                     "expected_count": expected_count,
+                    "source_step": source_step,
                 }
 
                 if empty_kind != EmptyKind.PROTOCOL_EMPTY:
@@ -996,6 +997,12 @@ class WorkerMailbox:
                     "WorkerMailbox.deposit_local_tensor requires a TransportTensor, "
                     f"got {type(tensor).__name__}."
                 )
+            if tensor.source_step is None:
+                raise ValueError(
+                    "WorkerMailbox.deposit_local_tensor requires tensor.source_step, "
+                    f"op={op_name} tuuid={tuuid} step={step} "
+                    f"sender={sender_id}:{rank}."
+                )
             values = tensor.flat_values
             backend = get_backend()
             shape = tuple(int(x) for x in backend.shape(values))
@@ -1018,10 +1025,10 @@ class WorkerMailbox:
                 "compact_params": None,
                 "sender_world_size": 1,
                 "expected_count": 1,
+                "source_step": tensor.source_step,
             }
-            self._tensor_slots.setdefault(op_name, {}).setdefault(tuuid, {}).setdefault(
-                step, {}
-            )[key] = [tensor]
+            state = self._get_step_state(op_name, step)
+            state.tensor_slots.setdefault(tuuid, {})[key] = [tensor]
 
             if barrier.tensor_arrived(tuuid, current_step=step) and self._on_ready:
                 self._on_ready(op_name, step)
@@ -1092,15 +1099,18 @@ class WorkerMailbox:
 
     async def get_all_tensor_shard_views(
         self, op_name: str, step: int
-    ) -> dict[int, dict[tuple[str, int], list[TransportShardView]]]:
+    ) -> dict[int, dict[tuple[str, int], list[TransportShardView | TransportTensor]]]:
         async with self._lock:
             expected_counts = self._expected_tensor_counts.get(op_name, {})
-            all_tuuids = set(self._tensor_slots.get(op_name, {}).keys()) | set(
-                expected_counts.keys()
-            )
-            result: dict[int, dict[tuple[str, int], list[TransportShardView]]] = {}
+            state = self._states.get(op_name, {}).get(step)
+            all_tuuids = set(expected_counts.keys())
+            if state:
+                all_tuuids |= set(state.tensor_slots.keys())
+            result: dict[
+                int, dict[tuple[str, int], list[TransportShardView | TransportTensor]]
+            ] = {}
             for tuuid in all_tuuids:
-                slotted = self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step)
+                slotted = state.tensor_slots.get(tuuid) if state else None
                 if slotted and len(slotted) >= expected_counts.get(tuuid, 0):
                     result[tuuid] = dict(slotted)
                     continue
@@ -1129,9 +1139,10 @@ class WorkerMailbox:
         step: int,
         rank: int,
         sender_id: str | None = None,
-    ) -> list[TransportShardView] | None:
+    ) -> list[TransportShardView | TransportTensor] | None:
         async with self._lock:
-            slot = self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
+            state = self._states.get(op_name, {}).get(step)
+            slot = state.tensor_slots.get(tuuid, {}) if state else {}
             if sender_id is not None:
                 return slot.get((sender_id, rank))
 
@@ -1143,39 +1154,51 @@ class WorkerMailbox:
 
     async def get_tensor_shard_views(
         self, op_name: str, tuuid: int, step: int
-    ) -> dict[tuple[str, int], list[TransportShardView]]:
+    ) -> dict[tuple[str, int], list[TransportShardView | TransportTensor]]:
         async with self._lock:
-            return dict(
-                self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
-            )
+            state = self._states.get(op_name, {}).get(step)
+            return dict(state.tensor_slots.get(tuuid, {})) if state else {}
 
     async def get_tensor_arrivals(
         self, op_name: str, tuuid: int, step: int
     ) -> dict[tuple[str, int], dict[str, Any]]:
         async with self._lock:
-            return dict(
-                self._tensor_arrivals.get(op_name, {}).get(tuuid, {}).get(step, {})
-            )
+            state = self._states.get(op_name, {}).get(step)
+            return dict(state.tensor_arrivals.get(tuuid, {})) if state else {}
 
     async def get_tensor_shard_views_and_arrivals(
         self, op_name: str, tuuid: int, step: int
     ) -> tuple[
         int,
-        dict[tuple[str, int], list[TransportShardView]],
+        dict[tuple[str, int], list[TransportShardView | TransportTensor]],
         dict[tuple[str, int], dict[str, Any]],
     ]:
         async with self._lock:
-            shards = dict(
-                self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {})
-            )
-            arrivals = dict(
-                self._tensor_arrivals.get(op_name, {}).get(tuuid, {}).get(step, {})
-            )
-            return step, shards, arrivals
+            state = self._states.get(op_name, {}).get(step)
+            shards = dict(state.tensor_slots.get(tuuid, {})) if state else {}
+            arrivals = dict(state.tensor_arrivals.get(tuuid, {})) if state else {}
+            source_steps = {
+                int(metadata["source_step"])
+                for metadata in arrivals.values()
+                if "source_step" in metadata
+            }
+            if not source_steps:
+                raise ValueError(
+                    f"[WorkerMailbox Error] missing source_step arrival metadata: "
+                    f"op={op_name} tuuid={tuuid} step={step}."
+                )
+            if len(source_steps) != 1:
+                raise ValueError(
+                    f"[WorkerMailbox Error] mixed source_step arrival metadata: "
+                    f"op={op_name} tuuid={tuuid} step={step} "
+                    f"source_steps={sorted(source_steps)}."
+                )
+            return next(iter(source_steps)), shards, arrivals
 
     async def get_tensor_shard_count(self, op_name: str, tuuid: int, step: int) -> int:
         async with self._lock:
-            return len(self._tensor_slots.get(op_name, {}).get(tuuid, {}).get(step, {}))
+            state = self._states.get(op_name, {}).get(step)
+            return len(state.tensor_slots.get(tuuid, {})) if state else 0
 
     # ------------------------------------------------------------------
     # Step readiness
@@ -1202,25 +1225,20 @@ class WorkerMailbox:
                 }
                 for op_name, step_map in self._barriers.items()
             }
-            tensor_arrivals = {
-                op_name: {
-                    str(tuuid): {
-                        str(step): len(arrivals) for step, arrivals in step_map.items()
-                    }
-                    for tuuid, step_map in tuuid_map.items()
-                }
-                for op_name, tuuid_map in self._tensor_arrivals.items()
-            }
-            tensor_slots = {
-                op_name: {
-                    str(tuuid): {
-                        str(step): sum(len(items) for items in sender_map.values())
-                        for step, sender_map in step_map.items()
-                    }
-                    for tuuid, step_map in tuuid_map.items()
-                }
-                for op_name, tuuid_map in self._tensor_slots.items()
-            }
+            tensor_arrivals = {}
+            tensor_slots = {}
+            for op_name, steps in self._states.items():
+                tensor_arrivals[op_name] = {}
+                tensor_slots[op_name] = {}
+                for step, state in steps.items():
+                    for tuuid, senders in state.tensor_arrivals.items():
+                        tensor_arrivals[op_name].setdefault(str(tuuid), {})[
+                            str(step)
+                        ] = len(senders)
+                    for tuuid, senders in state.tensor_slots.items():
+                        tensor_slots[op_name].setdefault(str(tuuid), {})[str(step)] = (
+                            sum(len(x) for x in senders.values())
+                        )
             return {
                 "barriers": barriers,
                 "tensor_arrivals": tensor_arrivals,
@@ -1260,15 +1278,15 @@ class WorkerMailbox:
         async with self._lock:
             receiver = TransportReceiver(wait_for_n_slices=0)
             receiver.register_zero_copy_buffers(target_buffers, expect_offsets)
-            self._zc_receivers.setdefault(op_name, {}).setdefault(tuuid, {})[step] = (
-                receiver
-            )
+            state = self._get_step_state(op_name, step)
+            state.zc_receivers[tuuid] = receiver
 
     async def get_zero_copy_buffers(
         self, op_name: str, tuuid: int, step: int
     ) -> list[Any] | None:
         async with self._lock:
-            receiver = self._zc_receivers.get(op_name, {}).get(tuuid, {}).get(step)
+            state = self._states.get(op_name, {}).get(step)
+            receiver = state.zc_receivers.get(tuuid) if state else None
             return receiver.target_buffers if receiver is not None else None
 
     # ------------------------------------------------------------------
@@ -1278,32 +1296,17 @@ class WorkerMailbox:
     async def clear_step(self, op_name: str, step: int) -> None:
         """Release all data for a completed step."""
         async with self._lock:
-            if op_name in self._tensor_slots:
-                for name, step_dict in list(self._tensor_slots[op_name].items()):
-                    step_dict.pop(step, None)
-                    if not step_dict:
-                        del self._tensor_slots[op_name][name]
-
-            if op_name in self._zc_receivers:
-                for name, step_dict in list(self._zc_receivers[op_name].items()):
-                    step_dict.pop(step, None)
-                    if not step_dict:
-                        del self._zc_receivers[op_name][name]
-
-            if op_name in self._control_arg_data:
-                for name, step_dict in list(self._control_arg_data[op_name].items()):
-                    step_dict.pop(step, None)
-                    if not step_dict:
-                        del self._control_arg_data[op_name][name]
+            if op_name in self._states:
+                self._states[op_name].pop(step, None)
+                if not self._states[op_name]:
+                    del self._states[op_name]
 
             if op_name in self._barriers:
                 self._barriers[op_name].pop(step, None)
 
     async def clear_all(self) -> None:
         async with self._lock:
-            self._control_arg_data.clear()
-            self._tensor_slots.clear()
-            self._zc_receivers.clear()
+            self._states.clear()
             self._barriers.clear()
 
     # ------------------------------------------------------------------
@@ -1317,12 +1320,10 @@ class WorkerMailbox:
     def _get_size_lock_free(self) -> int:
         """Internal helper to compute size without acquiring lock."""
         size = 0
-        for op_name_dict in self._control_arg_data.values():
-            for step_dict in op_name_dict.values():
-                size += len(step_dict)
-        for op_name_dict in self._tensor_slots.values():
-            for step_dict in op_name_dict.values():
-                for rank_dict in step_dict.values():
+        for steps in self._states.values():
+            for state in steps.values():
+                size += len(state.control_args)
+                for rank_dict in state.tensor_slots.values():
                     size += len(rank_dict)
         return size
 

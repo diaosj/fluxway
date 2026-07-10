@@ -22,6 +22,7 @@ async def test_mailbox_does_not_satisfy_future_step_with_prior_tensor():
         1,
         [np.array([1.0])],
         [1],
+        1,
     )
     assert mailbox.is_step_ready("op", 1)
 

@@ -68,7 +68,8 @@ EDGE_COMPACT_BEGIN = 7
 EDGE_COMPACT_COUNT = 8
 EDGE_GLOBAL_SHAPE_BEGIN = 9
 EDGE_GLOBAL_SHAPE_COUNT = 10
-EDGE_WIDTH = 11
+EDGE_SOURCE_STEP = 11
+EDGE_WIDTH = 12
 
 PAYLOAD_ROLE = 0
 PAYLOAD_DTYPE = 1
@@ -422,6 +423,7 @@ class TransportFrameTemplate:
         payload_segments: tuple[Any, ...],
         payload_valid_counts: tuple[int, ...],
         global_shapes: tuple[tuple[int, ...] | None, ...],
+        source_steps: tuple[int, ...],
     ) -> TransportFrame:
         if len(payload_segments) != self.payload_i32.shape[0]:
             raise ValueError(
@@ -437,6 +439,11 @@ class TransportFrameTemplate:
             raise ValueError(
                 "global shape length does not match template edge rows: "
                 f"shapes={len(global_shapes)} rows={self.edge_i32.shape[0]}."
+            )
+        if len(source_steps) != self.edge_i32.shape[0]:
+            raise ValueError(
+                "source step length does not match template edge rows: "
+                f"source_steps={len(source_steps)} rows={self.edge_i32.shape[0]}."
             )
 
         frame_i32 = self.frame_i32.copy()
@@ -479,8 +486,11 @@ class TransportFrameTemplate:
                 payload_index, "payload segment index"
             )
 
-        for edge_index, shape in enumerate(global_shapes):
+        for edge_index, (shape, source_step) in enumerate(
+            zip(global_shapes, source_steps, strict=True)
+        ):
             row = edge_i32[edge_index]
+            row[EDGE_SOURCE_STEP] = _as_i32(source_step, "source_step")
             shape_count = int(row[EDGE_GLOBAL_SHAPE_COUNT])
             shape_begin = int(row[EDGE_GLOBAL_SHAPE_BEGIN])
             if shape is None:
@@ -578,6 +588,7 @@ class TransportFrameBuilder:
         empty_kind: EmptyKind,
         min_rows: int,
         expected_count: int,
+        source_step: int,
         compact_params: list[int] | tuple[int, ...] | None = None,
         global_shape: tuple[int, ...] | None = None,
     ) -> int:
@@ -618,6 +629,7 @@ class TransportFrameBuilder:
             _as_i32(compact_count, "compact_count"),
             _as_i32(global_shape_begin, "global_shape_begin"),
             _as_i32(global_shape_count, "global_shape_count"),
+            _as_i32(source_step, "source_step"),
         )
         self._edge_count += 1
         return edge_index

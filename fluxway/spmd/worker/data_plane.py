@@ -301,6 +301,7 @@ def build_empty_step_frame_groups(
                     expected_count=expected_count,
                     tuuid=route.tuuid,
                     payload=empty_values,
+                    source_step=exec_step,
                 )
         for frame_arg in distributor.build_transport_frame_args(
             step=exec_step,
@@ -336,7 +337,20 @@ def build_successor_batches(
                 leaf_tensor = raw_leaf
             else:
                 leaf_tensor = TransportTensor.from_tensor(raw_leaf)
+            ensure_transport_source_step(
+                op_name=compiled_plan.op_name,
+                tensor_name=route.tensor_name,
+                tensor=leaf_tensor,
+                exec_step=exec_step,
+            )
             wrapped_results[route.output_index] = leaf_tensor
+        else:
+            ensure_transport_source_step(
+                op_name=compiled_plan.op_name,
+                tensor_name=route.tensor_name,
+                tensor=leaf_tensor,
+                exec_step=exec_step,
+            )
 
         if isinstance(route.source_spec, PhysicalLayout) and isinstance(
             route.source_spec.spec.routing, ReferentialRouting
@@ -379,6 +393,25 @@ def build_successor_batches(
             (route.tuuid, leaf_tensor)
         )
     return batches
+
+
+def ensure_transport_source_step(
+    *,
+    op_name: str,
+    tensor_name: str,
+    tensor: TransportTensor,
+    exec_step: int,
+) -> None:
+    source_step = tensor.source_step
+    if source_step is None:
+        tensor.source_step = exec_step
+        return
+    if source_step != exec_step:
+        raise ValueError(
+            f"[Fluxway SourceStep Error] Operator '{op_name}' output "
+            f"'{tensor_name}' has source_step={source_step}, but exec_step={exec_step}. "
+            "Operator outputs must belong to the step that produced them."
+        )
 
 
 def inherit_mirror_metadata(
@@ -453,4 +486,5 @@ def inherit_mirror_metadata(
         global_shape=inherited_global_shape,
         origin_indices=leaf_tensor.origin_indices or source_ref.origin_indices,
         receipt=source_ref.receipt,
+        source_step=leaf_tensor.source_step,
     )

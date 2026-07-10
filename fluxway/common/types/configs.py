@@ -149,6 +149,7 @@ class SPMDConfig(FluxwayBaseSchema):
     # Topology of the graph for each operator
     # {op_name: SPMDTopology}
     topology: dict[str, "SPMDTopology"] = Field(default_factory=dict)
+    active_operator_names: tuple[str, ...] = Field(default_factory=tuple)
 
     # Static arguments for operators: {arg_name: arg_value}
     static_args: dict[str, Any] = Field(default_factory=dict)
@@ -164,6 +165,21 @@ class SPMDConfig(FluxwayBaseSchema):
 
     # If true, workers enqueue source operators immediately after topology startup.
     auto_start_source_operators: bool = True
+
+    def require_active_operator_names(self) -> tuple[str, ...]:
+        if not self.active_operator_names:
+            raise RuntimeError(
+                "SPMDConfig.active_operator_names is empty. Build the SPMD "
+                "through the Fluxway graph builder so the active graph contract "
+                "is available to the runtime."
+            )
+        unknown = set(self.active_operator_names) - set(self.operator_metas)
+        if unknown:
+            raise RuntimeError(
+                "SPMDConfig.active_operator_names contains operators without "
+                f"metadata: {sorted(unknown)}"
+            )
+        return self.active_operator_names
 
     # Per-node Ray runtime_env for Driver/Worker actors.
     # Passed through to .options(runtime_env=...) when creating actors.
@@ -714,6 +730,8 @@ class AsyncPolicy(FluxwayBaseSchema):
 
 class OperatorContext(FluxwayBaseSchema):
     """Context provided to an operator during execution."""
+
+    model_config = ConfigDict(frozen=True)
 
     physical_rank: int
     physical_world_size: int

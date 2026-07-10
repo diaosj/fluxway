@@ -171,7 +171,8 @@ class TransportTensor:
         self._routing_indices = self._routing.indices
         self._origin_indices = self._lineage.origin.indices
         self._receipt = self._lineage.receipt
-        self._source_step = source_step
+        self._source_step = None
+        self.source_step = source_step
         validate_metadata_lengths(
             self._payload,
             self._layout,
@@ -479,9 +480,14 @@ class TransportTensor:
 
     @source_step.setter
     def source_step(self, value: int | None):
-        if value is not None and not isinstance(value, int):
+        if value is not None and (type(value) is not int):
             raise TypeError(
                 f"TransportTensor.source_step must be an int or None, got {type(value).__name__}."
+            )
+        if self._source_step is not None and value != self._source_step:
+            raise ValueError(
+                "TransportTensor.source_step is immutable once assigned; "
+                f"current={self._source_step}, attempted={value}."
             )
         self._source_step = value
 
@@ -1120,6 +1126,7 @@ class TransportTensor:
                 self._origin_indices,
                 self._receipt,
                 self._routing_axes,
+                self._source_step,
             ),
         )
 
@@ -1140,8 +1147,8 @@ def _reconstruct_transport_tensor(
     origin_indices=None,
     receipt=None,
     routing_axes=(0,),
+    source_step=None,
 ):
-    """Pickle reconstruction helper (top-level function for pickling)."""
     return TransportTensor(
         flat_values,
         nested_splits,
@@ -1150,6 +1157,7 @@ def _reconstruct_transport_tensor(
         origin_indices=origin_indices,
         receipt=receipt,
         routing_axes=routing_axes,
+        source_step=source_step,
     )
 
 
@@ -1171,16 +1179,14 @@ if _JAX_AVAILABLE:
             v._global_shape,
             v._origin_indices,
         )
-        # routing_axes is a static tuple of ints — keep it in aux_data so
-        # it does not get traced as a JAX leaf.
-        aux_data = v._routing_axes
+        aux_data = (v._routing_axes, v._source_step)
         return children, aux_data
 
     def _tt_unflatten(aux_data, children):
         flat_values, nested_splits, routing_indices, global_shape, origin_indices = (
             children
         )
-        routing_axes = aux_data if aux_data is not None else (0,)
+        routing_axes, source_step = aux_data
         return TransportTensor(
             flat_values,
             nested_splits,
@@ -1188,6 +1194,7 @@ if _JAX_AVAILABLE:
             global_shape=global_shape,
             origin_indices=origin_indices,
             routing_axes=routing_axes,
+            source_step=source_step,
         )
 
     jax.tree_util.register_pytree_node(TransportTensor, _tt_flatten, _tt_unflatten)

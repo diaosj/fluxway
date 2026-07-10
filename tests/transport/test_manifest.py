@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from fluxway.transport.manifest import (
+    EDGE_WIDTH,
     FRAME_VERSION,
     PAYLOAD_DTYPE,
     EmptyKind,
@@ -24,6 +25,7 @@ def test_manifest_uses_i32_metadata_and_preserves_u64_payload_and_i64_shape():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=4,
+        source_step=1,
         global_shape=(2**35,),
     )
     builder.add_payload(edge, PayloadRole.VALUES, ids, 2)
@@ -51,6 +53,7 @@ def test_transport_frame_header_round_trips_without_payload_copy():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=2,
     )
     builder.add_payload(edge, PayloadRole.VALUES, values, 2)
     frame = builder.build()
@@ -65,8 +68,8 @@ def test_transport_frame_header_round_trips_without_payload_copy():
 def test_transport_frame_header_rejects_non_numpy_metadata():
     with pytest.raises(TypeError, match="host numpy metadata"):
         TransportFrameHeader(
-            frame_i32=[1, 2, 3],
-            edge_i32=np.zeros((0, 11), dtype=np.int32),
+            frame_i32=[1, 2, 3],  # type: ignore
+            edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
             payload_i32=np.zeros((0, 8), dtype=np.int32),
             shape_i32=np.zeros((0,), dtype=np.int32),
             global_shape_i64=np.zeros((0,), dtype=np.int64),
@@ -84,6 +87,7 @@ def test_manifest_rejects_i32_shape_overflow():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=1,
     )
 
     with pytest.raises(OverflowError):
@@ -105,6 +109,7 @@ def test_manifest_validate_rejects_negative_metadata():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=1,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.arange(1, dtype=np.int32), 1)
     frame = builder.build()
@@ -124,6 +129,7 @@ def test_manifest_rejects_payload_without_dtype():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=1,
     )
 
     with pytest.raises(TypeError, match="dtype"):
@@ -140,6 +146,7 @@ def test_manifest_validate_rejects_dtype_mismatch():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=1,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.arange(1, dtype=np.int32), 1)
     frame = builder.build()

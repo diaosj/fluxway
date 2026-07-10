@@ -108,15 +108,9 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 num_workers=config.num_workers,
                 sync_policy=MaxSkewSyncPolicy(config.max_worker_step_skew),
             )
-            # Add known ops dynamically from config
-            if hasattr(config, "operator_metas") and config.operator_metas:
-                self.spmd_synchronizer.register_expected_ops(
-                    list(config.operator_metas.keys())
-                )
-            elif hasattr(config, "operators") and config.operators:
-                self.spmd_synchronizer.register_expected_ops(
-                    list(config.operators.keys())
-                )
+            self.spmd_synchronizer.register_expected_ops(
+                list(config.require_active_operator_names())
+            )
 
             self.monitor = SPMDMonitor(spmd_id)
 

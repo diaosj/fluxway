@@ -457,6 +457,7 @@ async def test_mailbox_declare_step_and_on_ready():
         sender_world_size=4,
         payloads=[tensor.flat_values],
         counts=[4],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     assert not fired
@@ -469,6 +470,7 @@ async def test_mailbox_declare_step_and_on_ready():
         sender_world_size=4,
         payloads=[tensor.flat_values],
         counts=[4],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     assert fired == [("compute", 0)]
@@ -494,6 +496,7 @@ async def test_mailbox_wait_step_ready():
             sender_world_size=4,
             payloads=[tensor.flat_values],
             counts=[3],
+            source_step=5,
             meta_tensor_state_list=[0],
         )
         await asyncio.sleep(0)
@@ -562,6 +565,7 @@ async def test_mailbox_periodic_trigger():
         sender_world_size=4,
         payloads=[tensor.flat_values],
         counts=[1],
+        source_step=100,
         meta_tensor_state_list=[0],
     )
 
@@ -575,6 +579,7 @@ async def test_mailbox_periodic_trigger():
         sender_world_size=4,
         payloads=[tensor.flat_values],
         counts=[1],
+        source_step=101,
         meta_tensor_state_list=[0],
     )
 
@@ -673,6 +678,7 @@ async def test_mailbox_tensor_put_get():
         sender_world_size=4,
         payloads=[tensor.flat_values],
         counts=[2],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     shards = await mb.get_tensor_shard_views("compute", 401, 0)
@@ -693,6 +699,7 @@ async def test_mailbox_tensor_multi_rank():
         sender_world_size=4,
         payloads=[tensor_zeros.flat_values],
         counts=[4],
+        source_step=1,
         meta_tensor_state_list=[0],
     )
     tensor_ones = TransportTensor.from_tensor(np.ones(4))
@@ -705,6 +712,7 @@ async def test_mailbox_tensor_multi_rank():
         sender_world_size=4,
         payloads=[tensor_ones.flat_values],
         counts=[4],
+        source_step=1,
         meta_tensor_state_list=[0],
     )
     assert await mb.get_tensor_shard_count("compute", 501, 1) == 2
@@ -722,6 +730,7 @@ async def test_mailbox_op_isolation():
         sender_world_size=4,
         payloads=[np.array([1.0])],
         counts=[1],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     await mb.deposit_shards(
@@ -733,6 +742,7 @@ async def test_mailbox_op_isolation():
         sender_world_size=4,
         payloads=[np.array([2.0])],
         counts=[1],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     fwd = await mb.get_tensor_shard_views("compute", 601, 0)
@@ -761,6 +771,7 @@ async def test_mailbox_clear_step():
         4,
         payloads=[tensor.flat_values],
         counts=[2],
+        source_step=1,
         meta_tensor_state_list=[0],
     )
     mb.declare_step("compute", 1, {}, [])
@@ -788,6 +799,7 @@ async def test_mailbox_get_size():
         1,
         payloads=[tensor.flat_values],
         counts=[2],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     await mb.deposit_shards(
@@ -799,6 +811,7 @@ async def test_mailbox_get_size():
         1,
         payloads=[tensor.flat_values],
         counts=[2],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
     assert await mb.get_size() == 3

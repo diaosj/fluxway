@@ -57,16 +57,16 @@ class TestPickleBehavior:
         """
         my_function = dummy_my_function
 
-        my_function.meta = {"key": "original"}
-        my_function.meta["key"] = "modified"
-        my_function.meta["new_key"] = "new_value"
+        my_function.meta = {"key": "original"}  # type: ignore[attr-defined]
+        my_function.meta["key"] = "modified"  # type: ignore[attr-defined]
+        my_function.meta["new_key"] = "new_value"  # type: ignore[attr-defined]  # type: ignore
 
         pickled = pickle.dumps(my_function)
         restored = pickle.loads(pickled)
 
         # Same process: restored IS my_function (same object reference)
         assert restored is my_function
-        assert restored.meta == {"key": "modified", "new_key": "new_value"}
+        assert restored.meta == {"key": "modified", "new_key": "new_value"}  # type: ignore[attr-defined]  # type: ignore
 
     def test_cross_process_pickle_loses_function_attribute_modifications(self):
         """
@@ -87,9 +87,11 @@ def test_function():
 test_function.meta = {"key": "default_value"}
 """)
             module_path = f.name
+            pickle_path = module_path + ".pkl"
 
         try:
             spec = importlib.util.spec_from_file_location("test_module", module_path)
+            assert spec is not None and spec.loader is not None
             test_module = importlib.util.module_from_spec(spec)
             sys.modules["test_module"] = test_module
             spec.loader.exec_module(test_module)
@@ -109,7 +111,6 @@ test_function.meta = {"key": "default_value"}
             pickled = pickle.dumps(fn)
 
             # Save pickle for child process
-            pickle_path = module_path + ".pkl"
             with open(pickle_path, "wb") as pf:
                 pf.write(pickled)
 
@@ -214,7 +215,9 @@ class TestOperatorMetaSerialization:
 
         # Create config with explicit meta; operators stores method name, not callable
         config = SPMDConfig(
-            operators={"test_op": "test_op"}, operator_metas={"test_op": meta}
+            operators={"test_op": "test_op"},
+            operator_metas={"test_op": meta},
+            active_operator_names=("test_op", "test_op"),
         )
 
         # Modify meta after config creation (simulating Builder linking)
@@ -250,13 +253,13 @@ class TestOwnerClassResolution:
             def train_step(self, x):
                 return x
 
-        config = MyModel.get_spmd_config()
+        config = MyModel.get_spmd_config()  # type: ignore
         meta = config.operator_metas["train_step"]
         assert "MyModel" in meta.owner_class_qualname
         assert meta.owner_class_module == __name__
 
     def test_resolve_owner_class_returns_same_object(self):
-        config = _ResolvableModel.get_spmd_config()
+        config = _ResolvableModel.get_spmd_config()  # type: ignore
         meta = config.operator_metas["forward"]
         resolved = _resolve_owner_class(
             meta.owner_class_module, meta.owner_class_qualname
@@ -264,7 +267,7 @@ class TestOwnerClassResolution:
         assert resolved is _ResolvableModel
 
     def test_resolve_owner_class_is_stable_across_calls(self):
-        config = _ResolvableModel.get_spmd_config()
+        config = _ResolvableModel.get_spmd_config()  # type: ignore
         meta = config.operator_metas["forward"]
         first = _resolve_owner_class(meta.owner_class_module, meta.owner_class_qualname)
         second = _resolve_owner_class(
@@ -273,7 +276,7 @@ class TestOwnerClassResolution:
         assert first is second
 
     def test_owner_info_survives_pickle(self):
-        config = _ResolvableModel.get_spmd_config()
+        config = _ResolvableModel.get_spmd_config()  # type: ignore
         restored_config = pickle.loads(pickle.dumps(config))
 
         meta = restored_config.operator_metas["forward"]
@@ -281,10 +284,10 @@ class TestOwnerClassResolution:
         assert meta.owner_class_module != ""
 
     def test_pre_instantiate_operators_uses_owner_meta(self):
-        config = _InstantiableModel.get_spmd_config()
+        config = _InstantiableModel.get_spmd_config()  # type: ignore
 
         _instance_storage.clear()
-        SPMDWorker._pre_instantiate_operators(config, rank=0)
+        SPMDWorker._pre_instantiate_operators(config, rank=0)  # type: ignore
 
         cls = _resolve_owner_class(
             config.operator_metas["run"].owner_class_module,
@@ -293,12 +296,12 @@ class TestOwnerClassResolution:
         assert id(cls) in _instance_storage
 
     def test_pre_instantiate_operators_logs_init_boundaries(self, caplog):
-        config = _InstantiableModel.get_spmd_config()
+        config = _InstantiableModel.get_spmd_config()  # type: ignore
 
         _instance_storage.clear()
         caplog.set_level("DEBUG", logger="fluxway.spmd.worker.worker")
 
-        SPMDWorker._pre_instantiate_operators(config, rank=0)
+        SPMDWorker._pre_instantiate_operators(config, rank=0)  # type: ignore
 
         begin_records = [
             record

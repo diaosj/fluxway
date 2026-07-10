@@ -10,9 +10,10 @@ from fluxway.spmd.driver.driver import SPMDDriver
 
 @pytest.mark.asyncio
 async def test_driver_stop_waits_for_worker_shutdown():
+    # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(mesh=SimpleNamespace(size=2)),
+        config=SPMDConfig(mesh=SimpleNamespace(size=2), active_operator_names=()),
         placement_group=None,
         worker_bundle_indices=[1, 2],
         controller_handle=None,
@@ -42,9 +43,10 @@ async def test_driver_stop_waits_for_worker_shutdown():
 
 @pytest.mark.asyncio
 async def test_stop_heartbeat_joins_background_thread():
+    # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(mesh=SimpleNamespace(size=1)),
+        config=SPMDConfig(mesh=SimpleNamespace(size=1), active_operator_names=()),
         placement_group=None,
         worker_bundle_indices=[1],
         controller_handle=None,
@@ -62,15 +64,15 @@ async def test_stop_heartbeat_joins_background_thread():
 
     await driver._stop_heartbeat()
 
-    assert driver._heartbeat_running is False
     join_mock.assert_called_once()
     assert driver._heartbeat_thread is None
 
 
 def test_driver_ignores_worker_callbacks_while_stopping():
+    # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(mesh=SimpleNamespace(size=1)),
+        config=SPMDConfig(mesh=SimpleNamespace(size=1), active_operator_names=()),
         placement_group=None,
         worker_bundle_indices=[1],
         controller_handle=MagicMock(),

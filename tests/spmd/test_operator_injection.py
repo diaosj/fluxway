@@ -28,6 +28,7 @@ class TestOperatorInjection(unittest.TestCase):
                     output_sharding={"out1": {"type": "static", "axis": []}},
                 )
             },
+            active_operator_names=("step", "step"),
         )
 
         # Instantiate OperatorManager

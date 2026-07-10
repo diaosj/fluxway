@@ -18,6 +18,7 @@ async def test_mailbox_deposits_flat_frame_and_preserves_64bit_payload():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=4,
+        source_step=2,
         global_shape=(2**35,),
     )
     builder.add_payload(edge, PayloadRole.VALUES, ids, 1)
@@ -27,7 +28,7 @@ async def test_mailbox_deposits_flat_frame_and_preserves_64bit_payload():
     mailbox.declare_step("op", 2, {10: 1}, [])
     await mailbox.deposit_transport_frame("op", "Input", builder.build())
 
-    stored = mailbox._tensor_slots["op"][10][2][("Input", 1)][0]
+    stored = mailbox._states["op"][2].tensor_slots[10][("Input", 1)][0]
     assert stored.flat_values.dtype == np.uint64
     assert int(stored.flat_values[0]) == 2**40
     assert stored.global_shape is not None
@@ -45,6 +46,7 @@ async def test_mailbox_protocol_empty_satisfies_barrier_without_business_slot():
         empty_kind=EmptyKind.PROTOCOL_EMPTY,
         min_rows=0,
         expected_count=1,
+        source_step=3,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int32), 0)
 
@@ -55,7 +57,7 @@ async def test_mailbox_protocol_empty_satisfies_barrier_without_business_slot():
     await mailbox.deposit_transport_frame("op", "Input", builder.build())
 
     assert fired == [("op", 3)]
-    assert 11 not in mailbox._tensor_slots.get("op", {})
+    assert 11 not in mailbox._states["op"][3].tensor_slots
     arrivals = await mailbox.get_tensor_arrivals("op", 11, 3)
     assert set(arrivals.keys()) == {("Input", 0)}
     assert arrivals[("Input", 0)]["empty_kind"] is EmptyKind.PROTOCOL_EMPTY
@@ -73,6 +75,7 @@ async def test_mailbox_data_empty_allowed_preserves_zero_row_slot():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=7,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int32), 0)
 
@@ -83,7 +86,7 @@ async def test_mailbox_data_empty_allowed_preserves_zero_row_slot():
     await mailbox.deposit_transport_frame("op", "Input", builder.build())
 
     assert fired == [("op", 7)]
-    stored = mailbox._tensor_slots["op"][15][7][("Input", 0)][0]
+    stored = mailbox._states["op"][7].tensor_slots[15][("Input", 0)][0]
     assert stored.flat_values.shape == (0,)
     assert stored.flat_values.dtype == np.int32
 
@@ -99,6 +102,7 @@ async def test_mailbox_rejects_data_required_empty_frame():
         empty_kind=EmptyKind.DATA_REQUIRED,
         min_rows=1,
         expected_count=1,
+        source_step=4,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int32), 0)
 
@@ -119,6 +123,7 @@ async def test_mailbox_rejects_duplicate_protocol_empty_frame():
         empty_kind=EmptyKind.PROTOCOL_EMPTY,
         min_rows=0,
         expected_count=1,
+        source_step=8,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int64), 0)
 
@@ -135,6 +140,7 @@ async def test_mailbox_rejects_duplicate_protocol_empty_frame():
         empty_kind=EmptyKind.PROTOCOL_EMPTY,
         min_rows=0,
         expected_count=1,
+        source_step=8,
     )
     duplicate.add_payload(
         duplicate_edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int64), 0
@@ -154,6 +160,7 @@ async def test_mailbox_frame_expected_count_configures_barrier():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=4,
+        source_step=5,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.array([1], dtype=np.int32), 1)
 
@@ -178,6 +185,7 @@ async def test_mailbox_frame_expected_count_reconfigures_after_control_arrival()
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=4,
+        source_step=6,
     )
     builder.add_payload(edge, PayloadRole.VALUES, np.array([1], dtype=np.int32), 1)
 
@@ -209,6 +217,7 @@ async def test_mailbox_zero_copy_writes_into_buffer():
         sender_world_size=4,
         payloads=[np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)],
         counts=[2],
+        source_step=0,
         meta_tensor_state_list=[0],
     )
 
@@ -241,6 +250,7 @@ async def test_mailbox_zero_copy_ragged_writes_data_and_lengths():
         1,
         payloads=[flat_values, lengths],
         counts=[5, 2],
+        source_step=0,
         meta_tensor_state_list=[1],
     )
 
@@ -271,6 +281,7 @@ async def test_mailbox_zero_copy_slots_accept_multiple_tensor_payloads():
         1,
         payloads=[first_payload, second_payload],
         counts=[4, 4],
+        source_step=0,
         meta_tensor_state_list=[0, 0],
     )
 

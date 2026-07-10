@@ -32,6 +32,7 @@ def _make_test_config(mesh: DeviceMesh, spmd_id: str = "") -> SPMDConfig:
         spmd_id=spmd_id,
         operators={"test_op": "test_op"},
         operator_metas={"test_op": meta},
+        active_operator_names=("test_op",),
     )
 
 
@@ -69,6 +70,7 @@ async def test_worker_receive_transport_frame_dispatches_to_mailbox(worker_confi
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=0,
     )
     builder.add_payload(edge, PayloadRole.VALUES, test_data, 2)
     frame = builder.build()
@@ -113,6 +115,7 @@ async def test_worker_receive_bundled_frame_dispatches_all_edges_to_mailbox():
                 }
             )
         },
+        active_operator_names=("compute", "compute"),
     )
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
@@ -131,6 +134,7 @@ async def test_worker_receive_bundled_frame_dispatches_all_edges_to_mailbox():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=1,
     )
     builder.add_payload(first_edge, PayloadRole.VALUES, first, 2)
     second_edge = builder.add_edge(
@@ -139,6 +143,7 @@ async def test_worker_receive_bundled_frame_dispatches_all_edges_to_mailbox():
         empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
         min_rows=0,
         expected_count=1,
+        source_step=1,
     )
     builder.add_payload(second_edge, PayloadRole.VALUES, second, 2)
     frame = builder.build()

@@ -653,6 +653,7 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
             operators={sender_op: sender_op},
             operator_metas={sender_op: meta},
             topology=topology,
+            active_operator_names=(sender_op, sender_op),
         )
 
         mgr = OperatorManager(config, rank=0, spmd_id="EmbeddingTable")
@@ -753,6 +754,7 @@ class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
             operators={"forward": "forward"},
             operator_metas={"forward": meta},
             topology=topology,
+            active_operator_names=("forward", "forward"),
         )
         mgr = OperatorManager(config, rank=0, spmd_id="DenseLayers")
 

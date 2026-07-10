@@ -159,6 +159,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
             operators={"loader": "loader"},
             operator_metas={"loader": loader_meta, "processor": processor_meta},
             topology=_meta_to_topology(loader_meta),
+            active_operator_names=("loader", "loader", "processor"),
         )
         w = cls(config, rank=rank)
         w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
@@ -175,6 +176,7 @@ async def test_multi_worker_interleaved_unit_mesh_inheritance():
             operators={"processor": "processor"},
             operator_metas={"loader": loader_meta, "processor": processor_meta},
             topology=_meta_to_topology(processor_meta),
+            active_operator_names=("processor", "loader", "processor"),
         )
         w = cls(config, rank=rank)
         w.setup_and_start(local_rank=rank, local_world_size=2, node_rank=0, num_nodes=1)
@@ -314,6 +316,7 @@ async def test_single_worker_interleaved_unit():
             operators={"loader": "loader"},
             operator_metas={"loader": loader_meta},
             topology=_meta_to_topology(loader_meta),
+            active_operator_names=("loader", "loader"),
         )
         w = cls(config, rank=rank)
         w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)

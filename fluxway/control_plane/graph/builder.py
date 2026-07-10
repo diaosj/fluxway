@@ -1114,6 +1114,29 @@ class Builder:
                     if succ.tuuid_sharding:
                         add_recursive_references(succ.tuuid_sharding)
 
+        active_ops_by_node: dict[str, set[str]] = {
+            node_name: set() for node_name in self._nodes
+        }
+        for edge in self._edges:
+            if edge.source_op is not None:
+                active_ops_by_node[edge.source_node].add(edge.source_op)
+            if edge.target_op is not None:
+                active_ops_by_node[edge.target_node].add(edge.target_op)
+
+        for node_name, node in self._nodes.items():
+            active_ops = active_ops_by_node[node_name]
+            unknown_ops = active_ops - set(node.spmd_config.operator_metas)
+            if unknown_ops:
+                raise ValueError(
+                    f"Active operators for node {node_name!r} are missing "
+                    f"operator metadata: {sorted(unknown_ops)}"
+                )
+            if not active_ops:
+                raise ValueError(
+                    f"Node {node_name!r} has no active operators in graph {name!r}."
+                )
+            node.spmd_config.active_operator_names = tuple(sorted(active_ops))
+
         graph = Graph(name=name, nodes=self._nodes.copy(), edges=self._edges.copy())
 
         return graph

@@ -26,9 +26,7 @@ def _make_config(mesh, *op_names):
         metas[name] = meta
 
     return SPMDConfig(
-        spmd_id="test",
-        mesh=mesh,
-        operator_metas=metas,
+        spmd_id="test", mesh=mesh, operator_metas=metas, active_operator_names=()
     )
 
 

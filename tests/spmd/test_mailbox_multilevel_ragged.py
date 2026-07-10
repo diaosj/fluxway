@@ -34,6 +34,7 @@ async def test_mailbox_reconstructs_multilevel_ragged_splits():
             np.array([2, 1], dtype=np.int32),
         ],
         counts=[3, 1, 2],
+        source_step=0,
         meta_tensor_state_list=[meta_state],
     )
 
