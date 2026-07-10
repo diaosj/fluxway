@@ -1,9 +1,9 @@
-import asyncio
 import os
 import sys
 from typing import Any
 from collections.abc import Callable, Awaitable
 import logging
+from fluxway.common import asyncio_runtime
 
 try:
     import ray
@@ -109,7 +109,7 @@ def launch(
         with _EnvRestorer(sandbox_env.keys()):
             for k, v in sandbox_env.items():
                 os.environ[k] = v
-            return asyncio.run(fn(*a, **kw))
+            return asyncio_runtime.run(fn(*a, **kw))
 
     ref = _sandbox.remote(entry_fn, args, kwargs)
     try:

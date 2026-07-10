@@ -74,6 +74,7 @@ class ResolvedTopologyInfo:
     interleave_unit_size: int = 1
     # Whether this is a self-loop edge (source_node == target_node)
     is_self_loop: bool = False
+    local_only: bool = False
     # Link to the symmetric edge – carried over from configs.SPMDTopologyInfo
     symmetric_to: tuple | None = None
     # For hierarchical sharding resolution
@@ -444,6 +445,7 @@ class OperatorManager:
                         is_interleaved=getattr(info, "is_interleaved", False),
                         interleave_unit_size=getattr(info, "interleave_unit_size", 1),
                         is_self_loop=(info.spmd_id == self._spmd_id),
+                        local_only=bool(getattr(info, "local_only", False)),
                     )
                     # Sync edge sharding to global registry
                     self._register_sharding_specs(sharding)
@@ -468,6 +470,7 @@ class OperatorManager:
                         is_interleaved=getattr(info, "is_interleaved", False),
                         interleave_unit_size=getattr(info, "interleave_unit_size", 1),
                         is_self_loop=(info.spmd_id == self._spmd_id),
+                        local_only=bool(getattr(info, "local_only", False)),
                     )
                     # Note: We do NOT register successor requirements into the global
                     # Production Truth registry. They are only context for routing.

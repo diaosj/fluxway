@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import AsyncExitStack
 from typing import Any
 
+from fluxway.common.types.tensor import TransportTensor
 from fluxway.profiler.clock import AxonNativeHlcBridge, RayFluxwayHlcBridge
 from fluxway.profiler.record import TraceCarrier
 from fluxway.profiler.recorder import TraceRecorder
@@ -190,6 +191,43 @@ class TracingWorkerMailbox:
                 sender_id,
                 frame,
             )
+
+    async def deposit_local_tensor(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        sender_id: str,
+        rank: int,
+        tensor: Any,
+    ) -> int:
+        if not isinstance(tensor, TransportTensor):
+            raise TypeError(
+                "TracingWorkerMailbox.deposit_local_tensor requires a TransportTensor, "
+                f"got {type(tensor).__name__}."
+            )
+        expected_count = tensor.routing_entity_count
+        async with self._recorder.mailbox_deposit_local_tensor(
+            op_name=op_name,
+            tuuid=tuuid,
+            step=step,
+            data_count=expected_count,
+        ):
+            data_count = await self._delegate.deposit_local_tensor(
+                op_name,
+                tuuid,
+                step,
+                sender_id,
+                rank,
+                tensor,
+            )
+        if data_count != expected_count:
+            raise ValueError(
+                "TracingWorkerMailbox local tensor data_count mismatch: "
+                f"op={op_name} tuuid={tuuid} step={step} "
+                f"expected={expected_count} actual={data_count}."
+            )
+        return data_count
 
     async def clear_step(self, op_name: str, step: int) -> None:
         async with self._recorder.mailbox_clear_step(op_name=op_name, step=step):

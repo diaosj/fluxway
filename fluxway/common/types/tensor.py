@@ -496,6 +496,11 @@ class TransportTensor:
         return self._routing_axes
 
     @property
+    def routing_entity_count(self) -> int:
+        backend = get_backend()
+        return routing_entity_count(self._payload, self._layout, backend)
+
+    @property
     def meta_state(self) -> int:
         """
         Computed bitmask/int representing the state of the tensor metadata.

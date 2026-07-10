@@ -21,7 +21,7 @@ See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 
 import asyncio
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import socket
 import time
@@ -73,12 +73,17 @@ from fluxway.transport.manifest import (
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.utils.tree import tree_flatten, tree_unflatten
-from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
+from fluxway.rpc.protocol import (
+    DataPlaneCallable,
+    LocalWorkerDataPlane,
+    TransportFrameEnvelope,
+)
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
     SuccessorRouteContext,
     compile_send_plan,
+    inherit_mirror_metadata,
 )
 from fluxway.spmd.worker.data_plane_executor import BatchingDataPlaneExecutor
 from fluxway.spmd.worker.assembly import (
@@ -94,6 +99,7 @@ from fluxway.spmd.worker.local_plan import (
     MappingCallableRegistry,
 )
 from fluxway.spmd.worker.user_callable_executor import (
+    USER_CALLABLE_DEFAULT_OPERATOR_LANE,
     UserCallableExecutor,
     UserCallableSpec,
 )
@@ -141,6 +147,9 @@ _COMMIT_STEP_CALLABLE = "__fluxway_commit_step__"
 _WAIT_INPUTS_RESOURCE = -1
 _SEND_OUTPUT_RESOURCE = -1
 _COMMIT_STEP_RESOURCE_SALT = "__fluxway_commit_step_resource__"
+_EXECUTION_DEFAULT_LANE = USER_CALLABLE_DEFAULT_OPERATOR_LANE
+_EXECUTION_STOP_OP = "__stop__"
+_EXECUTION_STOP_ITEM = (999, 0, 0, _EXECUTION_STOP_OP)
 
 
 def _assemble_detail_span(
@@ -336,6 +345,7 @@ class SPMDWorker:
     _completed_step_count: dict[str, int]
     _scheduled_step_count: dict[str, int]
     _pending_future_steps: dict[str, list[int]]
+    _pending_phase_order_steps: dict[str, list[int]]
     _successor_handlers: dict[str, dict[int, Any]]
     _operator_send_context_cache: dict[str, _OperatorSendContext]
     _heartbeat_interval: float
@@ -409,6 +419,9 @@ class SPMDWorker:
             op_name: asyncio.Event()
             for op_name in (self.config.operators if self.config is not None else {})
         }
+        self._latest_op_runnable_epoch: dict[str, int] = dict.fromkeys(
+            self.config.operators if self.config is not None else {}, -1
+        )
         for event in self._op_runnable.values():
             event.set()  # Initially all ops are runnable
 
@@ -425,6 +438,10 @@ class SPMDWorker:
             for op_name in (self.config.operators if self.config is not None else {})
         }
         self._pending_async_lag_steps: dict[str, list[int]] = {
+            op_name: []
+            for op_name in (self.config.operators if self.config is not None else {})
+        }
+        self._pending_phase_order_steps: dict[str, list[int]] = {
             op_name: []
             for op_name in (self.config.operators if self.config is not None else {})
         }
@@ -452,6 +469,10 @@ class SPMDWorker:
         self._execution_queue: asyncio.PriorityQueue[tuple[int, int, int, str]] = (
             asyncio.PriorityQueue()
         )
+        self._execution_queues: dict[
+            str, asyncio.PriorityQueue[tuple[int, int, int, str]]
+        ] = {_EXECUTION_DEFAULT_LANE: self._execution_queue}
+        self._initialize_execution_lanes()
 
         # --- Backpressure components ---
         self._max_in_flight = int(getattr(self.config, "data_plane_max_in_flight", 50))
@@ -506,6 +527,7 @@ class SPMDWorker:
         # Run loop synchronization
         self._start_event = asyncio.Event()  # Signals when to start execution
         self._run_task: asyncio.Task | None = None
+        self._lane_run_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
         profiler_config = getattr(self.config, "__dict__", {}).get("profiler_config")
         profiler_process_name = f"worker/{self.spmd_id}/rank:{self.rank}"
@@ -1097,29 +1119,29 @@ class SPMDWorker:
     # Op-Level Blocking
     # =========================================================================
 
-    def block_op(self, op_name: str) -> None:
-        """
-        Block an operator's execution.
-
-        When blocked, tasks of this op_name will be held in pending queue
-        instead of being executed. Other ops continue normally.
-        """
-        logger.debug(f"Op blocked op={op_name} spmd_id={self.spmd_id} rank={self.rank}")
-        self._op_runnable[op_name].clear()
-
-    async def unblock_op(self, op_name: str) -> None:
-        """
-        Unblock an operator and re-enqueue pending tasks.
-        """
-        self._op_runnable[op_name].set()
-
-        pending = self._pending_blocked[op_name]
-        self._pending_blocked[op_name] = []
-        for step in pending:
-            await self._enqueue(op_name, step)
-
+    async def set_op_runnable(
+        self, op_name: str, runnable: bool, op_runnable_epoch: int
+    ) -> None:
+        latest_epoch = self._latest_op_runnable_epoch[op_name]
+        if op_runnable_epoch < latest_epoch:
+            logger.debug(
+                f"Stale op runnable control ignored op={op_name} runnable={runnable} "
+                f"epoch={op_runnable_epoch} latest_epoch={latest_epoch} "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
+            )
+            return
+        self._latest_op_runnable_epoch[op_name] = op_runnable_epoch
+        if runnable:
+            self._op_runnable[op_name].set()
+            pending = self._pending_blocked[op_name]
+            self._pending_blocked[op_name] = []
+            for step in pending:
+                await self._enqueue(op_name, step)
+        else:
+            self._op_runnable[op_name].clear()
         logger.debug(
-            f"Op unblocked op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
+            f"Op runnable updated op={op_name} runnable={runnable} "
+            f"epoch={op_runnable_epoch} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     def is_op_blocked(self, op_name: str) -> bool:
@@ -1409,7 +1431,7 @@ class SPMDWorker:
 
     async def _enqueue_prepare_ready_refresh(self, op_name: str, step: int) -> None:
         schedule_key = self._effective_schedule_key(op_name, step)
-        await self._execution_queue.put(schedule_key)
+        await self._put_execution_item(op_name, schedule_key)
 
     def _should_prepare_inputs_on_ready(self, op_name: str) -> bool:
         if self._op_manager is None:
@@ -1439,11 +1461,19 @@ class SPMDWorker:
             await self._enqueue(op_name, step)
 
     def _scheduler_knows_step(self, op_name: str, step: int) -> bool:
+        completed = self._completed_step_count[op_name]
+        if step < completed:
+            return False
+        scheduled = self._scheduled_step_count[op_name]
+        if step < scheduled:
+            return True
         if (op_name, step) in self._in_op_step_queue:
             return True
         if step in self._pending_future_steps[op_name]:
             return True
         if step in self._pending_async_lag_steps[op_name]:
+            return True
+        if step in self._pending_phase_order_steps[op_name]:
             return True
         if step in self._ready_pending_pipeline_steps[op_name]:
             return True
@@ -1453,9 +1483,7 @@ class SPMDWorker:
             return True
         if step in self._finished_plan_steps[op_name]:
             return True
-        scheduled = self._scheduled_step_count[op_name]
-        completed = self._completed_step_count[op_name]
-        return completed <= step < scheduled
+        return False
 
     async def _enqueue(self, op_name: str, step: int) -> None:
         """Enqueue a task for execution."""
@@ -1485,12 +1513,52 @@ class SPMDWorker:
                 spec=WORKER_QUEUE_ENQUEUE,
                 payload=recorder.worker_op_payload(op_name, step, priority_key),
             ):
-                await self._execution_queue.put(schedule_key)
+                await self._put_execution_item(op_name, schedule_key)
         else:
-            await self._execution_queue.put(schedule_key)
+            await self._put_execution_item(op_name, schedule_key)
         logger.debug(
             f"Task enqueued op={op_name} step={step} schedule_key={schedule_key} spmd_id={self.spmd_id} rank={self.rank}"
         )
+
+    def _initialize_execution_lanes(self) -> None:
+        self._execution_queues = {_EXECUTION_DEFAULT_LANE: self._execution_queue}
+        for meta in self.config.operator_metas.values():
+            lane = meta.schedule_policy.lane
+            if lane is not None:
+                self._execution_queue_for_lane(lane)
+
+    def _execution_lane_for_op(self, op_name: str) -> str:
+        meta = self.op_manager._get_operator_metadata(op_name)
+        if not isinstance(meta, OperatorMeta):
+            raise TypeError(
+                f"operator metadata for op={op_name!r} must be OperatorMeta, "
+                f"got {type(meta).__name__}."
+            )
+        lane = meta.schedule_policy.lane
+        if lane is None:
+            return _EXECUTION_DEFAULT_LANE
+        return lane
+
+    def _execution_queue_for_lane(
+        self,
+        lane: str,
+    ) -> asyncio.PriorityQueue[tuple[int, int, int, str]]:
+        if lane not in self._execution_queues:
+            self._execution_queues[lane] = asyncio.PriorityQueue()
+        return self._execution_queues[lane]
+
+    def _execution_queue_for_op(
+        self,
+        op_name: str,
+    ) -> asyncio.PriorityQueue[tuple[int, int, int, str]]:
+        return self._execution_queue_for_lane(self._execution_lane_for_op(op_name))
+
+    async def _put_execution_item(
+        self,
+        op_name: str,
+        item: tuple[int, int, int, str],
+    ) -> None:
+        await self._execution_queue_for_op(op_name).put(item)
 
     def _effective_schedule_key(
         self, op_name: str, step: int
@@ -1509,15 +1577,25 @@ class SPMDWorker:
             if self._deadline_boost_active(op_name, step):
                 effective_priority += int(getattr(policy, "boost_priority", 0))
             return (-effective_priority, prepare_state, step, op_name)
-        if kind == "phase_order":
+        if kind in ("phase_order", "phase_graph"):
             phase_order = tuple(getattr(policy, "phase_ordering", ()))
             phase = getattr(policy, "phase", None)
-            if not phase_order or phase not in phase_order:
+            if phase is None or not phase_order or phase not in phase_order:
                 raise ValueError(
-                    f"phase_order schedule for op={op_name} has invalid phase={phase!r} "
+                    f"{kind} schedule for op={op_name} has invalid phase={phase!r} "
                     f"phase_order={phase_order!r}."
                 )
             phase_index = phase_order.index(phase)
+            if self._uses_lane_aware_phase_priority(policy):
+                lane = getattr(policy, "lane", None)
+                lane_priority = self._lane_priority(policy, lane)
+                phase_priority = self._phase_priority(policy, phase)
+                return (
+                    -base_priority - lane_priority - phase_priority,
+                    prepare_state,
+                    step,
+                    op_name,
+                )
             return (
                 step * len(phase_order) + phase_index - base_priority,
                 prepare_state,
@@ -1527,6 +1605,34 @@ class SPMDWorker:
         if kind != "fifo":
             raise ValueError(f"Unsupported schedule policy {kind!r} for op={op_name}.")
         return (-base_priority, prepare_state, step, op_name)
+
+    @staticmethod
+    def _uses_lane_aware_phase_priority(policy: Any) -> bool:
+        return bool(
+            getattr(policy, "lane", None)
+            or getattr(policy, "lane_ordering", ())
+            or getattr(policy, "lane_priorities", {})
+            or getattr(policy, "phase_priorities", {})
+        )
+
+    @staticmethod
+    def _lane_priority(policy: Any, lane: str | None) -> int:
+        if lane is None:
+            return 0
+        priorities = dict(getattr(policy, "lane_priorities", {}) or {})
+        if lane in priorities:
+            return int(priorities[lane])
+        lane_order = tuple(getattr(policy, "lane_ordering", ()) or ())
+        if not lane_order:
+            return 0
+        if lane not in lane_order:
+            raise ValueError(f"lane {lane!r} is not in lane_order={lane_order!r}.")
+        return len(lane_order) - lane_order.index(lane) - 1
+
+    @staticmethod
+    def _phase_priority(policy: Any, phase: str) -> int:
+        priorities = dict(getattr(policy, "phase_priorities", {}) or {})
+        return int(priorities.get(phase, 0))
 
     def _prepare_schedule_state(self, op_name: str, step: int) -> int:
         runtime = getattr(self, "_input_prepare_runtime", None)
@@ -1593,12 +1699,17 @@ class SPMDWorker:
                     f"[SPMDWorker] Missing successor topology for op={op_name} "
                     f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
                 )
-            handlers = self._successor_handlers.get(spmd_id, {})
-            if not handlers:
-                raise ValueError(
-                    f"[SPMDWorker] Missing successor handlers for op={op_name} "
-                    f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
+            if bool(getattr(succ_info, "local_only", False)):
+                handlers = self._local_only_successor_handlers(
+                    op_name, spmd_id, succ_info
                 )
+            else:
+                handlers = self._successor_handlers.get(spmd_id, {})
+                if not handlers:
+                    raise ValueError(
+                        f"[SPMDWorker] Missing successor handlers for op={op_name} "
+                        f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
+                    )
             effective_rank = self.rank
             if succ_info.is_interleaved:
                 effective_rank = self.rank % succ_info.interleave_unit_size
@@ -1617,6 +1728,7 @@ class SPMDWorker:
                 spmd_id=context.spmd_id,
                 info=context.info,
                 effective_rank=context.effective_rank,
+                local_only=bool(getattr(context.info, "local_only", False)),
             )
             for index, context in enumerate(successor_contexts)
         )
@@ -1650,6 +1762,37 @@ class SPMDWorker:
         self._operator_send_context_cache[op_name] = context
         return context
 
+    def _local_only_successor_handlers(
+        self, op_name: str, spmd_id: str, succ_info: Any
+    ) -> dict[int, Any]:
+        if (
+            spmd_id != self.spmd_id
+            or getattr(succ_info, "spmd_id", None) != self.spmd_id
+        ):
+            raise ValueError(
+                "local_only successors must target the current SPMD, "
+                f"op={op_name} source={self.spmd_id}:{self.rank} "
+                f"successor={spmd_id} info_spmd={getattr(succ_info, 'spmd_id', None)!r}."
+            )
+        if bool(getattr(succ_info, "is_interleaved", False)):
+            raise ValueError(
+                f"local_only successors do not support interleaved routing, op={op_name}."
+            )
+        if int(getattr(succ_info, "world_size", self._world_size)) != self._world_size:
+            raise ValueError(
+                "local_only successors require matching world_size, "
+                f"op={op_name} source_world_size={self._world_size} "
+                f"target_world_size={getattr(succ_info, 'world_size', None)}."
+            )
+        handler = LocalWorkerDataPlane(
+            self,
+            sender_spmd_code=self._require_local_spmd_code(),
+        )
+        return self._profiler_runtime.wrap_data_plane_handlers(
+            spmd_id,
+            {self.rank: handler},
+        )
+
     # =========================================================================
     # Execution Logic
     # =========================================================================
@@ -1660,14 +1803,25 @@ class SPMDWorker:
 
         The loop will block until start() is called.
         """
-        # Create and schedule the run task
-        # Note: In Ray async actors, we schedule the task to run in the actor's event loop
-        self._run_task = asyncio.get_event_loop().create_task(self._run())
+        self._initialize_execution_lanes()
+        event_loop = asyncio.get_event_loop()
+        self._lane_run_tasks = {}
+        self._run_task = event_loop.create_task(self._run())
+        self._lane_run_tasks[_EXECUTION_DEFAULT_LANE] = self._run_task
+        for lane in self._execution_queues:
+            if lane == _EXECUTION_DEFAULT_LANE:
+                continue
+            self._lane_run_tasks[lane] = event_loop.create_task(
+                self._run_execution_lane_loop(lane)
+            )
         logger.debug(
             f"Run loop task started waiting for start signal spmd_id={self.spmd_id} rank={self.rank}"
         )
 
     async def _run(self) -> None:
+        await self._run_execution_lane_loop(_EXECUTION_DEFAULT_LANE)
+
+    async def _run_execution_lane_loop(self, lane: str) -> None:
         """
         Internal main execution loop (async).
 
@@ -1687,22 +1841,27 @@ class SPMDWorker:
         if profiler_recorder is not None:
             profiler_recorder.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
 
+        execution_queue = self._execution_queue_for_lane(lane)
+
         # Normal SPMD mode: data-driven execution loop
         while self._running:
             try:
                 # Blocking wait for next task (async)
                 logger.debug(
-                    f"Waiting for next task in execution queue spmd_id={self.spmd_id} rank={self.rank}"
+                    f"Waiting for next task in execution queue lane={lane} spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 (
                     priority,
                     _prepare_state,
                     step,
                     op_name,
-                ) = await self._execution_queue.get()
+                ) = await execution_queue.get()
                 queue_key = (op_name, step)
-                if op_name != "__stop__" and queue_key not in self._in_op_step_queue:
-                    self._execution_queue.task_done()
+                if (
+                    op_name != _EXECUTION_STOP_OP
+                    and queue_key not in self._in_op_step_queue
+                ):
+                    execution_queue.task_done()
                     continue
                 if profiler_recorder is not None:
                     profiler_recorder.worker_scheduler_instant(
@@ -1720,7 +1879,7 @@ class SPMDWorker:
 
                 # Check if we should stop
                 if not self._running:
-                    self._execution_queue.task_done()
+                    execution_queue.task_done()
                     break
 
                 if not self._op_runnable[op_name].is_set():
@@ -1815,6 +1974,12 @@ class SPMDWorker:
                     if step not in pending_lag:
                         pending_lag.append(step)
                     continue
+                if self._phase_order_step_blocked(op_name, step):
+                    self._in_op_step_queue.discard(queue_key)
+                    pending_phase = self._pending_phase_order_steps[op_name]
+                    if step not in pending_phase:
+                        pending_phase.append(step)
+                    continue
                 if not self._can_start_local_plan(op_name):
                     self._in_op_step_queue.discard(queue_key)
                     self._ready_pending_pipeline_steps[op_name].append(step)
@@ -1841,13 +2006,23 @@ class SPMDWorker:
         async with self._drain_cond:
             self._drain_target_count = None
             self._drain_cond.notify_all()
-        # Put a sentinel to unblock the queue
-        await self._execution_queue.put((999, 0, 0, "__stop__"))
+        # Put sentinels to unblock all execution lanes.
+        await self._execution_queue.put(_EXECUTION_STOP_ITEM)
+        for lane, execution_queue in self._execution_queues.items():
+            if lane == _EXECUTION_DEFAULT_LANE:
+                continue
+            await execution_queue.put(_EXECUTION_STOP_ITEM)
 
         pending_tasks = []
         if self._run_task and not self._run_task.done():
             self._run_task.cancel()
             pending_tasks.append(self._run_task)
+        for lane, task in self._lane_run_tasks.items():
+            if lane == _EXECUTION_DEFAULT_LANE:
+                continue
+            if not task.done():
+                task.cancel()
+                pending_tasks.append(task)
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             pending_tasks.append(self._heartbeat_task)
@@ -2001,6 +2176,11 @@ class SPMDWorker:
                 if step not in pending_lag:
                     pending_lag.append(step)
                 continue
+            if self._phase_order_step_blocked(op_name, step):
+                pending_phase = self._pending_phase_order_steps[op_name]
+                if step not in pending_phase:
+                    pending_phase.append(step)
+                continue
             self._start_local_step_plan(op_name, step)
             await self._move_future_steps_into_pipeline_queue(op_name)
 
@@ -2058,6 +2238,125 @@ class SPMDWorker:
             for step in sorted(set(pending)):
                 if self._async_lag_limit_reached(op_name, step):
                     self._pending_async_lag_steps[op_name].append(step)
+                else:
+                    await self._enqueue(op_name, step)
+
+    def _phase_order_policy(self, op_name: str) -> Any | None:
+        meta = self.op_manager._get_operator_metadata(op_name)
+        if not isinstance(meta, OperatorMeta):
+            return None
+        policy = getattr(meta, "schedule_policy", None)
+        if str(getattr(policy, "kind", "fifo")) not in ("phase_order", "phase_graph"):
+            return None
+        return policy
+
+    def _phase_order_operator_sequence(self, policy: Any) -> tuple[str, ...]:
+        policy_kind = str(getattr(policy, "kind", "fifo"))
+        if policy_kind not in ("phase_order", "phase_graph"):
+            raise ValueError(
+                f"phase schedule requires a phase policy, got {policy_kind!r}."
+            )
+        phase_order = tuple(getattr(policy, "phase_ordering", ()))
+        if not phase_order:
+            raise ValueError(
+                f"{policy_kind} schedule requires a non-empty phase_order."
+            )
+        phase_to_op: dict[str, str] = {}
+        for name, meta in self.config.operator_metas.items():
+            other_policy = getattr(meta, "schedule_policy", None)
+            if str(getattr(other_policy, "kind", "fifo")) != policy_kind:
+                continue
+            if tuple(getattr(other_policy, "phase_ordering", ())) != phase_order:
+                continue
+            phase = getattr(other_policy, "phase", None)
+            if phase is None:
+                raise ValueError(f"phase_order operator {name} has no phase.")
+            existing = phase_to_op.get(phase)
+            if existing is not None and existing != name:
+                raise ValueError(
+                    f"phase_order phase {phase!r} is assigned to multiple operators: "
+                    f"{existing!r} and {name!r}."
+                )
+            phase_to_op[phase] = name
+
+        missing = [phase for phase in phase_order if phase not in phase_to_op]
+        if missing:
+            raise ValueError(
+                f"{policy_kind} schedule missing operators for phases {missing!r}."
+            )
+        return tuple(phase_to_op[phase] for phase in phase_order)
+
+    def _phase_order_step_blocked(self, op_name: str, step: int) -> bool:
+        policy = self._phase_order_policy(op_name)
+        if policy is None:
+            return False
+        kind = str(getattr(policy, "kind", "fifo"))
+        phase_order = tuple(getattr(policy, "phase_ordering", ()))
+        phase = getattr(policy, "phase", None)
+        if phase is None or phase not in phase_order:
+            raise ValueError(
+                f"{kind} schedule for op={op_name} has invalid phase={phase!r} "
+                f"phase_order={phase_order!r}."
+            )
+        phase_ops = self._phase_order_operator_sequence(policy)
+        if kind == "phase_graph":
+            return self._phase_graph_step_blocked(
+                op_name,
+                step,
+                phase,
+                phase_order,
+                phase_ops,
+                policy,
+            )
+        if kind != "phase_order":
+            raise ValueError(f"Unsupported phase schedule kind {kind!r}.")
+        phase_index = phase_order.index(phase)
+        for prior_op in phase_ops[:phase_index]:
+            if self._completed_step_count.get(prior_op, 0) <= step:
+                return True
+        if phase_index > 0 and step > 0:
+            for prior_cycle_op in phase_ops[phase_index:]:
+                if self._completed_step_count.get(prior_cycle_op, 0) < step:
+                    return True
+        return False
+
+    def _phase_graph_step_blocked(
+        self,
+        op_name: str,
+        step: int,
+        phase: str,
+        phase_order: tuple[str, ...],
+        phase_ops: tuple[str, ...],
+        policy: Any,
+    ) -> bool:
+        del op_name
+        phase_to_op = dict(zip(phase_order, phase_ops, strict=True))
+        dependencies = tuple(getattr(policy, "phase_dependencies", ()))
+        if not dependencies:
+            raise ValueError("phase_graph schedule requires dependencies.")
+        for before_phase, after_phase, step_delta in dependencies:
+            if after_phase != phase:
+                continue
+            required_step = step - int(step_delta)
+            if required_step < 0:
+                continue
+            prior_op = phase_to_op.get(before_phase)
+            if prior_op is None:
+                raise ValueError(
+                    f"phase_graph dependency references missing phase {before_phase!r}."
+                )
+            if self._completed_step_count.get(prior_op, 0) <= required_step:
+                return True
+        return False
+
+    async def _release_phase_order_steps(self) -> None:
+        for op_name, pending in self._pending_phase_order_steps.items():
+            if not pending:
+                continue
+            self._pending_phase_order_steps[op_name] = []
+            for step in sorted(set(pending)):
+                if self._phase_order_step_blocked(op_name, step):
+                    self._pending_phase_order_steps[op_name].append(step)
                 else:
                     await self._enqueue(op_name, step)
 
@@ -2548,6 +2847,11 @@ class SPMDWorker:
             fn=execute_operator_callable,
             is_stateful=is_stateful,
             resource_id=self._state_resource_id(op_name),
+            operator_lane=(
+                _EXECUTION_DEFAULT_LANE
+                if meta.schedule_policy.lane is None
+                else meta.schedule_policy.lane
+            ),
             operator_config=self.config if is_stateful else None,
             operator_name=op_name,
             operator_step=step,
@@ -3907,6 +4211,7 @@ class SPMDWorker:
         # Report definitive completed count to Driver for synchronization/drain.
         self._report_op_completed(op_name, completed_step_count)
         await self._release_async_lag_steps()
+        await self._release_phase_order_steps()
 
         # Check if this op is in periodic_trigger mode
         is_periodic = (
@@ -4033,6 +4338,7 @@ class SPMDWorker:
             )
             return tuple(tasks)
 
+        send_tasks: tuple[asyncio.Task, ...] = ()
         if profiler_recorder is None:
             send_tasks = await send_successor_frames()
         else:
@@ -4100,17 +4406,105 @@ class SPMDWorker:
         step_tuuid_cache: dict[int, Any],
         exec_step: int,
     ) -> list[asyncio.Task[Any]]:
+        await self._deposit_local_only_outputs(
+            flat_results,
+            send_context,
+            step_tuuid_cache,
+            exec_step,
+        )
+        compiled_plan, successor_handlers = self._non_local_send_plan(send_context)
+        if compiled_plan is None:
+            return []
         return await self._data_plane_executor.send_step_frames(
-            compiled_plan=send_context.compiled_plan,
+            compiled_plan=compiled_plan,
             flat_results=flat_results,
             step_tuuid_cache=step_tuuid_cache,
             exec_step=exec_step,
-            successor_handlers=send_context.successor_handlers,
+            successor_handlers=successor_handlers,
             source_spmd_id=self.spmd_id,
             batch_max_frames=self._data_plane_batch_max_frames,
             batch_flush_us=self._data_plane_batch_flush_us,
             submit_delivery=self._delivery_runtime.submit,
         )
+
+    def _non_local_send_plan(
+        self, send_context: _OperatorSendContext
+    ) -> tuple[CompiledSendPlan | None, tuple[dict[int, Any], ...]]:
+        routes = []
+        handlers = []
+        for route, route_handlers in zip(
+            send_context.compiled_plan.successor_routes,
+            send_context.successor_handlers,
+            strict=True,
+        ):
+            if route.local_only:
+                continue
+            routes.append(replace(route, context_index=len(routes)))
+            handlers.append(route_handlers)
+        if not routes:
+            return None, ()
+        return (
+            replace(send_context.compiled_plan, successor_routes=tuple(routes)),
+            tuple(handlers),
+        )
+
+    async def _deposit_local_only_outputs(
+        self,
+        flat_results: list[Any],
+        send_context: _OperatorSendContext,
+        step_tuuid_cache: dict[int, Any],
+        exec_step: int,
+    ) -> None:
+        wrapped_results: dict[int, TransportTensor] = {}
+        for route in send_context.compiled_plan.successor_routes:
+            if not route.local_only:
+                continue
+            if route.spmd_id != self.spmd_id:
+                raise ValueError(
+                    "local_only route must target the current SPMD, "
+                    f"source={self.spmd_id}:{self.rank} target={route.spmd_id}."
+                )
+            for tensor_route in route.tensor_routes:
+                if tensor_route.output_index >= len(flat_results):
+                    continue
+                raw_leaf = flat_results[tensor_route.output_index]
+                if raw_leaf is None:
+                    continue
+                leaf_tensor = wrapped_results.get(tensor_route.output_index)
+                if leaf_tensor is None:
+                    if isinstance(raw_leaf, TransportTensor):
+                        leaf_tensor = raw_leaf
+                    else:
+                        leaf_tensor = TransportTensor.from_tensor(raw_leaf)
+                    wrapped_results[tensor_route.output_index] = leaf_tensor
+                leaf_tensor = inherit_mirror_metadata(
+                    op_name=send_context.compiled_plan.op_name,
+                    tuuid=tensor_route.tuuid,
+                    leaf_tensor=leaf_tensor,
+                    source_spec=tensor_route.source_spec,
+                    tuuid_to_name=send_context.tuuid_to_name,
+                    step_tuuid_cache=step_tuuid_cache,
+                    exec_step=exec_step,
+                    spmd_id=self.spmd_id,
+                    rank=self.rank,
+                )
+                target_ops = self.op_manager.get_operators_for_tuuid(tensor_route.tuuid)
+                if not target_ops:
+                    raise ValueError(
+                        "local_only route has no local consumer for tuuid="
+                        f"{tensor_route.tuuid} op={send_context.compiled_plan.op_name} "
+                        f"source={self.spmd_id}:{self.rank}."
+                    )
+                for target_op in target_ops:
+                    self._ensure_step_declared(target_op, exec_step)
+                    await self._mailbox.deposit_local_tensor(
+                        target_op,
+                        tensor_route.tuuid,
+                        exec_step,
+                        self.spmd_id,
+                        self.rank,
+                        leaf_tensor,
+                    )
 
     def _reconstruct_data_type_from_dict(self, cls: type, data: dict[str, Any]) -> Any:
         """Reconstruct a @data_type or dataclass from a nested dictionary of fields."""
@@ -4829,6 +5223,9 @@ class SPMDWorker:
                     for op_name, event in sorted(self._op_runnable.items())
                     if not event.is_set()
                 ],
+                "latest_op_runnable_epoch": dict(
+                    sorted(self._latest_op_runnable_epoch.items())
+                ),
                 "pending_blocked": {
                     op_name: list(steps)
                     for op_name, steps in sorted(self._pending_blocked.items())
@@ -4866,7 +5263,13 @@ class SPMDWorker:
                     for op_name, steps in sorted(self._finished_plan_steps.items())
                     if steps
                 },
-                "execution_queue_size": self._execution_queue.qsize(),
+                "execution_queue_size": sum(
+                    queue.qsize() for queue in self._execution_queues.values()
+                ),
+                "execution_queue_sizes": {
+                    lane: queue.qsize()
+                    for lane, queue in sorted(self._execution_queues.items())
+                },
                 "in_op_step_queue": [
                     [op_name, step] for op_name, step in sorted(self._in_op_step_queue)
                 ],

@@ -1,6 +1,7 @@
 import inspect
 import asyncio
 import contextvars
+import threading
 import time
 
 import pytest
@@ -8,6 +9,7 @@ import pytest
 import fluxway as fw
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.spmd.worker.user_callable_executor import (
+    USER_CALLABLE_DEFAULT_OPERATOR_LANE,
     UserCallableExecutor,
     UserCallableLane,
     UserCallableSpec,
@@ -48,6 +50,7 @@ def test_process_affine_stateful_operator_uses_worker_process_lane():
         fn=fn,
         is_stateful=True,
         resource_id=0,
+        operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
         operator_name="step",
         process_affine=True,
     )
@@ -71,6 +74,7 @@ def test_stateful_ops_with_same_owner_share_ray_actor_key():
         fn=lambda: None,
         is_stateful=True,
         resource_id=0,
+        operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
         operator_name="lookup",
         operator_spmd_id="Embedding",
         operator_owner_classes=(owner,),
@@ -80,6 +84,7 @@ def test_stateful_ops_with_same_owner_share_ray_actor_key():
         fn=lambda: None,
         is_stateful=True,
         resource_id=0,
+        operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
         operator_name="update",
         operator_spmd_id="Embedding",
         operator_owner_classes=(owner,),
@@ -107,7 +112,12 @@ async def test_worker_process_runtime_runs_sync_call_without_blocking_event_loop
         return "done"
 
     heartbeat_task = asyncio.create_task(heartbeat())
-    result = await runtime.submit(long_call, callable_id="call", resource_id=1)
+    result = await runtime.submit(
+        long_call,
+        callable_id="call",
+        resource_id=1,
+        execution_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+    )
     stop.set()
     await heartbeat_task
     runtime.close()
@@ -125,7 +135,12 @@ async def test_worker_process_runtime_completes_awaitable_inside_thread():
         await asyncio.sleep(0)
         return 7
 
-    result = await runtime.submit(lambda: inner(), callable_id="call", resource_id=1)
+    result = await runtime.submit(
+        lambda: inner(),
+        callable_id="call",
+        resource_id=1,
+        execution_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+    )
     runtime.close()
 
     assert result == 7
@@ -141,6 +156,7 @@ async def test_worker_process_runtime_preserves_contextvars():
             token_var.get,
             callable_id="call",
             resource_id=1,
+            execution_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
         )
     finally:
         token_var.reset(token)
@@ -157,7 +173,12 @@ async def test_worker_process_runtime_propagates_exception():
         raise RuntimeError("call failed")
 
     with pytest.raises(RuntimeError, match="call failed"):
-        await runtime.submit(fail, callable_id="call", resource_id=1)
+        await runtime.submit(
+            fail,
+            callable_id="call",
+            resource_id=1,
+            execution_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+        )
     runtime.close()
 
 
@@ -175,10 +196,20 @@ async def test_worker_process_runtime_parallel_when_thread_safe_resource_allows_
         return started
 
     first = asyncio.create_task(
-        runtime.submit(blocking_call, callable_id="call", resource_id=-1)
+        runtime.submit(
+            blocking_call,
+            callable_id="call",
+            resource_id=-1,
+            execution_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+        )
     )
     second = asyncio.create_task(
-        runtime.submit(blocking_call, callable_id="call", resource_id=-1)
+        runtime.submit(
+            blocking_call,
+            callable_id="call",
+            resource_id=-1,
+            execution_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+        )
     )
     deadline = time.perf_counter() + 1.0
     while started < 2 and time.perf_counter() < deadline:
@@ -188,6 +219,67 @@ async def test_worker_process_runtime_parallel_when_thread_safe_resource_allows_
     runtime.close()
 
     assert started == 2
+
+
+@pytest.mark.asyncio
+async def test_process_affine_worker_process_runtime_isolates_operator_lanes():
+    runtime = WorkerProcessCallRuntime(max_workers=1)
+    executor = UserCallableExecutor(worker_process_runtime=runtime)
+    release = threading.Event()
+    started: list[str] = []
+
+    def blocking(name: str):
+        def call() -> str:
+            started.append(name)
+            while not release.is_set():
+                time.sleep(0.001)
+            return name
+
+        return call
+
+    first = asyncio.create_task(
+        executor.execute(
+            UserCallableSpec(
+                callable_id="train_core",
+                fn=blocking("compute"),
+                is_stateful=True,
+                resource_id=-1,
+                operator_lane="compute",
+                operator_name="train_core",
+                process_affine=True,
+            )
+        )
+    )
+    second = asyncio.create_task(
+        executor.execute(
+            UserCallableSpec(
+                callable_id="prepare_dense_inputs",
+                fn=blocking("data"),
+                is_stateful=True,
+                resource_id=-1,
+                operator_lane="data",
+                operator_name="prepare_dense_inputs",
+                process_affine=True,
+            )
+        )
+    )
+
+    try:
+        deadline = time.perf_counter() + 1.0
+        while len(started) < 2 and time.perf_counter() < deadline:
+            await asyncio.sleep(0.001)
+        release.set()
+        assert sorted(started) == ["compute", "data"]
+        assert sorted(runtime.execution_lane_names()) == [
+            USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+            "compute",
+            "data",
+        ]
+        assert sorted(await asyncio.gather(first, second)) == ["compute", "data"]
+    finally:
+        release.set()
+        await asyncio.gather(first, second, return_exceptions=True)
+        runtime.close()
 
 
 @pytest.mark.asyncio
@@ -218,6 +310,7 @@ async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
             fn=inline_async,
             is_stateful=False,
             resource_id=1,
+            operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
             operator_name="inline_async",
             operator_step=1,
             operator_rank=0,
@@ -229,6 +322,7 @@ async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
             fn=inline_sync,
             is_stateful=False,
             resource_id=1,
+            operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
             operator_name="inline_sync",
             operator_step=1,
             operator_rank=0,
@@ -240,6 +334,7 @@ async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
             fn=worker_process,
             is_stateful=False,
             resource_id=1,
+            operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
             operator_name="worker_process",
             operator_step=1,
             operator_rank=0,
@@ -276,6 +371,7 @@ async def test_user_profiler_context_propagates_to_local_free_thread_lane(tmp_pa
             fn=local_free_thread,
             is_stateful=False,
             resource_id=1,
+            operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
             operator_name="local_free_thread",
             operator_step=1,
             operator_rank=0,

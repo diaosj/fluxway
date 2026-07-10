@@ -17,6 +17,10 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+OpRunnableEpoch = int
+OpRunnableControlCallback = Callable[[int, str, OpRunnableEpoch], None]
+
+
 class SyncPolicy(ABC):
     """Abstract interface for operator dependency synchronization logic."""
 
@@ -58,6 +62,27 @@ class MaxSkewSyncPolicy(SyncPolicy):
         return skew_diff > self.max_skew and worker_step >= max_step
 
 
+class OpRunnableEpochIssuer:
+    __slots__ = ("_epochs_by_rank",)
+
+    def __init__(self, num_workers: int):
+        self._epochs_by_rank: dict[int, dict[str, OpRunnableEpoch]] = {
+            rank: {} for rank in range(num_workers)
+        }
+
+    def issue(self, rank: int, op_name: str) -> OpRunnableEpoch:
+        epochs = self._epochs_by_rank[rank]
+        if op_name in epochs:
+            epoch = epochs[op_name] + 1
+        else:
+            epoch = 0
+        epochs[op_name] = epoch
+        return epoch
+
+    def clear_worker(self, rank: int) -> None:
+        self._epochs_by_rank[rank].clear()
+
+
 class SPMDSynchronizer:
     """
     Manages worker step synchronization within a single SPMD.
@@ -88,6 +113,7 @@ class SPMDSynchronizer:
         self._worker_op_locked: dict[int, dict[str, bool]] = {
             rank: {} for rank in range(num_workers)
         }
+        self._op_runnable_epoch_issuer = OpRunnableEpochIssuer(num_workers)
 
         # Global flow control: op_name -> max allowed step (watermark from Controller)
         self._allowed_steps: dict[str, int] = {}
@@ -95,8 +121,8 @@ class SPMDSynchronizer:
         self._lock = threading.Lock()
 
         self._on_spmd_op_completed: Callable[[str, str, int], None] | None = None
-        self._block_worker_op: Callable[[int, str], None] | None = None
-        self._unblock_worker_op: Callable[[int, str], None] | None = None
+        self._block_worker_op: OpRunnableControlCallback | None = None
+        self._unblock_worker_op: OpRunnableControlCallback | None = None
 
         self._expected_ops: set = set()
 
@@ -162,12 +188,15 @@ class SPMDSynchronizer:
     def set_callbacks(
         self,
         on_spmd_op_completed: Callable[[str, str, int], None] | None = None,
-        block_worker_op: Callable[[int, str], None] | None = None,
-        unblock_worker_op: Callable[[int, str], None] | None = None,
+        block_worker_op: OpRunnableControlCallback | None = None,
+        unblock_worker_op: OpRunnableControlCallback | None = None,
     ) -> None:
         self._on_spmd_op_completed = on_spmd_op_completed
         self._block_worker_op = block_worker_op
         self._unblock_worker_op = unblock_worker_op
+
+    def _issue_op_runnable_epoch(self, rank: int, op_name: str) -> OpRunnableEpoch:
+        return self._op_runnable_epoch_issuer.issue(rank, op_name)
 
     def report_worker_op_completed(
         self, rank: int, op_name: str, completed_count: int
@@ -265,13 +294,17 @@ class SPMDSynchronizer:
                         f"Blocking rank {rank} {op_name} (count {worker_count}, reason={reason})"
                     )
                     if self._block_worker_op:
-                        self._block_worker_op(rank, op_name)
+                        self._block_worker_op(
+                            rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                        )
             else:
                 if self._worker_op_locked[rank].get(op_name, False):
                     self._worker_op_locked[rank][op_name] = False
                     logger.debug(f"Unblocking rank {rank} {op_name}")
                     if self._unblock_worker_op:
-                        self._unblock_worker_op(rank, op_name)
+                        self._unblock_worker_op(
+                            rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                        )
 
     def _all_workers_reached_count_internal(self, op_name: str, count: int) -> bool:
         """Check if all workers have reached the given count. Must hold lock."""
@@ -347,7 +380,9 @@ class SPMDSynchronizer:
         if self._block_worker_op:
             for rank in range(self.num_workers):
                 try:
-                    self._block_worker_op(rank, op_name)
+                    self._block_worker_op(
+                        rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                    )
                 except Exception as e:
                     logger.error(f"Error blocking worker {rank} op: {e}")
 
@@ -363,7 +398,9 @@ class SPMDSynchronizer:
         if self._unblock_worker_op:
             for rank in workers_to_unblock:
                 try:
-                    self._unblock_worker_op(rank, op_name)
+                    self._unblock_worker_op(
+                        rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                    )
                 except Exception as e:
                     logger.error(f"Error unblocking worker {rank} op: {e}")
 
@@ -428,5 +465,6 @@ class SPMDSynchronizer:
             for rank in range(self.num_workers):
                 self._worker_completed_count[rank].clear()
                 self._worker_op_locked[rank].clear()
+                self._op_runnable_epoch_issuer.clear_worker(rank)
             self._spmd_completed_count.clear()
             self._op_locked.clear()

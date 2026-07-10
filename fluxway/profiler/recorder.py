@@ -604,6 +604,12 @@ MAILBOX_DEPOSIT_FRAME = TraceEventSpec(
     ("op_id", "step", "edge_count", "payload_count"),
     "step",
 )
+MAILBOX_DEPOSIT_LOCAL_TENSOR = TraceEventSpec(
+    "mailbox.deposit_local_tensor",
+    "mailbox/deposit",
+    ("op_id", "tuuid", "step", "data_count"),
+    "step",
+)
 MAILBOX_READY_FIRE = TraceEventSpec(
     "mailbox.ready_fire",
     "mailbox/barrier",
@@ -1513,6 +1519,14 @@ class TraceRecorder:
         return self._async_span(
             MAILBOX_DEPOSIT_FRAME,
             payload=(self.intern(op_name), step, edge_count, payload_count),
+        )
+
+    def mailbox_deposit_local_tensor(
+        self, *, op_name: str, tuuid: int, step: int, data_count: int
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            MAILBOX_DEPOSIT_LOCAL_TENSOR,
+            payload=(self.intern(op_name), tuuid, step, data_count),
         )
 
     def mailbox_ready_fire(self, *, op_name: str, step: int) -> None:

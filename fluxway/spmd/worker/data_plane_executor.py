@@ -16,7 +16,6 @@ from fluxway.spmd.worker.data_plane import (
 from fluxway.transport.communication import TransportBatchPlan, TransportFrameBatch
 from fluxway.profiler.recorder import TraceRecorder
 
-
 SubmitDelivery = Callable[[Awaitable[Any]], Awaitable[asyncio.Task[Any]]]
 
 
@@ -227,7 +226,9 @@ async def build_and_send_step_frames(
     delivery_tasks: list[asyncio.Task[Any]] = []
     if profiler_recorder is None:
         for batch in batches:
-            target_spmd_id = compiled_plan.successor_routes[batch.context_index].spmd_id
+            route = compiled_plan.successor_routes[batch.context_index]
+            target_spmd_id = route.spmd_id
+            _validate_local_only_batch(route, compiled_plan, batch)
             handler = _handler_for_batch(
                 batch,
                 successor_handlers=successor_handlers,
@@ -267,7 +268,9 @@ async def build_and_send_step_frames(
         frame_count=len(frame_groups),
     ):
         for batch in batches:
-            target_spmd_id = compiled_plan.successor_routes[batch.context_index].spmd_id
+            route = compiled_plan.successor_routes[batch.context_index]
+            target_spmd_id = route.spmd_id
+            _validate_local_only_batch(route, compiled_plan, batch)
             handler = _handler_for_batch(
                 batch,
                 successor_handlers=successor_handlers,
@@ -346,6 +349,21 @@ def _batch_envelopes(
         TransportFrameEnvelope(header=header, payload_segments=payload_segments)
         for header, payload_segments in batch.frames
     )
+
+
+def _validate_local_only_batch(
+    route: Any,
+    compiled_plan: CompiledSendPlan,
+    batch: TransportFrameBatch,
+) -> None:
+    if not getattr(route, "local_only", False):
+        return
+    if batch.target_rank != compiled_plan.rank:
+        raise ValueError(
+            "local_only transport requires same-rank routing, "
+            f"op={compiled_plan.op_name} source_rank={compiled_plan.rank} "
+            f"target_spmd={route.spmd_id} target_rank={batch.target_rank}."
+        )
 
 
 async def _send_transport_frame_batch_to_handler(

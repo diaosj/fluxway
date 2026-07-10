@@ -25,7 +25,7 @@ from fluxway.common.index_descriptor import ContinuousIndex, ExplicitIndex
 from fluxway.common.ragged import ragged_level_count
 from fluxway.common.sync import ArrivalBarrier
 from fluxway.common.types.configs import BarrierConfig
-from fluxway.common.types.tensor import Scalar
+from fluxway.common.types.tensor import Scalar, TransportTensor
 from fluxway.transport.communication import TransportReceiver
 from fluxway.transport.manifest import (
     EDGE_EMPTY_KIND,
@@ -954,6 +954,78 @@ class WorkerMailbox:
                     self._on_ready(op_name, actual_step)
 
             return max(watermark, self._get_size_lock_free())
+
+    async def deposit_local_tensor(
+        self,
+        op_name: str,
+        tuuid: int,
+        step: int,
+        sender_id: str,
+        rank: int,
+        tensor: Any,
+    ) -> int:
+        async with self._lock:
+            barrier = self._barriers.get(op_name, {}).get(step)
+            if barrier is None:
+                raise ValueError(
+                    f"[WorkerMailbox] Cannot deposit local tensor before declare_step: "
+                    f"op={op_name} tuuid={tuuid} step={step}."
+                )
+            expected = self._expected_tensor_counts.setdefault(op_name, {}).get(
+                tuuid, 1
+            )
+            if expected != 1:
+                raise ValueError(
+                    f"[WorkerMailbox] local_only tensor requires expected_count=1, "
+                    f"op={op_name} tuuid={tuuid} step={step} expected={expected}."
+                )
+            self._expected_tensor_counts[op_name][tuuid] = 1
+            barrier.configure_expected_tensor_count(tuuid, 1)
+
+            key = (sender_id, rank)
+            arrival_slot = self._arrival_slot(op_name, tuuid, step)
+            if key in arrival_slot:
+                raise ValueError(
+                    f"[WorkerMailbox Error] DUPLICATE LOCAL SHARD RECEIVED: "
+                    f"op={op_name} tuuid={tuuid} step={step} "
+                    f"sender={sender_id} rank={rank}."
+                )
+
+            if not isinstance(tensor, TransportTensor):
+                raise TypeError(
+                    "WorkerMailbox.deposit_local_tensor requires a TransportTensor, "
+                    f"got {type(tensor).__name__}."
+                )
+            values = tensor.flat_values
+            backend = get_backend()
+            shape = tuple(int(x) for x in backend.shape(values))
+            dtype = backend.dtype(values)
+            data_count = tensor.routing_entity_count
+            global_shape = tensor.global_shape
+            arrival_slot[key] = {
+                "empty_kind": EmptyKind.DATA_EMPTY_ALLOWED,
+                "meta_state": 0,
+                "payload_schema": (
+                    {
+                        "role": int(PayloadRole.VALUES),
+                        "dtype": dtype,
+                        "shape": shape,
+                        "valid_count": data_count,
+                        "ndim": len(shape),
+                    },
+                ),
+                "global_shape": global_shape,
+                "compact_params": None,
+                "sender_world_size": 1,
+                "expected_count": 1,
+            }
+            self._tensor_slots.setdefault(op_name, {}).setdefault(tuuid, {}).setdefault(
+                step, {}
+            )[key] = [tensor]
+
+            if barrier.tensor_arrived(tuuid, current_step=step) and self._on_ready:
+                self._on_ready(op_name, step)
+            return data_count
 
     def _deposit_buffered_shard_views(
         self,

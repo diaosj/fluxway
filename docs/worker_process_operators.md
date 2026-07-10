@@ -71,6 +71,22 @@ because they release the GIL or are backend driven.
 If a process-affine class has mutable Python state and is not explicitly
 thread-safe, use the default `AsyncPolicy.sync()` or `StatePolicy.exclusive()`.
 
+Process-affine does not forbid local overlap. A `@requires_worker_process` class
+may expose stateless helper operators with `StatePolicy.thread_safe()` while
+keeping model/state mutating operators exclusive. The recommendation
+`DenseSPMD` uses this split:
+
+- `prepare_dense_inputs` and `scatter_sparse_grads` run on thread-safe local
+  async lanes because they do not read or write dense model state.
+- `train_core` and `update` keep exclusive state access because they read or
+  mutate the dense model/gradient accumulator.
+- `SchedulePolicy.phase_graph` allows `scatter_sparse_grads(step=N)` and
+  `update(step=N)` to overlap, while preventing `train_core(step=N+1)` from
+  starting before `update(step=N)` commits.
+
+Internal handoff between those phases can use functional graph `local=True`.
+That is a same-worker transport edge, not a remote call.
+
 ## Failure Mode
 
 Fluxway fails fast when a class calls `jax.distributed.initialize` but is not

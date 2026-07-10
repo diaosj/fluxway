@@ -95,6 +95,23 @@ class AsyncPolicySPMD:
     def stale_window(self, ids: TransportTensor):
         pass
 
+    @operator(
+        name="phase_graph_train",
+        async_policy=AsyncPolicy.pipelined(
+            depth=2,
+            schedule=SchedulePolicy.phase_graph(
+                phase="train",
+                phase_order=("prepare", "train", "update"),
+                dependencies=(
+                    ("prepare", "train", 0),
+                    ("update", "train", 1),
+                ),
+            ),
+        ),
+    )
+    def phase_graph_train(self):
+        pass
+
 
 def test_sharding_resolution():
     meta_uniform = getattr(MockSPMD.test_uniform, "_fluxway_operator_meta", None)
@@ -168,6 +185,38 @@ def test_operator_async_policy_lowering():
     assert meta_window.schedule_policy.kind == "deadline_boost"
     assert meta_window.schedule_policy.boost_priority == 150
     assert meta_window.barrier_config.type is BarrierType.STANDARD
+
+    meta_graph = getattr(
+        AsyncPolicySPMD.phase_graph_train, "_fluxway_operator_meta", None
+    )
+    assert meta_graph is not None
+    assert meta_graph.schedule_policy.kind == "phase_graph"
+    assert meta_graph.schedule_policy.phase_dependencies == (
+        ("prepare", "train", 0),
+        ("update", "train", 1),
+    )
+
+
+def test_phase_graph_rejects_invalid_dependencies():
+    with pytest.raises(ValueError, match="duplicate dependency"):
+        SchedulePolicy.phase_graph(
+            phase="train",
+            phase_order=("prepare", "train"),
+            dependencies=(
+                ("prepare", "train", 0),
+                ("prepare", "train", 0),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="acyclic"):
+        SchedulePolicy.phase_graph(
+            phase="prepare",
+            phase_order=("prepare", "train"),
+            dependencies=(
+                ("prepare", "train", 0),
+                ("train", "prepare", 0),
+            ),
+        )
 
 
 def test_operator_rejects_invalid_local_pipeline_options():

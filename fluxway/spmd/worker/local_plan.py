@@ -11,6 +11,7 @@ from typing import Any, Protocol
 from collections.abc import Callable
 
 from fluxway.spmd.worker.user_callable_executor import (
+    USER_CALLABLE_DEFAULT_OPERATOR_LANE,
     UserCallableExecutor,
     UserCallableSpec,
 )
@@ -179,6 +180,7 @@ class MappingCallableRegistry:
                 fn=call_with_dependencies,
                 is_stateful=False,
                 resource_id=resource_id,
+                operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
             )
 
         return user_callable_factory

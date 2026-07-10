@@ -7,6 +7,7 @@ Fluxway 是面向多 SPMD 图训练的异步数据流框架。当前架构的核
 - 用户 `CALL`、输入 prepare、输出 delivery 分别由 worker-local runtime 管理，避免阻塞 Ray actor event loop。
 - tensor 切分、frame 构造、batch 分组属于 transport/data-plane 层，不在 worker 调度层重复实现。
 - 所有 tensor/control/state 都是 exact-step 输入，Fluxway 不会用另一个 step 的数据替代当前 step。
+- 同 worker 内部流水线用显式 local-only edge，仍走 transport frame ABI 和 mailbox exact-step barrier，但不注册 Ray/Axon self-loop handler。
 
 ## Layering
 
@@ -59,7 +60,7 @@ driver 不执行用户算子，也不构造 transport frame。
 - `AsyncPolicy.sync()`：exact-step input、depth=1、ordered commit、exclusive state。
 - `AsyncPolicy.pipelined(depth=N)`：exact-step input，可多 step overlap，不允许跨 step 数据替代。
 - `AsyncPolicy.bounded_stale(depth=N, max_staleness=M)`：bounded operator lag，用于 sparse embedding 半异步半同步训练。它限制 lookup/update 能领先依赖进度多少步，但输入仍然是 exact-step tensor/control/state。
-- `AsyncPolicy.pipeline_parallel(...)`：把 phase scheduling lowering 到 worker scheduler，不改变 Local DAG ABI。
+- `AsyncPolicy.pipeline_parallel(...)`：把 phase scheduling lowering 到 worker scheduler，不改变 Local DAG ABI。phase 可以用全序 `SchedulePolicy.phase_order(...)`，也可以用部分序 `SchedulePolicy.phase_graph(...)`。
 
 旧式跨 step 数据替代语义已删除。`max_staleness` 是 operator lag window，不是 tensor 版本选择策略。
 
@@ -111,6 +112,11 @@ static-to-static 只 patch step 和 payload refs。dynamic 路径只缓存稳定
 
 Ray 和 Axon 共享 batch-first ABI。缺失 batch ABI 或非法 backend state 直接抛错。
 
+local-only edge 只允许 `source_node == target_node`。scheduler 建立全局 SPMD
+topology 时跳过这类边，因此同 rank 内部 operator 不等待 self-loop remote
+handler。worker 发送边界仍校验编译后目标 rank 必须等于 sender rank；不满足时直接
+抛错，不做 remote fallback。
+
 ## Commit, Fence, And Failure
 
 step commit 和 delivery completion 分离：
@@ -158,4 +164,37 @@ local-step span 和 data-plane span 分层显示：
 - lookup/update 的先后关系由 Local DAG 和 scheduler policy 表达。
 - tensor/control/state 仍然 exact-step，不允许数据版本替代。
 
-因此推荐写法是 sparse worker 使用 `AsyncPolicy.bounded_stale(...)`，dense worker 默认使用 `AsyncPolicy.sync()` 或显式确认安全后使用 pipelined policy。
+因此推荐写法是 sparse worker 使用 `AsyncPolicy.bounded_stale(...)`。Dense
+worker 可以拆成本地流水阶段：
+
+- `prepare_dense_inputs`：NumPy/CuPy gather、dense inverse、输入校验，使用 thread-safe pipelined lane。
+- `train_core`：JAX/NNX forward+grad，独占 dense model state。
+- `scatter_sparse_grads`：JAX 输出后的 sparse grad scatter，使用 thread-safe pipelined lane。
+- `update`：独占 dense model/grad_accum state。
+
+这些阶段之间的 Dense 内部边使用 `local=True`。Dense 的推荐 scheduler 是
+`SchedulePolicy.phase_graph`，用依赖边表达训练语义：
+
+- `prepare_dense_inputs(N) -> train_core(N)`
+- `train_core(N) -> scatter_sparse_grads(N)`
+- `train_core(N) -> update(N)`
+- `update(N) -> train_core(N+1)`
+
+这不是全序 phase list。`scatter_sparse_grads(N)` 和 `update(N)` 只依赖同一个
+`train_core(N)`，因此可以并行；`train_core(N+1)` 必须等待 `update(N)` 提交，
+保证 dense model 训练顺序不变。`phase_order` 仍适合真正全序的 phase pipeline，
+但会把 Dense 的 scatter/update 误串行化。
+
+## Dense Split Performance Notes
+
+2026-07-09 的 Dense split trace 和 `/tmp` probe 给出两个当前热点：
+
+- `update` 的 Python flat split/slice/unflatten/add 路径约 350ms；改成预编译
+  JAX accumulator 后，独立 `_update_impl` probe 为 14.5ms mean，trace 中
+  `update` mean 从 572.8ms 降到 115.0ms。数值 probe 的最大误差为 0，错误
+  flat size/sharding 会直接抛异常。
+- `scatter_sparse_grads` 的 `data_plane.frame_build` 仍是 100ms 级热点。trace
+  child profile 显示 frame_build mean 117.5ms，其中 `transport.distribute`
+  子阶段 mean sum 109.7ms，frame header/template 残差只有 7.8ms。下一步优化应
+  在 transport routing/split 复用上做通用重构，而不是给 Dense 写 data-plane
+  特例。

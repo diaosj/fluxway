@@ -298,6 +298,7 @@ async def test_worker_stop_clears_driver_handle_and_waits_for_tasks():
         await asyncio.Future()
 
     worker._execution_queue = asyncio.Queue()
+    worker._execution_queues = {"__default__": worker._execution_queue}
     worker._run_task = asyncio.create_task(run_forever())
     worker._heartbeat_task = asyncio.create_task(run_forever())
     worker._spawn_background_task(background_task())

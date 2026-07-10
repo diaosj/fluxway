@@ -34,6 +34,7 @@ class SuccessorRouteContext:
     spmd_id: str
     info: Any
     effective_rank: int
+    local_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,7 @@ class CompiledSuccessorRoute:
     spmd_id: str
     effective_rank: int
     tensor_routes: tuple[CompiledTensorRoute, ...]
+    local_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +145,7 @@ def compile_send_plan(
                 spmd_id=context.spmd_id,
                 effective_rank=context.effective_rank,
                 tensor_routes=tuple(tensor_routes),
+                local_only=context.local_only,
             )
         )
     return CompiledSendPlan(

@@ -44,6 +44,7 @@ from fluxway.profiler.filtering import filter_steady_state_records
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
 from fluxway.spmd.worker.user_callable_executor import (
+    USER_CALLABLE_DEFAULT_OPERATOR_LANE,
     UserCallableExecutor,
     UserCallableSpec,
 )
@@ -141,6 +142,7 @@ async def test_user_callable_execute_records_step_function_and_input_names(tmp_p
             fn=fn,
             is_stateful=False,
             resource_id=1,
+            operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
             operator_name="lookup",
             operator_step=9,
             operator_rank=0,

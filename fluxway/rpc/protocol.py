@@ -222,6 +222,55 @@ class RayActorDataPlane(DataPlaneCallable):
         return f"RayActorDataPlane(handle={self._handle})"
 
 
+class LocalWorkerDataPlane(DataPlaneCallable):
+    def __init__(self, handle: Any, sender_spmd_code: int):
+        self._handle = handle
+        if not isinstance(sender_spmd_code, int) or sender_spmd_code < 0:
+            raise ValueError(
+                f"sender_spmd_code must be a non-negative int, got {sender_spmd_code!r}."
+            )
+        if getattr(handle, "receive_transport_frames", None) is None:
+            raise TypeError(
+                "LocalWorkerDataPlane handle must expose receive_transport_frames."
+            )
+        if getattr(handle, "receive_control", None) is None:
+            raise TypeError("LocalWorkerDataPlane handle must expose receive_control.")
+        self._sender_spmd_code = sender_spmd_code
+
+    async def receive_transport_frames(
+        self,
+        frames: tuple[TransportFrameEnvelope, ...],
+    ) -> Any:
+        if not frames:
+            raise ValueError("receive_transport_frames requires at least one frame.")
+        validated_frames = tuple(
+            TransportFrameEnvelope(
+                header=_validated_transport_header(frame.header),
+                payload_segments=tuple(frame.payload_segments),
+            )
+            for frame in frames
+        )
+        result = self._handle.receive_transport_frames(validated_frames)
+        if not isawaitable(result):
+            raise TypeError(
+                "LocalWorkerDataPlane receive_transport_frames must return an awaitable."
+            )
+        return await result
+
+    async def receive_control(
+        self, op_name: str, step: int, names: list[str], values: list[Any]
+    ) -> Any:
+        result = self._handle.receive_control(op_name, step, names, values)
+        if not isawaitable(result):
+            raise TypeError(
+                "LocalWorkerDataPlane receive_control must return an awaitable."
+            )
+        return await result
+
+    def __repr__(self):
+        return f"LocalWorkerDataPlane(handle={self._handle})"
+
+
 class AxonDataPlane(DataPlaneCallable):
     def __init__(self, handle: Any, sender_spmd_code: int):
         self._handle = handle

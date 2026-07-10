@@ -1080,6 +1080,25 @@ class BaseDataDistributor:
             if primary.global_shape is not None
             else primary_logical_shape
         )
+        actual_req = local_shape[0] if local_shape else 1
+        assert actual_req is not None, (
+            "actual_req (primary_local_shape[0]) must be statically known"
+        )
+        if (
+            actual_req == 0
+            and primary.shape != ()
+            and target
+            and target.is_static
+            and primary.global_shape is not None
+        ):
+            raise ValueError(
+                f"[Fluxway Static Sharding Error] Static tensor has zero "
+                f"routing rows for TUUID: {self._format_tuuids(tuuid, tuuid_to_name)}. "
+                f"local_shape={local_shape}, global_shape={dst_shape}, "
+                f"target_partitions={target.partitions}. "
+                "Static outputs must be non-empty; use an explicit control tensor "
+                "for optional data semantics."
+            )
 
         if (
             not is_referential
@@ -1135,21 +1154,24 @@ class BaseDataDistributor:
                         f"or reduce the target mesh size."
                     )
 
-        if source is not None and target is not None:
+        if (
+            source is not None
+            and target is not None
+            and logger.isEnabledFor(logging.DEBUG)
+        ):
             logger.debug(
-                f"[Distributor] Planning: src_mesh={source.mesh.size if source.mesh is not None else 1}, "
-                f"dst_mesh={target.mesh.size if target.mesh is not None else 1}, "
-                f"local_rank={self.local_rank}, src_index_source={src_geometry_name}"
+                "[Distributor] Planning: src_mesh=%s dst_mesh=%s "
+                "local_rank=%s src_index_source=%s",
+                source.mesh.size if source.mesh is not None else 1,
+                target.mesh.size if target.mesh is not None else 1,
+                self.local_rank,
+                src_geometry_name,
             )
 
         # Set capacity bucket. Bucketing is *only* needed when the active
         # backend requires static shapes (jax.jit / torch.compile). Pure
         # eager paths (HybridBackend default, TorchBackend eager) keep
         # capacity == actual_req so all padding branches below are no-ops.
-        actual_req = local_shape[0] if local_shape else 1
-        assert actual_req is not None, (
-            "actual_req (primary_local_shape[0]) must be statically known"
-        )
         bk_static = backend.requires_static_shapes()
         if isinstance(capacity, list | tuple):
             selected_capacity = None
@@ -1218,6 +1240,40 @@ class BaseDataDistributor:
                 global_shapes_list,
                 has_meta_tensor_state_list,
                 [None] * len(has_meta_tensor_state_list),
+                [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
+            )
+            return
+
+        identity_target_rank = _static_identity_target_rank(
+            source,
+            target,
+            self.local_rank,
+        )
+        if identity_target_rank is not None and target is not None:
+            target_world_size = target.mesh.size
+            sender_has_data = [False] * target_world_size
+            sender_has_data[identity_target_rank] = True
+            self._current_plan_manifest = TransportPlanManifest(
+                expected_senders_per_dst=(1,) * target_world_size,
+                sender_has_data_per_dst=tuple(sender_has_data),
+                emission_mode=SenderEmissionMode.STATIC_PRODUCERS_ONLY,
+            )
+            direct_payloads, counts, direct_compact_params = (
+                _static_identity_payload_group(
+                    payloads=payloads,
+                    nested_length_list=nested_length_list,
+                    has_meta_tensor_state_list=has_meta_tensor_state_list,
+                    compact_desc_info=compact_desc_info,
+                )
+            )
+            yield (
+                [identity_target_rank],
+                direct_payloads,
+                counts,
+                None,
+                global_shapes_list,
+                has_meta_tensor_state_list,
+                direct_compact_params,
                 [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
             )
             return
@@ -1668,9 +1724,22 @@ class BaseDataDistributor:
         ) in self._plan_single_tensor_group(
             local_data, source, target, capacity, tuuid, tuuid_to_name
         ):
-            logger.debug(
-                f"[Distributor Plan] [Rank {self.local_rank}] targets={targets} tensors={tensors} counts={counts} sort_idx={sort_idx} global_shapes_list={global_shapes_list} has_meta_tensor_state_list={has_meta_tensor_state_list} slice_compact_desc_params={slice_compact_desc_params}"
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[Distributor Plan] [Rank %s] targets=%s tensors=%s counts=%s "
+                    "sort_idx=%s global_shapes_list=%s "
+                    "has_meta_tensor_state_list=%s slice_compact_desc_params=%s "
+                    "empty_kind_list=%s",
+                    self.local_rank,
+                    targets,
+                    tensors,
+                    counts,
+                    sort_idx,
+                    global_shapes_list,
+                    has_meta_tensor_state_list,
+                    slice_compact_desc_params,
+                    empty_kind_list,
+                )
             if self._meta_sort_indices is None:
                 self._meta_sort_indices = sort_idx
             for target_id in targets:
@@ -2044,6 +2113,112 @@ def _transport_frame_template_key(
             for edge in edge_plans
         ),
     )
+
+
+def _static_identity_target_rank(
+    source: PhysicalLayout | None,
+    target: PhysicalLayout | None,
+    local_rank: int,
+) -> int | None:
+    if source is None or target is None:
+        return None
+    if source.is_content_addressable or target.is_content_addressable:
+        return None
+    if source.is_referential or target.is_referential:
+        return None
+    if not source.is_static or not target.is_static:
+        return None
+    if not source.partitions or not target.partitions:
+        return None
+    if source.partitions != target.partitions:
+        return None
+    if not isinstance(source.spec.strategy, ChunkPartition):
+        return None
+    if not isinstance(target.spec.strategy, ChunkPartition):
+        return None
+    if source.mesh.axis_names != target.mesh.axis_names:
+        return None
+    if source.mesh.shape != target.mesh.shape:
+        return None
+    if tuple(source.mesh.flatten()) != tuple(target.mesh.flatten()):
+        return None
+
+    consumers = source.resolve_consumers(target, local_rank)
+    if len(consumers) != 1:
+        return None
+    target_rank = int(consumers[0])
+    producers = source.resolve_producers(target, target_rank)
+    if producers != [local_rank]:
+        return None
+    return target_rank
+
+
+def _payload_row_count(payload: Any) -> int:
+    shape = get_backend().shape(payload)
+    if not shape:
+        return 1
+    return int(shape[0])
+
+
+def _static_identity_payload_group(
+    *,
+    payloads: list[Any],
+    nested_length_list: list[tuple[Any, ...] | None],
+    has_meta_tensor_state_list: list[int],
+    compact_desc_info: list[IndexDescriptor | None],
+) -> tuple[list[Any], list[int], list[list[int] | None]]:
+    direct_payloads: list[Any] = []
+    counts: list[int] = []
+    compact_params: list[list[int] | None] = []
+    payload_cursor = 0
+
+    for meta_state, desc_obj in zip(
+        has_meta_tensor_state_list,
+        compact_desc_info,
+        strict=True,
+    ):
+        if payload_cursor >= len(payloads):
+            raise ValueError(
+                "Static identity transport payload cursor exceeded payload list "
+                f"at meta_state={meta_state}."
+            )
+        values = payloads[payload_cursor]
+        nested_lengths = nested_length_list[payload_cursor]
+        payload_cursor += 1
+        direct_payloads.append(values)
+        counts.append(_payload_row_count(values))
+
+        for lengths in nested_lengths or ():
+            direct_payloads.append(lengths)
+            counts.append(_payload_row_count(lengths))
+
+        if meta_state & 2:
+            if payload_cursor >= len(payloads):
+                raise ValueError(
+                    "Static identity transport expected materialized origin payload "
+                    f"for meta_state={meta_state}, but no payload remains."
+                )
+            origin = payloads[payload_cursor]
+            payload_cursor += 1
+            direct_payloads.append(origin)
+            counts.append(_payload_row_count(origin))
+
+        if meta_state & 4:
+            if not isinstance(desc_obj, ContinuousIndex):
+                raise TypeError(
+                    "Static identity compact origin metadata requires ContinuousIndex, "
+                    f"got {type(desc_obj).__name__}."
+                )
+            compact_params.append(desc_obj.to_compact_params())
+        else:
+            compact_params.append(None)
+
+    if payload_cursor != len(payloads):
+        raise ValueError(
+            "Static identity transport consumed an unexpected number of payloads: "
+            f"consumed={payload_cursor}, total={len(payloads)}."
+        )
+    return direct_payloads, counts, compact_params
 
 
 def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:

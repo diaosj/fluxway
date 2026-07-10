@@ -9,13 +9,55 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from numba import njit
 
 from fluxway.common.decorators import spmd, operator, requires_worker_process
-from fluxway.common.types import AsyncPolicy
+from fluxway.common.types import AsyncPolicy, SchedulePolicy, StatePolicy
 from fluxway.common.tensor_components import (
     dense_path_strides,
-    fill_nested_dense_inv_with_pad_kernel,
+    fill_nested_dense_inv_with_pad,
 )
 from fluxway.common.types.tensor import TransportTensor
 from .data_types import DPFeatures
+
+_DENSE_PHASE_ORDER = (
+    "prepare_dense_inputs",
+    "train_core",
+    "scatter_sparse_grads",
+    "update",
+)
+_DENSE_PHASE_DEPENDENCIES = (
+    ("prepare_dense_inputs", "train_core", 0),
+    ("train_core", "scatter_sparse_grads", 0),
+    ("train_core", "update", 0),
+    ("update", "train_core", 1),
+)
+_DENSE_LANE_ORDER = ("compute", "data")
+_DENSE_LANE_PRIORITIES = {"compute": 1000, "data": 100}
+_DENSE_PHASE_LANES = {
+    "prepare_dense_inputs": "data",
+    "train_core": "compute",
+    "scatter_sparse_grads": "data",
+    "update": "compute",
+}
+_DENSE_PHASE_PRIORITIES = {
+    "train_core": 500,
+    "update": 490,
+    "prepare_dense_inputs": 300,
+    "scatter_sparse_grads": 20,
+}
+
+
+def _dense_phase_schedule(phase: str) -> SchedulePolicy:
+    if phase not in _DENSE_PHASE_LANES:
+        raise ValueError(f"Unknown Dense phase {phase!r}.")
+    return SchedulePolicy.phase_graph(
+        phase=phase,
+        phase_order=_DENSE_PHASE_ORDER,
+        dependencies=_DENSE_PHASE_DEPENDENCIES,
+        lane=_DENSE_PHASE_LANES[phase],
+        lane_order=_DENSE_LANE_ORDER,
+        lane_priorities=_DENSE_LANE_PRIORITIES,
+        phase_priorities=_DENSE_PHASE_PRIORITIES,
+    )
+
 
 # Select array backend for JIT-external operations based on GPU availability.
 # When JAX uses GPU, CuPy provides zero-copy DLPack interop with JAX.
@@ -23,7 +65,7 @@ from .data_types import DPFeatures
 _GPU_AVAILABLE = False
 cupyx = None  # type: ignore[assignment]
 try:
-    import cupy as cp
+    import cupy as cp  # type: ignore[no-redef]
     import cupyx  # type: ignore[no-redef]
 
     # Verify CUDA is actually usable (cupy may be installed without a GPU)
@@ -53,7 +95,7 @@ def _host_array(x, dtype=None):
 # ---------------------------------------------------------------------------
 
 
-@njit(cache=True)
+@njit(nogil=True, cache=True)
 def _gather_2d_kernel(src, indices, out):
     """out[i, :] = src[indices[i], :] — 2D gather by row index.
 
@@ -66,7 +108,7 @@ def _gather_2d_kernel(src, indices, out):
             out[i, d] = src[idx, d]
 
 
-@njit(cache=True)
+@njit(nogil=True, cache=True)
 def _scatter_add_2d_kernel(out, idx, vals):
     """In-place ``out[idx] += vals`` for 2D ``out``/``vals`` and 1D ``idx``.
 
@@ -119,7 +161,7 @@ def _dense_inverse_for_sparse_group(
 
     out = np.empty((batch_size, *widths), dtype=np.int64)
     splits = tuple(_host_array(s, dtype=np.int64) for s in inv_tt.nested_splits)
-    fill_nested_dense_inv_with_pad_kernel(
+    fill_nested_dense_inv_with_pad(
         _host_array(inv_tt.flat_values, dtype=np.int64),
         splits,
         dense_path_strides(widths),
@@ -331,8 +373,12 @@ class DenseSPMD:
         self.grad_accum = state["grad_accum"]
 
     @operator(
-        name="step",
-        async_policy=AsyncPolicy.pipelined(depth=1),
+        name="prepare_dense_inputs",
+        async_policy=AsyncPolicy.pipelined(
+            depth=2,
+            schedule=_dense_phase_schedule("prepare_dense_inputs"),
+            state=StatePolicy.thread_safe(),
+        ),
         input_sharding={
             "emb1": {"type": "dynamic", "axis": ["dp"]},
             "inv1": {"type": "static", "axis": ["dp"]},
@@ -341,12 +387,17 @@ class DenseSPMD:
             "dp_data": {"type": "static", "axis": ["dp"]},
         },
         output_sharding={
-            "grad1": {"type": "mirror", "reference": "step.emb1"},
-            "grad2": {"type": "mirror", "reference": "step.emb2"},
-            "dense_grad": {"type": "static", "axis": []},
+            "f1_rec": {"type": "static", "axis": []},
+            "f2_rec": {"type": "static", "axis": []},
+            "dense_stats": {"type": "static", "axis": []},
+            "labels": {"type": "static", "axis": []},
+            "emb1_ref": {"type": "static", "axis": []},
+            "emb2_ref": {"type": "static", "axis": []},
+            "inv1_dense": {"type": "static", "axis": []},
+            "inv2_dense": {"type": "static", "axis": []},
         },
     )
-    def step(
+    def prepare_dense_inputs(
         self,
         emb1: TransportTensor,
         inv1: TransportTensor,
@@ -354,12 +405,10 @@ class DenseSPMD:
         inv2: TransportTensor,
         dp_data: DPFeatures,
     ) -> dict:
-        # -- Outside JIT: GPU(CuPy) / CPU(NumPy) operations --
         xp = _xp()
         emb1_2d = xp.asarray(emb1.flat_values).reshape(-1, emb1.flat_values.shape[-1])  # type: ignore
         emb2_2d = xp.asarray(emb2.flat_values).reshape(-1, emb2.flat_values.shape[-1])  # type: ignore
 
-        # -- Invariants on embedding dimension consistency --
         assert emb1_2d.shape[1] == self.embed_dim, (
             f"[DenseSPMD] emb1 last dim {emb1_2d.shape[1]} != configured embed_dim {self.embed_dim}"
         )
@@ -409,10 +458,6 @@ class DenseSPMD:
             "transport corruption between SparseEmbeddingSPMD and DenseSPMD"
         )
 
-        # Without pooling, sparse embeddings are naturally (B, S, D). For now
-        # each sample carries a single id (S=1), so we reshape directly back
-        # to 2D for the jit forward. Switch to sum/mean pooling here when
-        # sequence features are introduced.
         f1_rec_3d = _gather_sparse_input(
             emb1.flat_values, inv1_dense, local_batch, self.embed_dim, "f1"
         )
@@ -422,7 +467,6 @@ class DenseSPMD:
         f1_rec = xp.sum(f1_rec_3d, axis=1)  # type: ignore
         f2_rec = xp.sum(f2_rec_3d, axis=1)  # type: ignore
 
-        # -- Invariants on DP-aligned features --
         assert dense_stats.shape[1] == self.dense_stats_dim, (
             f"[DenseSPMD] dense_stats last dim {dense_stats.shape[1]} "
             f"!= configured dense_stats_dim {self.dense_stats_dim}"
@@ -435,10 +479,6 @@ class DenseSPMD:
             f"[DenseSPMD] labels batch {labels_local.shape[0]} "
             f"!= local_batch {local_batch}"
         )
-
-        # -- Numerical correctness check: gather restoration --
-        # f1_rec[i] == emb1_2d[inv1_1d[i]], i.e. reconstructed per-sample
-        # embedding aligns with the inverse mapping.
         assert f1_rec.shape[0] == local_batch, (
             f"[DenseSPMD] f1_rec batch size {f1_rec.shape[0]} != local_batch {local_batch}"
         )
@@ -446,18 +486,57 @@ class DenseSPMD:
             f"[DenseSPMD] f2_rec batch size {f2_rec.shape[0]} != local_batch {local_batch}"
         )
 
+        return {
+            "f1_rec": f1_rec,
+            "f2_rec": f2_rec,
+            "dense_stats": dense_stats,
+            "labels": labels_local,
+            "emb1_ref": emb1,
+            "emb2_ref": emb2,
+            "inv1_dense": inv1_dense,
+            "inv2_dense": inv2_dense,
+        }
+
+    @operator(
+        name="train_core",
+        async_policy=AsyncPolicy.pipelined(
+            depth=1,
+            schedule=_dense_phase_schedule("train_core"),
+        ),
+        input_sharding={
+            "f1_rec": {"type": "static", "axis": []},
+            "f2_rec": {"type": "static", "axis": []},
+            "dense_stats": {"type": "static", "axis": []},
+            "labels": {"type": "static", "axis": []},
+        },
+        output_sharding={
+            "grad_f1": {"type": "static", "axis": []},
+            "grad_f2": {"type": "static", "axis": []},
+            "dense_grad": {"type": "static", "axis": []},
+        },
+    )
+    def train_core(
+        self,
+        f1_rec: TransportTensor,
+        f2_rec: TransportTensor,
+        dense_stats: TransportTensor,
+        labels: TransportTensor,
+    ) -> dict:
+        xp = _xp()
+        f1_local = xp.asarray(f1_rec.flat_values)
+        f2_local = xp.asarray(f2_rec.flat_values)
+        stats_local = xp.asarray(dense_stats.flat_values)
+        labels_local = xp.asarray(labels.flat_values).reshape(-1).astype(xp.float32)  # type: ignore
+        local_batch = int(stats_local.shape[0])
+
         dp_sharding = NamedSharding(self.mesh, P("dp"))
         replicated = NamedSharding(self.mesh, P())
 
-        # -- JIT entry bridge: CuPy -> JAX (DLPack zero-copy) --
-        f1_jax = jnp.asarray(f1_rec)
-        f2_jax = jnp.asarray(f2_rec)
-        stats_jax = jnp.asarray(dense_stats)
+        f1_jax = jnp.asarray(f1_local)
+        f2_jax = jnp.asarray(f2_local)
+        stats_jax = jnp.asarray(stats_local)
         labels_jax = jnp.asarray(labels_local)
 
-        # All world_size JAX workers form one distributed session (via
-        # jax.distributed.initialize in __init__), so the global shape is
-        # world_size * local_batch regardless of CPU or GPU backend.
         jax_world_size = self.world_size
 
         global_f1 = jax.make_array_from_single_device_arrays(
@@ -481,7 +560,6 @@ class DenseSPMD:
             arrays=[labels_jax],
         )
 
-        # -- Inside JIT: JAX training core --
         @nnx.jit(
             in_shardings=(None, dp_sharding, dp_sharding, dp_sharding, dp_sharding),
             out_shardings=(None, dp_sharding, dp_sharding, replicated),
@@ -514,11 +592,75 @@ class DenseSPMD:
         if self.diagnostic_step_delay_ms:
             time.sleep(self.diagnostic_step_delay_ms / 1000.0)
 
-        # -- Post JIT: JAX -> xp --
         grad_f1_local = xp.asarray(grad_f1_global.addressable_shards[0].data)  # type: ignore
         grad_f2_local = xp.asarray(grad_f2_global.addressable_shards[0].data)  # type: ignore
 
-        # scatter-add: (local_batch, emb_dim) → (K_u, emb_dim)
+        dense_grad_leaves = jtu.tree_leaves(dense_param_grads)
+        dense_grad_flat = xp.concatenate(  # type: ignore
+            [xp.asarray(g).ravel() for g in dense_grad_leaves]  # type: ignore
+        )
+
+        print(
+            f"[DenseSPMD.train_core] rank={self.rank} "
+            f"f1_rec={f1_local.shape} f2_rec={f2_local.shape} "
+            f"loss={float(loss_val):.4f} "
+            f"dense_grad_norms={[float(xp.linalg.norm(xp.asarray(g))) for g in dense_grad_leaves]}"  # type: ignore
+        )
+
+        return {
+            "grad_f1": grad_f1_local,
+            "grad_f2": grad_f2_local,
+            "dense_grad": TransportTensor(
+                dense_grad_flat, global_shape=(int(dense_grad_flat.shape[0]),)
+            ),
+        }
+
+    @operator(
+        name="scatter_sparse_grads",
+        async_policy=AsyncPolicy.pipelined(
+            depth=2,
+            schedule=_dense_phase_schedule("scatter_sparse_grads"),
+            state=StatePolicy.thread_safe(),
+        ),
+        input_sharding={
+            "grad_f1": {"type": "static", "axis": []},
+            "grad_f2": {"type": "static", "axis": []},
+            "dense_grad": {"type": "static", "axis": []},
+            "emb1_ref": {"type": "static", "axis": []},
+            "emb2_ref": {"type": "static", "axis": []},
+            "inv1_dense": {"type": "static", "axis": []},
+            "inv2_dense": {"type": "static", "axis": []},
+        },
+        output_sharding={
+            "grad1": {"type": "mirror", "reference": "scatter_sparse_grads.emb1_ref"},
+            "grad2": {"type": "mirror", "reference": "scatter_sparse_grads.emb2_ref"},
+            "dense_grad": {"type": "static", "axis": []},
+        },
+    )
+    def scatter_sparse_grads(
+        self,
+        grad_f1: TransportTensor,
+        grad_f2: TransportTensor,
+        dense_grad: TransportTensor,
+        emb1_ref: TransportTensor,
+        emb2_ref: TransportTensor,
+        inv1_dense: TransportTensor,
+        inv2_dense: TransportTensor,
+    ) -> dict:
+        xp = _xp()
+        emb1_2d = xp.asarray(emb1_ref.flat_values).reshape(
+            -1, emb1_ref.flat_values.shape[-1]
+        )  # type: ignore
+        emb2_2d = xp.asarray(emb2_ref.flat_values).reshape(
+            -1, emb2_ref.flat_values.shape[-1]
+        )  # type: ignore
+        inv1_arr = xp.asarray(inv1_dense.flat_values)
+        inv2_arr = xp.asarray(inv2_dense.flat_values)
+        inv1_1d = inv1_arr.reshape(-1)
+        inv2_1d = inv2_arr.reshape(-1)
+        grad_f1_local = xp.asarray(grad_f1.flat_values)
+        grad_f2_local = xp.asarray(grad_f2.flat_values)
+
         emb1_for_grad = xp.concatenate(  # type: ignore
             [emb1_2d, xp.zeros((1, self.embed_dim), dtype=emb1_2d.dtype)], axis=0
         )
@@ -528,17 +670,14 @@ class DenseSPMD:
         g1_unique = _scatter_add_grad(
             emb1_for_grad,
             inv1_1d,
-            _pooled_grad_slots(inv1_dense, emb1_2d.shape[0], grad_f1_local),
+            _pooled_grad_slots(inv1_arr, emb1_2d.shape[0], grad_f1_local),
         )[: emb1_2d.shape[0]]
         g2_unique = _scatter_add_grad(
             emb2_for_grad,
             inv2_1d,
-            _pooled_grad_slots(inv2_dense, emb2_2d.shape[0], grad_f2_local),
+            _pooled_grad_slots(inv2_arr, emb2_2d.shape[0], grad_f2_local),
         )[: emb2_2d.shape[0]]
 
-        # -- Numerical correctness check: scatter-add gradients --
-        # The number of non-zero rows after scatter-add must not exceed the
-        # number of unique keys.
         if _GPU_AVAILABLE:
             g1_nonzero_rows = int(cp.count_nonzero(cp.any(g1_unique != 0, axis=1)))  # type: ignore
             g2_nonzero_rows = int(cp.count_nonzero(cp.any(g2_unique != 0, axis=1)))  # type: ignore
@@ -554,29 +693,18 @@ class DenseSPMD:
             f"exceeds unique keys count {emb2_2d.shape[0]}"
         )
 
-        dense_grad_leaves = jtu.tree_leaves(dense_param_grads)
-        dense_grad_flat = xp.concatenate(  # type: ignore
-            [xp.asarray(g).ravel() for g in dense_grad_leaves]  # type: ignore
-        )
-
-        print(
-            f"[DenseSPMD.step] rank={self.rank} "
-            f"f1_rec={f1_rec.shape} f2_rec={f2_rec.shape} "
-            f"loss={float(loss_val):.4f} "
-            f"dense_grad_norms={[float(xp.linalg.norm(xp.asarray(g))) for g in dense_grad_leaves]}"  # type: ignore
-        )
-
         return {
             "grad1": g1_unique,
             "grad2": g2_unique,
-            "dense_grad": TransportTensor(
-                dense_grad_flat, global_shape=(int(dense_grad_flat.shape[0]),)
-            ),
+            "dense_grad": dense_grad,
         }
 
     @operator(
         name="update",
-        async_policy=AsyncPolicy.sync(),
+        async_policy=AsyncPolicy.pipelined(
+            depth=1,
+            schedule=_dense_phase_schedule("update"),
+        ),
         input_sharding={"dense_grad": {"type": "static", "axis": []}},
     )
     def update(self, dense_grad: TransportTensor) -> None:

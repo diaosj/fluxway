@@ -10,7 +10,11 @@ import inspect
 import threading
 from typing import Any
 
+from fluxway.common import asyncio_runtime
 from fluxway.profiler.recorder import WORKER_OUTBOUND_TASK
+
+
+WORKER_PROCESS_DEFAULT_EXECUTION_LANE = "__default__"
 
 
 class WorkerProcessCallRuntime:
@@ -25,14 +29,14 @@ class WorkerProcessCallRuntime:
             raise ValueError(
                 f"worker process call max_workers must be positive, got {max_workers}."
             )
+        self._max_workers = max_workers
         self._profiler_runtime = profiler_runtime
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix=thread_name_prefix,
-        )
-        self._futures: set[Future[Any]] = set()
+        self._thread_name_prefix = thread_name_prefix
+        self._executors: dict[str, ThreadPoolExecutor] = {}
+        self._futures_by_lane: dict[str, set[Future[Any]]] = {}
         self._futures_lock = threading.Lock()
         self._closed = False
+        self._executor_for_lane(WORKER_PROCESS_DEFAULT_EXECUTION_LANE)
 
     async def submit(
         self,
@@ -40,9 +44,13 @@ class WorkerProcessCallRuntime:
         *,
         callable_id: str,
         resource_id: int,
+        execution_lane: str,
     ) -> Any:
         if self._closed:
             raise RuntimeError("WorkerProcessCallRuntime is closed.")
+        if not execution_lane:
+            raise ValueError("worker process execution_lane must be non-empty.")
+        executor = self._executor_for_lane(execution_lane)
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         profiler_runtime = self._profiler_runtime
@@ -62,7 +70,7 @@ class WorkerProcessCallRuntime:
             def invoke() -> Any:
                 result = fn()
                 if inspect.iscoroutine(result):
-                    return asyncio.run(result)
+                    return asyncio_runtime.run(result)
                 return result
 
             if recorder is None:
@@ -79,18 +87,18 @@ class WorkerProcessCallRuntime:
             else None
         )
         if recorder is None:
-            future = self._executor.submit(run_in_worker_thread)
+            future = executor.submit(run_in_worker_thread)
         else:
             with recorder.worker_process_submit(
                 callable_id=callable_id,
                 resource_id=resource_id,
-                pending_call_count=self.pending_count() + 1,
+                pending_call_count=self.pending_count(execution_lane) + 1,
             ):
-                future = self._executor.submit(run_in_worker_thread)
-        self._add_future(future)
+                future = executor.submit(run_in_worker_thread)
+        self._add_future(execution_lane, future)
 
         def on_done(done_future: Future[Any]) -> None:
-            self._discard_future(done_future)
+            self._discard_future(execution_lane, done_future)
             if start_future is not None and not start_future.done():
                 loop.call_soon_threadsafe(self._mark_thread_started, start_future)
 
@@ -101,39 +109,66 @@ class WorkerProcessCallRuntime:
                 async with recorder.worker_process_queue_wait(
                     callable_id=callable_id,
                     resource_id=resource_id,
-                    pending_call_count=self.pending_count(),
+                    pending_call_count=self.pending_count(execution_lane),
                 ):
                     await start_future
                 async with recorder.worker_process_future_wait(
                     callable_id=callable_id,
                     resource_id=resource_id,
-                    pending_call_count=self.pending_count(),
+                    pending_call_count=self.pending_count(execution_lane),
                 ):
                     return await asyncio.wrap_future(future)
             return await asyncio.wrap_future(future)
         finally:
             if future.done():
-                self._discard_future(future)
+                self._discard_future(execution_lane, future)
 
     @staticmethod
     def _mark_thread_started(start_future: asyncio.Future[None]) -> None:
         if not start_future.done():
             start_future.set_result(None)
 
-    def _add_future(self, future: Future[Any]) -> None:
-        with self._futures_lock:
-            self._futures.add(future)
+    def _executor_for_lane(self, lane: str) -> ThreadPoolExecutor:
+        if not lane:
+            raise ValueError("worker process lane must be non-empty.")
+        executor = self._executors.get(lane)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix=f"{self._thread_name_prefix}-{lane}",
+            )
+            self._executors[lane] = executor
+            self._futures_by_lane[lane] = set()
+        return executor
 
-    def _discard_future(self, future: Future[Any]) -> None:
+    def _add_future(self, lane: str, future: Future[Any]) -> None:
         with self._futures_lock:
-            self._futures.discard(future)
+            self._futures_by_lane[lane].add(future)
 
-    def _pending_futures(self) -> list[Future[Any]]:
+    def _discard_future(self, lane: str, future: Future[Any]) -> None:
         with self._futures_lock:
-            return [future for future in self._futures if not future.done()]
+            self._futures_by_lane[lane].discard(future)
 
-    def pending_count(self) -> int:
-        return len(self._pending_futures())
+    def _pending_futures(self, lane: str | None = None) -> list[Future[Any]]:
+        with self._futures_lock:
+            if lane is not None:
+                return [
+                    future
+                    for future in self._futures_by_lane[lane]
+                    if not future.done()
+                ]
+            return [
+                future
+                for futures in self._futures_by_lane.values()
+                for future in futures
+                if not future.done()
+            ]
+
+    def pending_count(self, lane: str | None = None) -> int:
+        return len(self._pending_futures(lane))
+
+    def execution_lane_names(self) -> tuple[str, ...]:
+        return tuple(self._executors.keys())
 
     async def drain(self) -> None:
         while True:
@@ -154,11 +189,13 @@ class WorkerProcessCallRuntime:
                 return_exceptions=True,
             )
         with self._futures_lock:
-            self._futures.clear()
+            for futures_by_lane in self._futures_by_lane.values():
+                futures_by_lane.clear()
 
     def close(self) -> None:
         self._closed = True
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        for executor in self._executors.values():
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 class LocalInputPrepareRuntime:

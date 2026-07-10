@@ -62,7 +62,10 @@ class NodeProxy:
         """
 
         def _call_op(
-            *args: OpHandle, condition_fn: Callable[..., bool] | None = None, **kwargs
+            *args: OpHandle,
+            condition_fn: Callable[..., bool] | None = None,
+            local: bool = False,
+            **kwargs,
         ) -> OpHandle:
             # Fetch target arguments to map positional args
             target_node = self._graph._builder._nodes.get(self.node_id)
@@ -136,6 +139,7 @@ class NodeProxy:
                     condition_fn=condition_fn,
                     source_output=inferred_source_output,
                     target_input=target_input,
+                    local_only=local,
                 )
 
             # Register edges for keyword arguments (with explicit target mapping)
@@ -171,6 +175,7 @@ class NodeProxy:
                     condition_fn=condition_fn,
                     source_output=inferred_source_output,
                     target_input=target_arg,
+                    local_only=local,
                 )
 
             # 3. Handle Outputs: Retrieve pre-assigned UUIDs from the Builder

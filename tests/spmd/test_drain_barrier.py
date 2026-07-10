@@ -141,7 +141,8 @@ class TestDrainAndAllowedStepIndependence:
         fired = threading.Event()
         sync = _make_sync(num_workers=2)
         sync.set_callbacks(
-            block_worker_op=lambda r, op: None, unblock_worker_op=lambda r, op: None
+            block_worker_op=lambda r, op, version: None,
+            unblock_worker_op=lambda r, op, version: None,
         )
         _register_op(sync, "op_a", step=0)
         sync.update_allowed_step("op_a", 3)

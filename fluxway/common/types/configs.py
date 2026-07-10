@@ -106,6 +106,8 @@ class SPMDTopologyInfo(FluxwayBaseSchema):
     condition_fn: Callable[..., bool] | None = None
     # Link to the symmetric edge (src_node, src_op, dst_node, dst_op)
     symmetric_to: tuple[str, str, str, str] | None = None
+    # Worker-local transport edge; valid only for same SPMD rank self edges.
+    local_only: bool = False
     # Whether this remote node is an interleaved source
     is_interleaved: bool = False
     # Size of the interleaved group (if applicable)
@@ -285,6 +287,8 @@ class Edge(FluxwayBaseSchema):
     # Link to the symmetric edge (for automatic mirror-sharding based routing)
     # Format: (source_node, source_op, target_node, target_op)
     symmetric_to: tuple[str, str, str, str] | None = None
+    # Skip global data-plane topology and deliver directly inside the worker.
+    local_only: bool = False
 
 
 class Node(FluxwayBaseSchema):
@@ -333,6 +337,7 @@ class EdgeShardingInfo(FluxwayBaseSchema):
     input_param_map: dict[str, list[str]] = Field(default_factory=dict)
     is_interleaved: bool = False
     interleave_unit_size: int = 1
+    local_only: bool = False
 
 
 class BarrierType(StrEnum):
@@ -404,6 +409,11 @@ class SchedulePolicy(FluxwayBaseSchema):
     trigger: str = "staleness_limit"
     phase: str | None = None
     phase_ordering: tuple[str, ...] = Field(default=(), alias="phase_order")
+    phase_dependencies: tuple[tuple[str, str, int], ...] = ()
+    lane: str | None = None
+    lane_ordering: tuple[str, ...] = Field(default=(), alias="lane_order")
+    lane_priorities: dict[str, int] = Field(default_factory=dict)
+    phase_priorities: dict[str, int] = Field(default_factory=dict)
     micro_step_key: str = "step"
 
     @classmethod
@@ -441,8 +451,35 @@ class SchedulePolicy(FluxwayBaseSchema):
             base_priority=base_priority,
         )
 
+    @classmethod
+    def phase_graph(
+        cls,
+        *,
+        phase: str,
+        phase_order: tuple[str, ...],
+        dependencies: tuple[tuple[str, str, int], ...],
+        lane: str | None = None,
+        lane_order: tuple[str, ...] = (),
+        lane_priorities: dict[str, int] | None = None,
+        phase_priorities: dict[str, int] | None = None,
+        micro_step_key: str = "step",
+        base_priority: int = 0,
+    ) -> "SchedulePolicy":
+        return cls(
+            kind="phase_graph",
+            phase=phase,
+            phase_ordering=phase_order,
+            phase_dependencies=dependencies,
+            lane=lane,
+            lane_ordering=lane_order,
+            lane_priorities={} if lane_priorities is None else lane_priorities,
+            phase_priorities={} if phase_priorities is None else phase_priorities,
+            micro_step_key=micro_step_key,
+            base_priority=base_priority,
+        )
+
     def model_post_init(self, __context: Any) -> None:
-        if self.kind not in ("fifo", "deadline_boost", "phase_order"):
+        if self.kind not in ("fifo", "deadline_boost", "phase_order", "phase_graph"):
             raise ValueError(f"Unsupported SchedulePolicy kind {self.kind!r}.")
         if self.trigger != "staleness_limit":
             raise ValueError(
@@ -452,14 +489,113 @@ class SchedulePolicy(FluxwayBaseSchema):
             raise ValueError(
                 f"SchedulePolicy.micro_step_key must be 'step', got {self.micro_step_key!r}."
             )
-        if self.kind == "phase_order":
+        if self.kind in ("phase_order", "phase_graph"):
             if not self.phase:
-                raise ValueError("SchedulePolicy.phase_order requires a phase.")
+                raise ValueError(f"SchedulePolicy.{self.kind} requires a phase.")
             if not self.phase_ordering:
-                raise ValueError("SchedulePolicy.phase_order requires phase_order.")
+                raise ValueError(f"SchedulePolicy.{self.kind} requires phase_order.")
             if self.phase not in self.phase_ordering:
                 raise ValueError(
                     f"phase {self.phase!r} must be present in phase_order={self.phase_ordering!r}."
+                )
+        if self.kind == "phase_graph":
+            self._validate_phase_graph()
+        self._validate_lane_schedule()
+
+    def _validate_phase_graph(self) -> None:
+        phase_order = tuple(self.phase_ordering)
+        if not self.phase_dependencies:
+            raise ValueError("SchedulePolicy.phase_graph requires dependencies.")
+        seen: set[tuple[str, str, int]] = set()
+        same_step_edges: dict[str, set[str]] = {phase: set() for phase in phase_order}
+        for dependency in self.phase_dependencies:
+            if len(dependency) != 3:
+                raise ValueError(
+                    "SchedulePolicy.phase_graph dependencies must be "
+                    "(before_phase, after_phase, step_delta) triples."
+                )
+            before, after, step_delta = dependency
+            if not before or not after:
+                raise ValueError(
+                    "SchedulePolicy.phase_graph dependency phases must be non-empty."
+                )
+            if before not in phase_order:
+                raise ValueError(
+                    f"phase_graph dependency before phase {before!r} is not in "
+                    f"phase_order={phase_order!r}."
+                )
+            if after not in phase_order:
+                raise ValueError(
+                    f"phase_graph dependency after phase {after!r} is not in "
+                    f"phase_order={phase_order!r}."
+                )
+            if not isinstance(step_delta, int):
+                raise ValueError(
+                    "SchedulePolicy.phase_graph dependency step_delta must be an int."
+                )
+            if step_delta < 0:
+                raise ValueError(
+                    "SchedulePolicy.phase_graph dependency step_delta must be non-negative."
+                )
+            if before == after and step_delta == 0:
+                raise ValueError(
+                    "SchedulePolicy.phase_graph same-step self-dependencies are invalid."
+                )
+            key = (before, after, step_delta)
+            if key in seen:
+                raise ValueError(
+                    f"SchedulePolicy.phase_graph duplicate dependency {key!r}."
+                )
+            seen.add(key)
+            if step_delta == 0:
+                same_step_edges[before].add(after)
+        self._validate_phase_graph_same_step_dag(same_step_edges)
+
+    @staticmethod
+    def _validate_phase_graph_same_step_dag(edges: dict[str, set[str]]) -> None:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(phase: str) -> None:
+            if phase in visited:
+                return
+            if phase in visiting:
+                raise ValueError(
+                    "SchedulePolicy.phase_graph same-step dependencies must be acyclic."
+                )
+            visiting.add(phase)
+            for successor in edges[phase]:
+                visit(successor)
+            visiting.remove(phase)
+            visited.add(phase)
+
+        for phase in edges:
+            visit(phase)
+
+    def _validate_lane_schedule(self) -> None:
+        if self.lane is None:
+            if self.lane_ordering:
+                raise ValueError("SchedulePolicy.lane_order requires lane.")
+            if self.lane_priorities:
+                raise ValueError("SchedulePolicy.lane_priorities requires lane.")
+            return
+        if not self.lane:
+            raise ValueError("SchedulePolicy.lane must be non-empty when provided.")
+        if self.lane_ordering and self.lane not in self.lane_ordering:
+            raise ValueError(
+                f"lane {self.lane!r} must be present in lane_order={self.lane_ordering!r}."
+            )
+        unknown_lanes = set(self.lane_priorities).difference(self.lane_ordering)
+        if unknown_lanes and self.lane_ordering:
+            raise ValueError(
+                f"lane_priorities references lanes outside lane_order: {sorted(unknown_lanes)}."
+            )
+        if self.phase_priorities:
+            phase_order = set(self.phase_ordering)
+            unknown_phases = set(self.phase_priorities).difference(phase_order)
+            if unknown_phases:
+                raise ValueError(
+                    f"phase_priorities references phases outside phase_order: {sorted(unknown_phases)}."
                 )
 
 
@@ -567,9 +703,9 @@ class AsyncPolicy(FluxwayBaseSchema):
         if self.mode == "pipeline_parallel":
             if not self.phases:
                 raise ValueError("AsyncPolicy.pipeline_parallel requires phases.")
-            if self.schedule.kind != "phase_order":
+            if self.schedule.kind not in ("phase_order", "phase_graph"):
                 raise ValueError(
-                    "AsyncPolicy.pipeline_parallel requires SchedulePolicy.phase_order()."
+                    "AsyncPolicy.pipeline_parallel requires a phase schedule."
                 )
 
     def max_staleness_limit(self) -> int | None:

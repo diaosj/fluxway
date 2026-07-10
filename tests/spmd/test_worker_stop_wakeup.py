@@ -27,7 +27,9 @@ def _make_worker_stub():
         _drain_target_count=typing.cast(int | None, 5),
         _drain_cond=asyncio.Condition(),
         _execution_queue=asyncio.PriorityQueue(),
+        _execution_queues={},
         _run_task=None,
+        _lane_run_tasks={},
         _heartbeat_task=None,
         _background_tasks=set(),
         _outbound_tasks=set(),
@@ -36,6 +38,7 @@ def _make_worker_stub():
         spmd_id="test_spmd",
         rank=0,
     )
+    stub._execution_queues = {"__default__": stub._execution_queue}
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
         background_tasks=stub._background_tasks,
         on_task_done=lambda _task: None,

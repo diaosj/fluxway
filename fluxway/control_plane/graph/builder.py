@@ -313,6 +313,7 @@ class Builder:
         target_input: str | None = None,
         tensor_map: dict[str, str] | None = None,
         symmetric_to: tuple[str, str, str, str] | None = None,
+        local_only: bool = False,
     ) -> "Builder":
         """
         Add a generic edge specifying source and target op names.
@@ -346,6 +347,11 @@ class Builder:
             raise ValueError(f"Source node '{source_node}' not found")
         if target_node not in self._nodes:
             raise ValueError(f"Target node '{target_node}' not found")
+        if local_only and source_node != target_node:
+            raise ValueError(
+                "local_only edges require source_node == target_node, "
+                f"got {source_node!r} -> {target_node!r}."
+            )
 
         edge = Edge(
             source_node=source_node,
@@ -354,6 +360,7 @@ class Builder:
             target_op=target_op,
             condition_fn=condition_fn,
             symmetric_to=symmetric_to,
+            local_only=local_only,
         )
 
         # All edges go into _edges (no semantic distinction anymore)
@@ -370,6 +377,7 @@ class Builder:
             target_input,
             tensor_map=tensor_map,
             symmetric_to=symmetric_to,
+            local_only=local_only,
         )
 
         return self
@@ -476,6 +484,7 @@ class Builder:
         target_input: str | None = None,
         tensor_map: dict[str, str] | None = None,
         symmetric_to: tuple[str, str, str, str] | None = None,
+        local_only: bool = False,
     ) -> None:
         """
         Validate and link operator metadata between two nodes.
@@ -565,6 +574,7 @@ class Builder:
             tuuid_src_out=tuuid_src_out,
             tuuid_dst_in=tuuid_dst_in,
             symmetric_to=symmetric_to,
+            local_only=local_only,
         )
         self._link_sharding(
             source_node,
@@ -579,6 +589,7 @@ class Builder:
             tuuid_map=tuuid_map,
             tuuid_src_out=tuuid_src_out,
             tuuid_dst_in=tuuid_dst_in,
+            local_only=local_only,
         )
 
     def _validate_edge_io(
@@ -772,6 +783,7 @@ class Builder:
         tuuid_src_out: dict[int, Any],
         tuuid_dst_in: dict[int, Any],
         symmetric_to: tuple[str, str, str, str] | None = None,
+        local_only: bool = False,
     ) -> None:
         """Link nodes within the SPMDConfig topology dictionaries."""
         src_cfg = self._nodes[source_node].spmd_config
@@ -792,11 +804,17 @@ class Builder:
                 tuuid_map=tuuid_map,
                 tuuid_sharding=tuuid_dst_in,
                 symmetric_to=symmetric_to,
+                local_only=local_only,
                 is_interleaved=getattr(src_meta, "is_interleaved", False),
                 interleave_unit_size=getattr(src_meta, "interleave_unit_size", 1),
             )
         else:
             topo = src_cfg.topology[source_op].successors[target_node]
+            if topo.local_only != local_only:
+                raise ValueError(
+                    "Cannot mix local_only and remote edges for the same successor "
+                    f"topology {source_node}.{source_op} -> {target_node}."
+                )
             topo.world_size = dst_cfg.num_workers
             topo.mesh = dst_cfg.mesh
             topo.tuuid_map.update(tuuid_map)
@@ -813,11 +831,17 @@ class Builder:
                 tuuid_map=tuuid_map,
                 tuuid_sharding=tuuid_src_out,
                 symmetric_to=symmetric_to,
+                local_only=local_only,
                 is_interleaved=getattr(src_meta, "is_interleaved", False),
                 interleave_unit_size=getattr(src_meta, "interleave_unit_size", 1),
             )
         else:
             topo = dst_cfg.topology[target_op].predecessors[source_node]
+            if topo.local_only != local_only:
+                raise ValueError(
+                    "Cannot mix local_only and remote edges for the same predecessor "
+                    f"topology {source_node} -> {target_node}.{target_op}."
+                )
             topo.world_size = src_cfg.num_workers
             topo.mesh = src_cfg.mesh
             topo.tuuid_map.update(tuuid_map)
@@ -897,6 +921,7 @@ class Builder:
         tuuid_map: dict[str, int],
         tuuid_src_out: dict[int, Any],
         tuuid_dst_in: dict[int, Any],
+        local_only: bool = False,
     ) -> None:
         """Inject edge sharding information into OperatorMeta objects."""
         src_cfg = self._nodes[source_node].spmd_config
@@ -945,6 +970,7 @@ class Builder:
                 output_param_map=src_meta.output_param_map,
                 is_interleaved=is_interleaved,
                 interleave_unit_size=interleave_unit_size,
+                local_only=local_only,
             )
         )
         src_meta.output_post_sharding.setdefault(target_node, []).append(
@@ -958,6 +984,7 @@ class Builder:
                 output_param_map=src_meta.output_param_map,
                 is_interleaved=is_interleaved,
                 interleave_unit_size=interleave_unit_size,
+                local_only=local_only,
             )
         )
 

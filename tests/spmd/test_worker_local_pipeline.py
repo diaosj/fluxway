@@ -24,6 +24,34 @@ def _raw_worker_class():
     return SPMDWorker.__ray_actor_class__
 
 
+def _attach_schedule_key_methods(stub, raw_cls):
+    stub._uses_lane_aware_phase_priority = raw_cls._uses_lane_aware_phase_priority
+    stub._lane_priority = raw_cls._lane_priority
+    stub._phase_priority = raw_cls._phase_priority
+
+
+def _attach_execution_queue_methods(stub, raw_cls):
+    stub._execution_queues = {"__default__": stub._execution_queue}
+    stub._initialize_execution_lanes = types.MethodType(
+        raw_cls._initialize_execution_lanes,
+        stub,
+    )
+    stub._execution_lane_for_op = types.MethodType(
+        raw_cls._execution_lane_for_op,
+        stub,
+    )
+    stub._execution_queue_for_lane = types.MethodType(
+        raw_cls._execution_queue_for_lane,
+        stub,
+    )
+    stub._execution_queue_for_op = types.MethodType(
+        raw_cls._execution_queue_for_op,
+        stub,
+    )
+    stub._put_execution_item = types.MethodType(raw_cls._put_execution_item, stub)
+    _attach_schedule_key_methods(stub, raw_cls)
+
+
 def _make_pipeline_stub(meta: OperatorMeta):
     return _make_pipeline_stub_with_profiler(meta, profiler_enabled=False)
 
@@ -56,6 +84,7 @@ def _make_pipeline_stub_with_profiler(
         _ready_pending_pipeline_steps={"op": []},
         _pending_future_steps={"op": []},
         _pending_async_lag_steps={"op": []},
+        _pending_phase_order_steps={"op": []},
         _completed_step_count={"op": 0},
         _scheduled_step_count={"op": 0},
         _mailbox_ready_steps={"op": set()},
@@ -142,6 +171,7 @@ def _make_pipeline_stub_with_profiler(
         stub,
     )
     stub._enqueue = types.MethodType(raw_cls._enqueue, stub)
+    _attach_execution_queue_methods(stub, raw_cls)
     stub._effective_schedule_key = types.MethodType(
         raw_cls._effective_schedule_key,
         stub,
@@ -169,6 +199,23 @@ def _make_pipeline_stub_with_profiler(
     )
     stub._release_async_lag_steps = types.MethodType(
         raw_cls._release_async_lag_steps,
+        stub,
+    )
+    stub._phase_order_policy = types.MethodType(raw_cls._phase_order_policy, stub)
+    stub._phase_order_operator_sequence = types.MethodType(
+        raw_cls._phase_order_operator_sequence,
+        stub,
+    )
+    stub._phase_order_step_blocked = types.MethodType(
+        raw_cls._phase_order_step_blocked,
+        stub,
+    )
+    stub._phase_graph_step_blocked = types.MethodType(
+        raw_cls._phase_graph_step_blocked,
+        stub,
+    )
+    stub._release_phase_order_steps = types.MethodType(
+        raw_cls._release_phase_order_steps,
         stub,
     )
     stub.set_drain_target_count = types.MethodType(
@@ -254,6 +301,7 @@ def test_deadline_boost_schedule_prioritizes_stale_boundary_update():
         raw_cls._prepare_schedule_state, stub
     )
     stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
+    _attach_schedule_key_methods(stub, raw_cls)
 
     assert stub._effective_schedule_key("update", 3) < stub._effective_schedule_key(
         "lookup",
@@ -391,6 +439,7 @@ def test_phase_order_schedule_places_forward_before_backward_same_micro_step():
         raw_cls._prepare_schedule_state, stub
     )
     stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
+    _attach_schedule_key_methods(stub, raw_cls)
 
     assert stub._effective_schedule_key("forward", 4) < stub._effective_schedule_key(
         "backward",
@@ -400,6 +449,176 @@ def test_phase_order_schedule_places_forward_before_backward_same_micro_step():
         "forward",
         5,
     )
+
+
+@pytest.mark.asyncio
+async def test_phase_order_gate_blocks_train_until_previous_update_commits():
+    raw_cls = _raw_worker_class()
+    order = (
+        "prepare_dense_inputs",
+        "train_core",
+        "scatter_sparse_grads",
+        "update",
+    )
+
+    def meta(name):
+        policy = SchedulePolicy.phase_order(phase=name, phase_order=order)
+        return OperatorMeta(
+            name=name,
+            async_policy=AsyncPolicy.pipelined(depth=2, schedule=policy),
+            schedule_policy=policy,
+        )
+
+    metas = {name: meta(name) for name in order}
+    op_manager = MagicMock()
+    op_manager._get_operator_metadata.side_effect = lambda name: metas[name]
+    op_manager.get_operator_metadata.side_effect = lambda name: metas[name]
+    stub = types.SimpleNamespace(
+        op_manager=op_manager,
+        config=types.SimpleNamespace(operator_metas=metas),
+        _completed_step_count={
+            "prepare_dense_inputs": 2,
+            "train_core": 1,
+            "scatter_sparse_grads": 1,
+            "update": 0,
+        },
+        _pending_phase_order_steps={"train_core": [1]},
+        _execution_queue=asyncio.PriorityQueue(),
+        _in_op_step_queue=set(),
+        _running=True,
+        _profiler_runtime=types.SimpleNamespace(enabled=False),
+        spmd_id="dense",
+        rank=0,
+    )
+    stub._phase_order_policy = types.MethodType(raw_cls._phase_order_policy, stub)
+    stub._phase_order_operator_sequence = types.MethodType(
+        raw_cls._phase_order_operator_sequence,
+        stub,
+    )
+    stub._phase_order_step_blocked = types.MethodType(
+        raw_cls._phase_order_step_blocked,
+        stub,
+    )
+    stub._release_phase_order_steps = types.MethodType(
+        raw_cls._release_phase_order_steps,
+        stub,
+    )
+    stub._enqueue = types.MethodType(raw_cls._enqueue, stub)
+    _attach_execution_queue_methods(stub, raw_cls)
+    stub._effective_schedule_key = types.MethodType(
+        raw_cls._effective_schedule_key,
+        stub,
+    )
+    stub._prepare_schedule_state = types.MethodType(
+        raw_cls._prepare_schedule_state,
+        stub,
+    )
+    stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
+    stub._should_prepare_inputs_on_ready = lambda _op_name: False
+
+    assert not stub._phase_order_step_blocked("prepare_dense_inputs", 1)
+    assert stub._phase_order_step_blocked("train_core", 1)
+
+    stub._completed_step_count["update"] = 1
+    assert not stub._phase_order_step_blocked("train_core", 1)
+
+    await stub._release_phase_order_steps()
+    assert stub._pending_phase_order_steps["train_core"] == []
+    assert await stub._execution_queue.get() == (5, 0, 1, "train_core")
+
+
+@pytest.mark.asyncio
+async def test_phase_graph_allows_scatter_and_update_parallel_but_blocks_next_train():
+    raw_cls = _raw_worker_class()
+    order = (
+        "prepare_dense_inputs",
+        "train_core",
+        "scatter_sparse_grads",
+        "update",
+    )
+    dependencies = (
+        ("prepare_dense_inputs", "train_core", 0),
+        ("train_core", "scatter_sparse_grads", 0),
+        ("train_core", "update", 0),
+        ("update", "train_core", 1),
+    )
+
+    def meta(name):
+        policy = SchedulePolicy.phase_graph(
+            phase=name,
+            phase_order=order,
+            dependencies=dependencies,
+        )
+        return OperatorMeta(
+            name=name,
+            async_policy=AsyncPolicy.pipelined(depth=2, schedule=policy),
+            schedule_policy=policy,
+        )
+
+    metas = {name: meta(name) for name in order}
+    op_manager = MagicMock()
+    op_manager._get_operator_metadata.side_effect = lambda name: metas[name]
+    op_manager.get_operator_metadata.side_effect = lambda name: metas[name]
+    stub = types.SimpleNamespace(
+        op_manager=op_manager,
+        config=types.SimpleNamespace(operator_metas=metas),
+        _completed_step_count={
+            "prepare_dense_inputs": 2,
+            "train_core": 1,
+            "scatter_sparse_grads": 0,
+            "update": 0,
+        },
+        _pending_phase_order_steps={"update": [0], "train_core": [1]},
+        _execution_queue=asyncio.PriorityQueue(),
+        _in_op_step_queue=set(),
+        _running=True,
+        _profiler_runtime=types.SimpleNamespace(enabled=False),
+        spmd_id="dense",
+        rank=0,
+    )
+    stub._phase_order_policy = types.MethodType(raw_cls._phase_order_policy, stub)
+    stub._phase_order_operator_sequence = types.MethodType(
+        raw_cls._phase_order_operator_sequence,
+        stub,
+    )
+    stub._phase_order_step_blocked = types.MethodType(
+        raw_cls._phase_order_step_blocked,
+        stub,
+    )
+    stub._phase_graph_step_blocked = types.MethodType(
+        raw_cls._phase_graph_step_blocked,
+        stub,
+    )
+    stub._release_phase_order_steps = types.MethodType(
+        raw_cls._release_phase_order_steps,
+        stub,
+    )
+    stub._enqueue = types.MethodType(raw_cls._enqueue, stub)
+    _attach_execution_queue_methods(stub, raw_cls)
+    stub._effective_schedule_key = types.MethodType(
+        raw_cls._effective_schedule_key,
+        stub,
+    )
+    stub._prepare_schedule_state = types.MethodType(
+        raw_cls._prepare_schedule_state,
+        stub,
+    )
+    stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
+    stub._should_prepare_inputs_on_ready = lambda _op_name: False
+
+    assert not stub._phase_order_step_blocked("scatter_sparse_grads", 0)
+    assert not stub._phase_order_step_blocked("update", 0)
+    assert stub._phase_order_step_blocked("train_core", 1)
+
+    await stub._release_phase_order_steps()
+    assert stub._pending_phase_order_steps["update"] == []
+    assert stub._pending_phase_order_steps["train_core"] == [1]
+    assert await stub._execution_queue.get() == (3, 0, 0, "update")
+
+    stub._completed_step_count["update"] = 1
+    await stub._release_phase_order_steps()
+    assert stub._pending_phase_order_steps["train_core"] == []
+    assert await stub._execution_queue.get() == (5, 0, 1, "train_core")
 
 
 @pytest.mark.asyncio

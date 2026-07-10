@@ -318,6 +318,8 @@ class Scheduler:
         """
         topology: dict[str, list[str]] = {name: [] for name in graph.nodes}
         for edge in graph.edges:
+            if getattr(edge, "local_only", False):
+                continue
             if edge.source_node in topology:
                 if edge.target_node not in topology[edge.source_node]:
                     topology[edge.source_node].append(edge.target_node)

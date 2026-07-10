@@ -495,7 +495,7 @@ def dense_path_strides(widths: tuple[int, ...]) -> np.ndarray:
     return strides
 
 
-@njit(parallel=True, cache=True)
+@njit(parallel=True, nogil=True, cache=True)
 def nested_global_positions_kernel(
     local_rows: np.ndarray,
     path_offsets: np.ndarray,
@@ -510,7 +510,7 @@ def nested_global_positions_kernel(
         out[i] = slot
 
 
-@njit(parallel=True, cache=True)
+@njit(parallel=True, nogil=True, cache=True)
 def scatter_inv_local_kernel(
     global_positions: np.ndarray,
     inv_1d: np.ndarray,
@@ -521,7 +521,7 @@ def scatter_inv_local_kernel(
         out[i] = global_positions[inv_1d[i]] - global_start
 
 
-@njit(cache=True)
+@njit(nogil=True, cache=True)
 def fill_nested_dense_inv_kernel(
     flat_to_unique_local: np.ndarray,
     nested_splits: tuple[np.ndarray, ...],
@@ -543,7 +543,7 @@ def fill_nested_dense_inv_kernel(
         out.flat[dense_slot] = flat_to_unique_local[flat_index]
 
 
-@njit(cache=True)
+@njit(nogil=True, cache=True)
 def fill_nested_dense_inv_with_pad_kernel(
     flat_to_unique_local: np.ndarray,
     nested_splits: tuple[np.ndarray, ...],
@@ -564,6 +564,64 @@ def fill_nested_dense_inv_with_pad_kernel(
             child = parent
         dense_slot += child * strides[0]
         out.flat[dense_slot] = flat_to_unique_local[flat_index]
+
+
+@njit(parallel=True, nogil=True, cache=True)
+def fill_single_level_dense_inv_with_pad_kernel(
+    flat_to_unique_local: np.ndarray,
+    splits: np.ndarray,
+    pad_index: int,
+    out: np.ndarray,
+) -> None:
+    rows = splits.shape[0] - 1
+    width = out.shape[1]
+    for row in prange(rows):  # type: ignore
+        start = splits[row]
+        end = splits[row + 1]
+        length = end - start
+        for slot in range(width):
+            if slot < length:
+                out[row, slot] = flat_to_unique_local[start + slot]
+            else:
+                out[row, slot] = pad_index
+
+
+def fill_nested_dense_inv_with_pad(
+    flat_to_unique_local: np.ndarray,
+    nested_splits: tuple[np.ndarray, ...],
+    strides: np.ndarray,
+    pad_index: int,
+    out: np.ndarray,
+) -> None:
+    if len(nested_splits) == 1 and out.ndim == 2:
+        splits = nested_splits[0]
+        if splits.ndim != 1:
+            raise ValueError(f"single-level splits must be 1-D, got {splits.shape}.")
+        if splits.size != out.shape[0] + 1:
+            raise ValueError(
+                f"single-level splits length {splits.size} does not match "
+                f"out rows {out.shape[0]}."
+            )
+        lengths = splits[1:] - splits[:-1]
+        if lengths.size and int(lengths.max()) > int(out.shape[1]):
+            raise ValueError(
+                f"single-level sparse row width {int(lengths.max())} exceeds "
+                f"dense width {int(out.shape[1])}."
+            )
+        fill_single_level_dense_inv_with_pad_kernel(
+            flat_to_unique_local,
+            splits,
+            pad_index,
+            out,
+        )
+        return
+    fill_nested_dense_inv_with_pad_kernel(
+        flat_to_unique_local,
+        nested_splits,
+        strides,
+        pad_index,
+        out,
+    )
 
 
 def _validate_splits(field_name: str, splits: np.ndarray) -> None:

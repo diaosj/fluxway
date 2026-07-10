@@ -19,7 +19,13 @@ import ray
 
 from fluxway.profiler.runtime import ProfilerRuntimeFactory
 from fluxway.profiler.user_api import activate_user_profiler
-from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
+from fluxway.spmd.worker.runtime import (
+    WORKER_PROCESS_DEFAULT_EXECUTION_LANE,
+    WorkerProcessCallRuntime,
+)
+
+
+USER_CALLABLE_DEFAULT_OPERATOR_LANE = WORKER_PROCESS_DEFAULT_EXECUTION_LANE
 
 
 class UserCallableLane(str, Enum):
@@ -37,6 +43,7 @@ class UserCallableSpec:
     fn: Callable[..., Any]
     is_stateful: bool
     resource_id: int
+    operator_lane: str
     save_state: Callable[[str], Any] | None = None
     restore_state: Callable[[Any, str], None] | None = None
     operator_config: Any | None = None
@@ -464,10 +471,15 @@ class UserCallableExecutor:
             return await asyncio.to_thread(spec.fn)
 
     async def _execute_worker_process(self, spec: UserCallableSpec) -> Any:
+        if not spec.operator_lane:
+            raise ValueError(
+                f"process-affine callable {spec.callable_id!r} requires operator_lane."
+            )
         return await self._worker_process_runtime.submit(
             spec.fn,
             callable_id=spec.callable_id,
             resource_id=spec.resource_id,
+            execution_lane=spec.operator_lane,
         )
 
     async def _execute_ray_actor(self, spec: UserCallableSpec) -> Any:

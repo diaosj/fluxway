@@ -990,23 +990,27 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self.spmd_synchronizer.unblock_all_ops()
             self.state_machine.trigger(DriverEvent.UNBLOCK_REQUESTED)
 
-        def _block_worker_op(self, rank: int, op_name: str) -> None:
+        def _block_worker_op(
+            self, rank: int, op_name: str, op_runnable_epoch: int
+        ) -> None:
             """Block a specific worker's op."""
             worker = self._worker_handles.get(rank)
             if worker is not None:
                 try:
-                    worker.block_op.remote(op_name)
+                    worker.set_op_runnable.remote(op_name, False, op_runnable_epoch)
                 except Exception as e:
                     logger.error(
                         f"Failed to block worker op rank={rank} error={e} spmd_id={self.spmd_id}"
                     )
 
-        def _unblock_worker_op(self, rank: int, op_name: str) -> None:
+        def _unblock_worker_op(
+            self, rank: int, op_name: str, op_runnable_epoch: int
+        ) -> None:
             """Unblock a specific worker's op."""
             worker = self._worker_handles.get(rank)
             if worker is not None:
                 try:
-                    worker.unblock_op.remote(op_name)
+                    worker.set_op_runnable.remote(op_name, True, op_runnable_epoch)
                 except Exception as e:
                     logger.error(
                         f"Failed to unblock worker op rank={rank} error={e} spmd_id={self.spmd_id}"
@@ -1014,15 +1018,14 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
         def _block_all_workers(self) -> None:
             """Block all workers (internal method)."""
-            for rank, worker in self._worker_handles.items():
-                try:
-                    ops = list(self.spmd_synchronizer.get_spmd_steps().keys())
-                    for op_name in ops:
-                        worker.block_op.remote(op_name)
-                except Exception as e:
-                    logger.error(
-                        f"Failed to block worker rank={rank} error={e} spmd_id={self.spmd_id}"
-                    )
+            try:
+                ops = list(self.spmd_synchronizer.get_spmd_steps().keys())
+                for op_name in ops:
+                    self.spmd_synchronizer.block_spmd_op(op_name)
+            except Exception as e:
+                logger.error(
+                    f"Failed to block workers error={e} spmd_id={self.spmd_id}"
+                )
 
         # =====================================================================
         # State Argument Broadcasting

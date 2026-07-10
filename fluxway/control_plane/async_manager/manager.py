@@ -86,6 +86,8 @@ class AsyncStepManager:
             op_topo_limits = {}  # (source_id, source_op) -> min_allowed_step
 
             for edge in self._graph.edges:
+                if edge.local_only:
+                    continue
                 if not edge.source_op or not edge.target_op:
                     continue
 

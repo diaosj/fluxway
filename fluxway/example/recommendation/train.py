@@ -181,7 +181,7 @@ async def run_training(args):
             unique_ids=h_proc.unique_item_ids  # type: ignore
         ).sparse_features
 
-        h_step = dense.step(
+        h_prepare = dense.prepare_dense_inputs(
             emb1=h_emb1,
             inv1=h_proc.user_inv,  # type: ignore
             emb2=h_emb2,
@@ -189,9 +189,28 @@ async def run_training(args):
             dp_data=h_proc.dp_data,  # type: ignore
         )
 
-        table1.update(grads=h_step.grad1)  # type: ignore
-        table2.update(grads=h_step.grad2)  # type: ignore
-        dense.update(dense_grad=h_step.dense_grad)  # type: ignore
+        h_core = dense.train_core(
+            f1_rec=h_prepare.f1_rec,  # type: ignore
+            f2_rec=h_prepare.f2_rec,  # type: ignore
+            dense_stats=h_prepare.dense_stats,  # type: ignore
+            labels=h_prepare.labels,  # type: ignore
+            local=True,
+        )
+
+        h_scatter = dense.scatter_sparse_grads(
+            grad_f1=h_core.grad_f1,  # type: ignore
+            grad_f2=h_core.grad_f2,  # type: ignore
+            dense_grad=h_core.dense_grad,  # type: ignore
+            emb1_ref=h_prepare.emb1_ref,  # type: ignore
+            emb2_ref=h_prepare.emb2_ref,  # type: ignore
+            inv1_dense=h_prepare.inv1_dense,  # type: ignore
+            inv2_dense=h_prepare.inv2_dense,  # type: ignore
+            local=True,
+        )
+
+        table1.update(grads=h_scatter.grad1)  # type: ignore
+        table2.update(grads=h_scatter.grad2)  # type: ignore
+        dense.update(dense_grad=h_scatter.dense_grad, local=True)  # type: ignore
 
         task_graph = graph.compile()
 
@@ -282,7 +301,7 @@ def main():
         "--dense-step-delay-ms",
         type=int,
         default=0,
-        help="Diagnostic delay inside DenseSPMD.step for overlap proof runs",
+        help="Diagnostic delay inside DenseSPMD.train_core for overlap proof runs",
     )
     parser.add_argument(
         "--clear-ckpt",

@@ -37,12 +37,16 @@ def test_worker_sync_skew_limit():
     blocked_workers = set()
     unblocked_workers = set()
 
-    def block_cb(rank, op):
+    versions = []
+
+    def block_cb(rank, op, version):
+        versions.append((rank, op, version))
         blocked_workers.add(rank)
         if rank in unblocked_workers:
             unblocked_workers.remove(rank)
 
-    def unblock_cb(rank, op):
+    def unblock_cb(rank, op, version):
+        versions.append((rank, op, version))
         unblocked_workers.add(rank)
         if rank in blocked_workers:
             blocked_workers.remove(rank)
@@ -86,6 +90,7 @@ def test_worker_sync_skew_limit():
 
     # 6. SPMD step should be 2 (minimum of all workers)
     assert sync.get_spmd_step(op) == 2
+    assert versions == sorted(versions, key=lambda item: item[2])
 
 
 def test_worker_sync_controller_lock():
@@ -95,11 +100,35 @@ def test_worker_sync_controller_lock():
     )
 
     blocked = []
-    sync.set_callbacks(block_worker_op=lambda r, o: blocked.append(r))
+    sync.set_callbacks(block_worker_op=lambda r, o, v: blocked.append((r, v)))
 
     sync.block_spmd_op("train")
     assert len(blocked) == 2
+    assert [version for _, version in blocked] == [0, 0]
     assert sync.is_op_locked("train")
+
+
+def test_worker_sync_op_runnable_epochs_are_monotonic_per_worker_op():
+    sync = SPMDSynchronizer(
+        spmd_id="test_spmd", num_workers=2, sync_policy=MaxSkewSyncPolicy(0)
+    )
+    events = []
+    sync.set_callbacks(
+        block_worker_op=lambda r, op, v: events.append(("block", r, op, v)),
+        unblock_worker_op=lambda r, op, v: events.append(("unblock", r, op, v)),
+    )
+
+    sync.report_worker_op_completed(0, "train", 1)
+    sync.report_worker_op_completed(1, "train", 1)
+    sync.report_worker_op_completed(0, "train", 2)
+    sync.report_worker_op_completed(1, "train", 2)
+
+    epochs_by_worker = {}
+    for _kind, rank, op_name, epoch in events:
+        epochs_by_worker.setdefault((rank, op_name), []).append(epoch)
+    for epochs in epochs_by_worker.values():
+        assert epochs == sorted(epochs)
+        assert len(epochs) == len(set(epochs))
 
 
 # =============================================================================
@@ -159,6 +188,33 @@ def test_async_manager_edge_limit():
     # target B.consume is at 2, limit 2. allowed_step = 2 + 2 = 4
     updates = manager.check_and_enforce_limits()
     assert ("A", op_a, 4) in updates
+
+
+def test_async_manager_ignores_local_only_edges_for_flow_control():
+    op_a = "prepare"
+    op_b = "train"
+    meta_a = OperatorMeta(name=op_a)
+    meta_b = OperatorMeta(name=op_b, max_inflight_steps=0)
+    node = Node(
+        name="Dense",
+        spmd_config=SPMDConfig(operator_metas={op_a: meta_a, op_b: meta_b}),
+    )
+    edge = Edge(
+        source_node="Dense",
+        target_node="Dense",
+        source_op=op_a,
+        target_op=op_b,
+        local_only=True,
+    )
+    graph = Graph(nodes={"Dense": node}, edges=[edge])
+    manager = AsyncStepManager(graph=graph)
+
+    manager.report_op_completed("Dense", op_a, 5)
+    manager.report_op_completed("Dense", op_b, 4)
+    updates = manager.check_and_enforce_limits()
+
+    assert ("Dense", op_a, 4) not in updates
+    assert ("Dense", op_a, 999999999) in updates
 
 
 def test_async_manager_global_limit():
