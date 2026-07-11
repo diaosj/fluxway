@@ -14,6 +14,7 @@ The SPMD Driver coordinates all workers within the SPMD:
 
 import asyncio
 from collections import defaultdict
+from collections.abc import Iterable
 import copy
 import threading
 import time
@@ -33,6 +34,7 @@ from fluxway.common.types import (
     DriverHeartbeat,
     DriverState,
     DriverStatus,
+    FlowControlState,
     HeartbeatConfig,
     ReaderState,
     SPMDConfig,
@@ -41,6 +43,12 @@ from fluxway.common.types import (
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.control_plane.checkpointer.checkpoint import _validate_manifest_pure_data
 from fluxway.rpc.protocol import DataPlaneCallable
+from fluxway.spmd.driver.credit import (
+    CreditEdge,
+    CreditUpdate,
+    CreditWindow,
+    UpstreamCreditState,
+)
 from fluxway.spmd.driver.state_machine import DriverStateMachine
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 from fluxway.spmd.driver.monitor import SPMDMonitor
@@ -141,11 +149,20 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self._init_timeout: float = 120.0
             self._init_start_time: float = 0.0
 
-            self._busy_worker_ratio: float = 0.0  # Ratio of workers with full mailbox
-
             # Backpressure / Pause control
             self._is_paused = False
             self._source_state: ReaderState | None = ReaderState.INITIALIZING
+            self._credit_epoch = 0
+            self._upstream_credit_state = UpstreamCreditState((), self._credit_epoch)
+            self._upstream_credit_edges_by_id: dict[str, CreditEdge] = {}
+            self._downstream_credit_edges_by_target_op: dict[str, list[CreditEdge]] = (
+                defaultdict(list)
+            )
+            self._upstream_driver_handles: dict[str, Any] = {}
+            self._controller_credit_windows_by_op: dict[str, int] = {}
+            self._peer_credit_hints_by_op: dict[str, int] = {}
+            self._credit_sequence_by_edge_id: dict[str, int] = {}
+            self._last_sent_allowed_by_edge_id: dict[str, int] = {}
 
             # Pending snapshot state
             self._pending_snapshot_id: str | None = None
@@ -488,6 +505,113 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 )
 
             logger.debug(f"Topology registration completed spmd_id={self.spmd_id}")
+
+        def register_credit_topology(
+            self,
+            upstream_driver_handles: dict[str, Any],
+            upstream_edges: tuple[CreditEdge, ...],
+            downstream_edges: tuple[CreditEdge, ...],
+            epoch: int = 0,
+        ) -> None:
+            self._credit_epoch = epoch
+            self._upstream_driver_handles = dict(upstream_driver_handles)
+            self._upstream_credit_state = UpstreamCreditState(
+                tuple(upstream_edges), self._credit_epoch
+            )
+            self._upstream_credit_edges_by_id = {
+                edge.edge_id: edge for edge in upstream_edges
+            }
+            self._downstream_credit_edges_by_target_op = defaultdict(list)
+            self._controller_credit_windows_by_op = {}
+            self._peer_credit_hints_by_op = {}
+            self._credit_sequence_by_edge_id = {}
+            self._last_sent_allowed_by_edge_id = {}
+
+            for edge in downstream_edges:
+                handle = self._upstream_driver_handles.get(edge.source_spmd_id)
+                if handle is None:
+                    raise ValueError(
+                        f"Missing upstream driver handle for credit edge {edge.edge_id!r} "
+                        f"on driver {self.spmd_id!r}."
+                    )
+                self._downstream_credit_edges_by_target_op[edge.target_op].append(edge)
+                self._credit_sequence_by_edge_id[edge.edge_id] = 0
+                self._last_sent_allowed_by_edge_id[edge.edge_id] = (
+                    edge.max_inflight_steps
+                )
+
+            initial_allowed_steps = self._upstream_credit_state.allowed_steps()
+            self._peer_credit_hints_by_op = dict(initial_allowed_steps)
+            self._controller_credit_windows_by_op = dict(initial_allowed_steps)
+            self._apply_effective_credit_windows(initial_allowed_steps)
+
+        def apply_credit_window(self, windows: tuple[CreditWindow, ...]) -> None:
+            changed_ops: set[str] = set()
+            for window in windows:
+                if window.epoch != self._credit_epoch:
+                    raise ValueError(
+                        f"Credit window epoch mismatch for {self.spmd_id}.{window.op_name}: "
+                        f"expected={self._credit_epoch}, got={window.epoch}."
+                    )
+                allowed_step = window.allowed_step
+                if allowed_step < 0:
+                    raise ValueError(
+                        f"Credit window cannot be negative for {self.spmd_id}.{window.op_name}: "
+                        f"{allowed_step}."
+                    )
+                if window.op_name not in self._peer_credit_hints_by_op:
+                    raise ValueError(
+                        f"Driver {self.spmd_id!r} received controller credit window "
+                        f"for unknown upstream op {window.op_name!r}."
+                    )
+                current = self._controller_credit_windows_by_op.get(window.op_name)
+                if current is not None and allowed_step < current:
+                    raise ValueError(
+                        f"Controller credit window cannot decrease for "
+                        f"{self.spmd_id}.{window.op_name}: current={current}, "
+                        f"got={allowed_step}."
+                    )
+                if current != allowed_step:
+                    self._controller_credit_windows_by_op[window.op_name] = allowed_step
+                    changed_ops.add(window.op_name)
+            self._apply_effective_credit_windows(changed_ops)
+
+        def receive_credit_update(
+            self, downstream_id: str, edge_id: str, update: CreditUpdate
+        ) -> None:
+            edge = self._upstream_credit_edges_by_id.get(edge_id)
+            if edge is None:
+                raise ValueError(
+                    f"Driver {self.spmd_id!r} received unknown credit edge {edge_id!r}."
+                )
+            if edge.target_spmd_id != downstream_id:
+                raise ValueError(
+                    f"Credit edge {edge_id!r} downstream mismatch: "
+                    f"expected={edge.target_spmd_id!r}, got={downstream_id!r}."
+                )
+            if self._upstream_credit_state.receive(edge_id, update):
+                self._peer_credit_hints_by_op[edge.source_op] = (
+                    self._upstream_credit_state.allowed_step(edge.source_op)
+                )
+                self._apply_effective_credit_windows((edge.source_op,))
+
+        def _apply_effective_credit_windows(self, op_names: Iterable[str]) -> None:
+            for op_name in op_names:
+                controller_allowed = self._controller_credit_windows_by_op.get(op_name)
+                peer_allowed = self._peer_credit_hints_by_op.get(op_name)
+                if controller_allowed is None:
+                    raise RuntimeError(
+                        f"Driver {self.spmd_id!r} has no controller credit window "
+                        f"for op {op_name!r}."
+                    )
+                if peer_allowed is None:
+                    raise RuntimeError(
+                        f"Driver {self.spmd_id!r} has no peer credit hint "
+                        f"for op {op_name!r}."
+                    )
+                self.spmd_synchronizer.update_allowed_step(
+                    op_name, min(controller_allowed, peer_allowed)
+                )
 
         async def stop(self, save_checkpoint: bool = True) -> None:
             """Stop execution."""
@@ -841,27 +965,15 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 self._profiler_runtime.recorder.driver_worker_heartbeat(
                     rank=rank,
                     status=heartbeat.status.name,
-                    completed_count=sum(heartbeat.completed_step_count.values()),
-                    mailbox_full=bool(
-                        heartbeat.mailbox_status and heartbeat.mailbox_status.is_full
-                    ),
                 )
             logger.heartbeat(
                 f"Received worker heartbeat rank={rank} "
-                f"status={heartbeat.status.name} completed_count={heartbeat.completed_step_count} "
-                f"mailbox_full={heartbeat.mailbox_status.is_full if heartbeat.mailbox_status else False} "
-                f"spmd_id={self.spmd_id}"
+                f"status={heartbeat.status.name} spmd_id={self.spmd_id}"
             )
 
             # Check for worker error
             if heartbeat.error_message:
                 self._handle_worker_error(rank, heartbeat.error_message)
-
-            # Update monitor
-            if heartbeat.telemetry:
-                self.monitor.report_single_worker_telemetry(
-                    str(rank), heartbeat.telemetry
-                )
 
             # Check if all workers have reported heartbeat (workers_ready)
             if not self._workers_ready:
@@ -948,14 +1060,38 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self.spmd_synchronizer.report_worker_op_completed(rank, op_name, step)
 
         def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
-            """
-            Callback when SPMD completes an op step.
+            if self.controller_handle is None:
+                raise RuntimeError(
+                    f"Driver {self.spmd_id!r} cannot report op completion without "
+                    "a controller handle."
+                )
+            self.controller_handle.report_op_completed.remote(spmd_id, op_name, step)
+            self._send_credit_updates(op_name, step)
 
-            Reports to Controller.
-            """
-            if self.controller_handle is not None:
-                self.controller_handle.report_op_completed.remote(
-                    spmd_id, op_name, step
+        def _send_credit_updates(self, op_name: str, completed_count: int) -> None:
+            edges = self._downstream_credit_edges_by_target_op.get(op_name, ())
+            for edge in edges:
+                allowed_step = completed_count + edge.max_inflight_steps
+                last_allowed = self._last_sent_allowed_by_edge_id[edge.edge_id]
+                if allowed_step <= last_allowed:
+                    continue
+                handle = self._upstream_driver_handles.get(edge.source_spmd_id)
+                if handle is None:
+                    raise ValueError(
+                        f"Missing upstream driver handle for credit edge {edge.edge_id!r} "
+                        f"on driver {self.spmd_id!r}."
+                    )
+                sequence = self._credit_sequence_by_edge_id[edge.edge_id] + 1
+                self._credit_sequence_by_edge_id[edge.edge_id] = sequence
+                self._last_sent_allowed_by_edge_id[edge.edge_id] = allowed_step
+                handle.receive_credit_update.remote(
+                    self.spmd_id,
+                    edge.edge_id,
+                    CreditUpdate(
+                        epoch=self._credit_epoch,
+                        sequence=sequence,
+                        allowed_step=allowed_step,
+                    ),
                 )
 
         # =====================================================================
@@ -969,10 +1105,6 @@ if TYPE_CHECKING or RAY_AVAILABLE:
         def unblock_op(self, op_name: str) -> None:
             """Unblock an op for all workers (called by Controller)."""
             self.spmd_synchronizer.unblock_spmd_op(op_name)
-
-        def set_allowed_step(self, op_name: str, step: int) -> None:
-            """Set global watermark for an op (called by Controller)."""
-            self.spmd_synchronizer.update_allowed_step(op_name, step)
 
         def block_all_ops(self) -> None:
             """Block all ops for all workers."""
@@ -1198,32 +1330,16 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             else:
                 status = DriverStatus.HEALTHY
 
-            # Calculate busy worker ratio for backpressure
-            busy_count = 0
-            for hb in self._worker_heartbeats.values():
-                if hb.mailbox_status is not None and hb.mailbox_status.is_full:
-                    busy_count += 1
-            self._busy_worker_ratio = (
-                busy_count / self.config.num_workers
-                if self.config.num_workers > 0
-                else 0.0
-            )
-
             heartbeat = DriverHeartbeat(
                 spmd_id=self.spmd_id,
                 timestamp=time.time(),
                 status=status,
                 state=self.state_machine.state,
                 error_message=self.state_machine.get_error_message(),
-                completed_step_count=self.spmd_synchronizer.get_spmd_steps(),
                 num_workers=self.config.num_workers,
                 healthy_num_workers=healthy_count,
-                blocked_ops=self.spmd_synchronizer.get_locked_ops(),
                 workers_ready=self._workers_ready,
                 workers_running=self._workers_running,
-                is_downstream_busy=self._is_paused,
-                source_state=self._source_state,
-                busy_worker_ratio=self._busy_worker_ratio,
             )
 
             try:
@@ -1232,8 +1348,6 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     f"Driver heartbeat sent status={status.name} "
                     f"state={heartbeat.state.name} "
                     f"healthy_workers={healthy_count}/{self.config.num_workers} "
-                    f"completed_count={heartbeat.completed_step_count} "
-                    f"busy_ratio={self._busy_worker_ratio:.2f} "
                     f"spmd_id={self.spmd_id}"
                 )
             except Exception as e:
@@ -1385,6 +1499,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
             self._is_paused = True
             self._source_state = ReaderState.PAUSED
+            self._report_flow_control_state()
             logger.debug(f"Sources paused due to backpressure spmd_id={self.spmd_id}")
 
             for worker in self._worker_handles.values():
@@ -1404,6 +1519,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
             self._is_paused = False
             self._source_state = ReaderState.READING
+            self._report_flow_control_state()
             logger.debug(f"Sources resumed spmd_id={self.spmd_id}")
 
             for worker in self._worker_handles.values():
@@ -1425,6 +1541,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
 
         async def _start_source_operators_unprofiled(self) -> None:
             self._source_state = ReaderState.READING
+            self._report_flow_control_state()
             tasks = [
                 worker.start_source_operators.remote()
                 for worker in self._worker_handles.values()
@@ -1432,13 +1549,24 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             if tasks:
                 await asyncio.gather(*tasks)
 
+        def _report_flow_control_state(self) -> None:
+            if self.controller_handle is None:
+                raise RuntimeError(
+                    f"Driver {self.spmd_id!r} cannot report flow-control state "
+                    "without a controller handle."
+                )
+            self.controller_handle.report_flow_control_state.remote(
+                FlowControlState(
+                    spmd_id=self.spmd_id,
+                    timestamp=time.time(),
+                    paused=self._is_paused,
+                    epoch=self._credit_epoch,
+                )
+            )
+
         def get_source_state(self) -> ReaderState | None:
             """Get current source state."""
             return self._source_state
-
-        def get_busy_worker_ratio(self) -> float:
-            """Get ratio of workers with full mailbox."""
-            return self._busy_worker_ratio
 
 else:
     # Mock class when Ray is not available

@@ -1,5 +1,5 @@
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.configs import SPMDConfig
+from fluxway.common.types.configs import OperatorMeta, SPMDConfig
 from fluxway.spmd.driver.driver import SPMDDriver
 import pytest
 
@@ -12,7 +12,10 @@ def _driver_cls():
 def _make_driver():
     mesh = DeviceMesh(axis_names=("dp",), device_shape=(4,))
     config = SPMDConfig(
-        mesh=mesh, operators={}, operator_metas={}, active_operator_names=()
+        mesh=mesh,
+        operators={},
+        operator_metas={"compute": OperatorMeta(name="compute")},
+        active_operator_names=("compute",),
     )
     driver_cls = _driver_cls()
     return driver_cls(

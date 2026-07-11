@@ -42,6 +42,7 @@ def _make_worker_stub():
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
         background_tasks=stub._background_tasks,
         on_task_done=lambda _task: None,
+        schedule_key=lambda op_name, step: (0, 0, step, op_name),
     )
     stub._delivery_runtime = types.SimpleNamespace(cancel_pending=AsyncMock())
     stub._worker_process_call_runtime = types.SimpleNamespace(

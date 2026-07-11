@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from fluxway.common.types import ControllerState, ControllerEvent
 from fluxway.common.types.configs import (
+    OperatorMeta,
     SPMDConfig,
     Graph,
     Node,
@@ -34,7 +35,10 @@ def _make_controller(
     node = Node(
         name="dense_spmd",
         spmd_config=SPMDConfig(
-            spmd_id="dense_spmd", fail_fast=fail_fast, active_operator_names=()
+            spmd_id="dense_spmd",
+            fail_fast=fail_fast,
+            operator_metas={"run": OperatorMeta(name="run")},
+            active_operator_names=("run",),
         ),
     )
     graph = Graph(nodes={"dense_spmd": node})
@@ -154,13 +158,19 @@ class TestFailFastMultiNode:
         reader_node = Node(
             name="reader",
             spmd_config=SPMDConfig(
-                spmd_id="reader", fail_fast=False, active_operator_names=()
+                spmd_id="reader",
+                fail_fast=False,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         dense_node = Node(
             name="dense_spmd",
             spmd_config=SPMDConfig(
-                spmd_id="dense_spmd", fail_fast=True, active_operator_names=()
+                spmd_id="dense_spmd",
+                fail_fast=True,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         graph = Graph(nodes={"reader": reader_node, "dense_spmd": dense_node})
@@ -189,7 +199,10 @@ class TestFailFastMultiNode:
         reader_node = Node(
             name="reader",
             spmd_config=SPMDConfig(
-                spmd_id="reader", fail_fast=False, active_operator_names=()
+                spmd_id="reader",
+                fail_fast=False,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         graph = Graph(nodes={"reader": reader_node})
@@ -288,11 +301,18 @@ class TestFailFastConfig:
     """fail_fast config defaults and overrides."""
 
     def test_default_fail_fast_is_true(self):
-        config = SPMDConfig(active_operator_names=())
+        config = SPMDConfig(
+            operator_metas={"run": OperatorMeta(name="run")},
+            active_operator_names=("run",),
+        )
         assert config.fail_fast is True
 
     def test_fail_fast_override_false(self):
-        config = SPMDConfig(fail_fast=False, active_operator_names=())
+        config = SPMDConfig(
+            fail_fast=False,
+            operator_metas={"run": OperatorMeta(name="run")},
+            active_operator_names=("run",),
+        )
         assert config.fail_fast is False
 
 
@@ -397,13 +417,19 @@ class TestRepeatedDriverError:
         reader_node = Node(
             name="reader",
             spmd_config=SPMDConfig(
-                spmd_id="reader", fail_fast=False, active_operator_names=()
+                spmd_id="reader",
+                fail_fast=False,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         dense_node = Node(
             name="dense",
             spmd_config=SPMDConfig(
-                spmd_id="dense", fail_fast=False, active_operator_names=()
+                spmd_id="dense",
+                fail_fast=False,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         graph = Graph(nodes={"reader": reader_node, "dense": dense_node})
@@ -435,13 +461,19 @@ class TestRepeatedDriverError:
         reader_node = Node(
             name="reader",
             spmd_config=SPMDConfig(
-                spmd_id="reader", fail_fast=False, active_operator_names=()
+                spmd_id="reader",
+                fail_fast=False,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         dense_node = Node(
             name="dense",
             spmd_config=SPMDConfig(
-                spmd_id="dense", fail_fast=False, active_operator_names=()
+                spmd_id="dense",
+                fail_fast=False,
+                operator_metas={"run": OperatorMeta(name="run")},
+                active_operator_names=("run",),
             ),
         )
         graph = Graph(nodes={"reader": reader_node, "dense": dense_node})

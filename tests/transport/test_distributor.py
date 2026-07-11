@@ -51,8 +51,16 @@ def test_colocation_dispatch_uses_two_payload_segments():
     mesh = DeviceMesh(("x",), (2,), [0, 1])
     source = ShardingSpec.chunk(P("x")).bind(mesh)
     target = ShardingSpec.chunk(P("x")).bind(mesh)
-    keys = TransportTensor(jnp.array([10, 20], dtype=jnp.int32), global_shape=(4,))
-    vals = TransportTensor(jnp.array([0.1, 0.2], dtype=jnp.float32), global_shape=(4,))
+    keys = TransportTensor(
+        jnp.array([10, 20], dtype=jnp.int32),
+        global_shape=(4,),
+        source_step=1,
+    )
+    vals = TransportTensor(
+        jnp.array([0.1, 0.2], dtype=jnp.float32),
+        global_shape=(4,),
+        source_step=1,
+    )
 
     (_result, _sort), captured = asyncio.run(
         _capture(
@@ -105,6 +113,7 @@ def test_mirror_backflow_drops_static_padding_receipt_rows():
             has_meta_tensor_state_list=[0],
             compact_desc_info=[None],
             global_shapes_list=[tuple(grads.shape)],
+            source_steps_list=[0],
         )
     )
 
@@ -131,6 +140,7 @@ def test_content_source_to_static_target_keeps_origin_descriptor_symbolic(monkey
         backend.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=backend.float32()),
         origin_indices=ContinuousIndex.chunk(2, 2),
         global_shape=(4, 2),
+        source_step=2,
     )
 
     def forbidden(self):
@@ -164,7 +174,7 @@ def test_mirror_routing_builds_single_expected_frame():
     mesh = DeviceMesh(device_shape=(1,), axis_names=("worker",))
     receipt = SymmetryReceipt(world_size=43, sender_rank_tags=jnp.array([42, 42, 42]))
     data = jnp.array([[1.0], [2.0], [3.0]])
-    tensor = TransportTensor(data, receipt=receipt)
+    tensor = TransportTensor(data, receipt=receipt, source_step=1)
     spec = ShardingSpec.follow("source.input").bind(mesh)
 
     distributor = AsyncDataDistributor(local_rank=0)

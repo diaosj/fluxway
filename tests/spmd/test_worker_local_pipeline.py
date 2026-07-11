@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 import types
 from unittest.mock import AsyncMock, MagicMock
@@ -98,6 +99,7 @@ def _make_pipeline_stub_with_profiler(
         _last_error=None,
         _driver_handle=None,
         _profiler_runtime=profiler_runtime,
+        _clear_direct_local_step=MagicMock(),
         config=types.SimpleNamespace(max_steps=None, operator_metas={"op": meta}),
         spmd_id="test_spmd",
         rank=0,
@@ -157,6 +159,7 @@ def _make_pipeline_stub_with_profiler(
         on_task_done=stub._on_background_task_done,
         profiler_runtime=profiler_runtime,
         on_prepare_ready=stub._on_prepare_ready,
+        schedule_key=lambda op_name, step: (0, 0, step, op_name),
     )
     stub._prepare_inputs_if_policy_allows = types.MethodType(
         raw_cls._prepare_inputs_if_policy_allows,
@@ -236,6 +239,90 @@ def _make_pipeline_stub_with_profiler(
 
 def _prepared(cache=None):
     return _PreparedOperatorInput(value={}, step_tuuid_cache=dict(cache or {}))
+
+
+@pytest.mark.asyncio
+async def test_input_prepare_threads_use_stable_schedule_priority():
+    started = []
+    release = threading.Event()
+    priorities = {
+        ("scatter", 0): (30, 0, 0, "scatter"),
+        ("prepare", 2): (20, 0, 2, "prepare"),
+        ("prepare", 1): (10, 0, 1, "prepare"),
+    }
+    runtime = LocalInputPrepareRuntime(
+        background_tasks=set(),
+        on_task_done=lambda _task: None,
+        max_workers=1,
+        schedule_key=lambda op_name, step: priorities[(op_name, step)],
+    )
+
+    def run(op_name, step):
+        started.append((op_name, step))
+        if (op_name, step) == ("scatter", 0):
+            release.wait(timeout=5)
+        return op_name, step
+
+    async def submit(op_name, step):
+        return await runtime.run_assemble(
+            op_name,
+            step,
+            lambda: run(op_name, step),
+        )
+
+    try:
+        running = asyncio.create_task(submit("scatter", 0))
+        while not started:
+            await asyncio.sleep(0)
+        future_prepare = asyncio.create_task(submit("prepare", 2))
+        next_prepare = asyncio.create_task(submit("prepare", 1))
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(running, future_prepare, next_prepare)
+        assert started == [("scatter", 0), ("prepare", 1), ("prepare", 2)]
+    finally:
+        release.set()
+        await runtime.cancel_pending()
+        runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_input_prepare_threads_keep_fifo_for_equal_schedule_keys():
+    started = []
+    release = threading.Event()
+    runtime = LocalInputPrepareRuntime(
+        background_tasks=set(),
+        on_task_done=lambda _task: None,
+        max_workers=1,
+        schedule_key=lambda op_name, step: (0, 0, step, op_name),
+    )
+
+    def run(name):
+        started.append(name)
+        if name == "running":
+            release.wait(timeout=5)
+        return name
+
+    try:
+        running = asyncio.create_task(
+            runtime.run_assemble("prepare", 0, lambda: run("running"))
+        )
+        while not started:
+            await asyncio.sleep(0)
+        first = asyncio.create_task(
+            runtime.run_assemble("prepare", 1, lambda: run("first"))
+        )
+        second = asyncio.create_task(
+            runtime.run_assemble("prepare", 1, lambda: run("second"))
+        )
+        await asyncio.sleep(0.01)
+        release.set()
+        await asyncio.gather(running, first, second)
+        assert started == ["running", "first", "second"]
+    finally:
+        release.set()
+        await runtime.cancel_pending()
+        runtime.close()
 
 
 def test_local_pipeline_depth_one_preserves_single_running_slot():
@@ -347,7 +434,8 @@ def test_bounded_stale_lookup_stops_at_lag_boundary_while_update_closes_lag():
     )
 
     assert not stub._async_lag_limit_reached("lookup", 2)
-    assert stub._async_lag_limit_reached("lookup", 8)
+    assert not stub._async_lag_limit_reached("lookup", 8)
+    assert stub._async_lag_limit_reached("lookup", 9)
     assert not stub._async_lag_limit_reached("update", 1)
 
 
@@ -379,18 +467,18 @@ async def test_bounded_stale_lag_release_requeues_lookup_after_update_progress()
     stub.op_manager._get_operator_metadata.side_effect = lambda name: metas[name]
     stub.op_manager.get_operator_metadata.side_effect = lambda name: metas[name]
     stub._completed_step_count = {"lookup": 7, "update": 1}
-    stub._pending_async_lag_steps = {"lookup": [8], "update": []}
+    stub._pending_async_lag_steps = {"lookup": [9], "update": []}
     stub._in_op_step_queue = set()
 
     await stub._release_async_lag_steps()
-    assert stub._pending_async_lag_steps["lookup"] == [8]
+    assert stub._pending_async_lag_steps["lookup"] == [9]
     assert stub._execution_queue.empty()
 
     stub._completed_step_count["update"] = 2
     await stub._release_async_lag_steps()
     assert stub._pending_async_lag_steps["lookup"] == []
     queued = await stub._execution_queue.get()
-    assert queued == (0, 0, 8, "lookup")
+    assert queued == (-100, 0, 9, "lookup")
 
 
 def test_phase_order_schedule_places_forward_before_backward_same_micro_step():

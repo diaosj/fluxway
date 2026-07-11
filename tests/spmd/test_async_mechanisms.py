@@ -6,7 +6,22 @@ These tests verify:
 2. max_inflight_steps: Limits step difference between connected SPMDs in the graph.
 """
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from fluxway.control_plane.flow_control.manager import FlowControlManager
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
+from fluxway.spmd.driver.driver import SPMDDriver
+from fluxway.spmd.driver.credit import (
+    CreditEdge,
+    CreditUpdate,
+    CreditWindow,
+    UpstreamCreditState,
+    build_credit_edges,
+    credit_topology_for_driver,
+)
 from fluxway.control_plane.async_manager.manager import AsyncStepManager
 from fluxway.common.types.configs import (
     Graph,
@@ -15,6 +30,12 @@ from fluxway.common.types.configs import (
     SPMDConfig,
     OperatorMeta,
     AsyncStepConfig,
+    DriverHeartbeat,
+    DriverState,
+    DriverStatus,
+    FlowControlState,
+    WorkerHeartbeat,
+    WorkerStatus,
 )
 
 # =============================================================================
@@ -132,19 +153,13 @@ def test_worker_sync_op_runnable_epochs_are_monotonic_per_worker_op():
 
 
 # =============================================================================
-# 2. Inter-SPMD: AsyncStepManager Tests
+# 2. Inter-SPMD: Driver Credit Tests
 # =============================================================================
 
 
-def test_async_manager_edge_limit():
-    """
-    Verify that AsyncStepManager locks source SPMD when it gets too far ahead of target.
-    """
-    # Setup graph: A -> B
+def test_driver_credit_edge_limit():
     op_a = "produce"
     op_b = "consume"
-
-    # Node A
     meta_a = OperatorMeta(name=op_a)
     node_a = Node(
         name="A",
@@ -152,8 +167,6 @@ def test_async_manager_edge_limit():
             operator_metas={op_a: meta_a}, active_operator_names=(op_a,)
         ),
     )
-
-    # Node B with max_inflight_steps = 2
     meta_b = OperatorMeta(name=op_b, max_inflight_steps=2)
     node_b = Node(
         name="B",
@@ -165,42 +178,20 @@ def test_async_manager_edge_limit():
     edge = Edge(source_node="A", target_node="B", source_op=op_a, target_op=op_b)
     graph = Graph(nodes={"A": node_a, "B": node_b}, edges=[edge])
 
-    manager = AsyncStepManager(graph=graph)
+    credit_edges = build_credit_edges(graph, AsyncStepConfig())
+    upstream_edges, downstream_edges = credit_topology_for_driver("A", credit_edges)
+    assert downstream_edges == ()
+    state = UpstreamCreditState(upstream_edges, epoch=0)
+    assert state.allowed_steps() == {op_a: 2}
 
-    # 1. Both at step 0
-    manager.report_op_completed("A", op_a, 0)
-    manager.report_op_completed("B", op_b, 0)
-    updates = manager.check_and_enforce_limits()
-    # allowed_step = target_min_step (0) + limit (2) = 2
-    assert ("A", op_a, 2) in updates
-
-    # 2. A moves to step 2
-    manager.report_op_completed("A", op_a, 2)
-    updates = manager.check_and_enforce_limits()
-    # A is at 2, B is at 0. diff=2. allowed_step = B(0) + limit(2) = 2.
-    # Cached, should not return update
-    assert not any(u for u in updates if u[0] == "A" and u[1] == op_a)
-
-    # 3. A moves to step 3
-    manager.report_op_completed("A", op_a, 3)
-    updates = manager.check_and_enforce_limits()
-    # Still allowed_step = 2, cached.
-    assert not any(u for u in updates if u[0] == "A" and u[1] == op_a)
-
-    # 4. B moves to step 1
-    manager.report_op_completed("B", op_b, 1)
-    updates = manager.check_and_enforce_limits()
-    # target B.consume is at 1, limit is 2. allowed_step = 1 + 2 = 3
-    assert ("A", op_a, 3) in updates
-
-    # 5. B moves to step 2
-    manager.report_op_completed("B", op_b, 2)
-    # target B.consume is at 2, limit 2. allowed_step = 2 + 2 = 4
-    updates = manager.check_and_enforce_limits()
-    assert ("A", op_a, 4) in updates
+    edge_id = credit_edges[0].edge_id
+    assert state.receive(edge_id, CreditUpdate(epoch=0, sequence=1, allowed_step=3))
+    assert state.allowed_step(op_a) == 3
+    assert state.receive(edge_id, CreditUpdate(epoch=0, sequence=2, allowed_step=4))
+    assert state.allowed_step(op_a) == 4
 
 
-def test_async_manager_ignores_local_only_edges_for_flow_control():
+def test_driver_credit_ignores_local_only_edges_for_flow_control():
     op_a = "prepare"
     op_b = "train"
     meta_a = OperatorMeta(name=op_a)
@@ -220,42 +211,264 @@ def test_async_manager_ignores_local_only_edges_for_flow_control():
         local_only=True,
     )
     graph = Graph(nodes={"Dense": node}, edges=[edge])
-    manager = AsyncStepManager(graph=graph)
-
-    manager.report_op_completed("Dense", op_a, 5)
-    manager.report_op_completed("Dense", op_b, 4)
-    updates = manager.check_and_enforce_limits()
-
-    assert ("Dense", op_a, 4) not in updates
-    assert ("Dense", op_a, 999999999) in updates
+    assert build_credit_edges(graph, AsyncStepConfig()) == ()
 
 
-def test_async_manager_global_limit():
-    """Verify that AsyncStepManager locks all ops when max_steps is reached."""
-    meta = OperatorMeta(name="run")
-    node = Node(
-        name="N",
+def test_driver_credit_uses_min_per_source_op_and_keeps_other_ops_independent():
+    node_a = Node(
+        name="A",
         spmd_config=SPMDConfig(
-            operator_metas={"run": meta}, active_operator_names=("run",)
+            operator_metas={
+                "forward": OperatorMeta(name="forward"),
+                "metrics": OperatorMeta(name="metrics"),
+            },
+            active_operator_names=("forward", "metrics"),
         ),
     )
-    graph = Graph(nodes={"N": node})
+    node_b = Node(
+        name="B",
+        spmd_config=SPMDConfig(
+            operator_metas={"train": OperatorMeta(name="train", max_inflight_steps=3)},
+            active_operator_names=("train",),
+        ),
+    )
+    node_c = Node(
+        name="C",
+        spmd_config=SPMDConfig(
+            operator_metas={"train": OperatorMeta(name="train", max_inflight_steps=1)},
+            active_operator_names=("train",),
+        ),
+    )
+    node_d = Node(
+        name="D",
+        spmd_config=SPMDConfig(
+            operator_metas={
+                "consume": OperatorMeta(name="consume", max_inflight_steps=9)
+            },
+            active_operator_names=("consume",),
+        ),
+    )
+    graph = Graph(
+        nodes={"A": node_a, "B": node_b, "C": node_c, "D": node_d},
+        edges=[
+            Edge(
+                source_node="A", target_node="B", source_op="forward", target_op="train"
+            ),
+            Edge(
+                source_node="A", target_node="C", source_op="forward", target_op="train"
+            ),
+            Edge(
+                source_node="A",
+                target_node="D",
+                source_op="metrics",
+                target_op="consume",
+            ),
+        ],
+    )
+    credit_edges = build_credit_edges(graph, AsyncStepConfig())
+    upstream_edges, _downstream_edges = credit_topology_for_driver("A", credit_edges)
+    state = UpstreamCreditState(upstream_edges, epoch=0)
 
-    config = AsyncStepConfig(max_steps=5)
-    manager = AsyncStepManager(graph=graph, config=config)
+    assert state.allowed_steps() == {"forward": 1, "metrics": 9}
+    by_id = {edge.edge_id: edge for edge in credit_edges}
+    edge_b = by_id["A.forward->B.train"]
+    edge_c = by_id["A.forward->C.train"]
+    state.receive(
+        edge_b.edge_id,
+        CreditUpdate(epoch=0, sequence=1, allowed_step=8),
+    )
+    assert state.allowed_steps() == {"forward": 1, "metrics": 9}
+    state.receive(
+        edge_c.edge_id,
+        CreditUpdate(epoch=0, sequence=1, allowed_step=4),
+    )
+    assert state.allowed_steps() == {"forward": 4, "metrics": 9}
 
-    manager.report_op_completed("N", "run", 4)
-    updates = manager.check_and_enforce_limits()
-    # allowed_step should be 5 because max_steps=5 and global_step is 4
-    # Wait, Global Limit code:
-    # `allowed_step = min(allowed_step, self._config.max_steps)`
-    # actually it should allow step 5 if we just completed 4.
-    assert ("N", "run", 5) in [u for u in updates if u[0] == "N"]
 
-    manager.report_op_completed("N", "run", 5)
-    updates = manager.check_and_enforce_limits()
-    # Limit hasn't changed, should be empty
-    assert not any(u for u in updates if u[0] == "N" and u[1] == "run")
+def test_heartbeat_contract_excludes_progress_and_backpressure_fields():
+    worker_heartbeat = WorkerHeartbeat(
+        rank=0,
+        timestamp=1.0,
+        status=WorkerStatus.RUNNING,
+    )
+    driver_heartbeat = DriverHeartbeat(
+        spmd_id="A",
+        timestamp=1.0,
+        status=DriverStatus.HEALTHY,
+        state=DriverState.RUNNING,
+        num_workers=1,
+        healthy_num_workers=1,
+        workers_ready=True,
+        workers_running=True,
+    )
+
+    removed_worker_fields = {
+        "completed_step_count",
+        "telemetry",
+        "mailbox_status",
+    }
+    removed_driver_fields = {
+        "completed_step_count",
+        "blocked_ops",
+        "is_downstream_busy",
+        "source_state",
+        "busy_worker_ratio",
+    }
+
+    assert removed_worker_fields.isdisjoint(worker_heartbeat.as_dict())
+    assert removed_driver_fields.isdisjoint(driver_heartbeat.as_dict())
+
+
+def test_flow_control_manager_produces_controller_authoritative_windows():
+    graph = Graph(
+        nodes={
+            "A": Node(
+                name="A",
+                spmd_config=SPMDConfig(
+                    operator_metas={"produce": OperatorMeta(name="produce")},
+                    active_operator_names=("produce",),
+                ),
+            ),
+            "B": Node(
+                name="B",
+                spmd_config=SPMDConfig(
+                    operator_metas={
+                        "consume": OperatorMeta(name="consume", max_inflight_steps=2)
+                    },
+                    active_operator_names=("consume",),
+                ),
+            ),
+        },
+        edges=[
+            Edge(
+                source_node="A",
+                target_node="B",
+                source_op="produce",
+                target_op="consume",
+            )
+        ],
+    )
+    manager = FlowControlManager(graph, AsyncStepConfig())
+
+    assert manager.initial_windows_for_driver("A") == (
+        CreditWindow(epoch=0, op_name="produce", allowed_step=2),
+    )
+    assert manager.observe_op_completed("B", "consume", 3) == {
+        "A": (CreditWindow(epoch=0, op_name="produce", allowed_step=5),)
+    }
+
+    manager.report_state(
+        FlowControlState(spmd_id="A", timestamp=1.0, paused=True, epoch=0)
+    )
+    state = manager.state_for_driver("A")
+    assert state is not None
+    assert state.paused is True
+    with pytest.raises(ValueError, match="epoch mismatch"):
+        manager.report_state(
+            FlowControlState(spmd_id="A", timestamp=1.0, paused=False, epoch=1)
+        )
+
+
+def _make_driver(spmd_id: str, controller_handle=None):
+    # pyrefly: ignore [missing-attribute]
+    return SPMDDriver.__ray_actor_class__(
+        spmd_id=spmd_id,
+        config=SPMDConfig(
+            mesh=SimpleNamespace(size=1),
+            operator_metas={
+                "produce": OperatorMeta(name="produce"),
+                "consume": OperatorMeta(name="consume"),
+            },
+            active_operator_names=("produce", "consume"),
+        ),
+        placement_group=None,
+        worker_bundle_indices=[1],
+        controller_handle=controller_handle,
+        graph_topology={},
+        checkpoint_backend=None,
+    )
+
+
+def test_driver_combines_controller_window_and_peer_hint_by_min():
+    driver = _make_driver("A", MagicMock())
+    driver.spmd_synchronizer.update_allowed_step = MagicMock()
+    edge = CreditEdge(
+        edge_id="A.produce->B.consume",
+        source_spmd_id="A",
+        source_op="produce",
+        target_spmd_id="B",
+        target_op="consume",
+        max_inflight_steps=2,
+    )
+
+    driver.register_credit_topology({}, (edge,), (), epoch=0)
+    driver.spmd_synchronizer.update_allowed_step.assert_called_with("produce", 2)
+
+    driver.spmd_synchronizer.update_allowed_step.reset_mock()
+    driver.receive_credit_update(
+        "B",
+        edge.edge_id,
+        CreditUpdate(epoch=0, sequence=1, allowed_step=9),
+    )
+    driver.spmd_synchronizer.update_allowed_step.assert_called_once_with("produce", 2)
+
+    driver.spmd_synchronizer.update_allowed_step.reset_mock()
+    driver.apply_credit_window(
+        (CreditWindow(epoch=0, op_name="produce", allowed_step=5),)
+    )
+    driver.spmd_synchronizer.update_allowed_step.assert_called_once_with("produce", 5)
+
+    with pytest.raises(ValueError, match="cannot decrease"):
+        driver.apply_credit_window(
+            (CreditWindow(epoch=0, op_name="produce", allowed_step=4),)
+        )
+    with pytest.raises(ValueError, match="epoch mismatch"):
+        driver.apply_credit_window(
+            (CreditWindow(epoch=1, op_name="produce", allowed_step=6),)
+        )
+
+
+def test_driver_completion_reports_controller_and_keeps_peer_fast_path():
+    controller = MagicMock()
+    upstream_driver = MagicMock()
+    driver = _make_driver("B", controller)
+    edge = CreditEdge(
+        edge_id="A.produce->B.consume",
+        source_spmd_id="A",
+        source_op="produce",
+        target_spmd_id="B",
+        target_op="consume",
+        max_inflight_steps=2,
+    )
+    driver.register_credit_topology({"A": upstream_driver}, (), (edge,), epoch=0)
+
+    driver._on_spmd_op_completed("B", "consume", 3)
+
+    controller.report_op_completed.remote.assert_called_once_with("B", "consume", 3)
+    upstream_driver.receive_credit_update.remote.assert_called_once()
+    downstream_id, edge_id, update = (
+        upstream_driver.receive_credit_update.remote.call_args.args
+    )
+    assert downstream_id == "B"
+    assert edge_id == edge.edge_id
+    assert update == CreditUpdate(epoch=0, sequence=1, allowed_step=5)
+
+
+def test_driver_reports_flow_control_state_outside_heartbeat():
+    controller = MagicMock()
+    driver = _make_driver("A", controller)
+
+    driver.pause_sources()
+    paused_state = controller.report_flow_control_state.remote.call_args.args[0]
+    assert paused_state.spmd_id == "A"
+    assert paused_state.paused is True
+    assert paused_state.epoch == 0
+
+    driver.resume_sources()
+    resumed_state = controller.report_flow_control_state.remote.call_args.args[0]
+    assert resumed_state.spmd_id == "A"
+    assert resumed_state.paused is False
+    assert resumed_state.epoch == 0
 
 
 def test_async_manager_reports_all_completed_at_max_steps():
@@ -265,17 +478,15 @@ def test_async_manager_reports_all_completed_at_max_steps():
     node_a = Node(
         name="A",
         spmd_config=SPMDConfig(
-            operator_metas={
-                op_a: OperatorMeta(name=op_a, active_operator_names=(op_a,))
-            }
+            operator_metas={op_a: OperatorMeta(name=op_a)},
+            active_operator_names=(op_a,),
         ),
     )
     node_b = Node(
         name="B",
         spmd_config=SPMDConfig(
-            operator_metas={
-                op_b: OperatorMeta(name=op_b, active_operator_names=(op_b,))
-            }
+            operator_metas={op_b: OperatorMeta(name=op_b)},
+            active_operator_names=(op_b,),
         ),
     )
     graph = Graph(nodes={"A": node_a, "B": node_b})

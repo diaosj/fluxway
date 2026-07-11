@@ -1,3 +1,4 @@
+from typing import cast
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,6 +8,7 @@ from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.spmd.worker.assembly import compile_assemble_plan
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
+from fluxway.spmd.worker.operator_manager.operator_manager import OperatorManager
 
 
 class FakeOpManager:
@@ -39,17 +41,18 @@ async def test_dynamic_assemble_accepts_complete_protocol_empty_arrivals():
             min_rows=0,
             expected_count=3,
             global_shape=(768,),
+            source_step=2,
         )
         builder.add_payload(edge, PayloadRole.VALUES, np.empty((0,), dtype=np.int64), 0)
         await mailbox.deposit_transport_frame("lookup", "Input", builder.build())
 
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     WorkerClass = cls.modified_class if cls else SPMDWorker  # type: ignore[reportAttributeAccessIssue]
-    worker = WorkerClass.__new__(WorkerClass)
+    worker = WorkerClass.__new__(WorkerClass)  # type: ignore[reportArgumentType]
     worker.rank = 0
     worker.spmd_id = "Embedding_geek_id"
     worker._mailbox = mailbox
-    worker._op_manager = FakeOpManager()
+    worker._op_manager = cast(OperatorManager, FakeOpManager())
 
     shards = await mailbox.get_tensor_shard_views("lookup", 52, 2)
     arrivals = await mailbox.get_tensor_arrivals("lookup", 52, 2)

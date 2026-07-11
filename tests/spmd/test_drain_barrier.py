@@ -184,6 +184,7 @@ class TestWorkerDrainTarget:
         stub._input_prepare_runtime = LocalInputPrepareRuntime(
             background_tasks=stub._background_tasks,
             on_task_done=lambda _task: None,
+            schedule_key=lambda op_name, step: (0, 0, step, op_name),
         )
         stub.set_drain_target_count = types.MethodType(
             raw_cls.set_drain_target_count, stub

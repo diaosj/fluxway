@@ -153,6 +153,12 @@ PREPARE_ASSEMBLE_THREAD = TraceEventSpec(
     ("op_id", "step"),
     "step",
 )
+PREPARE_ASSEMBLE_QUEUE_WAIT = TraceEventSpec(
+    "prepare.assemble_queue_wait",
+    "compute/prepare",
+    ("op_id", "step", "priority", "prepare_state", "schedule_step"),
+    "step",
+)
 PREPARE_CONSUME = TraceEventSpec(
     "prepare.consume",
     "compute/prepare",
@@ -497,8 +503,7 @@ DRIVER_SOURCE_START = TraceEventSpec(
 DRIVER_WORKER_HEARTBEAT = TraceEventSpec(
     "driver.worker_heartbeat",
     "driver/heartbeat",
-    ("rank", "status_id", "completed_count", "mailbox_full"),
-    "completed_count",
+    ("rank", "status_id"),
 )
 DRIVER_OP_COMPLETION = TraceEventSpec(
     "driver.op_completion",
@@ -891,6 +896,24 @@ class TraceRecorder:
         return self._span(
             PREPARE_ASSEMBLE_THREAD,
             payload=(self.intern(op_name), step),
+        )
+
+    def prepare_assemble_queue_wait(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        schedule_key: tuple[int, int, int, str],
+    ) -> AbstractAsyncContextManager[None]:
+        return self._async_span(
+            PREPARE_ASSEMBLE_QUEUE_WAIT,
+            payload=(
+                self.intern(op_name),
+                step,
+                schedule_key[0],
+                schedule_key[1],
+                schedule_key[2],
+            ),
         )
 
     def prepare_consume(
@@ -1438,12 +1461,10 @@ class TraceRecorder:
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(DRIVER_SOURCE_START, payload=(worker_count,))
 
-    def driver_worker_heartbeat(
-        self, *, rank: int, status: str, completed_count: int, mailbox_full: bool
-    ) -> None:
+    def driver_worker_heartbeat(self, *, rank: int, status: str) -> None:
         self._instant(
             DRIVER_WORKER_HEARTBEAT,
-            payload=(rank, self.intern(status), completed_count, int(mailbox_full)),
+            payload=(rank, self.intern(status)),
         )
 
     def driver_op_completion(self, *, rank: int, op_name: str, step: int) -> None:

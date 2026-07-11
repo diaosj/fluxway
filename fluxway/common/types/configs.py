@@ -4,7 +4,7 @@ Core data type definitions for Fluxway framework.
 Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
-from typing import Optional, Any, Annotated, TypeVar
+from typing import Any, Annotated, TypeVar
 from collections.abc import Callable
 
 from pydantic import BaseModel, Field, ConfigDict
@@ -1122,13 +1122,8 @@ class WorkerHeartbeat(FluxwayBaseSchema):
 
     rank: int
     timestamp: float
-    completed_step_count: dict[str, int] = Field(
-        default_factory=dict
-    )  # op_type.name -> completed count
     status: WorkerStatus = WorkerStatus.RUNNING
     error_message: str | None = None
-    telemetry: Optional["WorkerTelemetry"] = None
-    mailbox_status: MailboxStatus | None = None  # Mailbox status for backpressure
 
 
 class DriverHeartbeat(FluxwayBaseSchema):
@@ -1139,19 +1134,19 @@ class DriverHeartbeat(FluxwayBaseSchema):
     status: DriverStatus = DriverStatus.HEALTHY
     state: DriverState = DriverState.INITIALIZING
     error_message: str | None = None
-    completed_step_count: dict[str, int] = Field(
-        default_factory=dict
-    )  # op_type.name -> completed step count
     num_workers: int = 0
     healthy_num_workers: int = 0
-    blocked_ops: list[str] = Field(default_factory=list)
     workers_ready: bool = False  # All workers have reported heartbeat
     workers_running: bool = False  # All workers are running main loop
-    is_downstream_busy: bool = (
-        False  # Whether downstream SPMDs are busy (for backpressure)
-    )
-    source_state: ReaderState | None = None  # Generic source state
-    busy_worker_ratio: float = 0.0  # Ratio of workers with full mailbox
+
+
+class FlowControlState(FluxwayBaseSchema):
+    """Driver flow-control state reported outside the heartbeat channel."""
+
+    spmd_id: str
+    timestamp: float
+    paused: bool = False
+    epoch: int = 0
 
 
 class ErrorPolicy(FluxwayBaseSchema):

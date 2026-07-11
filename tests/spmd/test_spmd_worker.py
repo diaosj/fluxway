@@ -928,9 +928,10 @@ async def test_send_output_none_mesh():
     worker._op_manager.get_output_state_names.return_value = []
     worker._op_manager.get_output_tuuid_to_name.return_value = {123: "out"}
 
-    op_meta_mock = MagicMock()
-    op_meta_mock.output_treedef = None
-    worker._op_manager.get_operator_metadata.return_value = op_meta_mock
+    op_meta = OperatorMeta(name="compute")
+    op_meta.output_treedef = None
+    worker._op_manager.get_operator_metadata.return_value = op_meta
+    worker._op_manager._get_operator_metadata.return_value = op_meta
 
     disp_mock = MagicMock()
     disp_mock.interleave_unit_size = None

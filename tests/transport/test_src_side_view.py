@@ -59,6 +59,7 @@ def test_per_dim_indices_single_axis_chunk():
         src_spec=src, src_local_rank=1, target=dst, dst_global_shape=(100,)
     )
     _, spec1 = view1.per_dim_indices[0]
+    assert isinstance(spec1, RangeIndices)
     assert spec1.start == 50
     assert spec1.length == 50
 
@@ -263,7 +264,7 @@ def _build_chunked_tensor(local_shape, global_shape):
     from fluxway.common.types.tensor import TransportTensor
 
     flat = jnp.zeros(local_shape, dtype=jnp.float32)
-    return TransportTensor(flat, global_shape=global_shape)
+    return TransportTensor(flat, global_shape=global_shape, source_step=0)
 
 
 def test_distributor_last_src_view_populated_after_plan():
@@ -332,7 +333,7 @@ def test_distributor_expected_n_for_dst_data_driven_falls_back():
     dst = ShardingSpec.hash(P("y")).bind(dst_mesh)
 
     keys = jnp.arange(0, 6, dtype=jnp.int32)
-    tt = TransportTensor(keys, global_shape=(12,))
+    tt = TransportTensor(keys, global_shape=(12,), source_step=0)
     dist = AsyncDataDistributor(local_rank=0)
     dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=6, tuuid=3)
 

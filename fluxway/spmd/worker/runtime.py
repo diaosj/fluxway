@@ -6,7 +6,10 @@ import asyncio
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
+from dataclasses import dataclass, field
+import heapq
 import inspect
+import queue
 import threading
 from typing import Any
 
@@ -15,6 +18,111 @@ from fluxway.profiler.recorder import WORKER_OUTBOUND_TASK
 
 
 WORKER_PROCESS_DEFAULT_EXECUTION_LANE = "__default__"
+ScheduleKey = tuple[int, int, int, str]
+
+
+@dataclass(order=True, slots=True)
+class _PriorityThreadWork:
+    schedule_key: ScheduleKey
+    sequence: int
+    fn: Callable[[], Any] | None = field(compare=False)
+    future: Future[Any] | None = field(compare=False)
+
+
+class _PriorityThreadExecutor:
+    def __init__(self, *, max_workers: int, thread_name_prefix: str) -> None:
+        if max_workers <= 0:
+            raise ValueError(
+                f"priority thread executor max_workers must be positive, got {max_workers}."
+            )
+        self._max_workers = max_workers
+        self._queue: queue.PriorityQueue[_PriorityThreadWork] = queue.PriorityQueue()
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=thread_name_prefix,
+        )
+        self._lock = threading.Lock()
+        self._closed = False
+        self._sequence = 0
+        self._workers: list[Future[Any]] = []
+
+    def submit(self, schedule_key: ScheduleKey, fn: Callable[[], Any]) -> Future[Any]:
+        if len(schedule_key) != 4:
+            raise ValueError(
+                f"schedule key must have four fields, got {schedule_key!r}."
+            )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Priority thread executor is closed.")
+            if not self._workers:
+                self._workers = [
+                    self._executor.submit(self._run) for _ in range(self._max_workers)
+                ]
+            future: Future[Any] = Future()
+            sequence = self._sequence
+            self._sequence += 1
+            self._queue.put(
+                _PriorityThreadWork(
+                    schedule_key=schedule_key,
+                    sequence=sequence,
+                    fn=fn,
+                    future=future,
+                )
+            )
+            return future
+
+    def _run(self) -> None:
+        while True:
+            work = self._queue.get()
+            try:
+                if work.fn is None:
+                    return
+                future = work.future
+                if future is None:
+                    raise RuntimeError(
+                        "Priority thread work is missing its result future."
+                    )
+                if not future.set_running_or_notify_cancel():
+                    continue
+                try:
+                    future.set_result(work.fn())
+                except BaseException as exc:
+                    future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if cancel_futures:
+                while True:
+                    try:
+                        work = self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    try:
+                        if work.future is not None:
+                            work.future.cancel()
+                    finally:
+                        self._queue.task_done()
+            stop_key: ScheduleKey = (
+                2**63 - 1,
+                2**63 - 1,
+                2**63 - 1,
+                "\uffff",
+            )
+            for worker_index in range(len(self._workers)):
+                self._queue.put(
+                    _PriorityThreadWork(
+                        schedule_key=stop_key,
+                        sequence=self._sequence + worker_index,
+                        fn=None,
+                        future=None,
+                    )
+                )
+        self._executor.shutdown(wait=wait, cancel_futures=False)
 
 
 class WorkerProcessCallRuntime:
@@ -207,6 +315,7 @@ class LocalInputPrepareRuntime:
         profiler_runtime: Any | None = None,
         on_prepare_ready: Callable[[str, int], None] | None = None,
         max_workers: int = 1,
+        schedule_key: Callable[[str, int], ScheduleKey],
     ) -> None:
         if max_workers <= 0:
             raise ValueError(
@@ -216,8 +325,9 @@ class LocalInputPrepareRuntime:
         self._on_task_done = on_task_done
         self._profiler_runtime = profiler_runtime
         self._on_prepare_ready = on_prepare_ready
+        self._schedule_key = schedule_key
         self._tasks: dict[tuple[str, int], asyncio.Task[Any]] = {}
-        self._executor = ThreadPoolExecutor(
+        self._executor = _PriorityThreadExecutor(
             max_workers=max_workers,
             thread_name_prefix="fluxway-input-prepare",
         )
@@ -275,8 +385,14 @@ class LocalInputPrepareRuntime:
         loop = asyncio.get_running_loop()
         context = contextvars.copy_context()
         profiler_runtime = self._profiler_runtime
+        schedule_key = self._schedule_key(op_name, step)
+        start_future: asyncio.Future[None] | None = None
+        if profiler_runtime is not None and profiler_runtime.enabled:
+            start_future = loop.create_future()
 
         def run_in_prepare_thread() -> Any:
+            if start_future is not None:
+                loop.call_soon_threadsafe(self._mark_assemble_started, start_future)
             recorder = (
                 profiler_runtime.recorder
                 if profiler_runtime is not None and profiler_runtime.enabled
@@ -287,14 +403,27 @@ class LocalInputPrepareRuntime:
             with recorder.prepare_assemble_thread(op_name=op_name, step=step):
                 return context.run(fn)
 
-        future = self._executor.submit(run_in_prepare_thread)
+        future = self._executor.submit(schedule_key, run_in_prepare_thread)
         self._add_thread_future(future)
         future.add_done_callback(self._discard_thread_future)
         try:
+            if start_future is not None:
+                assert profiler_runtime is not None
+                async with profiler_runtime.recorder.prepare_assemble_queue_wait(
+                    op_name=op_name,
+                    step=step,
+                    schedule_key=schedule_key,
+                ):
+                    await start_future
             return await asyncio.wrap_future(future, loop=loop)
         finally:
             if future.done():
                 self._discard_thread_future(future)
+
+    @staticmethod
+    def _mark_assemble_started(start_future: asyncio.Future[None]) -> None:
+        if not start_future.done():
+            start_future.set_result(None)
 
     def _add_thread_future(self, future: Future[Any]) -> None:
         with self._thread_futures_lock:
@@ -431,13 +560,18 @@ class OutboundDeliveryRuntime:
             raise ValueError(
                 f"data_plane_max_in_flight must be positive, got {max_in_flight}."
             )
-        self._semaphore = asyncio.Semaphore(max_in_flight)
+        self._capacity = _PriorityCapacityGate(max_in_flight)
         self._profiler_runtime = profiler_runtime
         self._background_tasks = background_tasks
         self._on_task_done = on_task_done
         self._tasks: set[asyncio.Task] = set()
 
-    async def submit(self, awaitable: Coroutine[Any, Any, Any]) -> asyncio.Task:
+    async def submit(
+        self,
+        awaitable: Coroutine[Any, Any, Any],
+        *,
+        schedule_key: ScheduleKey,
+    ) -> asyncio.Task:
         original_coro = awaitable
         if self._profiler_runtime.enabled:
             recorder = self._profiler_runtime.recorder
@@ -452,11 +586,11 @@ class OutboundDeliveryRuntime:
                     spec=WORKER_OUTBOUND_TASK,
                     payload=(recorder.intern(task_name),),
                 ):
-                    return await self._run_delivery(original_coro)
+                    return await self._run_delivery(original_coro, schedule_key)
 
             coro = traced_coro()
         else:
-            coro = self._run_delivery(original_coro)
+            coro = self._run_delivery(original_coro, schedule_key)
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.delivery_register_token(
                 pending_delivery_count=len(self._tasks) + 1,
@@ -483,7 +617,11 @@ class OutboundDeliveryRuntime:
         task.add_done_callback(_done)
         return task
 
-    async def _run_delivery(self, awaitable: Coroutine[Any, Any, Any]) -> Any:
+    async def _run_delivery(
+        self,
+        awaitable: Coroutine[Any, Any, Any],
+        schedule_key: ScheduleKey,
+    ) -> Any:
         acquired = False
         started = False
         try:
@@ -491,9 +629,9 @@ class OutboundDeliveryRuntime:
                 async with self._profiler_runtime.recorder.delivery_semaphore_wait(
                     pending_delivery_count=self.pending_count(),
                 ):
-                    await self._semaphore.acquire()
+                    await self._capacity.acquire(schedule_key)
             else:
-                await self._semaphore.acquire()
+                await self._capacity.acquire(schedule_key)
             acquired = True
             started = True
             if self._profiler_runtime.enabled:
@@ -504,7 +642,7 @@ class OutboundDeliveryRuntime:
             return await awaitable
         finally:
             if acquired:
-                self._semaphore.release()
+                await self._capacity.release()
             if not started:
                 close = getattr(awaitable, "close", None)
                 if callable(close):
@@ -537,3 +675,59 @@ class OutboundDeliveryRuntime:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+
+
+class _PriorityCapacityGate:
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError(f"priority capacity must be positive, got {capacity}.")
+        self._capacity = capacity
+        self._active = 0
+        self._sequence = 0
+        self._waiters: list[tuple[ScheduleKey, int, asyncio.Future[None]]] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, schedule_key: ScheduleKey) -> None:
+        if len(schedule_key) != 4:
+            raise ValueError(
+                f"schedule key must have four fields, got {schedule_key!r}."
+            )
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[None] | None = None
+        async with self._lock:
+            self._discard_cancelled_waiters()
+            if self._active < self._capacity and not self._waiters:
+                self._active += 1
+                return
+            waiter = loop.create_future()
+            sequence = self._sequence
+            self._sequence += 1
+            heapq.heappush(self._waiters, (schedule_key, sequence, waiter))
+        try:
+            await waiter
+        except BaseException:
+            granted = waiter.done() and not waiter.cancelled()
+            if granted:
+                await asyncio.shield(self.release())
+            else:
+                waiter.cancel()
+            raise
+
+    async def release(self) -> None:
+        async with self._lock:
+            if self._active <= 0:
+                raise RuntimeError(
+                    "priority capacity released without an active holder."
+                )
+            self._discard_cancelled_waiters()
+            while self._waiters:
+                _schedule_key, _sequence, waiter = heapq.heappop(self._waiters)
+                if waiter.done():
+                    continue
+                waiter.set_result(None)
+                return
+            self._active -= 1
+
+    def _discard_cancelled_waiters(self) -> None:
+        while self._waiters and self._waiters[0][2].done():
+            heapq.heappop(self._waiters)

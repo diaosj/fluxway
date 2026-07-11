@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+import heapq
 from typing import Any
 
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
@@ -15,6 +16,7 @@ from fluxway.spmd.worker.data_plane import (
 )
 from fluxway.transport.communication import TransportBatchPlan, TransportFrameBatch
 from fluxway.profiler.recorder import TraceRecorder
+from fluxway.spmd.worker.runtime import ScheduleKey
 
 SubmitDelivery = Callable[[Awaitable[Any]], Awaitable[asyncio.Task[Any]]]
 
@@ -29,6 +31,7 @@ class _QueuedBatch:
     target_rank: int
     batch_seq: int
     profiler_recorder: TraceRecorder | None
+    schedule_key: ScheduleKey
 
 
 class _TargetBatchQueue:
@@ -39,7 +42,8 @@ class _TargetBatchQueue:
             raise ValueError(f"batch_flush_us must be non-negative, got {flush_us}.")
         self._max_frames = max_frames
         self._flush_s = flush_us / 1_000_000.0
-        self._items: list[_QueuedBatch] = []
+        self._items: list[tuple[ScheduleKey, int, _QueuedBatch]] = []
+        self._sequence = 0
         self._flush_task: asyncio.Task[Any] | None = None
         self._lock = asyncio.Lock()
 
@@ -54,24 +58,29 @@ class _TargetBatchQueue:
         target_rank: int,
         batch_seq: int,
         profiler_recorder: TraceRecorder | None,
+        schedule_key: ScheduleKey,
     ) -> Any:
         if not frames:
             raise ValueError("transport frame batch must contain at least one frame.")
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         async with self._lock:
-            self._items.append(
-                _QueuedBatch(
-                    frames=frames,
-                    future=future,
-                    compiled_plan=compiled_plan,
-                    output_step=output_step,
-                    target_spmd_id=target_spmd_id,
-                    target_rank=target_rank,
-                    batch_seq=batch_seq,
-                    profiler_recorder=profiler_recorder,
-                )
+            item = _QueuedBatch(
+                frames=frames,
+                future=future,
+                compiled_plan=compiled_plan,
+                output_step=output_step,
+                target_spmd_id=target_spmd_id,
+                target_rank=target_rank,
+                batch_seq=batch_seq,
+                profiler_recorder=profiler_recorder,
+                schedule_key=schedule_key,
             )
+            heapq.heappush(
+                self._items,
+                (schedule_key, self._sequence, item),
+            )
+            self._sequence += 1
             if self._flush_task is None or self._flush_task.done():
                 self._flush_task = asyncio.create_task(self._flush_later(handler))
         return await future
@@ -86,10 +95,11 @@ class _TargetBatchQueue:
                 selected: list[_QueuedBatch] = []
                 frame_count = 0
                 while self._items:
-                    next_frame_count = len(self._items[0].frames)
+                    _next_schedule_key, _next_sequence, next_item = self._items[0]
+                    next_frame_count = len(next_item.frames)
                     if selected and frame_count + next_frame_count > self._max_frames:
                         break
-                    item = self._items.pop(0)
+                    _schedule_key, _sequence, item = heapq.heappop(self._items)
                     selected.append(item)
                     frame_count += next_frame_count
                     if frame_count >= self._max_frames:
@@ -171,6 +181,7 @@ async def build_and_send_step_frames(
     batch_delivery_factory: Callable[..., Awaitable[Any]] | None = None,
     empty_values: Any | None = None,
     profiler_recorder: TraceRecorder | None = None,
+    delivery_schedule_key: ScheduleKey,
 ) -> list[asyncio.Task[Any]]:
     if len(successor_handlers) != len(compiled_plan.successor_routes):
         raise ValueError(
@@ -247,6 +258,7 @@ async def build_and_send_step_frames(
                     target_rank=batch.target_rank,
                     batch_seq=batch.batch_seq,
                     profiler_recorder=None,
+                    schedule_key=delivery_schedule_key,
                 )
                 if batch_delivery_factory is not None
                 else _send_transport_frame_batch_to_handler(
@@ -299,6 +311,7 @@ async def build_and_send_step_frames(
                         target_rank=batch.target_rank,
                         batch_seq=batch.batch_seq,
                         profiler_recorder=profiler_recorder,
+                        schedule_key=delivery_schedule_key,
                     )
                     if batch_delivery_factory is not None
                     else _send_transport_frame_batch_to_handler(
@@ -412,6 +425,7 @@ class BatchingDataPlaneExecutor:
         submit_delivery: SubmitDelivery,
         empty_values: Any | None = None,
         profiler_recorder: TraceRecorder | None = None,
+        delivery_schedule_key: ScheduleKey,
     ) -> list[asyncio.Task[Any]]:
         return await build_and_send_step_frames(
             compiled_plan=compiled_plan,
@@ -429,6 +443,7 @@ class BatchingDataPlaneExecutor:
             ),
             empty_values=empty_values,
             profiler_recorder=profiler_recorder,
+            delivery_schedule_key=delivery_schedule_key,
         )
 
     async def _enqueue_batch_delivery(
@@ -444,6 +459,7 @@ class BatchingDataPlaneExecutor:
         profiler_recorder: TraceRecorder | None,
         batch_max_frames: int,
         batch_flush_us: int,
+        schedule_key: ScheduleKey,
     ) -> Any:
         key = (id(handler), target_rank)
         queue = self._queues.get(key)
@@ -462,4 +478,5 @@ class BatchingDataPlaneExecutor:
             target_rank=target_rank,
             batch_seq=batch_seq,
             profiler_recorder=profiler_recorder,
+            schedule_key=schedule_key,
         )

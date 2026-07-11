@@ -11,19 +11,24 @@ from fluxway.rpc.protocol import (
     payload_device_class,
     validate_payload_iov_device_class,
 )
-from fluxway.transport.manifest import TransportFrameHeader
+from fluxway.transport.manifest import (
+    EDGE_WIDTH,
+    FRAME_WIDTH,
+    PAYLOAD_WIDTH,
+    TransportFrameHeader,
+)
 
 
 def _make_header() -> TransportFrameHeader:
-    frame_i32 = np.arange(8, dtype=np.int32)
+    frame_i32 = np.arange(FRAME_WIDTH, dtype=np.int32)
     frame_i32[0] = 1
     frame_i32[5] = 1
     frame_i32[6] = 2
-    edge_i32 = np.zeros((1, 11), dtype=np.int32)
+    edge_i32 = np.zeros((1, EDGE_WIDTH), dtype=np.int32)
     edge_i32[0, 2] = 0
     edge_i32[0, 4] = 2
     edge_i32[0, 6] = 1
-    payload_i32 = np.zeros((2, 8), dtype=np.int32)
+    payload_i32 = np.zeros((2, PAYLOAD_WIDTH), dtype=np.int32)
     payload_i32[:, 0] = 0
     payload_i32[0, 1] = 4
     payload_i32[1, 1] = 6

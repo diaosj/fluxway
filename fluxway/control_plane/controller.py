@@ -45,6 +45,7 @@ from fluxway.common.types import (
     ControllerState,
     DriverHeartbeat,
     ErrorPolicy,
+    FlowControlState,
     Graph,
     HeartbeatConfig,
 )
@@ -55,6 +56,7 @@ from fluxway.control_plane.scheduler import Scheduler
 from fluxway.control_plane.spmd_manager import SPMDManager, SPMDHandle
 from fluxway.control_plane.state_manager import StateManager
 from fluxway.control_plane.heartbeat import HeartbeatManager
+from fluxway.control_plane.flow_control import FlowControlManager
 from fluxway.control_plane.state_machine import ControllerStateMachine
 from fluxway.control_plane.async_manager import AsyncStepManager
 from fluxway.common.types import CheckpointConfig
@@ -254,6 +256,9 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 error_policy=self._error_policy,
             )
             self._async_step_manager = AsyncStepManager(graph, self._async_step_config)
+            self._flow_control_manager = FlowControlManager(
+                graph, self._async_step_config
+            )
             # snapshot_id → {expected, received, metadata, event}
             self._pending_snapshots: dict[str, Any] = {}
 
@@ -274,13 +279,6 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self._last_completed_drain_target: int = 0
             self._drained_drivers: set = set()
             self._start_sources_when_running: bool = False
-
-            # Backpressure tracking
-            self._busy_spmds: dict[str, float] = {}  # {spmd_id: busy_worker_ratio}
-            self._backpressure_threshold: float = (
-                0.5  # 50% workers busy triggers backpressure
-            )
-            self._paused_readers: set = set()  # Set of paused reader IDs
 
             logger.debug(f"ControllerActor created with {len(graph.nodes)} nodes")
 
@@ -477,6 +475,13 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             """Get all latest heartbeats from all SPMDs."""
             return await self.heartbeat_manager.get_all_heartbeats()
 
+        async def get_async_step_progress(self) -> dict[str, dict[str, int]]:
+            steps = self.async_step_manager.get_all_spmd_steps()
+            return {
+                spmd_id: dict(spmd_step.completed_step_count)
+                for spmd_id, spmd_step in steps.items()
+            }
+
         def is_initialized(self) -> bool:
             """Check if controller is initialized."""
             return self._initialized
@@ -519,14 +524,7 @@ if TYPE_CHECKING or RAY_AVAILABLE:
         async def _receive_driver_heartbeat_unprofiled(
             self, heartbeat: DriverHeartbeat
         ) -> None:
-            # Route to heartbeat manager
             await self.heartbeat_manager.receive_heartbeat(heartbeat)
-
-            # Update busy status for backpressure
-            self._busy_spmds[heartbeat.spmd_id] = heartbeat.busy_worker_ratio
-
-            # Check and enforce backpressure for readers
-            await self._check_and_enforce_backpressure()
 
         # =====================================================================
         # Op Completion Interface (called by drivers)
@@ -547,7 +545,11 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self.async_step_manager.report_op_completed(
                 spmd_id, op_name, completed_count
             )
-            await self._check_and_enforce_step_limits()
+            await self._apply_flow_control_windows(
+                self._flow_control_manager.observe_op_completed(
+                    spmd_id, op_name, completed_count
+                )
+            )
             if (
                 self._drain_strategy is None
                 and self.async_step_manager.is_all_completed()
@@ -557,15 +559,26 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     ControllerEvent.ALL_DRIVERS_COMPLETED
                 )
 
-        async def _check_and_enforce_step_limits(self) -> None:
-            """Check step differences and apply lock/unlock actions."""
+        async def report_flow_control_state(self, state: FlowControlState) -> None:
+            self._flow_control_manager.report_state(state)
 
-            for (
-                spmd_id,
-                op_name,
-                allowed_step,
-            ) in self.async_step_manager.check_and_enforce_limits():
-                await self._set_spmd_allowed_step(spmd_id, op_name, allowed_step)
+        @require_spmd_manager
+        async def _apply_flow_control_windows(
+            self, windows_by_spmd_id: dict[str, tuple[Any, ...]]
+        ) -> None:
+            apply_tasks = []
+            for spmd_id, windows in windows_by_spmd_id.items():
+                if not windows:
+                    continue
+                driver = self.spmd_manager.get_driver_handle(spmd_id)
+                if driver is None:
+                    raise RuntimeError(
+                        f"Missing driver handle for SPMD {spmd_id!r} "
+                        "while applying flow-control windows."
+                    )
+                apply_tasks.append(driver.apply_credit_window.remote(windows))
+            if apply_tasks:
+                await asyncio.gather(*apply_tasks)
 
         async def report_driver_drained(self, spmd_id: str) -> None:
             """Called by a driver when it has successfully drained to the target."""
@@ -629,7 +642,6 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                         f"(already persisted at this step)"
                     )
                     await self._resume_and_schedule_next_drain()
-                    await self._check_and_enforce_step_limits()
                     return
 
                 # Issue snapshot
@@ -649,14 +661,12 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     finally:
                         # Always release drain and schedule the next iteration
                         await self._resume_and_schedule_next_drain()
-                        await self._check_and_enforce_step_limits()
 
                 self._checkpoint_task = asyncio.create_task(do_ckpt(boundary))
             else:
                 # No checkpointer configured.
                 # In future 'eager' mode, this would notify the caller.
                 await self._resume_and_schedule_next_drain()
-                await self._check_and_enforce_step_limits()
 
         async def _resume_and_schedule_next_drain(self) -> None:
             self._last_completed_drain_target = self._last_requested_drain_target
@@ -689,20 +699,6 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     await self._schedule_drain(next_target)
 
         @require_spmd_manager
-        async def _set_spmd_allowed_step(
-            self, spmd_id: str, op_name: str, allowed_step: int
-        ) -> None:
-            """Propagate global watermark to an SPMD Driver."""
-            driver = self.spmd_manager.get_driver_handle(spmd_id)
-            if driver is not None:
-                try:
-                    await driver.set_allowed_step.remote(op_name, allowed_step)
-                except Exception as e:
-                    logger.error(
-                        f"Failed to set allowed_step {allowed_step} for {spmd_id}.{op_name}: {e}"
-                    )
-
-        @require_spmd_manager
         async def _lock_spmd_op(self, spmd_id: str, op_name: str) -> None:
             """Lock an SPMD's operation."""
             driver = self.spmd_manager.get_driver_handle(spmd_id)
@@ -723,95 +719,6 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                     # logger.debug(f"Unlocked {spmd_id} {op_name}")
                 except Exception as e:
                     logger.error(f"Failed to unlock {spmd_id} {op_name}: {e}")
-
-        # =====================================================================
-        # Backpressure Management for Reader Nodes
-        # =====================================================================
-
-        @require_spmd_manager
-        async def _check_and_enforce_backpressure(self) -> None:
-            """
-            Check downstream SPMD busy status and apply backpressure to readers.
-
-            Logic:
-            - For each Reader node, check if any of its downstream SPMDs are busy
-            - If downstream is busy (busy_worker_ratio > threshold), pause the reader
-            - If downstream is no longer busy, resume the reader
-            """
-            if self._profiler_runtime.enabled:
-                async with self._profiler_runtime.recorder.controller_backpressure(
-                    busy_spmd_count=sum(
-                        1
-                        for busy_ratio in self._busy_spmds.values()
-                        if busy_ratio >= self._backpressure_threshold
-                    ),
-                    paused_reader_count=len(self._paused_readers),
-                ):
-                    await self._check_and_enforce_backpressure_unprofiled()
-                return
-            await self._check_and_enforce_backpressure_unprofiled()
-
-        async def _check_and_enforce_backpressure_unprofiled(self) -> None:
-            # Source nodes are candidates for backpressure (e.g., readers)
-            reader_nodes = self._source_nodes
-
-            for reader_id in reader_nodes:
-                # Get downstream SPMDs for this reader
-                downstream_spmds = self.spmd_manager.get_successors(reader_id)
-
-                # Check if any downstream SPMD is busy
-                is_downstream_busy = False
-                for downstream_id in downstream_spmds:
-                    busy_ratio = self._busy_spmds.get(downstream_id, 0.0)
-                    if busy_ratio >= self._backpressure_threshold:
-                        is_downstream_busy = True
-                        break
-
-                # Apply backpressure actions
-                if is_downstream_busy and reader_id not in self._paused_readers:
-                    # Pause reader
-                    await self._pause_reader(reader_id)
-                elif not is_downstream_busy and reader_id in self._paused_readers:
-                    # Resume reader
-                    await self._resume_reader(reader_id)
-
-        @require_spmd_manager
-        async def _pause_reader(self, reader_id: str) -> None:
-            """
-            Pause a reader due to backpressure.
-
-            Args:
-                reader_id: Reader SPMD ID to pause
-            """
-            driver = self.spmd_manager.get_driver_handle(reader_id)
-            if driver is not None:
-                try:
-                    await driver.pause_sources.remote()
-                    self._paused_readers.add(reader_id)
-                    logger.debug(f"Paused reader {reader_id} due to backpressure")
-                except Exception as e:
-                    logger.error(f"Failed to pause reader {reader_id}: {e}")
-
-        @require_spmd_manager
-        async def _resume_reader(self, reader_id: str) -> None:
-            """
-            Resume a paused reader.
-
-            Args:
-                reader_id: Reader SPMD ID to resume
-            """
-            driver = self.spmd_manager.get_driver_handle(reader_id)
-            if driver is not None:
-                try:
-                    await driver.resume_sources.remote()
-                    self._paused_readers.discard(reader_id)
-                    logger.debug(f"Resumed reader {reader_id}")
-                except Exception as e:
-                    logger.error(f"Failed to resume reader {reader_id}: {e}")
-
-        def get_paused_readers(self) -> list[str]:
-            """Get list of currently paused readers."""
-            return list(self._paused_readers)
 
         # =====================================================================
         # State Argument Transport
@@ -1083,14 +990,19 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             self.state_manager.save_snapshot(snapshot_id, manifest)
 
             # Hydrate Control Plane step watermarks from spmd_state before unblocking.
+            flow_control_updates: dict[str, tuple[Any, ...]] = {}
             for spmd_id, spmd_entry in manifest.items():
                 spmd_state = spmd_entry.get("spmd_state", {})
                 for op_name, count in spmd_state.get(
                     "completed_step_count", {}
                 ).items():
                     self.async_step_manager.report_op_completed(spmd_id, op_name, count)
-
-            await self._check_and_enforce_step_limits()
+                    flow_control_updates.update(
+                        self._flow_control_manager.observe_op_completed(
+                            spmd_id, op_name, count
+                        )
+                    )
+            await self._apply_flow_control_windows(flow_control_updates)
 
             await self.block_all_spmds()
 
@@ -1570,8 +1482,18 @@ if TYPE_CHECKING or RAY_AVAILABLE:
             spmd_id_by_code = {
                 code: spmd_id for spmd_id, code in spmd_code_by_id.items()
             }
+            driver_handles_by_id: dict[str, Any] = {}
+            for driver_spmd_id in all_spmd_ids:
+                driver_handle = self.spmd_manager.get_driver_handle(driver_spmd_id)
+                if driver_handle is None:
+                    raise RuntimeError(
+                        f"Missing driver handle for SPMD {driver_spmd_id!r} "
+                        "during credit topology registration."
+                    )
+                driver_handles_by_id[driver_spmd_id] = driver_handle
+
             for spmd_id in all_spmd_ids:
-                driver = self.spmd_manager.get_driver_handle(spmd_id)
+                driver = driver_handles_by_id[spmd_id]
                 if driver is None:
                     continue
 
@@ -1612,6 +1534,24 @@ if TYPE_CHECKING or RAY_AVAILABLE:
                 logger.debug(f"  - succ_handlers keys: {list(succ_handlers.keys())}")
 
                 try:
+                    upstream_edges, downstream_edges = (
+                        self._flow_control_manager.topology_for_driver(spmd_id)
+                    )
+                    upstream_driver_handles = {
+                        edge.source_spmd_id: driver_handles_by_id[edge.source_spmd_id]
+                        for edge in downstream_edges
+                    }
+                    await driver.register_credit_topology.remote(
+                        upstream_driver_handles,
+                        upstream_edges,
+                        downstream_edges,
+                        0,
+                    )
+                    initial_windows = (
+                        self._flow_control_manager.initial_windows_for_driver(spmd_id)
+                    )
+                    if initial_windows:
+                        await driver.apply_credit_window.remote(initial_windows)
                     # Now call register_topology with ACTUAL DataPlaneCallable objects
                     driver.register_topology.remote(
                         pred_handlers,

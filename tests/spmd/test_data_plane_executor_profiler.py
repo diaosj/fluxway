@@ -17,7 +17,11 @@ from fluxway.spmd.worker.data_plane_executor import (
     _TargetBatchQueue,
     build_and_send_step_frames,
 )
-from fluxway.transport.manifest import TransportFrameHeader
+from fluxway.transport.manifest import (
+    EDGE_WIDTH,
+    PAYLOAD_WIDTH,
+    TransportFrameHeader,
+)
 
 
 class _Handler(DataPlaneCallable):
@@ -35,8 +39,8 @@ class _Handler(DataPlaneCallable):
 def _empty_header(step: int = 0) -> TransportFrameHeader:
     return TransportFrameHeader(
         frame_i32=np.array([1, step, 0, 0, 1, 0, 0, 0], dtype=np.int32),
-        edge_i32=np.zeros((0, 11), dtype=np.int32),
-        payload_i32=np.zeros((0, 8), dtype=np.int32),
+        edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
+        payload_i32=np.zeros((0, PAYLOAD_WIDTH), dtype=np.int32),
         shape_i32=np.zeros((0,), dtype=np.int32),
         global_shape_i64=np.zeros((0,), dtype=np.int64),
         compact_i64=np.zeros((0,), dtype=np.int64),
@@ -87,6 +91,7 @@ async def test_target_batch_queue_drains_enqueue_during_inflight_flush():
             target_rank=0,
             batch_seq=0,
             profiler_recorder=None,
+            schedule_key=(0, 0, 1, "op"),
         )
     )
     await handler.entered.wait()
@@ -100,6 +105,7 @@ async def test_target_batch_queue_drains_enqueue_during_inflight_flush():
             target_rank=0,
             batch_seq=1,
             profiler_recorder=None,
+            schedule_key=(0, 0, 0, "op"),
         )
     )
     await asyncio.sleep(0.01)
@@ -123,8 +129,8 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
             frame_i32=np.array(
                 [1, kwargs["exec_step"], 0, 0, 1, 0, 0, 0], dtype=np.int32
             ),
-            edge_i32=np.zeros((0, 11), dtype=np.int32),
-            payload_i32=np.zeros((0, 8), dtype=np.int32),
+            edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
+            payload_i32=np.zeros((0, PAYLOAD_WIDTH), dtype=np.int32),
             shape_i32=np.zeros((0,), dtype=np.int32),
             global_shape_i64=np.zeros((0,), dtype=np.int64),
             compact_i64=np.zeros((0,), dtype=np.int64),
@@ -173,6 +179,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         source_spmd_id="source",
         batch_max_frames=8,
         submit_delivery=submit_delivery,
+        delivery_schedule_key=(0, 0, 3, "op"),
         profiler_recorder=runtime.recorder,
     )
 
@@ -204,7 +211,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         payload_i32[0] = np.array([0, 6, 1, 0, 1, 1, 0, 0], dtype=np.int32)
         header = TransportFrameHeader(
             frame_i32=frame_i32,
-            edge_i32=np.zeros((0, 11), dtype=np.int32),
+            edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
             payload_i32=payload_i32,
             shape_i32=np.array([1], dtype=np.int32),
             global_shape_i64=np.zeros((0,), dtype=np.int64),
@@ -270,6 +277,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         batch_max_frames=8,
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
+        delivery_schedule_key=(0, 0, 4, "op"),
     )
     second = await executor.send_step_frames(
         compiled_plan=compiled_plan,
@@ -281,17 +289,16 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         batch_max_frames=8,
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
+        delivery_schedule_key=(0, 0, 5, "op"),
     )
 
     assert first + second == delivery_tasks
     await asyncio.gather(*delivery_tasks)
 
     assert len(handle.calls) == 1
-    frames, payload_device_class, sender_spmd_code = handle.calls[0]
-    assert payload_device_class == "cpu"
-    assert sender_spmd_code == 7
-    assert isinstance(frames, tuple)
-    assert len(frames) == 2
+    frames = handle.calls[0][0]
+    assert handle.calls[0][1] == "cpu"
+    assert handle.calls[0][2] == 7
     assert all(isinstance(frame, TransportFrameEnvelope) for frame in frames)
     assert [int(frame.header.frame_i32[1]) for frame in frames] == [4, 5]
     assert [float(frame.payload_segments[0][0]) for frame in frames] == [4.0, 5.0]

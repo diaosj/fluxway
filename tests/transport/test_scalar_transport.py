@@ -23,6 +23,7 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
     source_spec = ShardingConfig(type="static", axis=[]).to_spec().bind(mesh)
     target_spec = ShardingConfig(type="static", axis=[]).to_spec().bind(mesh)
     scalar = TransportTensor.from_tensor(jnp.array(42.0), global_shape=())
+    scalar.source_step = 1
 
     async def capture_for_rank(rank):
         captured = {}

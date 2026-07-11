@@ -29,6 +29,7 @@ from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.types.sharding import AlgebraicRouting, ChunkPartition
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
+from fluxway.transport.manifest import EDGE_SOURCE_STEP
 from fluxway.spmd.worker.worker import (
     SPMDWorker as RaySPMDWorker,
     _nonzero_1d_indices,
@@ -45,6 +46,7 @@ def make_tt(
     routing_indices=None,
     receipt: SymmetryReceipt | None = None,
     global_shape=None,
+    source_step: int = 0,
 ) -> TransportTensor:
     return TransportTensor(
         jnp.array(values, dtype=jnp.float32),
@@ -60,6 +62,7 @@ def make_tt(
         ),
         receipt=receipt,
         global_shape=global_shape,
+        source_step=source_step,
     )
 
 
@@ -228,7 +231,10 @@ class _AssemblyMixin:
             assembled_receipt = SymmetryReceipt(all_receipt.world_size, final_ranks)
 
         return TransportTensor(
-            assembled_data, global_shape=global_shape, receipt=assembled_receipt
+            assembled_data,
+            global_shape=global_shape,
+            receipt=assembled_receipt,
+            source_step=0,
         )
 
 
@@ -439,6 +445,7 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             origin_indices=ExplicitIndex(np.array([8, 10, 13], dtype=np.int64)),
             global_shape=(16, 2),
             receipt=SymmetryReceipt(4, np.array([0, 1, 1], dtype=np.int32)),
+            source_step=0,
         )
 
         assemble_plan = _dynamic_to_static_assemble_plan(
@@ -862,6 +869,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                         if len(payload_iovs) > 1
                         else None,
                         global_shape=g_shape,
+                        source_step=int(header.edge_i32[0, EDGE_SOURCE_STEP]),
                     )
                     network_mailbox[target_rank].append(received_tt)
                 return True
@@ -1039,7 +1047,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         from fluxway.transport.communication import AsyncDataDistributor
 
         tt = TransportTensor(
-            jnp.array(values, dtype=jnp.float32), global_shape=global_shape
+            jnp.array(values, dtype=jnp.float32),
+            global_shape=global_shape,
+            source_step=0,
         )
         distributor = AsyncDataDistributor(local_rank=0)
 
@@ -1062,7 +1072,11 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
     def test_undersized_batch_raises(self):
         """batch_size=4 with dp=6 must raise a clear ValueError."""
         source_spec, target_spec, _ = self._make_specs(total_items=4, dp=6)
-        tt = TransportTensor(jnp.ones((4, 1), dtype=jnp.float32), global_shape=(4, 1))
+        tt = TransportTensor(
+            jnp.ones((4, 1), dtype=jnp.float32),
+            global_shape=(4, 1),
+            source_step=0,
+        )
         import asyncio
         from fluxway.transport.communication import AsyncDataDistributor
 
@@ -1089,7 +1103,11 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
     def test_exact_size_passes(self):
         """batch_size=6 with dp=6 must pass without raising."""
         source_spec, target_spec, _ = self._make_specs(total_items=6, dp=6)
-        tt = TransportTensor(jnp.ones((6, 1), dtype=jnp.float32), global_shape=(6, 1))
+        tt = TransportTensor(
+            jnp.ones((6, 1), dtype=jnp.float32),
+            global_shape=(6, 1),
+            source_step=0,
+        )
         import asyncio
         from fluxway.transport.communication import AsyncDataDistributor
 
@@ -1119,6 +1137,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
         empty_tt = TransportTensor(
             jnp.zeros((0,), dtype=jnp.float32),
             global_shape=None,  # EOS signal — no global shape
+            source_step=0,
         )
         import asyncio
         from fluxway.transport.communication import AsyncDataDistributor

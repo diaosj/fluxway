@@ -20,6 +20,7 @@ See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 """
 
 import asyncio
+from functools import partial
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import os
@@ -50,9 +51,8 @@ from fluxway.common.types import (
     SPMDConfig,
     WorkerHeartbeat,
     WorkerStatus,
-    WorkerTelemetry,
 )
-from fluxway.common.types.configs import ArgumentType, MailboxStatus, OperatorMeta
+from fluxway.common.types.configs import ArgumentType, OperatorMeta
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.common.types.sharding import (
     ShardingSpec,
@@ -580,6 +580,7 @@ class SPMDWorker:
             profiler_runtime=self._profiler_runtime,
             on_prepare_ready=self._on_prepare_ready,
             max_workers=self._input_prepare_max_workers(),
+            schedule_key=self._effective_schedule_key,
         )
         self._delivery_runtime = OutboundDeliveryRuntime(
             max_in_flight=self._max_in_flight,
@@ -1678,11 +1679,12 @@ class SPMDWorker:
     ) -> tuple[int, int, int, str]:
         meta = self.op_manager._get_operator_metadata(op_name)
         if not isinstance(meta, OperatorMeta):
-            return (0, 0, step, op_name)
+            raise TypeError(
+                f"operator metadata for op={op_name!r} must be OperatorMeta, "
+                f"got {type(meta).__name__}."
+            )
         policy = getattr(meta, "schedule_policy", None)
-        base_priority = int(
-            getattr(policy, "base_priority", getattr(meta, "priority", 0))
-        )
+        base_priority = meta.priority
         kind = str(getattr(policy, "kind", "fifo"))
         prepare_state = self._prepare_schedule_state(op_name, step)
         if kind == "deadline_boost":
@@ -2218,7 +2220,8 @@ class SPMDWorker:
             source_spmd_id=self.spmd_id,
             batch_max_frames=self._data_plane_batch_max_frames,
             batch_flush_us=self._data_plane_batch_flush_us,
-            submit_delivery=self._delivery_runtime.submit,
+            submit_delivery=self._delivery_submitter(op_name, step),
+            delivery_schedule_key=self._effective_schedule_key(op_name, step),
             empty_values=empty_values,
         )
         return tuple(tasks)
@@ -2340,7 +2343,7 @@ class SPMDWorker:
         own_completed = self._completed_step_count.get(op_name, 0)
         if own_completed <= slowest_completed:
             return False
-        return step - slowest_completed >= int(max_async_lag)
+        return step - slowest_completed > int(max_async_lag)
 
     async def _release_async_lag_steps(self) -> None:
         for op_name in self._bounded_async_ops():
@@ -2618,7 +2621,7 @@ class SPMDWorker:
         if not isinstance(input_data, _PreparedOperatorInput):
             raise TypeError(
                 f"Local CALL for op={op_name} step={step} requires prepared input "
-                "metadata from WAIT."
+                f"metadata from WAIT; actual_type={type(input_data).__name__}."
             )
         operator_input = input_data.value
         recorder = (
@@ -4605,7 +4608,18 @@ class SPMDWorker:
             source_spmd_id=self.spmd_id,
             batch_max_frames=self._data_plane_batch_max_frames,
             batch_flush_us=self._data_plane_batch_flush_us,
-            submit_delivery=self._delivery_runtime.submit,
+            submit_delivery=self._delivery_submitter(
+                send_context.compiled_plan.op_name, exec_step
+            ),
+            delivery_schedule_key=self._effective_schedule_key(
+                send_context.compiled_plan.op_name, exec_step
+            ),
+        )
+
+    def _delivery_submitter(self, op_name: str, step: int):
+        return partial(
+            self._delivery_runtime.submit,
+            schedule_key=self._effective_schedule_key(op_name, step),
         )
 
     def _non_local_send_plan(
@@ -4893,49 +4907,23 @@ class SPMDWorker:
         else:
             status = WorkerStatus.INITIALIZING
 
-        # Get mailbox status for backpressure monitoring
-        mailbox_status = await self._get_mailbox_status()
-
         heartbeat = WorkerHeartbeat(
             rank=self.rank,
             timestamp=time.time(),
-            completed_step_count=dict(self._completed_step_count),
             status=status,
             error_message=self._last_error,
-            telemetry=self._collect_telemetry(),
-            mailbox_status=mailbox_status,
         )
 
         try:
             self._driver_handle.receive_worker_heartbeat.remote(self.rank, heartbeat)
             logger.heartbeat(
                 f"Worker heartbeat sent status={status.name} "
-                f"completed_step_count={heartbeat.completed_step_count} mailbox_full={mailbox_status.is_full} "
                 f"spmd_id={self.spmd_id} rank={self.rank}"
             )
         except Exception as e:
             logger.error(
                 f"Failed to send heartbeat error={e} spmd_id={self.spmd_id} rank={self.rank}"
             )
-
-    async def _get_mailbox_status(self) -> MailboxStatus:
-        """Get mailbox status for backpressure monitoring."""
-        current_size = await self._mailbox.get_size()
-        capacity = await self._mailbox.get_capacity()
-        full_ratio = 0.8  # Consider full when 80% capacity reached
-        is_full = current_size >= capacity * full_ratio
-
-        return MailboxStatus(
-            is_full=is_full,
-            capacity=capacity,
-            current_size=current_size,
-            full_ratio=full_ratio,
-        )
-
-    def _collect_telemetry(self) -> WorkerTelemetry | None:
-        """Collect worker telemetry data."""
-        # Placeholder - implement actual telemetry collection
-        return WorkerTelemetry(worker_id=f"{self.spmd_id}_{self.rank}")
 
     def _actor_owned_operator_names(self) -> set[str | None]:
         executor = self._local_step_plan_executor.user_callable_executor

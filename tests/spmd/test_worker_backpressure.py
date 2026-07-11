@@ -26,7 +26,10 @@ def _make_config(mesh, *op_names):
         metas[name] = meta
 
     return SPMDConfig(
-        spmd_id="test", mesh=mesh, operator_metas=metas, active_operator_names=()
+        spmd_id="test",
+        mesh=mesh,
+        operator_metas=metas,
+        active_operator_names=tuple(op_names),
     )
 
 
@@ -49,9 +52,13 @@ async def test_spmd_worker_delivery_token_registration_is_not_throttled():
             await release_first.wait()
         return name
 
-    first = await worker._delivery_runtime.submit(delivery("first"))
+    first = await worker._delivery_runtime.submit(
+        delivery("first"), schedule_key=(0, 0, 0, "op")
+    )
     second_submit = asyncio.create_task(
-        worker._delivery_runtime.submit(delivery("second"))
+        worker._delivery_runtime.submit(
+            delivery("second"), schedule_key=(0, 0, 1, "op")
+        )
     )
     await asyncio.sleep(0.01)
 
@@ -95,8 +102,12 @@ async def test_spmd_worker_delivery_runtime_profiler_spans_lifecycle():
             await release_first.wait()
         return name
 
-    first = await worker._delivery_runtime.submit(delivery("first"))
-    second = await worker._delivery_runtime.submit(delivery("second"))
+    first = await worker._delivery_runtime.submit(
+        delivery("first"), schedule_key=(0, 0, 0, "op")
+    )
+    second = await worker._delivery_runtime.submit(
+        delivery("second"), schedule_key=(0, 0, 1, "op")
+    )
     await asyncio.sleep(0.01)
     assert started == ["first"]
 

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fluxway.common.types import SPMDConfig
+from fluxway.common.types import SPMDConfig, OperatorMeta
 from fluxway.spmd.driver.driver import SPMDDriver
 
 
@@ -13,7 +13,11 @@ async def test_driver_stop_waits_for_worker_shutdown():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(mesh=SimpleNamespace(size=2), active_operator_names=()),
+        config=SPMDConfig(
+            mesh=SimpleNamespace(size=2),
+            operator_metas={"compute": OperatorMeta(name="compute")},
+            active_operator_names=("compute",),
+        ),
         placement_group=None,
         worker_bundle_indices=[1, 2],
         controller_handle=None,
@@ -46,7 +50,11 @@ async def test_stop_heartbeat_joins_background_thread():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(mesh=SimpleNamespace(size=1), active_operator_names=()),
+        config=SPMDConfig(
+            mesh=SimpleNamespace(size=1),
+            operator_metas={"compute": OperatorMeta(name="compute")},
+            active_operator_names=("compute",),
+        ),
         placement_group=None,
         worker_bundle_indices=[1],
         controller_handle=None,
@@ -72,7 +80,11 @@ def test_driver_ignores_worker_callbacks_while_stopping():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(mesh=SimpleNamespace(size=1), active_operator_names=()),
+        config=SPMDConfig(
+            mesh=SimpleNamespace(size=1),
+            operator_metas={"compute": OperatorMeta(name="compute")},
+            active_operator_names=("compute",),
+        ),
         placement_group=None,
         worker_bundle_indices=[1],
         controller_handle=MagicMock(),
@@ -81,9 +93,6 @@ def test_driver_ignores_worker_callbacks_while_stopping():
     )
 
     heartbeat = MagicMock()
-    heartbeat.error_message = None
-    heartbeat.telemetry = None
-    heartbeat.mailbox_status = None
 
     driver._stopping = True
     driver.spmd_synchronizer.report_worker_op_completed = MagicMock()

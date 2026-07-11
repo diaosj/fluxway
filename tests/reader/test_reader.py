@@ -62,37 +62,21 @@ async def test_reader_processor_data_flows():
     try:
         for _ in range(_MAX_POLL_ROUNDS):
             await asyncio.sleep(_POLL_INTERVAL_S)
-            heartbeats = await controller.get_all_heartbeats.remote()
-            reader_steps = (
-                getattr(heartbeats.get(reader_id), "completed_step_count", {})
-                if heartbeats.get(reader_id)
-                else {}
-            )
-            proc_steps = (
-                getattr(heartbeats.get(proc_id), "completed_step_count", {})
-                if heartbeats.get(proc_id)
-                else {}
-            )
+            progress = await controller.get_async_step_progress.remote()
+            reader_steps = progress.get(reader_id, {})
+            proc_steps = progress.get(proc_id, {})
             if reader_steps.get("read", 0) > 0 and proc_steps.get("process", 0) > 0:
                 break
 
-        heartbeats = await controller.get_all_heartbeats.remote()
-        reader_steps = (
-            getattr(heartbeats.get(reader_id), "completed_step_count", {})
-            if heartbeats.get(reader_id)
-            else {}
-        )
-        proc_steps = (
-            getattr(heartbeats.get(proc_id), "completed_step_count", {})
-            if heartbeats.get(proc_id)
-            else {}
-        )
+        progress = await controller.get_async_step_progress.remote()
+        reader_steps = progress.get(reader_id, {})
+        proc_steps = progress.get(proc_id, {})
 
         assert reader_steps.get("read", 0) > 0, (
-            f"Reader {reader_id} never produced data. Heartbeat: {heartbeats.get(reader_id)}"
+            f"Reader {reader_id} never produced data. Async progress: {reader_steps}"
         )
         assert proc_steps.get("process", 0) > 0, (
-            f"Processor {proc_id} never consumed data. Heartbeat: {heartbeats.get(proc_id)}"
+            f"Processor {proc_id} never consumed data. Async progress: {proc_steps}"
         )
     finally:
         await controller.stop.remote()

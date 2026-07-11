@@ -44,10 +44,19 @@ async def _capture_frame(distributor, **kwargs):
     return result, captured
 
 
+def _with_source_step(tensor: TransportTensor, step: int) -> TransportTensor:
+    tensor.source_step = step
+    return tensor
+
+
 def test_async_distributor_uses_only_flat_frame_abi():
     mesh = DeviceMesh(axis_names=("x",), device_shape=(2,), device_ids=np.array([0, 1]))
     spec = ShardingSpec.chunk(P("x")).bind(mesh)
-    data = TransportTensor(jnp.arange(10, dtype=jnp.float32), global_shape=(20,))
+    data = TransportTensor(
+        jnp.arange(10, dtype=jnp.float32),
+        global_shape=(20,),
+        source_step=3,
+    )
 
     async def run_test():
         return await _capture_frame(
@@ -82,16 +91,22 @@ def test_async_distributor_uses_only_flat_frame_abi():
 def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
     mesh = DeviceMesh(axis_names=("x",), device_shape=(1,), device_ids=np.array([0]))
     spec = ShardingSpec.chunk(P("x")).bind(mesh)
-    dense = TransportTensor(jnp.arange(4, dtype=jnp.float32), global_shape=(4,))
+    dense = TransportTensor(
+        jnp.arange(4, dtype=jnp.float32),
+        global_shape=(4,),
+        source_step=4,
+    )
     ragged = TransportTensor(
         jnp.arange(5, dtype=jnp.float32),
         nested_splits=[jnp.array([0, 2, 5], dtype=jnp.int32)],
         global_shape=(2,),
+        source_step=4,
     )
     origin = TransportTensor(
         jnp.arange(3, dtype=jnp.float32),
         origin_indices=jnp.array([7, 8, 9], dtype=jnp.int64),
         global_shape=(10,),
+        source_step=4,
     )
 
     async def run_test():
@@ -133,10 +148,13 @@ def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():
     )
     source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
     target_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
-    data = TransportTensor.from_lists(
-        [[[2**40, 2**40 + 1], [2**40 + 2]], [[2**40 + 3]]],
-        dtype=np.uint64,
-        global_shape=(2,),
+    data = _with_source_step(
+        TransportTensor.from_lists(
+            [[[2**40, 2**40 + 1], [2**40 + 2]], [[2**40 + 3]]],
+            dtype=np.uint64,
+            global_shape=(2,),
+        ),
+        7,
     )
 
     async def run_test():
@@ -172,7 +190,11 @@ def test_transport_frame_static_manifest_emits_only_real_producers():
     dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("x",))
     source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
     target_spec = ShardingSpec.chunk(P("x")).bind(dst_mesh)
-    data = TransportTensor(jnp.arange(5, dtype=jnp.int32), global_shape=(10,))
+    data = TransportTensor(
+        jnp.arange(5, dtype=jnp.int32),
+        global_shape=(10,),
+        source_step=8,
+    )
 
     async def run_test():
         return await _capture_frame(
@@ -198,7 +220,11 @@ def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
     dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("y",))
     source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
     target_spec = ShardingSpec.hash(P("y")).bind(dst_mesh)
-    data = TransportTensor(jnp.array([0, 1, 4], dtype=jnp.int32), global_shape=(6,))
+    data = TransportTensor(
+        jnp.array([0, 1, 4], dtype=jnp.int32),
+        global_shape=(6,),
+        source_step=9,
+    )
 
     async def run_test():
         return await _capture_frame(
