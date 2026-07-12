@@ -63,6 +63,7 @@ from fluxway.control_plane import GraphParser, Builder
 # Import runner
 from fluxway.runner import launch
 from fluxway import profiler
+from fluxway.visualization import graph_manifest, view_graph, visualize_graph
 
 __all__ = [
     # Version
@@ -97,6 +98,9 @@ __all__ = [
     # Control Plane
     "GraphParser",
     "Builder",
+    "graph_manifest",
+    "visualize_graph",
+    "view_graph",
 ]
 
 ensure_logging_configured()

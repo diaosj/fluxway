@@ -101,6 +101,20 @@ def _build_ray_init_kwargs(args):
     return ray_init_kwargs or None
 
 
+def _export_graph_visualization(task_graph, args) -> None:
+    if args.graph_visualization_dir is None:
+        return
+    from fluxway import visualize_graph
+
+    bundle = visualize_graph(
+        task_graph,
+        args.graph_visualization_dir,
+        overwrite=args.overwrite_graph_visualization,
+    )
+    print(f"[Fluxway] Graph visualization bundle: {bundle}")
+    print(f"[Fluxway] View with: model-explorer {bundle / 'model_explorer.json'}")
+
+
 async def run_training(args):
     if args.dense_step_delay_ms < 0:
         raise ValueError(
@@ -215,6 +229,7 @@ async def run_training(args):
         task_graph = graph.compile()
 
     _apply_data_plane_config(task_graph, args)
+    _export_graph_visualization(task_graph, args)
     print(f"[Fluxway] Graph compiled. Nodes: {list(task_graph.nodes.keys())}")
 
     async_step_config = AsyncStepConfig(max_steps=args.max_steps)
@@ -312,6 +327,16 @@ def main():
         "--profiler-trace-dir",
         default=None,
         help="Enable profiler and configure the MPMD trace output root directory",
+    )
+    parser.add_argument(
+        "--graph-visualization-dir",
+        default=None,
+        help="Export a Model Explorer graph bundle after graph compilation",
+    )
+    parser.add_argument(
+        "--overwrite-graph-visualization",
+        action="store_true",
+        help="Replace an existing verified Fluxway graph bundle",
     )
     parser.add_argument(
         "--profiler-run-id",

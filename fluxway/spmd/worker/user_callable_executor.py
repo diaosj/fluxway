@@ -17,6 +17,7 @@ from typing import Any
 
 import ray
 
+from fluxway.common.types.manifest import ManifestOperatorFacts
 from fluxway.profiler.runtime import ProfilerRuntimeFactory
 from fluxway.profiler.user_api import activate_user_profiler
 from fluxway.spmd.worker.runtime import (
@@ -60,9 +61,7 @@ class UserCallableSpec:
     rank0_address: str | None = None
     operator_owner_classes: tuple[tuple[str, str, type], ...] = ()
     process_affine: bool = False
-    debug_tensor_names: tuple[str, ...] = ()
-    debug_control_names: tuple[str, ...] = ()
-    debug_static_names: tuple[str, ...] = ()
+    operator_facts: ManifestOperatorFacts | None = None
 
 
 @dataclass(slots=True)
@@ -144,7 +143,7 @@ class _RayFunctionExecutionActor:
                 op_name=op_name,
                 step=step,
                 rank=rank,
-                lane=UserCallableLane.RAY_EXECUTION_ACTOR.value,
+                execution_mode=UserCallableLane.RAY_EXECUTION_ACTOR.value,
             ):
                 return await self._execute_inner()
         return await self._execute_inner()
@@ -247,7 +246,7 @@ class _RayOperatorExecutionActor:
                 op_name=op_name,
                 step=step,
                 rank=self._rank,
-                lane=UserCallableLane.RAY_EXECUTION_ACTOR.value,
+                execution_mode=UserCallableLane.RAY_EXECUTION_ACTOR.value,
             ):
                 return await self._manager.execute_async(op_name, step, *args, **kwargs)
         return await self._manager.execute_async(op_name, step, *args, **kwargs)

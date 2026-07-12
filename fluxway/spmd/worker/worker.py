@@ -52,7 +52,7 @@ from fluxway.common.types import (
     WorkerHeartbeat,
     WorkerStatus,
 )
-from fluxway.common.types.configs import ArgumentType, OperatorMeta
+from fluxway.common.types.configs import OperatorMeta
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.common.types.sharding import (
     ShardingSpec,
@@ -2918,6 +2918,20 @@ class SPMDWorker:
         self, op_name: str, step: int, input_data: Any
     ) -> UserCallableSpec:
         meta = self.op_manager.get_operator_metadata(op_name)
+        if meta.graph_facts is None:
+            raise ValueError(f"Operator {self.spmd_id}.{op_name} has no graph facts.")
+        spmd_facts = self.config.graph_spmd_facts
+        if spmd_facts is None:
+            raise ValueError(f"Worker {self.spmd_id} has no SPMD graph facts.")
+        if meta.graph_facts.manifest_id != self.config.graph_manifest_id:
+            raise ValueError(
+                f"Operator {self.spmd_id}.{op_name} graph facts do not match "
+                "the worker manifest."
+            )
+        if meta.graph_facts.operator != spmd_facts.operator_facts(op_name):
+            raise ValueError(
+                f"Operator {self.spmd_id}.{op_name} facts do not match its SPMD."
+            )
         is_stateful = bool(getattr(meta, "owner_class_qualname", ""))
         owner_classes: tuple[tuple[str, str, type], ...] = ()
         process_affine = bool(getattr(meta, "requires_worker_process", False))
@@ -2953,20 +2967,6 @@ class SPMDWorker:
                 )
             return await self.op_manager.execute_async(op_name, step)
 
-        debug_tensor_names: tuple[str, ...] = ()
-        debug_control_names: tuple[str, ...] = ()
-        debug_static_names: tuple[str, ...] = ()
-        if self._profiler_runtime.enabled:
-            debug_tensor_names = tuple(
-                meta.get_arguments(is_output=False, arg_type=ArgumentType.DATA)
-            )
-            debug_control_names = tuple(
-                meta.get_arguments(is_output=False, arg_type=ArgumentType.CONTROL)
-            )
-            debug_static_names = tuple(
-                meta.get_arguments(is_output=False, arg_type=ArgumentType.STATIC)
-            )
-
         return UserCallableSpec(
             callable_id=op_name,
             fn=execute_operator_callable,
@@ -2991,9 +2991,7 @@ class SPMDWorker:
             rank0_address=self.rank0_address,
             operator_owner_classes=owner_classes if is_stateful else (),
             process_affine=process_affine,
-            debug_tensor_names=debug_tensor_names,
-            debug_control_names=debug_control_names,
-            debug_static_names=debug_static_names,
+            operator_facts=meta.graph_facts,
         )
 
     async def _assemble_input(self, op_name: str, step: int) -> Any:

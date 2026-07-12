@@ -12,6 +12,13 @@ from pydantic import BaseModel, Field, ConfigDict
 
 from enum import StrEnum
 
+from .manifest import (
+    ComputationGraphManifest,
+    ManifestOperatorFacts,
+    SPMDFacts,
+    TransferFacts,
+)
+
 T = TypeVar("T")
 
 
@@ -137,6 +144,8 @@ class SPMDConfig(FluxwayBaseSchema):
 
     # Mesh axis configuration (e.g., ("data", 4), ("model", 2))
     spmd_id: str = ""
+    graph_manifest_id: str = Field(default="", frozen=True)
+    graph_spmd_facts: SPMDFacts | None = Field(default=None, frozen=True)
     mesh: Any = None  # DeviceMesh (use Any to avoid circular import)
 
     # Maps operator name to its method name on the owner class.
@@ -305,6 +314,7 @@ class Edge(FluxwayBaseSchema):
     symmetric_to: tuple[str, str, str, str] | None = None
     # Skip global data-plane topology and deliver directly inside the worker.
     local_only: bool = False
+    transfers: tuple[TransferFacts, ...] | None = None
 
 
 class Node(FluxwayBaseSchema):
@@ -324,6 +334,8 @@ class Node(FluxwayBaseSchema):
     placement_strategy: PlacementStrategy | None = None  # Per-node placement strategy
     spmd_config: SPMDConfig = Field(default_factory=SPMDConfig)
     node_type: NodeType = NodeType.SPMD  # Node type: SPMD
+    spmd_class_module: str | None = None
+    spmd_class_qualname: str | None = None
 
 
 class ArgumentType(StrEnum):
@@ -749,6 +761,7 @@ class OperatorMeta(FluxwayBaseSchema):
     name: str
     owner_class_qualname: str = ""
     owner_class_module: str = ""
+    graph_facts: ManifestOperatorFacts | None = Field(default=None, frozen=True)
     requires_worker_process: bool = False
 
     is_source: bool | None = None  # Explicitly mark as source (producer)
@@ -888,6 +901,7 @@ class Graph(FluxwayBaseSchema):
     edges: list[Edge] = Field(default_factory=list)
     source_nodes: list[str] = Field(default_factory=list)  # Entry nodes (no upstream)
     sink_nodes: list[str] = Field(default_factory=list)  # Exit nodes (no downstream)
+    manifest: ComputationGraphManifest | None = None
 
 
 class GraphValidationResult(FluxwayBaseSchema):

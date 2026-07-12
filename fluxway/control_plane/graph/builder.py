@@ -35,6 +35,15 @@ from fluxway.common.types.sharding import (
     ReferentialRouting,
 )
 from fluxway.common.types.configs import ArgumentType
+from fluxway.common.types.manifest import (
+    ComputationGraphManifest,
+    OperatorArguments,
+    OperatorFacts,
+    OperatorPort,
+    ResourceFacts,
+    SPMDFacts,
+    TransferFacts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +208,11 @@ class Builder:
             priority=priority,
             placement_strategy=placement_strategy,
             spmd_config=spmd_config,
+            spmd_class_module=spmd_class.__module__,
+            spmd_class_qualname=spmd_class.__qualname__,
         )
+
+        spmd_config.spmd_id = name
 
         self._nodes[name] = node
         self._spmd_classes[name] = spmd_class
@@ -353,21 +366,7 @@ class Builder:
                 f"got {source_node!r} -> {target_node!r}."
             )
 
-        edge = Edge(
-            source_node=source_node,
-            target_node=target_node,
-            source_op=source_op,
-            target_op=target_op,
-            condition_fn=condition_fn,
-            symmetric_to=symmetric_to,
-            local_only=local_only,
-        )
-
-        # All edges go into _edges (no semantic distinction anymore)
-        self._edges.append(edge)
-
-        # Validate and link sharding between source and target
-        self._validate_and_link_edge(
+        transfers = self._validate_and_link_edge(
             source_node,
             source_op,
             target_node,
@@ -378,6 +377,19 @@ class Builder:
             tensor_map=tensor_map,
             symmetric_to=symmetric_to,
             local_only=local_only,
+        )
+
+        self._edges.append(
+            Edge(
+                source_node=source_node,
+                target_node=target_node,
+                source_op=source_op,
+                target_op=target_op,
+                condition_fn=condition_fn,
+                symmetric_to=symmetric_to,
+                local_only=local_only,
+                transfers=transfers,
+            )
         )
 
         return self
@@ -485,7 +497,7 @@ class Builder:
         tensor_map: dict[str, str] | None = None,
         symmetric_to: tuple[str, str, str, str] | None = None,
         local_only: bool = False,
-    ) -> None:
+    ) -> tuple[TransferFacts, ...]:
         """
         Validate and link operator metadata between two nodes.
         Refactored into discrete validation and linking phases.
@@ -591,6 +603,28 @@ class Builder:
             tuuid_dst_in=tuuid_dst_in,
             local_only=local_only,
         )
+        condition_id = None
+        if condition_fn is not None:
+            condition_id = f"{condition_fn.__module__}.{condition_fn.__qualname__}"
+        return tuple(
+            TransferFacts(
+                source=OperatorPort(
+                    spmd_id=source_node,
+                    op_id=source_op,
+                    name=source_name,
+                ),
+                target=OperatorPort(
+                    spmd_id=target_node,
+                    op_id=target_op,
+                    name=target_name,
+                ),
+                tuuid=tuuid_map[target_name],
+                local_only=local_only,
+                condition_id=condition_id,
+                symmetric_to=symmetric_to,
+            )
+            for source_name, target_name in tensor_map.items()
+        )
 
     def _validate_edge_io(
         self,
@@ -670,7 +704,8 @@ class Builder:
 
         # Positional mapping if both endpoints were explicitly specified and their structures match
         if (
-            (source_output is None and target_input is None)
+            not tensor_map
+            and (source_output is None and target_input is None)
             and explicit_source
             and explicit_target
         ):
@@ -686,13 +721,13 @@ class Builder:
                     f"  Fix: Ensure the data structures are identical or extract specific fields."
                 )
         # Simple 1-to-1 explicit mapping of primitive names
-        elif source_output and target_input:
+        elif not tensor_map and source_output and target_input:
             tensor_map[source_output] = target_input
-        elif source_output:
+        elif not tensor_map and source_output:
             tensor_map[source_output] = source_output
-        elif target_input:
+        elif not tensor_map and target_input:
             tensor_map[target_input] = target_input
-        else:
+        elif not tensor_map:
             # Fallback: Intersection (Map fields with matching names)
             common = [n for n in effective_src_names if n in effective_dst_names]
             for n in common:
@@ -1137,9 +1172,119 @@ class Builder:
                 )
             node.spmd_config.active_operator_names = tuple(sorted(active_ops))
 
-        graph = Graph(name=name, nodes=self._nodes.copy(), edges=self._edges.copy())
+        manifest = self._build_manifest(name, active_ops_by_node)
+        graph_nodes = copy.deepcopy(self._nodes)
+        graph = Graph(
+            name=name,
+            nodes=graph_nodes,
+            edges=self._edges.copy(),
+            manifest=manifest,
+        )
+        graph_manifest = graph.manifest
+        if graph_manifest is None:
+            raise ValueError("Built graph is missing its computation manifest.")
+        spmd_facts_by_id = {spmd.spmd_id: spmd for spmd in graph_manifest.spmds}
+        for spmd_id, node in graph.nodes.items():
+            config = node.spmd_config.model_copy(
+                update={
+                    "graph_manifest_id": graph_manifest.manifest_id,
+                    "graph_spmd_facts": spmd_facts_by_id[spmd_id],
+                }
+            )
+            for op_id in active_ops_by_node[spmd_id]:
+                meta = config.operator_metas[op_id]
+                config.operator_metas[op_id] = meta.model_copy(
+                    update={
+                        "graph_facts": graph_manifest.runtime_operator_facts(
+                            spmd_id, op_id
+                        )
+                    }
+                )
+            node.spmd_config = config
 
         return graph
+
+    def _build_manifest(
+        self, graph_name: str, active_ops_by_node: dict[str, set[str]]
+    ) -> ComputationGraphManifest:
+        spmds = []
+        for spmd_id in sorted(self._nodes):
+            node = self._nodes[spmd_id]
+            if node.spmd_class_module is None or node.spmd_class_qualname is None:
+                raise ValueError(f"Node {spmd_id!r} is missing SPMD class metadata.")
+            operators = []
+            for op_id in sorted(active_ops_by_node[spmd_id]):
+                meta = node.spmd_config.operator_metas[op_id]
+                method_name = node.spmd_config.operators.get(op_id)
+                if (
+                    not method_name
+                    or not meta.owner_class_module
+                    or not meta.owner_class_qualname
+                ):
+                    raise ValueError(
+                        f"Operator {spmd_id}.{op_id} is missing function metadata."
+                    )
+                inputs = OperatorArguments(
+                    data=tuple(meta.get_arguments(False, ArgumentType.DATA)),
+                    control=tuple(meta.get_arguments(False, ArgumentType.CONTROL)),
+                    static=tuple(meta.get_arguments(False, ArgumentType.STATIC)),
+                )
+                outputs = OperatorArguments(
+                    data=tuple(meta.get_arguments(True, ArgumentType.DATA)),
+                    control=tuple(meta.get_arguments(True, ArgumentType.CONTROL)),
+                )
+                facts = OperatorFacts(
+                    spmd_id=spmd_id,
+                    op_id=op_id,
+                    function_id=(
+                        f"{meta.owner_class_module}.{meta.owner_class_qualname}."
+                        f"{method_name}"
+                    ),
+                    inputs=inputs,
+                    outputs=outputs,
+                    input_signature_id=inputs.signature_id,
+                    output_signature_id=outputs.signature_id,
+                )
+                operators.append(facts)
+            resource = None
+            if node.resource is not None:
+                resource = ResourceFacts(**node.resource.model_dump())
+            mesh = tuple(
+                zip(
+                    node.spmd_config.mesh.axis_names,
+                    node.spmd_config.mesh.shape,
+                    strict=True,
+                )
+            )
+            spmds.append(
+                SPMDFacts(
+                    spmd_id=spmd_id,
+                    class_id=f"{node.spmd_class_module}.{node.spmd_class_qualname}",
+                    description=node.description,
+                    mesh=mesh,
+                    resource=resource,
+                    priority=str(node.priority) if node.priority is not None else None,
+                    placement_strategy=(
+                        str(node.placement_strategy)
+                        if node.placement_strategy is not None
+                        else None
+                    ),
+                    operators=tuple(operators),
+                )
+            )
+        transfers = []
+        for edge in self._edges:
+            if edge.transfers is None:
+                raise ValueError(
+                    f"Edge {edge.source_node}.{edge.source_op} -> "
+                    f"{edge.target_node}.{edge.target_op} is missing resolved transfers."
+                )
+            transfers.extend(edge.transfers)
+        return ComputationGraphManifest.create(
+            graph_name=graph_name,
+            spmds=tuple(spmds),
+            transfers=tuple(transfers),
+        )
 
     def _resolve_path_to_tuuid(
         self, node_name: str, op_name: str, primary_direction: str, path: str

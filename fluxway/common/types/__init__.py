@@ -82,6 +82,16 @@ from .tensor import TransportTensor
 
 # Operator interfaces
 from .operator import StatefulOperatorProtocol
+from .manifest import (
+    ComputationGraphManifest,
+    ManifestOperatorFacts,
+    OperatorArguments,
+    OperatorFacts,
+    OperatorPort,
+    ResourceFacts,
+    SPMDFacts,
+    TransferFacts,
+)
 
 __all__ = [
     "SPMDConfig",
@@ -145,4 +155,12 @@ __all__ = [
     "PhysicalLayout",
     "TransportTensor",
     "StatefulOperatorProtocol",
+    "ComputationGraphManifest",
+    "ManifestOperatorFacts",
+    "OperatorArguments",
+    "OperatorFacts",
+    "OperatorPort",
+    "ResourceFacts",
+    "SPMDFacts",
+    "TransferFacts",
 ]

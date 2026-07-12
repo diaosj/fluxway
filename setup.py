@@ -42,6 +42,8 @@ setup(
             "ruff>=0.12.1",
         ],
         "torch": ["torch>=1.12.0"],
+        "profiler": ["perfetto"],
+        "visualization": ["ai-edge-model-explorer"],
     },
     classifiers=[
         "Development Status :: 3 - Alpha",

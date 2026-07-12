@@ -1,12 +1,21 @@
 import inspect
 import asyncio
+from typing import Any
 import contextvars
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 import fluxway as fw
+from fluxway.common.types import (
+    ComputationGraphManifest,
+    OperatorArguments,
+    OperatorFacts,
+    SPMDFacts,
+    SPMDConfig,
+)
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.spmd.worker.user_callable_executor import (
     USER_CALLABLE_DEFAULT_OPERATOR_LANE,
@@ -16,6 +25,83 @@ from fluxway.spmd.worker.user_callable_executor import (
     _RayOperatorExecutionActor,
 )
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
+from fluxway.spmd.worker.worker import SPMDWorker
+
+
+_EMPTY_OPERATOR_ARGUMENTS = OperatorArguments()
+
+
+def _operator_facts(op_id: str) -> OperatorFacts:
+    return OperatorFacts(
+        spmd_id="test",
+        op_id=op_id,
+        function_id=f"tests.{op_id}",
+        inputs=_EMPTY_OPERATOR_ARGUMENTS,
+        outputs=_EMPTY_OPERATOR_ARGUMENTS,
+        input_signature_id=_EMPTY_OPERATOR_ARGUMENTS.signature_id,
+        output_signature_id=_EMPTY_OPERATOR_ARGUMENTS.signature_id,
+    )
+
+
+def _trace_fields(op_id: str) -> dict[str, Any]:
+    facts = _operator_facts(op_id)
+    manifest = ComputationGraphManifest.create(
+        graph_name="user-callable-context",
+        spmds=(
+            SPMDFacts(
+                spmd_id="test",
+                class_id="tests.Operator",
+                description="",
+                mesh=(("data", 1),),
+                resource=None,
+                priority=None,
+                placement_strategy=None,
+                operators=(facts,),
+            ),
+        ),
+        transfers=(),
+    )
+    return {"operator_facts": manifest.runtime_operator_facts("test", op_id)}
+
+
+def test_worker_rejects_operator_facts_from_another_manifest():
+    facts = _operator_facts("run")
+    first = ComputationGraphManifest.create(
+        graph_name="first",
+        spmds=(
+            SPMDFacts(
+                spmd_id="test",
+                class_id="tests.Operator",
+                description="",
+                mesh=(("data", 1),),
+                resource=None,
+                priority=None,
+                placement_strategy=None,
+                operators=(facts,),
+            ),
+        ),
+        transfers=(),
+    )
+    second = ComputationGraphManifest.create(
+        graph_name="second",
+        spmds=first.spmds,
+        transfers=(),
+    )
+    config = SPMDConfig(
+        spmd_id="test",
+        graph_manifest_id=first.manifest_id,
+        graph_spmd_facts=first.spmds[0],
+    )
+    meta = SimpleNamespace(graph_facts=second.runtime_operator_facts("test", "run"))
+    # pyrefly: ignore [missing-attribute]
+    raw_worker = SPMDWorker.__ray_metadata__.modified_class
+    worker = object.__new__(raw_worker)
+    worker.spmd_id = "test"
+    worker.config = config
+    worker._op_manager = SimpleNamespace(get_operator_metadata=lambda _: meta)
+
+    with pytest.raises(ValueError, match="do not match the worker manifest"):
+        raw_worker._operator_user_callable_spec(worker, "run", 0, {})
 
 
 def _make_executor(*, max_workers: int = 1) -> UserCallableExecutor:
@@ -314,6 +400,7 @@ async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
             operator_name="inline_async",
             operator_step=1,
             operator_rank=0,
+            **_trace_fields("inline_async"),
         )
     )
     await wrapped.execute(
@@ -326,6 +413,7 @@ async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
             operator_name="inline_sync",
             operator_step=1,
             operator_rank=0,
+            **_trace_fields("inline_sync"),
         )
     )
     await wrapped.execute(
@@ -339,6 +427,7 @@ async def test_user_profiler_context_propagates_to_worker_local_lanes(tmp_path):
             operator_step=1,
             operator_rank=0,
             process_affine=True,
+            **_trace_fields("worker_process"),
         )
     )
 
@@ -375,6 +464,7 @@ async def test_user_profiler_context_propagates_to_local_free_thread_lane(tmp_pa
             operator_name="local_free_thread",
             operator_step=1,
             operator_rank=0,
+            **_trace_fields("local_free_thread"),
         )
     )
 

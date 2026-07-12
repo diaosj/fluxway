@@ -14,7 +14,6 @@ _ROLE_ORDER = {
     "SPMDs": 10,
     "controller": 0,
     "driver": 0,
-    "workers": 10,
 }
 
 _SUBSYSTEM_ORDER = {
@@ -32,7 +31,7 @@ _SUBSYSTEM_ORDER = {
     "tensor": 110,
     "transport": 120,
     "mailbox": 130,
-    "worker": 140,
+    "scheduler": 140,
     "heartbeat": 900,
 }
 
@@ -98,7 +97,7 @@ class TraceTrackHierarchy:
         if len(parts) < 5 or not parts[2].startswith("rank:"):
             raise ValueError(f"invalid worker profiler track: {track_name!r}")
         return cls(
-            groups=("SPMDs", parts[1], "workers", parts[2], parts[3]),
+            groups=("SPMDs", parts[1], parts[2], parts[3]),
             leaf_name="/".join(parts[4:]),
         )
 

@@ -17,10 +17,17 @@ RUN chmod 1777 /tmp && \
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     vim \
     wget \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://get.perfetto.dev/trace_processor -o /tmp/trace_processor && \
+    python3 /tmp/trace_processor --version && \
+    install -m 0755 "$(find /root/.local/share/perfetto/prebuilts -type f -name 'trace_processor_shell-*' -print -quit)" /usr/local/bin/trace_processor_shell && \
+    rm -rf /tmp/trace_processor /root/.local/share/perfetto && \
+    trace_processor_shell --version
 
 # Configure pip index mirrors for faster resolution
 RUN pip config set global.index-url ${PIP_INDEX_URL} && \
@@ -51,6 +58,7 @@ RUN pip install --default-timeout=1000 --no-cache-dir \
     ray[all] \
     rich \
     s3fs \
+    scikit-learn \
     vortex-data \
     fastparquet
 
@@ -65,9 +73,9 @@ RUN pip install --default-timeout=1000 --no-cache-dir --extra-index-url https://
 # docker build -t fluxway -f docker/Dockerfile .
 COPY . /workspace/
 
-# Install the project in editable mode
+# Install Fluxway core, JAX, profiling, and graph visualization dependencies
 RUN cd /workspace && \
-    pip install --default-timeout=1000 --no-cache-dir -e ".[profiler]"
+    pip install --default-timeout=1000 --no-cache-dir -e ".[jax,profiler,visualization]"
 
 # Default command
 CMD ["/bin/bash"]

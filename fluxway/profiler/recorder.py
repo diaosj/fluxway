@@ -11,6 +11,8 @@ import time
 import threading
 from collections.abc import AsyncGenerator, Generator
 
+from fluxway.common.types.manifest import OperatorFacts
+
 from fluxway.profiler.record import (
     EMPTY_TRACE_PAYLOAD,
     ProfilerSnapshot,
@@ -271,7 +273,8 @@ DATA_PLANE_RECEIVER_DEPOSIT = TraceEventSpec(
 LOCAL_STEP_PLAN_EXECUTE = TraceEventSpec(
     "local_step_plan.execute",
     "compute/local_plan",
-    ("node_count",),
+    ("op_id", "step", "node_count"),
+    "step",
 )
 LOCAL_STEP_WAIT_INPUTS = TraceEventSpec(
     "local_step.wait_inputs",
@@ -307,18 +310,24 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
     "user_callable.execute",
     "compute/user_callable",
     (
-        "callable_id",
-        "function_id",
+        "manifest_id",
+        "spmd_id",
         "op_id",
+        "function_id",
         "step",
-        "tensor_names_id",
-        "control_names_id",
-        "static_names_id",
-        "lane_id",
+        "input_signature_id",
+        "output_signature_id",
+        "execution_mode",
     ),
     "step",
 )
-USER_CUSTOM_PAYLOAD_FIELDS = ("op_id", "step", "rank", "lane_id", "attrs_id")
+USER_CUSTOM_PAYLOAD_FIELDS = (
+    "op_id",
+    "step",
+    "rank",
+    "execution_mode",
+    "attrs_id",
+)
 WORKER_PROCESS_CALL_SUBMIT = TraceEventSpec(
     "worker_process_call.submit",
     "compute/user_callable_runtime",
@@ -513,75 +522,75 @@ DRIVER_OP_COMPLETION = TraceEventSpec(
 )
 WORKER_BACKGROUND_TASK = TraceEventSpec(
     "worker.background_task",
-    "worker/scheduler",
+    "scheduler/task",
     ("task_id",),
 )
 WORKER_OUTBOUND_TASK = TraceEventSpec(
     "worker.outbound_task",
-    "worker/scheduler",
+    "scheduler/task",
     ("task_id",),
 )
 WORKER_QUEUE_ENQUEUE = TraceEventSpec(
     "worker.queue_enqueue",
-    "worker/scheduler",
+    "scheduler/queue",
     ("op_id", "step", "priority"),
     "step",
 )
 WORKER_QUEUE_DEQUEUE = TraceEventSpec(
     "worker.queue_dequeue",
-    "worker/scheduler",
+    "scheduler/queue",
     ("op_id", "step", "priority"),
     "step",
 )
 WORKER_BLOCKED_TASK = TraceEventSpec(
     "worker.blocked_task",
-    "worker/scheduler",
+    "scheduler/queue",
     ("op_id", "step"),
     "step",
 )
 WORKER_FUTURE_TASK = TraceEventSpec(
     "worker.future_task",
-    "worker/scheduler",
+    "scheduler/queue",
     ("op_id", "step", "completed_count"),
     "step",
 )
 WORKER_STALE_TASK = TraceEventSpec(
     "worker.stale_task",
-    "worker/scheduler",
+    "scheduler/queue",
     ("op_id", "step", "completed_count"),
     "step",
 )
 WORKER_RUN_LOOP = TraceEventSpec(
     "worker.run_loop",
-    "worker/scheduler",
+    "scheduler/loop",
     EMPTY_PAYLOAD_FIELDS,
 )
 WORKER_ADVANCE_STEP = TraceEventSpec(
     "worker.advance_step",
-    "worker/scheduler",
+    "scheduler/step",
     ("op_id", "step", "next_step"),
     "step",
 )
 WORKER_DRAIN_WAIT = TraceEventSpec(
     "worker.drain_wait",
-    "worker/scheduler",
+    "scheduler/step",
     ("op_id", "step", "target_step"),
     "step",
 )
 WORKER_CHECKPOINT_SAVE = TraceEventSpec(
     "checkpoint.async_save",
-    "checkpoint/worker",
+    "checkpoint/storage",
     ("step", "operator_count"),
     "step",
 )
 WORKER_CHECKPOINT_LOAD = TraceEventSpec(
     "checkpoint.async_load",
-    "checkpoint/worker",
+    "checkpoint/storage",
     ("operator_count", "has_rank_storage"),
 )
 WORKER_SNAPSHOT_HOOK = TraceEventSpec(
     "worker.snapshot_hook",
-    "checkpoint/worker",
+    "checkpoint/hook",
     ("hook_id", "step"),
     "step",
 )
@@ -1055,11 +1064,11 @@ class TraceRecorder:
         )
 
     def local_step_plan_execute(
-        self, *, node_count: int
+        self, *, op_name: str, step: int, node_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             LOCAL_STEP_PLAN_EXECUTE,
-            payload=(node_count,),
+            payload=(self.intern(op_name), step, node_count),
         )
 
     def local_step_node(
@@ -1092,26 +1101,22 @@ class TraceRecorder:
     def user_callable_execute(
         self,
         *,
-        callable_id: str,
-        function_name: str,
-        op_name: str,
+        manifest_id: str,
+        operator_facts: OperatorFacts,
         step: int,
-        tensor_names: str,
-        control_names: str,
-        static_names: str,
-        lane: str,
+        execution_mode: str,
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             USER_CALLABLE_EXECUTE,
             payload=(
-                self.intern(callable_id),
-                self.intern(function_name),
-                self.intern(op_name),
+                self.intern(manifest_id),
+                self.intern(operator_facts.spmd_id),
+                self.intern(operator_facts.op_id),
+                self.intern(operator_facts.function_id),
                 step,
-                self.intern(tensor_names),
-                self.intern(control_names),
-                self.intern(static_names),
-                self.intern(lane),
+                self.intern(operator_facts.input_signature_id),
+                self.intern(operator_facts.output_signature_id),
+                self.intern(execution_mode),
             ),
         )
 
@@ -1122,16 +1127,16 @@ class TraceRecorder:
         op_name: str,
         step: int,
         rank: int,
-        lane: str,
+        execution_mode: str,
         attrs_json: str,
     ) -> AbstractContextManager[None]:
         return self._span(
-            self._user_custom_spec(name=name, lane=lane),
+            self._user_custom_spec(name=name, execution_mode=execution_mode),
             payload=(
                 self.intern(op_name),
                 step,
                 rank,
-                self.intern(lane),
+                self.intern(execution_mode),
                 self.intern(attrs_json),
             ),
         )
@@ -1143,25 +1148,25 @@ class TraceRecorder:
         op_name: str,
         step: int,
         rank: int,
-        lane: str,
+        execution_mode: str,
         attrs_json: str,
     ) -> None:
         self._instant(
-            self._user_custom_spec(name=name, lane=lane),
+            self._user_custom_spec(name=name, execution_mode=execution_mode),
             payload=(
                 self.intern(op_name),
                 step,
                 rank,
-                self.intern(lane),
+                self.intern(execution_mode),
                 self.intern(attrs_json),
             ),
         )
 
     @staticmethod
-    def _user_custom_spec(*, name: str, lane: str) -> TraceEventSpec:
+    def _user_custom_spec(*, name: str, execution_mode: str) -> TraceEventSpec:
         return TraceEventSpec(
             name,
-            f"compute/user_custom/{lane}",
+            f"compute/user_custom/{execution_mode}",
             USER_CUSTOM_PAYLOAD_FIELDS,
             "step",
         )
@@ -1500,14 +1505,6 @@ class TraceRecorder:
         return self._async_span(
             WORKER_CHECKPOINT_LOAD,
             payload=(operator_count, int(has_rank_storage)),
-        )
-
-    def worker_snapshot_hook(
-        self, *, hook_name: str, step: int
-    ) -> AbstractAsyncContextManager[None]:
-        return self._async_span(
-            WORKER_SNAPSHOT_HOOK,
-            payload=(self.intern(hook_name), step),
         )
 
     def mailbox_declare_step(

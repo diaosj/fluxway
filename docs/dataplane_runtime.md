@@ -275,9 +275,13 @@ Use these spans to verify nonblocking overlap:
 `send_output` and `await_send` correlate by
 `(source_spmd_code, source_rank, op_id, step)`. Batch spans add
 `target_spmd_id`, `target_rank`, and `batch_seq`.
-`user_callable.execute` includes interned ids for callable/function/operator
-names, `ctx.step`, input tensor names, control names, static names, and selected
-lane.
+`user_callable.execute` includes `manifest_id`, `spmd_id`, `op_id`,
+`function_id`, `step`, `input_signature_id`, `output_signature_id`, and
+`execution_mode`. The static identifiers come directly from the computation graph
+manifest used by Model Explorer; the trace wrapper does not reconstruct them
+from runtime callables. Worker configs carry the same frozen SPMD facts and a
+compact `ManifestOperatorFacts` binding; execution fails if either disagrees
+with the manifest ID before a trace record is written.
 
 For short runs:
 
@@ -290,6 +294,6 @@ not branch on step filters.
 
 For user-defined subregions inside an operator, use
 [`fw.profiler.scope/event`](user_profiler.md). These records appear below
-`compute/user_custom/<lane>` and are interpreted as subphases of the surrounding
+`compute/user_custom/<execution_mode>` and are interpreted as subphases of the surrounding
 `user_callable.execute` span. Do not wrap the whole operator with a custom
 scope; Fluxway already records that outer call.

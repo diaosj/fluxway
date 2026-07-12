@@ -12,7 +12,7 @@ from fluxway.profiler.recorder import TraceRecorder
 _ACTIVE_USER_PROFILER: contextvars.ContextVar[UserProfilerHandle | None] = (
     contextvars.ContextVar("fluxway_active_user_profiler", default=None)
 )
-_RESERVED_ATTR_KEYS = frozenset({"op_id", "step", "rank", "lane_id", "attrs_id"})
+_RESERVED_ATTR_KEYS = frozenset({"op_id", "step", "rank", "execution_mode", "attrs_id"})
 
 
 class _NoopScope:
@@ -34,7 +34,7 @@ _NOOP_SCOPE = _NoopScope()
 
 
 class UserProfilerHandle:
-    __slots__ = ("_recorder", "_op_name", "_step", "_rank", "_lane")
+    __slots__ = ("_recorder", "_op_name", "_step", "_rank", "_execution_mode")
 
     def __init__(
         self,
@@ -43,13 +43,13 @@ class UserProfilerHandle:
         op_name: str,
         step: int,
         rank: int,
-        lane: str,
+        execution_mode: str,
     ) -> None:
         self._recorder = recorder
         self._op_name = op_name
         self._step = step
         self._rank = rank
-        self._lane = lane
+        self._execution_mode = execution_mode
 
     @contextmanager
     def scope(self, name: str, attrs: dict[str, Any]) -> Generator[None, None, None]:
@@ -60,7 +60,7 @@ class UserProfilerHandle:
             op_name=self._op_name,
             step=self._step,
             rank=self._rank,
-            lane=self._lane,
+            execution_mode=self._execution_mode,
             attrs_json=attrs_json,
         ):
             yield
@@ -71,7 +71,7 @@ class UserProfilerHandle:
             op_name=self._op_name,
             step=self._step,
             rank=self._rank,
-            lane=self._lane,
+            execution_mode=self._execution_mode,
             attrs_json=_attrs_json(attrs),
         )
 
@@ -101,14 +101,14 @@ def activate_user_profiler(
     op_name: str,
     step: int,
     rank: int,
-    lane: str,
+    execution_mode: str,
 ) -> Generator[None, None, None]:
     handle = UserProfilerHandle(
         recorder=recorder,
         op_name=op_name,
         step=step,
         rank=rank,
-        lane=lane,
+        execution_mode=execution_mode,
     )
     token = _ACTIVE_USER_PROFILER.set(handle)
     try:

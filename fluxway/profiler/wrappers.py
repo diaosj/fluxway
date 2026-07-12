@@ -293,11 +293,13 @@ class TracingLocalStepPlanExecutor:
         self._recorder = recorder
 
     async def execute(self, plan: Any, registry: Any, step_context: Any = None) -> Any:
+        if step_context is None:
+            raise ValueError("TracingLocalStepPlanExecutor requires a step context.")
         async with self._recorder.local_step_plan_execute(
+            op_name=step_context.op_name,
+            step=step_context.step,
             node_count=len(getattr(plan, "node_kinds", ())),
         ):
-            if step_context is None:
-                return await self._delegate.execute(plan, registry)
             return await self._delegate.execute(plan, registry, step_context)
 
     async def drain_user_callables(self) -> None:
@@ -318,30 +320,31 @@ class TracingUserCallableExecutor:
 
     async def execute(self, spec: Any) -> Any:
         lane = self._delegate._lane_for(spec)
-        lane_value = str(getattr(lane, "value", lane))
-        op_name = str(
-            getattr(spec, "operator_name", None) or getattr(spec, "callable_id", "")
-        )
+        execution_mode = str(getattr(lane, "value", lane))
+        operator_facts = getattr(spec, "operator_facts", None)
+        if operator_facts is None:
+            raise ValueError("traced user callable execution requires operator_facts.")
+        canonical_facts = operator_facts.operator
+        operator_name = getattr(spec, "operator_name", None)
+        if operator_name is not None and operator_name != canonical_facts.op_id:
+            raise ValueError("operator_name does not match graph_manifest.")
+        op_name = canonical_facts.op_id
         step = self._operator_step(spec)
         rank = self._operator_rank(spec)
         async with self._recorder.user_callable_execute(
-            callable_id=str(getattr(spec, "callable_id", "")),
-            function_name=self._function_name(spec),
-            op_name=op_name,
+            manifest_id=operator_facts.manifest_id,
+            operator_facts=canonical_facts,
             step=step,
-            tensor_names=self._joined_names(getattr(spec, "debug_tensor_names", ())),
-            control_names=self._joined_names(getattr(spec, "debug_control_names", ())),
-            static_names=self._joined_names(getattr(spec, "debug_static_names", ())),
-            lane=lane_value,
+            execution_mode=execution_mode,
         ):
             with activate_user_profiler(
                 recorder=self._recorder,
                 op_name=op_name,
                 step=step,
                 rank=rank,
-                lane=lane_value,
+                execution_mode=execution_mode,
             ):
-                return await self._execute_selected_lane(spec, lane_value)
+                return await self._execute_selected_mode(spec, execution_mode)
 
     def actor_owned_operator_names(self) -> set[str | None]:
         return self._delegate.actor_owned_operator_names()
@@ -385,22 +388,24 @@ class TracingUserCallableExecutor:
         ):
             return await self._delegate.restore_state(states, ckpt_dir)
 
-    async def _execute_selected_lane(self, spec: Any, lane_value: str) -> Any:
-        if lane_value == "inline_async":
+    async def _execute_selected_mode(self, spec: Any, execution_mode: str) -> Any:
+        if execution_mode == "inline_async":
             return await spec.fn()
-        if lane_value == "inline_sync":
+        if execution_mode == "inline_sync":
             return self._delegate._execute_sync_sampled(spec)
-        if lane_value == "worker_process":
+        if execution_mode == "worker_process":
             return await self._delegate._execute_worker_process(spec)
-        if lane_value == "local_free_thread":
+        if execution_mode == "local_free_thread":
             return await self._delegate._execute_local_free_thread(spec)
-        if lane_value == "ray_execution_actor":
+        if execution_mode == "ray_execution_actor":
             return await self._delegate._execute_ray_actor(spec)
-        if lane_value == "native_backend":
+        if execution_mode == "native_backend":
             raise NotImplementedError(
-                "native_backend user callable lane is not installed."
+                "native_backend user callable execution mode is not installed."
             )
-        raise ValueError(f"unsupported user callable lane {lane_value!r}.")
+        raise ValueError(
+            f"unsupported user callable execution mode {execution_mode!r}."
+        )
 
     @staticmethod
     def _operator_step(spec: Any) -> int:
@@ -415,17 +420,3 @@ class TracingUserCallableExecutor:
         if rank is None:
             raise ValueError("traced user callable execution requires operator_rank.")
         return int(rank)
-
-    @staticmethod
-    def _function_name(spec: Any) -> str:
-        op_name = getattr(spec, "operator_name", None)
-        if op_name:
-            return str(op_name)
-        fn = getattr(spec, "fn", None)
-        return str(getattr(fn, "__qualname__", getattr(spec, "callable_id", "")))
-
-    @staticmethod
-    def _joined_names(names: Any) -> str:
-        if not names:
-            return ""
-        return ",".join(str(name) for name in names)

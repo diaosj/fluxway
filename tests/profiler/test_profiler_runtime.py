@@ -10,6 +10,12 @@ import numpy as np
 import pytest
 
 import fluxway as fw
+from fluxway.common.types import (
+    ComputationGraphManifest,
+    OperatorArguments,
+    OperatorFacts,
+    SPMDFacts,
+)
 from fluxway.profiler import (
     CausalClockViolation,
     MissingAxonNativeHlc,
@@ -27,6 +33,7 @@ from fluxway.profiler.hierarchy import (
 from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
 from fluxway.profiler.record import (
     PAYLOAD_START_COLUMN,
+    RECORD_WIDTH,
     ProfilerSnapshot,
     TraceArena,
     TraceCarrier,
@@ -39,9 +46,11 @@ from fluxway.profiler.recorder import (
     TraceRecorder,
 )
 from fluxway.profiler.user_api import activate_user_profiler
+from fluxway.profiler.wrappers import TracingLocalStepPlanExecutor
 from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.filtering import filter_steady_state_records
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
+from fluxway.spmd.worker.local_plan import LocalStepContext, LocalStepPlan
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
 from fluxway.spmd.worker.user_callable_executor import (
     USER_CALLABLE_DEFAULT_OPERATOR_LANE,
@@ -49,6 +58,36 @@ from fluxway.spmd.worker.user_callable_executor import (
     UserCallableSpec,
 )
 from fluxway.transport.manifest import TransportFrameHeader
+
+
+_TRACE_INPUTS = OperatorArguments(data=("ids", "weights"), control=("lr",))
+_TRACE_OUTPUTS = OperatorArguments(data=("embeddings",))
+_TRACE_OPERATOR_FACTS = OperatorFacts(
+    spmd_id="embedding",
+    op_id="lookup",
+    function_id="tests.Embedding.lookup",
+    inputs=_TRACE_INPUTS,
+    outputs=_TRACE_OUTPUTS,
+    input_signature_id=_TRACE_INPUTS.signature_id,
+    output_signature_id=_TRACE_OUTPUTS.signature_id,
+)
+_TRACE_MANIFEST = ComputationGraphManifest.create(
+    graph_name="profiler-test",
+    spmds=(
+        SPMDFacts(
+            spmd_id="embedding",
+            class_id="tests.Embedding",
+            description="",
+            mesh=(("data", 1),),
+            resource=None,
+            priority=None,
+            placement_strategy=None,
+            operators=(_TRACE_OPERATOR_FACTS,),
+        ),
+    ),
+    transfers=(),
+)
+_TRACE_RUNTIME_FACTS = _TRACE_MANIFEST.runtime_operator_facts("embedding", "lookup")
 
 
 def test_disabled_factory_returns_original_objects():
@@ -143,7 +182,7 @@ def test_heartbeat_diagnostics_are_opt_in(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_user_callable_execute_records_step_function_and_input_names(tmp_path):
+async def test_user_callable_execute_records_manifest_operator_facts(tmp_path):
     runtime = WorkerProcessCallRuntime(max_workers=1)
     executor = UserCallableExecutor(worker_process_runtime=runtime)
     factory = ProfilerRuntimeFactory.from_config(
@@ -165,9 +204,7 @@ async def test_user_callable_execute_records_step_function_and_input_names(tmp_p
             operator_name="lookup",
             operator_step=9,
             operator_rank=0,
-            debug_tensor_names=("ids", "weights"),
-            debug_control_names=("lr",),
-            debug_static_names=("training",),
+            operator_facts=_TRACE_RUNTIME_FACTS,
         )
     )
     await runtime.drain()
@@ -186,13 +223,51 @@ async def test_user_callable_execute_records_step_function_and_input_names(tmp_p
     payload = row[PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(fields)]
     values = dict(zip(fields, payload, strict=True))
 
-    assert metadata.name_for(int(values["function_id"])) == "lookup"
+    assert len(fields) == 8
+    assert metadata.name_for(int(values["manifest_id"])) == _TRACE_MANIFEST.manifest_id
+    assert metadata.name_for(int(values["spmd_id"])) == "embedding"
+    assert metadata.name_for(int(values["function_id"])) == "tests.Embedding.lookup"
     assert metadata.name_for(int(values["op_id"])) == "lookup"
     assert int(values["step"]) == 9
-    assert metadata.name_for(int(values["tensor_names_id"])) == "ids,weights"
-    assert metadata.name_for(int(values["control_names_id"])) == "lr"
-    assert metadata.name_for(int(values["static_names_id"])) == "training"
-    assert metadata.name_for(int(values["lane_id"])) == "inline_async"
+    assert (
+        metadata.name_for(int(values["input_signature_id"]))
+        == _TRACE_INPUTS.signature_id
+    )
+    assert (
+        metadata.name_for(int(values["output_signature_id"]))
+        == _TRACE_OUTPUTS.signature_id
+    )
+    assert metadata.name_for(int(values["execution_mode"])) == "inline_async"
+
+
+@pytest.mark.asyncio
+async def test_user_callable_execute_rejects_operator_name_mismatch(tmp_path):
+    runtime = WorkerProcessCallRuntime(max_workers=1)
+    executor = UserCallableExecutor(worker_process_runtime=runtime)
+    factory = ProfilerRuntimeFactory.from_config(
+        ProfilerConfig(trace_dir=str(tmp_path), run_id="run"),
+        process_name="worker/spmd/rank:0",
+    )
+    wrapped = factory.user_callable_executor(executor)
+
+    async def fn() -> int:
+        return 11
+
+    with pytest.raises(ValueError, match="operator_name does not match"):
+        await wrapped.execute(
+            UserCallableSpec(
+                callable_id="lookup",
+                fn=fn,
+                is_stateful=False,
+                resource_id=1,
+                operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+                operator_name="other",
+                operator_step=9,
+                operator_rank=0,
+                operator_facts=_TRACE_RUNTIME_FACTS,
+            )
+        )
+    runtime.close()
 
 
 def test_profiler_config_rejects_negative_skip_initial_steps(tmp_path):
@@ -234,6 +309,51 @@ async def test_trace_recorder_skips_step_level_records_below_threshold():
     assert names.count("local_step.wait_inputs") == 1
 
 
+def test_scheduler_loop_uses_responsibility_track():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=2 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+
+    recorder.worker_scheduler_instant(spec=WORKER_RUN_LOOP)
+
+    tracks = {
+        recorder.metadata.name_for(int(row[3])) for row in recorder.arena.snapshot()
+    }
+    assert "worker/spmd/rank:0/scheduler/loop" in tracks
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_storage_uses_responsibility_track():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=4 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+
+    async with recorder.worker_checkpoint_save(step=3, operator_count=2):
+        pass
+
+    tracks = {
+        recorder.metadata.name_for(int(row[3])) for row in recorder.arena.snapshot()
+    }
+    assert "worker/spmd/rank:0/checkpoint/storage" in tracks
+
+
+@pytest.mark.asyncio
+async def test_tracing_local_step_plan_requires_step_context():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=4 * RECORD_WIDTH * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+    )
+    wrapped = TracingLocalStepPlanExecutor(object(), recorder)
+
+    with pytest.raises(ValueError, match="requires a step context"):
+        await wrapped.execute(object(), object())
+
+
 @pytest.mark.asyncio
 async def test_skipped_trace_span_preserves_wrapped_exception():
     recorder = TraceRecorder(
@@ -272,7 +392,7 @@ def test_user_profiler_scope_event_record_readable_payload():
         op_name="lookup",
         step=3,
         rank=2,
-        lane="inline_sync",
+        execution_mode="inline_sync",
     ):
         assert fw.profiler.enabled() is True
         with fw.profiler.scope("embedding_lookup", table="item", id_count=17):
@@ -292,7 +412,7 @@ def test_user_profiler_scope_event_record_readable_payload():
     assert metadata.name_for(int(values["op_id"])) == "lookup"
     assert int(values["step"]) == 3
     assert int(values["rank"]) == 2
-    assert metadata.name_for(int(values["lane_id"])) == "inline_sync"
+    assert metadata.name_for(int(values["execution_mode"])) == "inline_sync"
     assert metadata.name_for(int(values["attrs_id"])) == (
         '{"id_count":17,"table":"item"}'
     )
@@ -309,7 +429,7 @@ def test_user_profiler_enabled_rejects_invalid_inputs():
         op_name="lookup",
         step=0,
         rank=0,
-        lane="inline_sync",
+        execution_mode="inline_sync",
     ):
         with pytest.raises(ValueError, match="non-empty"):
             fw.profiler.event("")
@@ -332,7 +452,7 @@ def test_user_profiler_skip_initial_steps_applies_to_custom_records():
             op_name="lookup",
             step=step,
             rank=0,
-            lane="inline_sync",
+            execution_mode="inline_sync",
         ):
             fw.profiler.event("cache_hit", step_value=step)
 
@@ -514,11 +634,16 @@ def test_trace_hierarchy_models_fluxway_abstractions():
         "driver/InputProcessor/driver/checkpoint"
     )
     controller = TraceTrackHierarchy.from_track_name("controller/controller/fsm")
+    scheduler = TraceTrackHierarchy.from_track_name(
+        "worker/InputProcessor/rank:0/scheduler/queue"
+    )
+    checkpoint = TraceTrackHierarchy.from_track_name(
+        "worker/InputProcessor/rank:0/checkpoint/storage"
+    )
 
     assert worker.groups == (
         "SPMDs",
         "InputProcessor",
-        "workers",
         "rank:0",
         "transport",
     )
@@ -527,6 +652,20 @@ def test_trace_hierarchy_models_fluxway_abstractions():
     assert driver.leaf_name == "checkpoint"
     assert controller.groups == ("Control Plane", "controller")
     assert controller.leaf_name == "fsm"
+    assert scheduler.groups == (
+        "SPMDs",
+        "InputProcessor",
+        "rank:0",
+        "scheduler",
+    )
+    assert scheduler.leaf_name == "queue"
+    assert checkpoint.groups == (
+        "SPMDs",
+        "InputProcessor",
+        "rank:0",
+        "checkpoint",
+    )
+    assert checkpoint.leaf_name == "storage"
     assert worker.to_layout(leaf_uuid=7).nodes[0].name == TRACE_ROOT_TRACK_NAME
     with pytest.raises(ValueError):
         TraceTrackHierarchy.from_track_name("unknown/path")
@@ -571,15 +710,22 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
         run_id="run",
         process_name="worker/spmd/rank:0",
     )
+
+    class Delegate:
+        async def execute(self, plan, registry, step_context):
+            return None
+
+    wrapped = TracingLocalStepPlanExecutor(Delegate(), recorder)
+    await wrapped.execute(
+        LocalStepPlan.single_call("lookup"),
+        object(),
+        LocalStepContext(op_name="lookup", step=4),
+    )
     async with recorder.user_callable_execute(
-        callable_id="lookup_callable",
-        function_name="lookup",
-        op_name="lookup",
+        manifest_id=_TRACE_MANIFEST.manifest_id,
+        operator_facts=_TRACE_OPERATOR_FACTS,
         step=4,
-        tensor_names="ids,weights",
-        control_names="lr",
-        static_names="training",
-        lane="inline_async",
+        execution_mode="inline_async",
     ):
         pass
 
@@ -604,14 +750,101 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
                 annotations[annotation.name] = int(annotation.int_value)
         break
 
-    assert annotations["callable_id"] == "lookup_callable"
-    assert annotations["function_id"] == "lookup"
+    assert annotations["manifest_id"] == _TRACE_MANIFEST.manifest_id
+    assert annotations["spmd_id"] == "embedding"
+    assert annotations["function_id"] == "tests.Embedding.lookup"
     assert annotations["op_id"] == "lookup"
     assert annotations["step"] == 4
-    assert annotations["tensor_names_id"] == "ids,weights"
-    assert annotations["control_names_id"] == "lr"
-    assert annotations["static_names_id"] == "training"
-    assert annotations["lane_id"] == "inline_async"
+    assert annotations["input_signature_id"] == _TRACE_INPUTS.signature_id
+    assert annotations["output_signature_id"] == _TRACE_OUTPUTS.signature_id
+    assert annotations["execution_mode"] == "inline_async"
+
+    local_step_annotations = {}
+    for packet in trace.packet:
+        event = packet.track_event
+        if event.name != "local_step_plan.execute":
+            continue
+        for annotation in event.debug_annotations:
+            if annotation.HasField("string_value"):
+                local_step_annotations[annotation.name] = annotation.string_value
+            elif annotation.HasField("int_value"):
+                local_step_annotations[annotation.name] = int(annotation.int_value)
+        break
+
+    assert local_step_annotations == {
+        "op_id": "lookup",
+        "step": 4,
+        "node_count": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_perfetto_writer_assigns_overlapping_slices_to_lanes(
+    tmp_path, monkeypatch
+):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    # pyrefly: ignore [missing-import]
+    from perfetto.protos.perfetto.trace import perfetto_trace_pb2 as proto
+
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * RECORD_WIDTH * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:3",
+    )
+    timestamps = iter((100, 200, 300, 400))
+    monkeypatch.setattr(
+        "fluxway.profiler.recorder.time.perf_counter_ns",
+        lambda: next(timestamps),
+    )
+    first = recorder.local_step_plan_execute(op_name="train", step=7, node_count=1)
+    second = recorder.local_step_plan_execute(op_name="train", step=8, node_count=1)
+    await first.__aenter__()
+    await second.__aenter__()
+    await first.__aexit__(None, None, None)
+    await second.__aexit__(None, None, None)
+
+    path = Path(tmp_path) / "overlapping.pftrace"
+    PerfettoTraceWriter().write(
+        recorder.arena.snapshot(), path, metadata=recorder.metadata
+    )
+    trace = proto.Trace()
+    trace.ParseFromString(path.read_bytes())
+
+    descriptors = {
+        packet.track_descriptor.uuid: packet.track_descriptor
+        for packet in trace.packet
+        if packet.HasField("track_descriptor")
+    }
+    events_by_step = {7: [], 8: []}
+    for packet in trace.packet:
+        event = packet.track_event
+        if event.name != "local_step_plan.execute":
+            continue
+        step = next(
+            int(annotation.int_value)
+            for annotation in event.debug_annotations
+            if annotation.name == "step"
+        )
+        events_by_step[step].append(
+            (int(event.type), int(packet.timestamp), int(event.track_uuid))
+        )
+
+    lane_uuids = set()
+    for events in events_by_step.values():
+        assert len(events) == 2
+        begin, end = events
+        assert begin[0] == int(proto.TrackEvent.TYPE_SLICE_BEGIN)
+        assert end[0] == int(proto.TrackEvent.TYPE_SLICE_END)
+        assert end[1] - begin[1] == 200
+        assert begin[2] == end[2]
+        lane_uuids.add(begin[2])
+
+    assert len(lane_uuids) == 2
+    for lane_uuid in lane_uuids:
+        lane = descriptors[lane_uuid]
+        assert lane.name in {"lane:0", "lane:1"}
+        assert descriptors[lane.parent_uuid].name == "local_plan"
 
 
 def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
@@ -630,7 +863,7 @@ def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
         op_name="lookup",
         step=4,
         rank=1,
-        lane="inline_sync",
+        execution_mode="inline_sync",
     ):
         with fw.profiler.scope(
             "embedding_lookup",
@@ -670,7 +903,7 @@ def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
     assert annotations["op_id"] == "lookup"
     assert annotations["step"] == 4
     assert annotations["rank"] == 1
-    assert annotations["lane_id"] == "inline_sync"
+    assert annotations["execution_mode"] == "inline_sync"
     assert annotations["table"] == "item"
     assert annotations["id_count"] == 19
     assert annotations["hit"] is True

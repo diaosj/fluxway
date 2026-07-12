@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import json
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from fluxway.profiler.record import (
     PAYLOAD_START_COLUMN,
     TraceEventKind,
     TraceMetadata,
+    stable_u64,
 )
 
 
@@ -19,7 +21,6 @@ FLUXWAY_TRACE_PACKET_SEQUENCE_ID = 1
 
 INTERNED_PAYLOAD_FIELDS = frozenset(
     {
-        "callable_id",
         "checkpoint_id",
         "control_names_id",
         "error_id",
@@ -28,7 +29,8 @@ INTERNED_PAYLOAD_FIELDS = frozenset(
         "from_state_id",
         "function_id",
         "hook_id",
-        "lane_id",
+        "execution_mode",
+        "manifest_id",
         "method_id",
         "op_id",
         "snapshot_id",
@@ -38,9 +40,44 @@ INTERNED_PAYLOAD_FIELDS = frozenset(
         "status_id",
         "target_spmd_id",
         "tensor_names_id",
+        "input_signature_id",
+        "output_signature_id",
         "to_state_id",
     }
 )
+
+
+def _allocate_slice_lanes(records: np.ndarray) -> dict[int, int]:
+    intervals_by_track: dict[int, list[tuple[int, int, int]]] = {}
+    for row_index, row in enumerate(records):
+        if int(row[0]) != int(TraceEventKind.SLICE_BEGIN):
+            continue
+        start = int(row[1])
+        duration = int(row[2])
+        if duration < 0:
+            raise ValueError(f"trace slice duration must be non-negative: {duration}")
+        track_uuid = int(row[3])
+        intervals_by_track.setdefault(track_uuid, []).append(
+            (start, start + duration, row_index)
+        )
+
+    assignments: dict[int, int] = {}
+    for intervals in intervals_by_track.values():
+        active: list[tuple[int, int]] = []
+        available: list[int] = []
+        lane_count = 0
+        for start, end, row_index in sorted(intervals):
+            while active and active[0][0] <= start:
+                _, lane = heapq.heappop(active)
+                heapq.heappush(available, lane)
+            if available:
+                lane = heapq.heappop(available)
+            else:
+                lane = lane_count
+                lane_count += 1
+            assignments[row_index] = lane
+            heapq.heappush(active, (end, lane))
+    return assignments
 
 
 class PerfettoTraceWriter:
@@ -53,8 +90,7 @@ class PerfettoTraceWriter:
             from perfetto.trace_builder.proto_builder import StreamingTraceProtoBuilder
         except ImportError as exc:
             raise ImportError(
-                "PerfettoTraceWriter requires the optional dependency "
-                "`perfetto==0.57.1`."
+                "PerfettoTraceWriter requires the optional dependency `perfetto`."
             ) from exc
         self._proto = proto
         self._builder_cls = StreamingTraceProtoBuilder
@@ -68,17 +104,19 @@ class PerfettoTraceWriter:
     ) -> None:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
+        slice_lanes = _allocate_slice_lanes(records)
         with output.open("wb") as f:
             builder = self._builder_cls(f)
             emitted_tracks: set[int] = set()
             emitted_descriptors: set[int] = set()
-            for row in records:
+            for row_index, row in enumerate(records):
                 self._write_record(
                     builder,
                     row,
                     metadata,
                     emitted_tracks,
                     emitted_descriptors,
+                    slice_lane=slice_lanes.get(row_index),
                 )
 
     def _write_record(
@@ -88,6 +126,8 @@ class PerfettoTraceWriter:
         metadata: TraceMetadata,
         emitted_tracks: set[int],
         emitted_descriptors: set[int],
+        *,
+        slice_lane: int | None,
     ) -> None:
         proto = self._proto
         kind = int(row[0])
@@ -101,6 +141,20 @@ class PerfettoTraceWriter:
                 emitted_descriptors=emitted_descriptors,
             )
             emitted_tracks.add(track_uuid)
+        event_track_uuid = track_uuid
+        if slice_lane is not None:
+            event_track_uuid = stable_u64(
+                "fluxway-profiler", "slice-lane", track_uuid, slice_lane
+            )
+            if event_track_uuid not in emitted_descriptors:
+                self._write_track_descriptor(
+                    builder,
+                    track_uuid=event_track_uuid,
+                    name=f"lane:{slice_lane}",
+                    parent_uuid=track_uuid,
+                    sibling_order_rank=slice_lane,
+                )
+                emitted_descriptors.add(event_track_uuid)
         payload_fields = metadata.payload_fields_for(name_id)
         payload_values = row[
             PAYLOAD_START_COLUMN : PAYLOAD_START_COLUMN + len(payload_fields)
@@ -109,7 +163,7 @@ class PerfettoTraceWriter:
             self._write_track_event(
                 builder,
                 ts_ns=int(row[1]),
-                track_uuid=track_uuid,
+                track_uuid=event_track_uuid,
                 name=metadata.name_for(name_id),
                 event_type=proto.TrackEvent.TYPE_SLICE_BEGIN,
                 flow_id=int(row[5]),
@@ -120,7 +174,7 @@ class PerfettoTraceWriter:
             self._write_track_event(
                 builder,
                 ts_ns=int(row[1]) + int(row[2]),
-                track_uuid=track_uuid,
+                track_uuid=event_track_uuid,
                 name=metadata.name_for(name_id),
                 event_type=proto.TrackEvent.TYPE_SLICE_END,
                 flow_id=0,

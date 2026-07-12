@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_DIR = REPO_ROOT / "fluxway" / "example" / "recommendation"
@@ -174,3 +175,35 @@ def test_input_spmd_marks_preprocessing_worker_process():
     }
 
     assert "requires_worker_process" in decorator_names
+
+
+def test_recommendation_visualization_export_is_explicit(monkeypatch, tmp_path):
+    from fluxway.example.recommendation import train
+
+    calls = []
+    monkeypatch.setattr(
+        "fluxway.visualize_graph",
+        lambda graph, directory, *, overwrite: calls.append(
+            (graph, directory, overwrite)
+        )
+        or directory,
+    )
+    graph = object()
+    train._export_graph_visualization(
+        graph,
+        SimpleNamespace(
+            graph_visualization_dir=None,
+            overwrite_graph_visualization=False,
+        ),
+    )
+    assert calls == []
+
+    destination = tmp_path / "bundle"
+    train._export_graph_visualization(
+        graph,
+        SimpleNamespace(
+            graph_visualization_dir=destination,
+            overwrite_graph_visualization=True,
+        ),
+    )
+    assert calls == [(graph, destination, True)]
