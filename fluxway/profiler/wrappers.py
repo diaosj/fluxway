@@ -267,6 +267,16 @@ class TracingWorkerMailbox:
             op_name, tuuid, step
         )
 
+    async def get_tensor_shard_views_and_arrivals_many(
+        self,
+        op_name: str,
+        tuuids: list[int] | tuple[int, ...],
+        step: int,
+    ) -> list[tuple[int, dict[Any, Any], dict[Any, Any]]]:
+        return await self._delegate.get_tensor_shard_views_and_arrivals_many(
+            op_name, tuuids, step
+        )
+
     async def snapshot(self) -> dict[str, Any]:
         return await self._delegate.snapshot()
 

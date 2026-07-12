@@ -87,6 +87,8 @@ class SymmetryReceipt:
                 f"Inconsistent provenance: Expected {len(receipts)} receipts, "
                 f"but found {len(valid_receipts)}. All shards must carry receipts."
             )
+        if len(valid_receipts) == 1:
+            return valid_receipts[0]
 
         world_size = valid_receipts[0].world_size
 
@@ -1162,14 +1164,14 @@ def _reconstruct_transport_tensor(
 
 
 try:
-    import jax
+    import jax  # pyrefly: ignore [missing-import]
 
     _JAX_AVAILABLE = True
 except ImportError:
     _JAX_AVAILABLE = False
 
 if _JAX_AVAILABLE:
-    import jax
+    import jax  # pyrefly: ignore [missing-import]
 
     def _tt_flatten(v):
         children = (

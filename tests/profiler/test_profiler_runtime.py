@@ -103,6 +103,25 @@ def test_tracing_mailbox_declare_step_forwards_exact_barrier_metadata(tmp_path):
     }
 
 
+@pytest.mark.asyncio
+async def test_tracing_mailbox_forwards_multi_tensor_snapshot(tmp_path):
+    config = ProfilerConfig(trace_dir=str(tmp_path), run_id="run")
+    factory = ProfilerRuntimeFactory.from_config(
+        config, process_name="worker/spmd/rank:0"
+    )
+    mailbox = _MailboxLike()
+    wrapped = factory.worker_mailbox(mailbox)
+
+    result = await wrapped.get_tensor_shard_views_and_arrivals_many("op", [11, 13], 3)
+
+    assert result == [(3, {11: "shards"}, {11: "arrivals"})]
+    assert mailbox.snapshot_many == {
+        "op_name": "op",
+        "tuuids": [11, 13],
+        "step": 3,
+    }
+
+
 def test_heartbeat_diagnostics_are_opt_in(tmp_path):
     default_runtime = ProfilerRuntimeFactory.from_config(
         ProfilerConfig(trace_dir=str(tmp_path), run_id="default"),
@@ -213,6 +232,26 @@ async def test_trace_recorder_skips_step_level_records_below_threshold():
     ]
     assert names.count("worker.run_loop") == 1
     assert names.count("local_step.wait_inputs") == 1
+
+
+@pytest.mark.asyncio
+async def test_skipped_trace_span_preserves_wrapped_exception():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/spmd/rank:0",
+        skip_initial_steps=1,
+    )
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        async with recorder.local_step_node(
+            spec=LOCAL_STEP_WAIT_INPUTS,
+            op_name="op",
+            step=0,
+        ):
+            raise RuntimeError("prepare failed")
+
+    assert recorder.arena.snapshot().shape[0] == 0
 
 
 def test_user_profiler_disabled_is_noop_without_attr_validation():
@@ -707,6 +746,7 @@ class _RayLikeDataPlane(DataPlaneCallable):
 class _MailboxLike:
     def __init__(self) -> None:
         self.declared = None
+        self.snapshot_many = None
 
     def declare_step(
         self,
@@ -723,3 +763,11 @@ class _MailboxLike:
             "expected_states": expected_states,
             "barrier_config": barrier_config,
         }
+
+    async def get_tensor_shard_views_and_arrivals_many(self, op_name, tuuids, step):
+        self.snapshot_many = {
+            "op_name": op_name,
+            "tuuids": tuuids,
+            "step": step,
+        }
+        return [(step, {11: "shards"}, {11: "arrivals"})]

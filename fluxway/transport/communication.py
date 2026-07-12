@@ -857,10 +857,20 @@ class BaseDataDistributor:
                 )
             return
 
-        sender_rank_tags = backend.as_tensor(sender_rank_tags)
-        stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
-            sender_rank_tags, payloads, mirror_target_world_size
+        grouped_layout = _grouped_numpy_rank_layout(
+            sender_rank_tags,
+            mirror_target_world_size,
         )
+        if grouped_layout is None:
+            sender_rank_tags = backend.as_tensor(sender_rank_tags)
+            stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
+                sender_rank_tags, payloads, mirror_target_world_size
+            )
+        else:
+            counts, offsets = grouped_layout
+            stitched_tensors = payloads
+            tensors_size = backend.as_tensor(counts)
+            tensor_offsets = backend.as_tensor(offsets)
 
         counts_np = backend.to_numpy(tensors_size)
         offsets_np = backend.to_numpy(tensor_offsets)
@@ -2669,6 +2679,36 @@ def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
 
     stitched_tensors = backend.tree_map(reorder_fn, slave_tensors)
     return stitched_tensors, counts, offsets
+
+
+def _grouped_numpy_rank_layout(
+    rank_tags: Any,
+    world_size: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not isinstance(rank_tags, np.ndarray):
+        return None
+    if rank_tags.ndim != 1:
+        raise ValueError(
+            f"mirror sender rank tags must be 1D, got shape={rank_tags.shape}."
+        )
+    if rank_tags.size:
+        minimum = int(rank_tags[0])
+        maximum = int(rank_tags[-1])
+        if minimum < 0 or maximum > world_size:
+            raise ValueError(
+                "mirror sender rank tags must be target ranks or the padding "
+                f"sentinel {world_size}, got min={minimum} max={maximum}."
+            )
+        if np.any(rank_tags[1:] < rank_tags[:-1]):
+            return None
+    boundaries = np.searchsorted(
+        rank_tags,
+        np.arange(world_size + 1, dtype=rank_tags.dtype),
+        side="left",
+    )
+    counts = np.diff(boundaries).astype(np.int32, copy=False)
+    offsets = boundaries[:-1].astype(np.int32, copy=False)
+    return counts, offsets
 
 
 def _build_routing_domain(

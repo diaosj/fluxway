@@ -1175,25 +1175,66 @@ class WorkerMailbox:
     ]:
         async with self._lock:
             state = self._states.get(op_name, {}).get(step)
-            shards = dict(state.tensor_slots.get(tuuid, {})) if state else {}
-            arrivals = dict(state.tensor_arrivals.get(tuuid, {})) if state else {}
-            source_steps = {
-                int(metadata["source_step"])
-                for metadata in arrivals.values()
-                if "source_step" in metadata
-            }
-            if not source_steps:
-                raise ValueError(
-                    f"[WorkerMailbox Error] missing source_step arrival metadata: "
-                    f"op={op_name} tuuid={tuuid} step={step}."
+            return self._snapshot_tensor_shard_views_and_arrivals(
+                op_name, tuuid, step, state
+            )
+
+    async def get_tensor_shard_views_and_arrivals_many(
+        self,
+        op_name: str,
+        tuuids: list[int] | tuple[int, ...],
+        step: int,
+    ) -> list[
+        tuple[
+            int,
+            dict[tuple[str, int], list[TransportShardView | TransportTensor]],
+            dict[tuple[str, int], dict[str, Any]],
+        ]
+    ]:
+        if len(tuuids) != len(set(tuuids)):
+            raise ValueError(
+                f"tensor snapshot tuuids must be unique: op={op_name} "
+                f"step={step} tuuids={tuuids}."
+            )
+        async with self._lock:
+            state = self._states.get(op_name, {}).get(step)
+            return [
+                self._snapshot_tensor_shard_views_and_arrivals(
+                    op_name, tuuid, step, state
                 )
-            if len(source_steps) != 1:
-                raise ValueError(
-                    f"[WorkerMailbox Error] mixed source_step arrival metadata: "
-                    f"op={op_name} tuuid={tuuid} step={step} "
-                    f"source_steps={sorted(source_steps)}."
-                )
-            return next(iter(source_steps)), shards, arrivals
+                for tuuid in tuuids
+            ]
+
+    @staticmethod
+    def _snapshot_tensor_shard_views_and_arrivals(
+        op_name: str,
+        tuuid: int,
+        step: int,
+        state: MailboxStepState | None,
+    ) -> tuple[
+        int,
+        dict[tuple[str, int], list[TransportShardView | TransportTensor]],
+        dict[tuple[str, int], dict[str, Any]],
+    ]:
+        shards = dict(state.tensor_slots.get(tuuid, {})) if state else {}
+        arrivals = dict(state.tensor_arrivals.get(tuuid, {})) if state else {}
+        source_steps = {
+            int(metadata["source_step"])
+            for metadata in arrivals.values()
+            if "source_step" in metadata
+        }
+        if not source_steps:
+            raise ValueError(
+                f"[WorkerMailbox Error] missing source_step arrival metadata: "
+                f"op={op_name} tuuid={tuuid} step={step}."
+            )
+        if len(source_steps) != 1:
+            raise ValueError(
+                f"[WorkerMailbox Error] mixed source_step arrival metadata: "
+                f"op={op_name} tuuid={tuuid} step={step} "
+                f"source_steps={sorted(source_steps)}."
+            )
+        return next(iter(source_steps)), shards, arrivals
 
     async def get_tensor_shard_count(self, op_name: str, tuuid: int, step: int) -> int:
         async with self._lock:

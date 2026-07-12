@@ -1610,19 +1610,18 @@ class TraceRecorder:
             yield
         finally:
             end = time.perf_counter_ns()
-            if self._skip_record(spec, payload):
-                return
-            self._arena.append(
-                kind=TraceEventKind.SLICE_BEGIN,
-                ts_ns=start,
-                dur_ns=end - start,
-                track_id=track_id,
-                name_id=name_id,
-                flow_id=active.flow_id,
-                task_id=active.task_id,
-                parent_task_id=active.parent_task_id,
-                payload=payload,
-            )
+            if not self._skip_record(spec, payload):
+                self._arena.append(
+                    kind=TraceEventKind.SLICE_BEGIN,
+                    ts_ns=start,
+                    dur_ns=end - start,
+                    track_id=track_id,
+                    name_id=name_id,
+                    flow_id=active.flow_id,
+                    task_id=active.task_id,
+                    parent_task_id=active.parent_task_id,
+                    payload=payload,
+                )
 
     def _skip_record(self, spec: TraceEventSpec, payload: tuple[int, ...]) -> bool:
         if self._skip_initial_steps <= 0:

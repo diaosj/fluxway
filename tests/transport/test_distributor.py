@@ -130,6 +130,68 @@ def test_mirror_backflow_drops_static_padding_receipt_rows():
     }
 
 
+def test_grouped_numpy_mirror_uses_contiguous_payload_views(monkeypatch):
+    world_size = 3
+    tags = np.array([0, 0, 1, 2, 2, world_size], dtype=np.int32)
+    values = jnp.arange(12, dtype=jnp.float32).reshape(6, 2)
+    receipt = SymmetryReceipt(world_size, tags)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("grouped NumPy mirror routing must not sort payloads")
+
+    monkeypatch.setattr(
+        "fluxway.transport.communication._stitch_with_prime",
+        forbidden,
+    )
+    plan = list(
+        AsyncDataDistributor(local_rank=0)._plan_mirror_group(
+            receipt=receipt,
+            payloads=[values],
+            has_meta_tensor_state_list=[0],
+            compact_desc_info=[None],
+            global_shapes_list=[tuple(values.shape)],
+            source_steps_list=[4],
+        )
+    )
+
+    actual = {
+        int(ranks[0]): np.asarray(tensors[0][: counts[0]]).tolist()
+        for ranks, tensors, counts, *_rest in plan
+    }
+    assert actual == {
+        0: [[0.0, 1.0], [2.0, 3.0]],
+        1: [[4.0, 5.0]],
+        2: [[6.0, 7.0], [8.0, 9.0]],
+    }
+
+
+def test_unordered_numpy_mirror_keeps_general_sorting_contract():
+    backend = get_backend()
+    world_size = 3
+    receipt = SymmetryReceipt(
+        world_size,
+        np.array([2, 0, 2, 1], dtype=np.int32),
+    )
+    values = jnp.array([[20.0], [0.0], [21.0], [10.0]], dtype=jnp.float32)
+
+    plan = list(
+        AsyncDataDistributor(local_rank=0)._plan_mirror_group(
+            receipt=receipt,
+            payloads=[values],
+            has_meta_tensor_state_list=[0],
+            compact_desc_info=[None],
+            global_shapes_list=[tuple(values.shape)],
+            source_steps_list=[4],
+        )
+    )
+
+    actual = {
+        int(ranks[0]): backend.to_numpy(tensors[0][: counts[0]]).reshape(-1).tolist()
+        for ranks, tensors, counts, *_rest in plan
+    }
+    assert actual == {0: [0.0], 1: [10.0], 2: [20.0, 21.0]}
+
+
 def test_content_source_to_static_target_keeps_origin_descriptor_symbolic(monkeypatch):
     backend = get_backend()
     src_mesh = DeviceMesh(("x",), (2,), [0, 1])

@@ -3033,11 +3033,11 @@ class SPMDWorker:
         unique_tuuids = list(set(all_tuuids))
 
         async def snapshot_tensors() -> list[Any]:
-            tensor_input_tasks = [
-                self._mailbox.get_tensor_shard_views_and_arrivals(op_name, u, step)
-                for u in unique_tuuids
-            ]
-            return await asyncio.gather(*tensor_input_tasks)
+            return await self._mailbox.get_tensor_shard_views_and_arrivals_many(
+                op_name,
+                unique_tuuids,
+                step,
+            )
 
         profiler_recorder = (
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
@@ -3228,18 +3228,13 @@ class SPMDWorker:
         if count == 0:
             raise ValueError("Cannot concatenate an empty shard list.")
 
-        # Fast Path: Single tensor is already the result (Zero-copy)
         if count == 1:
-            t = tensor_list[0]
-            # Ray deserialization may produce readonly NumPy arrays.
-            # force_writable patches __array_interface__ / __cuda_array_interface__
-            # to grant write access without copying.
-            return force_writable(t)
+            return backend.as_tensor(force_writable(tensor_list[0]))
 
         # Find the archetype (first non-empty tensor with proper rank)
         prototype = None
         for t in tensor_list:
-            if backend.size(t) > 0:
+            if all(extent > 0 for extent in backend.shape(t)):
                 prototype = t
                 break
 
@@ -3942,7 +3937,7 @@ class SPMDWorker:
             step=step,
             first_count=len(valid_shards),
         ):
-            all_values = backend.cat(
+            all_values = self._normalize_and_cat_shards(
                 [self._get_values(s) for s in valid_shards], dim=routing_dim
             )
 
@@ -3979,7 +3974,7 @@ class SPMDWorker:
             step=step,
             first_count=len(all_indices_list),
         ):
-            all_indices = backend.cat(all_indices_list, dim=0)
+            all_indices = self._normalize_and_cat_shards(all_indices_list, dim=0)
 
         # global_shape resolution hierarchy (Strict)
         if shard_global_shape is not None:

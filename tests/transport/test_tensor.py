@@ -1,7 +1,7 @@
 import pytest
 import pickle
 import jax.numpy as jnp
-from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.common.tensor_backend import set_backend, get_backend
 from fluxway.common.index_descriptor import ContinuousIndex
 
@@ -32,6 +32,24 @@ def test_jax_zero_copy_construction():
     # Verify Identity
     assert tensor.flat_values is original_flat
     assert jnp.array_equal(tensor.flat_values, original_flat)
+
+
+def test_single_symmetry_receipt_concatenate_returns_same_object():
+    receipt = SymmetryReceipt(4, jnp.array([0, 1, 3], dtype=jnp.int32))
+
+    result = SymmetryReceipt.concatenate([receipt], [3])
+
+    assert result is receipt
+
+
+def test_multiple_symmetry_receipts_concatenate_values():
+    left = SymmetryReceipt(4, jnp.array([0, 1], dtype=jnp.int32))
+    right = SymmetryReceipt(4, jnp.array([2, 3], dtype=jnp.int32))
+
+    result = SymmetryReceipt.concatenate([left, right], [2, 2])
+
+    assert result is not None
+    assert jnp.array_equal(result.sender_rank_tags, jnp.array([0, 1, 2, 3]))
 
 
 def test_flat_ragged_conversion():
