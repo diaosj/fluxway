@@ -1085,6 +1085,7 @@ class ControllerEvent(StrEnum):
     DRIVER_ERROR = "driver_error"  # Driver heartbeat timeout or error
     ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
     CLEANUP_FINISHED = "cleanup_finished"  # Terminal cleanup completed
+    CLEANUP_FAILED = "cleanup_failed"  # Terminal cleanup failed
 
 
 class DriverState(StrEnum):

@@ -142,6 +142,122 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
 
 
 @pytest.mark.asyncio
+async def test_shutdown_hook_failure_marks_controller_failed(controller):
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._cleanup_all_spmds = AsyncMock(
+        side_effect=RuntimeError("metrics drain failed")
+    )
+    controller.stop_checkpointer = AsyncMock()
+    controller._release_stopped_spmd_handles = MagicMock()
+
+    assert await controller._state_machine.trigger_event(
+        ControllerEvent.ALL_DRIVERS_COMPLETED
+    )
+
+    assert controller._state_machine.state == ControllerState.FAILED
+    assert await controller.wait_for_completion(timeout=0.1) is False
+
+
+@pytest.mark.asyncio
+async def test_driver_handle_release_failure_marks_controller_failed(controller):
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._cleanup_all_spmds = AsyncMock()
+    controller.stop_checkpointer = AsyncMock()
+    controller._release_stopped_spmd_handles = MagicMock(
+        side_effect=RuntimeError("handle release failed")
+    )
+
+    assert await controller._state_machine.trigger_event(
+        ControllerEvent.ALL_DRIVERS_COMPLETED
+    )
+
+    assert controller._state_machine.state == ControllerState.FAILED
+    assert await controller.wait_for_completion(timeout=0.1) is False
+
+
+@pytest.mark.asyncio
+async def test_unexpected_terminal_callback_failure_marks_controller_failed(controller):
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._state_machine._on_enter_completing = AsyncMock(
+        side_effect=RuntimeError("unexpected terminal failure")
+    )
+
+    assert await controller._state_machine.trigger_event(
+        ControllerEvent.ALL_DRIVERS_COMPLETED
+    )
+
+    assert controller._state_machine.state == ControllerState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_eager_stop_propagates_shutdown_failure_and_releases_handles(controller):
+    controller.block_all_spmds = AsyncMock()
+    controller.stop_checkpointer = AsyncMock()
+    controller._cleanup_all_spmds = AsyncMock(
+        side_effect=RuntimeError("metrics drain failed")
+    )
+    controller._release_stopped_spmd_handles = MagicMock()
+
+    with pytest.raises(RuntimeError, match="metrics drain failed"):
+        await controller.stop(save_checkpoint=False)
+
+    controller._release_stopped_spmd_handles.assert_called_once_with()
+    controller.stop_checkpointer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_eager_stop_aggregates_cleanup_and_handle_release_failures(controller):
+    controller.block_all_spmds = AsyncMock()
+    controller.stop_checkpointer = AsyncMock()
+    controller._cleanup_all_spmds = AsyncMock(
+        side_effect=RuntimeError("metrics drain failed")
+    )
+    controller._release_stopped_spmd_handles = MagicMock(
+        side_effect=RuntimeError("handle release failed")
+    )
+
+    with pytest.raises(ExceptionGroup, match="terminal cleanup failed") as raised:
+        await controller.stop(save_checkpoint=False)
+
+    assert {str(error) for error in raised.value.exceptions} == {
+        "metrics drain failed",
+        "handle release failed",
+    }
+    controller.stop_checkpointer.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_eager_stop_finalizes_runtime_when_blocking_fails(controller):
+    controller.block_all_spmds = AsyncMock(side_effect=RuntimeError("block failed"))
+    controller._finalize_runtime = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="block failed"):
+        await controller.stop(save_checkpoint=False)
+
+    controller._finalize_runtime.assert_awaited_once_with(export_profiler_trace=False)
+
+
+@pytest.mark.asyncio
+async def test_block_all_spmds_reports_submission_and_rpc_failures(
+    controller, mock_spmd_manager
+):
+    mock_spmd_manager.mock_driver1.block_all_ops.remote = MagicMock(
+        side_effect=RuntimeError("submit failed")
+    )
+    mock_spmd_manager.mock_driver2.block_all_ops.remote = AsyncMock(
+        side_effect=RuntimeError("rpc failed")
+    )
+
+    with pytest.raises(ExceptionGroup, match="block SPMDs failed") as raised:
+        await controller.block_all_spmds()
+
+    assert {str(error) for error in raised.value.exceptions} == {
+        "submit failed",
+        "rpc failed",
+    }
+
+
+@pytest.mark.asyncio
 async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release(
     controller,
 ):
@@ -164,10 +280,56 @@ async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release
 
 
 @pytest.mark.asyncio
+async def test_cleanup_all_spmds_propagates_failures_after_releasing_resources(
+    controller,
+):
+    controller._heartbeat_manager = MagicMock()
+    controller._heartbeat_manager.stop_monitoring_async = AsyncMock()
+    controller._spmd_manager.stop_spmd = AsyncMock(
+        side_effect=(RuntimeError("metrics drain failed"), None)
+    )
+    controller._scheduler = MagicMock()
+    controller._scheduler.pg_manager.has_job_pg = True
+
+    with pytest.raises(ExceptionGroup, match="SPMD cleanup failed") as raised:
+        await controller._cleanup_all_spmds()
+
+    assert str(raised.value.exceptions[0]) == "metrics drain failed"
+    assert controller._spmd_manager.stop_spmd.await_count == 2
+    controller._scheduler.release_resources.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_all_spmds_continues_after_monitoring_failures(controller):
+    controller._heartbeat_manager = MagicMock()
+    controller._heartbeat_manager.stop_monitoring_async = AsyncMock(
+        side_effect=RuntimeError("monitor stop failed")
+    )
+    controller._heartbeat_manager.unregister_spmd.side_effect = (
+        RuntimeError("unregister failed"),
+        None,
+    )
+    controller._spmd_manager.stop_spmd = AsyncMock()
+    controller._scheduler = MagicMock()
+    controller._scheduler.pg_manager.has_job_pg = True
+
+    with pytest.raises(ExceptionGroup, match="SPMD cleanup failed") as raised:
+        await controller._cleanup_all_spmds()
+
+    assert {str(error) for error in raised.value.exceptions} == {
+        "monitor stop failed",
+        "unregister failed",
+    }
+    assert controller._spmd_manager.stop_spmd.await_count == 2
+    controller._scheduler.release_resources.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_driver_error_transitions_through_failing(controller):
     cleanup_gate = asyncio.Event()
     controller._state_machine._state = ControllerState.RUNNING
     controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller.stop_checkpointer = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
 
     transition_task = asyncio.create_task(
@@ -186,6 +348,7 @@ async def test_driver_error_transitions_through_failing(controller):
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.FAILED
     controller._release_stopped_spmd_handles.assert_called_once_with()
+    controller.stop_checkpointer.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio

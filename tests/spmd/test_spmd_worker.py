@@ -268,6 +268,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
                 "node_rank": 0,
                 "num_nodes": 2,
                 "rank0_address": None,
+                "operator_location": "worker",
             },
         )
     ]

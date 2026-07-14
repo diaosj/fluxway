@@ -91,7 +91,13 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     worker_cls = cls.modified_class if cls else SPMDWorker
     worker_cls._pre_instantiate_operators(  # type: ignore
-        config, 3, local_rank=1, local_world_size=4, node_rank=0, num_nodes=2
+        config,
+        3,
+        operator_location="execution_actor",
+        local_rank=1,
+        local_world_size=4,
+        node_rank=0,
+        num_nodes=2,
     )
 
     storage, _ = get_instance_storage()

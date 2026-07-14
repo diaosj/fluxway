@@ -16,6 +16,17 @@ def _make_controller() -> MagicMock:
     controller = MagicMock()
     controller._cleanup_all_spmds = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
+    controller.stop_checkpointer = AsyncMock()
+
+    async def finalize_runtime(*, export_profiler_trace: bool) -> None:
+        assert export_profiler_trace is False
+        await controller.stop_checkpointer()
+        try:
+            await controller._cleanup_all_spmds()
+        finally:
+            controller._release_stopped_spmd_handles()
+
+    controller._finalize_runtime = AsyncMock(side_effect=finalize_runtime)
     return controller
 
 

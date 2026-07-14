@@ -157,6 +157,14 @@ class _RayFunctionExecutionActor:
     async def export_profiler_snapshot(self) -> Any:
         return self._profiler_runtime.snapshot()
 
+    async def shutdown(self) -> None:
+        instance = self._bound_instance()
+        if instance is None:
+            return
+        result = _call_state_hook(instance, "on_shutdown")
+        if inspect.isawaitable(result):
+            await result
+
     async def on_snapshot_begin(self, spmd_dir: str) -> None:
         instance = self._bound_instance()
         if instance is not None:
@@ -211,6 +219,7 @@ class _RayOperatorExecutionActor:
         SPMDWorker._pre_instantiate_operators(
             config,
             rank,
+            operator_location="execution_actor",
             local_rank=local_rank,
             local_world_size=local_world_size,
             node_rank=node_rank,
@@ -253,6 +262,16 @@ class _RayOperatorExecutionActor:
 
     async def export_profiler_snapshot(self) -> Any:
         return self._profiler_runtime.snapshot()
+
+    async def shutdown(self, operator_names: tuple[str, ...]) -> None:
+        instances: dict[int, Any] = {}
+        for op_name in operator_names:
+            instance = self._operator_instance(op_name)
+            instances.setdefault(id(instance), instance)
+        for instance in instances.values():
+            result = _call_state_hook(instance, "on_shutdown")
+            if inspect.isawaitable(result):
+                await result
 
     async def save_state(self, op_name: str, ckpt_dir: str) -> Any:
         instance = self._operator_instance(op_name)
@@ -335,6 +354,33 @@ class UserCallableExecutor:
 
     async def drain(self) -> None:
         await self._worker_process_runtime.drain()
+
+    async def shutdown(self) -> None:
+        shutdown_refs = []
+        shutdown_errors: list[Exception] = []
+        for record in self._ray_actors.values():
+            try:
+                if record.operator_name is None:
+                    shutdown_refs.append(record.actor.shutdown.remote())
+                else:
+                    operator_names = tuple(
+                        sorted(
+                            name for name in record.operator_names if name is not None
+                        )
+                    )
+                    shutdown_refs.append(record.actor.shutdown.remote(operator_names))
+            except Exception as error:
+                shutdown_errors.append(error)
+        results = await asyncio.gather(*shutdown_refs, return_exceptions=True)
+        shutdown_errors.extend(
+            result for result in results if isinstance(result, Exception)
+        )
+        self._ray_actors.clear()
+        if shutdown_errors:
+            raise ExceptionGroup(
+                "execution actor shutdown failed",
+                shutdown_errors,
+            )
 
     async def export_profiler_snapshots(self) -> tuple[Any, ...]:
         refs = [
@@ -429,12 +475,12 @@ class UserCallableExecutor:
             return UserCallableLane.WORKER_PROCESS
         if inspect.iscoroutinefunction(spec.fn) and not spec.is_stateful:
             return UserCallableLane.INLINE_ASYNC
-        if self._free_threading_enabled:
-            return UserCallableLane.LOCAL_FREE_THREAD
         profile = self._profiles[spec.callable_id]
         if spec.is_stateful:
             profile.lane = UserCallableLane.RAY_EXECUTION_ACTOR
             return profile.lane
+        if self._free_threading_enabled:
+            return UserCallableLane.LOCAL_FREE_THREAD
         if profile.lane is not None:
             return profile.lane
         if len(profile.samples) < self._sample_count:

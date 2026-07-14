@@ -10,9 +10,10 @@ Uses lightweight stubs (no Ray actors) matching the pattern in test_drain_barrie
 """
 
 import asyncio
+import threading
 import types
 import typing
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -37,6 +38,7 @@ def _make_worker_stub():
         _plan_tasks=set(),
         spmd_id="test_spmd",
         rank=0,
+        config=types.SimpleNamespace(operator_metas={}),
     )
     stub._execution_queues = {"__default__": stub._execution_queue}
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
@@ -48,6 +50,13 @@ def _make_worker_stub():
     stub._worker_process_call_runtime = types.SimpleNamespace(
         cancel_pending=AsyncMock(),
         close=lambda: None,
+    )
+    stub._local_step_plan_executor = types.SimpleNamespace(
+        user_callable_executor=types.SimpleNamespace(shutdown=AsyncMock())
+    )
+    stub._actor_owned_operator_names = lambda: set()
+    stub._shutdown_local_operator_instances = types.MethodType(
+        raw_cls._shutdown_local_operator_instances, stub
     )
     stub.stop = types.MethodType(raw_cls.stop, stub)
     return stub
@@ -103,6 +112,127 @@ class TestStopWakesDrainCondition:
         await stub.stop()
 
         assert stub._running is False  # type: ignore[reportUnnecessaryComparison]
+
+    @pytest.mark.asyncio
+    async def test_stop_shuts_down_user_callables(self):
+        stub = _make_worker_stub()
+
+        await stub.stop()
+
+        shutdown = stub._local_step_plan_executor.user_callable_executor.shutdown
+        shutdown.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stop_closes_local_runtimes_when_user_shutdown_fails(self):
+        stub = _make_worker_stub()
+        shutdown = stub._local_step_plan_executor.user_callable_executor.shutdown
+        shutdown.side_effect = RuntimeError("metrics drain failed")
+        stub._input_prepare_runtime.close = Mock()
+        stub._worker_process_call_runtime.close = Mock()
+
+        with pytest.raises(RuntimeError, match="metrics drain failed"):
+            await stub.stop()
+
+        stub._input_prepare_runtime.close.assert_called_once_with()
+        stub._worker_process_call_runtime.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stop_runs_user_shutdown_when_cancel_pending_fails(self):
+        stub = _make_worker_stub()
+        stub._input_prepare_runtime.cancel_pending = AsyncMock(
+            side_effect=RuntimeError("cancel failed")
+        )
+        shutdown = stub._local_step_plan_executor.user_callable_executor.shutdown
+        stub._input_prepare_runtime.close = Mock()
+        stub._worker_process_call_runtime.close = Mock()
+
+        with pytest.raises(RuntimeError, match="cancel failed"):
+            await stub.stop()
+
+        shutdown.assert_awaited_once_with()
+        stub._input_prepare_runtime.close.assert_called_once_with()
+        stub._worker_process_call_runtime.close.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stop_shuts_down_worker_process_operator_once(self, monkeypatch):
+        stub = _make_worker_stub()
+        shutdown_count = 0
+
+        class Operator:
+            async def on_shutdown(self) -> None:
+                nonlocal shutdown_count
+                await asyncio.sleep(0)
+                shutdown_count += 1
+
+        operator = Operator()
+        operator_meta = types.SimpleNamespace(
+            owner_class_module=Operator.__module__,
+            owner_class_qualname=Operator.__qualname__,
+        )
+        stub.config = types.SimpleNamespace(
+            operator_metas={"step": operator_meta, "flush": operator_meta}
+        )
+        stub._actor_owned_operator_names = lambda: set()
+        monkeypatch.setattr(
+            "fluxway.spmd.worker.worker._resolve_owner_class",
+            lambda *_: Operator,
+        )
+        monkeypatch.setattr(
+            "fluxway.spmd.worker.worker.get_instance_storage",
+            lambda: ({id(Operator): operator}, threading.Lock()),
+        )
+
+        await stub.stop()
+
+        assert shutdown_count == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_attempts_all_worker_process_operators_on_failure(
+        self, monkeypatch
+    ):
+        stub = _make_worker_stub()
+        calls = []
+
+        class FailingOperator:
+            def on_shutdown(self) -> None:
+                calls.append("failing")
+                raise RuntimeError("local shutdown failed")
+
+        class HealthyOperator:
+            def on_shutdown(self) -> None:
+                calls.append("healthy")
+
+        classes = {
+            "FailingOperator": FailingOperator,
+            "HealthyOperator": HealthyOperator,
+        }
+        instances = {
+            id(FailingOperator): FailingOperator(),
+            id(HealthyOperator): HealthyOperator(),
+        }
+        stub.config = types.SimpleNamespace(
+            operator_metas={
+                name: types.SimpleNamespace(
+                    owner_class_module="test",
+                    owner_class_qualname=name,
+                )
+                for name in classes
+            }
+        )
+        stub._actor_owned_operator_names = lambda: set()
+        monkeypatch.setattr(
+            "fluxway.spmd.worker.worker._resolve_owner_class",
+            lambda _, qualname: classes[qualname],
+        )
+        monkeypatch.setattr(
+            "fluxway.spmd.worker.worker.get_instance_storage",
+            lambda: (instances, threading.Lock()),
+        )
+
+        with pytest.raises(RuntimeError, match="local shutdown failed"):
+            await stub.stop()
+
+        assert calls == ["failing", "healthy"]
 
 
 class TestStopSentinel:

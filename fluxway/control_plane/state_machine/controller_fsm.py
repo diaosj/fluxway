@@ -75,6 +75,14 @@ class ControllerStateMachine:
             ControllerState.FAILING,
             ControllerEvent.CLEANUP_FINISHED,
         ): ControllerState.FAILED,
+        (
+            ControllerState.COMPLETING,
+            ControllerEvent.CLEANUP_FAILED,
+        ): ControllerState.FAILED,
+        (
+            ControllerState.FAILING,
+            ControllerEvent.CLEANUP_FAILED,
+        ): ControllerState.FAILED,
         # Errors during init phases
         (
             ControllerState.PENDING,
@@ -130,11 +138,14 @@ class ControllerStateMachine:
             next_state = self._TRANSITIONS[key]
 
             # Handle event-specific data
-            if event == ControllerEvent.DRIVER_ERROR:
-                spmd_id = kwargs.get("spmd_id", "unknown")
+            if event in (ControllerEvent.DRIVER_ERROR, ControllerEvent.CLEANUP_FAILED):
+                spmd_id = kwargs.get(
+                    "spmd_id",
+                    "cleanup" if event == ControllerEvent.CLEANUP_FAILED else "unknown",
+                )
                 error = kwargs.get("error", "Unknown error")
                 self._error_spmds[spmd_id] = error
-                logger.error(f"Driver error: {spmd_id} - {error}")
+                logger.error(f"Controller error: {spmd_id} - {error}")
 
             # Perform state transition
             old_state = self._state
@@ -180,6 +191,15 @@ class ControllerStateMachine:
                     await callback()
             except Exception as e:
                 logger.error(f"Error in entry callback for {state}: {e}")
+                if state in (ControllerState.COMPLETING, ControllerState.FAILING) and (
+                    self._state == state
+                ):
+                    await self.trigger_event(
+                        ControllerEvent.CLEANUP_FAILED,
+                        error=str(e),
+                    )
+                    return
+                raise
 
     def get_state(self) -> ControllerState:
         """Get current state (alias for property)."""
@@ -187,7 +207,7 @@ class ControllerStateMachine:
 
     def is_running(self) -> bool:
         """Check if controller is in RUNNING state."""
-        return bool(self.state == ControllerState.RUNNING)
+        return self.state == ControllerState.RUNNING
 
     def is_completed(self) -> bool:
         """Check if controller has completed."""
@@ -286,28 +306,20 @@ class ControllerStateMachine:
         """
         logger.debug("Controller entering COMPLETING state")
 
+        cleanup_error = None
         try:
-            if hasattr(self._controller, "stop_checkpointer"):
-                await self._controller.stop_checkpointer()
-            capture_fn = getattr(
-                self._controller, "capture_profiler_snapshots_if_enabled", None
+            await self._controller._finalize_runtime(
+                export_profiler_trace=True,
             )
-            profiler_snapshots = None
-            if capture_fn is not None:
-                profiler_snapshots = await capture_fn()
-            await self._controller._cleanup_all_spmds()
-            write_fn = getattr(
-                self._controller, "write_profiler_trace_if_enabled", None
-            )
-            if write_fn is not None:
-                await write_fn(profiler_snapshots)
-            release_fn = getattr(
-                self._controller, "_release_stopped_spmd_handles", None
-            )
-            if release_fn is not None:
-                release_fn()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs: {e}")
+            cleanup_error = e
+        if cleanup_error is not None:
+            await self.trigger_event(
+                ControllerEvent.CLEANUP_FAILED,
+                error=str(cleanup_error),
+            )
+            return
         await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
 
     async def _on_enter_failing(self) -> None:
@@ -322,15 +334,20 @@ class ControllerStateMachine:
         logger.error(f"Failed SPMDs: {errors}")
 
         # Attempt to cleanup resources even on failure
+        cleanup_error = None
         try:
-            await self._controller._cleanup_all_spmds()
-            release_fn = getattr(
-                self._controller, "_release_stopped_spmd_handles", None
+            await self._controller._finalize_runtime(
+                export_profiler_trace=False,
             )
-            if release_fn is not None:
-                release_fn()
         except Exception as e:
             logger.error(f"Failed to cleanup SPMDs during failure handling: {e}")
+            cleanup_error = e
+        if cleanup_error is not None:
+            await self.trigger_event(
+                ControllerEvent.CLEANUP_FAILED,
+                error=str(cleanup_error),
+            )
+            return
         await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
 
     async def _on_enter_completed(self) -> None:

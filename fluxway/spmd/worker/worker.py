@@ -139,7 +139,7 @@ from fluxway.profiler.recorder import (
     WORKER_SNAPSHOT_HOOK,
     WORKER_STALE_TASK,
 )
-from typing import Any, Optional, get_type_hints, cast
+from typing import Any, Literal, Optional, get_type_hints, cast
 
 _WAIT_INPUTS_CALLABLE = "__fluxway_wait_inputs__"
 _CALL_USER_OP_CALLABLE = "__fluxway_call_user_op__"
@@ -637,6 +637,7 @@ class SPMDWorker:
         config: "SPMDConfig",
         rank: int,
         *,
+        operator_location: Literal["worker", "execution_actor"],
         local_rank: int | None = None,
         local_world_size: int | None = None,
         node_rank: int | None = None,
@@ -674,6 +675,9 @@ class SPMDWorker:
             storage, lock = get_instance_storage()
             for op_meta in (config.operator_metas or {}).values():
                 if not op_meta.owner_class_qualname:
+                    continue
+                process_affine = op_meta.requires_worker_process
+                if process_affine != (operator_location == "worker"):
                     continue
                 cls = _resolve_owner_class(
                     op_meta.owner_class_module, op_meta.owner_class_qualname
@@ -828,6 +832,7 @@ class SPMDWorker:
             self._pre_instantiate_operators(
                 self.config,
                 self.rank,
+                operator_location="worker",
                 local_rank=local_rank,
                 local_world_size=local_world_size,
                 node_rank=node_rank,
@@ -2141,14 +2146,24 @@ class SPMDWorker:
         if self._heartbeat_task and not self._heartbeat_task.done():
             self._heartbeat_task.cancel()
             pending_tasks.append(self._heartbeat_task)
-        await self._input_prepare_runtime.cancel_pending()
-        await self._worker_process_call_runtime.cancel_pending()
-        await self._delivery_runtime.cancel_pending()
+        shutdown_errors: list[Exception] = []
+        cancel_results = await asyncio.gather(
+            self._input_prepare_runtime.cancel_pending(),
+            self._worker_process_call_runtime.cancel_pending(),
+            self._delivery_runtime.cancel_pending(),
+            return_exceptions=True,
+        )
+        shutdown_errors.extend(
+            result for result in cancel_results if isinstance(result, Exception)
+        )
         send_tasks = [
             task for task in getattr(self, "_send_tasks", set()) if not task.done()
         ]
         if send_tasks:
-            await asyncio.gather(*send_tasks, return_exceptions=True)
+            send_results = await asyncio.gather(*send_tasks, return_exceptions=True)
+            shutdown_errors.extend(
+                result for result in send_results if isinstance(result, Exception)
+            )
         plan_tasks = [
             task for task in getattr(self, "_plan_tasks", set()) if not task.done()
         ]
@@ -2161,14 +2176,37 @@ class SPMDWorker:
         pending_tasks.extend(background_tasks)
 
         if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+            pending_results = await asyncio.gather(
+                *pending_tasks, return_exceptions=True
+            )
+            shutdown_errors.extend(
+                result for result in pending_results if isinstance(result, Exception)
+            )
         if hasattr(self, "_plan_tasks"):
             self._plan_tasks.clear()
         if hasattr(self, "_send_tasks"):
             self._send_tasks.clear()
         self._background_tasks.clear()
-        self._input_prepare_runtime.close()
-        self._worker_process_call_runtime.close()
+        user_shutdown_results = await asyncio.gather(
+            self._shutdown_local_operator_instances(),
+            self._local_step_plan_executor.user_callable_executor.shutdown(),
+            return_exceptions=True,
+        )
+        shutdown_errors.extend(
+            result for result in user_shutdown_results if isinstance(result, Exception)
+        )
+        for close in (
+            self._input_prepare_runtime.close,
+            self._worker_process_call_runtime.close,
+        ):
+            try:
+                close()
+            except Exception as error:
+                shutdown_errors.append(error)
+        if len(shutdown_errors) == 1:
+            raise shutdown_errors[0]
+        if shutdown_errors:
+            raise ExceptionGroup("worker shutdown failed", shutdown_errors)
 
         logger.debug(f"Worker stopping spmd_id={self.spmd_id} rank={self.rank}")
 
@@ -4921,6 +4959,39 @@ class SPMDWorker:
     def _actor_owned_operator_names(self) -> set[str | None]:
         executor = self._local_step_plan_executor.user_callable_executor
         return executor.actor_owned_operator_names()
+
+    async def _shutdown_local_operator_instances(self) -> None:
+        actor_owned_ops = self._actor_owned_operator_names()
+        storage, lock = get_instance_storage()
+        instances: dict[int, Any] = {}
+        for op_name, op_meta in (self.config.operator_metas or {}).items():
+            if op_name in actor_owned_ops or not op_meta.owner_class_qualname:
+                continue
+            cls = _resolve_owner_class(
+                op_meta.owner_class_module,
+                op_meta.owner_class_qualname,
+            )
+            if cls is None:
+                continue
+            with lock:
+                instance = storage.get(id(cls))
+            if instance is not None:
+                instances.setdefault(id(instance), instance)
+        shutdown_errors: list[Exception] = []
+        for instance in instances.values():
+            hook = getattr(instance, "on_shutdown", None)
+            if not callable(hook):
+                continue
+            try:
+                result = hook()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as error:
+                shutdown_errors.append(error)
+        if len(shutdown_errors) == 1:
+            raise shutdown_errors[0]
+        if shutdown_errors:
+            raise ExceptionGroup("local operator shutdown failed", shutdown_errors)
 
     # =========================================================================
     # State Persistence (checkpoint I/O)

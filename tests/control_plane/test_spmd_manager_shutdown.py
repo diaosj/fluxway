@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -50,4 +51,23 @@ async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup()
 
     assert stop_method.calls == [((False,), {})]
     assert handle.driver_handle is driver_handle
+    assert handle.is_initialized is False
+
+
+@pytest.mark.asyncio
+async def test_stop_spmd_propagates_driver_shutdown_failure_after_state_cleanup():
+    manager = SPMDManager()
+    handle = SPMDHandle("metrics")
+    handle.set_initialized(True)
+
+    stop_method = _AsyncRemoteMethod()
+    stop_method._result = AsyncMock(side_effect=RuntimeError("drain failed"))
+    driver_handle = SimpleNamespace(stop=stop_method)
+    handle.set_driver_handle(driver_handle)
+    manager.register_spmd("metrics", handle)
+
+    with pytest.raises(RuntimeError, match="drain failed"):
+        await manager.stop_spmd("metrics", save_checkpoint=False)
+
+    assert handle.driver_handle is None
     assert handle.is_initialized is False

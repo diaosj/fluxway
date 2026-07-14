@@ -260,8 +260,6 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         try:
             # Stop the driver and wait for its worker shutdown path.
             await handle.call_driver("stop", save_checkpoint)
-        except Exception as e:
-            logger.error(f"Error stopping SPMD {spmd_id}: {e}")
         finally:
             if release_driver_handle:
                 handle.set_driver_handle(None)

@@ -22,6 +22,7 @@ from fluxway.spmd.worker.user_callable_executor import (
     UserCallableExecutor,
     UserCallableLane,
     UserCallableSpec,
+    _ActorRecord,
     _RayOperatorExecutionActor,
 )
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
@@ -145,6 +146,21 @@ def test_process_affine_stateful_operator_uses_worker_process_lane():
     assert executor._lane_for(spec) is UserCallableLane.WORKER_PROCESS
 
 
+def test_stateful_operator_uses_execution_actor_when_free_threading_is_enabled():
+    spec = UserCallableSpec(
+        callable_id="step",
+        fn=lambda: None,
+        is_stateful=True,
+        resource_id=0,
+        operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+        operator_name="step",
+    )
+    executor = _make_executor()
+    executor._free_threading_enabled = True
+
+    assert executor._lane_for(spec) is UserCallableLane.RAY_EXECUTION_ACTOR
+
+
 def test_stateful_ops_with_same_owner_share_ray_actor_key():
     class Table:
         def lookup(self):
@@ -177,6 +193,85 @@ def test_stateful_ops_with_same_owner_share_ray_actor_key():
     )
 
     assert executor._ray_actor_key(lookup) == executor._ray_actor_key(update)
+
+
+@pytest.mark.asyncio
+async def test_user_callable_executor_shutdown_waits_for_execution_actors():
+    executor = _make_executor()
+    actor = SimpleNamespace(shutdown=SimpleNamespace(remote=lambda *_: shutdown()))
+    completed = False
+
+    async def shutdown() -> None:
+        nonlocal completed
+        await asyncio.sleep(0)
+        completed = True
+
+    executor._ray_actors[("operator",)] = _ActorRecord(
+        actor=actor,
+        callable_id="step",
+        operator_name="step",
+        operator_names={"step"},
+    )
+
+    await executor.shutdown()
+
+    # pyrefly: ignore [unnecessary-comparison]
+    assert completed is True
+    assert executor._ray_actors == {}
+
+
+@pytest.mark.asyncio
+async def test_user_callable_executor_shutdown_releases_all_actors_on_failure():
+    executor = _make_executor()
+    completed = False
+
+    async def fail() -> None:
+        raise RuntimeError("metrics drain failed")
+
+    async def complete() -> None:
+        nonlocal completed
+        await asyncio.sleep(0)
+        completed = True
+
+    for callable_id, shutdown in (("fail", fail), ("complete", complete)):
+        actor = SimpleNamespace(
+            shutdown=SimpleNamespace(remote=lambda *_, fn=shutdown: fn())
+        )
+        executor._ray_actors[(callable_id,)] = _ActorRecord(
+            actor=actor,
+            callable_id=callable_id,
+            operator_name=callable_id,
+            operator_names={callable_id},
+        )
+
+    with pytest.raises(ExceptionGroup, match="execution actor shutdown failed"):
+        await executor.shutdown()
+
+    # pyrefly: ignore [unnecessary-comparison]
+    assert completed is True
+    assert executor._ray_actors == {}
+
+
+@pytest.mark.asyncio
+async def test_ray_operator_execution_actor_shuts_down_owner_once():
+    # pyrefly: ignore [missing-attribute]
+    actor_type = _RayOperatorExecutionActor.__ray_metadata__.modified_class
+    actor = object.__new__(actor_type)
+    actor._config = SimpleNamespace(active_operator_names=("step", "flush"))
+    shutdown_count = 0
+
+    class Operator:
+        async def on_shutdown(self) -> None:
+            nonlocal shutdown_count
+            await asyncio.sleep(0)
+            shutdown_count += 1
+
+    operator = Operator()
+    actor._operator_instance = lambda _: operator
+
+    await actor.shutdown(("step", "flush"))
+
+    assert shutdown_count == 1
 
 
 @pytest.mark.asyncio

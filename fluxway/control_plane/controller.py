@@ -1242,16 +1242,24 @@ class ControllerActor:
         logger.warning("Blocking all SPMDs")
 
         tasks = []
+        block_errors: list[Exception] = []
         for spmd_id in self.spmd_manager.get_all_spmd_ids():
             driver = self.spmd_manager.get_driver_handle(spmd_id)
             if driver is not None:
-                tasks.append(driver.block_all_ops.remote())
+                try:
+                    tasks.append(driver.block_all_ops.remote())
+                except Exception as error:
+                    block_errors.append(error)
 
         if tasks:
-            try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except Exception as e:
-                logger.error(f"Error blocking SPMDs: {e}")
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            block_errors.extend(
+                result for result in results if isinstance(result, Exception)
+            )
+        if len(block_errors) == 1:
+            raise block_errors[0]
+        if block_errors:
+            raise ExceptionGroup("block SPMDs failed", block_errors)
 
     @require_spmd_manager
     async def unblock_all_spmds(self) -> None:
@@ -1506,10 +1514,12 @@ class ControllerActor:
     async def _cleanup_all_spmds_unprofiled(self) -> None:
         logger.debug("Cleaning up all SPMDs")
 
-        # Stop heartbeat monitoring
-        await self.heartbeat_manager.stop_monitoring_async()
+        cleanup_errors: list[Exception] = []
+        try:
+            await self.heartbeat_manager.stop_monitoring_async()
+        except Exception as error:
+            cleanup_errors.append(error)
 
-        # Stop all SPMDs
         for spmd_id in self.spmd_manager.get_all_spmd_ids():
             try:
                 if self._profiler_runtime.enabled:
@@ -1529,11 +1539,51 @@ class ControllerActor:
                     )
             except Exception as e:
                 logger.error(f"Error stopping SPMD {spmd_id}: {e}")
-            finally:
+                cleanup_errors.append(e)
+            try:
                 self.heartbeat_manager.unregister_spmd(spmd_id)
+            except Exception as error:
+                cleanup_errors.append(error)
 
         if self.scheduler.pg_manager.has_job_pg:
-            self.scheduler.release_resources()
+            try:
+                self.scheduler.release_resources()
+            except Exception as error:
+                cleanup_errors.append(error)
+        if cleanup_errors:
+            raise ExceptionGroup("SPMD cleanup failed", cleanup_errors)
+
+    async def _finalize_runtime(self, *, export_profiler_trace: bool) -> None:
+        cleanup_errors: list[Exception] = []
+        profiler_snapshots = None
+        profiler_capture_succeeded = False
+        try:
+            await self.stop_checkpointer()
+        except Exception as error:
+            cleanup_errors.append(error)
+        if export_profiler_trace:
+            try:
+                profiler_snapshots = await self.capture_profiler_snapshots_if_enabled()
+                profiler_capture_succeeded = True
+            except Exception as error:
+                cleanup_errors.append(error)
+        try:
+            await self._cleanup_all_spmds()
+        except Exception as error:
+            cleanup_errors.append(error)
+        if export_profiler_trace and profiler_capture_succeeded:
+            try:
+                await self.write_profiler_trace_if_enabled(profiler_snapshots)
+            except Exception as error:
+                cleanup_errors.append(error)
+        try:
+            self._release_stopped_spmd_handles()
+        except Exception as error:
+            cleanup_errors.append(error)
+        if len(cleanup_errors) == 1:
+            raise cleanup_errors[0]
+        if cleanup_errors:
+            raise ExceptionGroup("terminal cleanup failed", cleanup_errors)
 
     def _release_stopped_spmd_handles(self) -> None:
         """Release driver handles after terminal cleanup has fully completed."""
@@ -1552,16 +1602,24 @@ class ControllerActor:
         """
         logger.debug("Stopping controller")
 
-        # Block all SPMDs first
-        await self.block_all_spmds()
+        stop_errors: list[Exception] = []
+        try:
+            await self.block_all_spmds()
+        except Exception as error:
+            stop_errors.append(error)
 
         # Save checkpoint if requested (placeholder)
         if save_checkpoint:
             logger.warning("Checkpoint save not implemented")
 
-        # Cleanup
-        await self._cleanup_all_spmds()
-        self._release_stopped_spmd_handles()
+        try:
+            await self._finalize_runtime(export_profiler_trace=False)
+        except Exception as error:
+            stop_errors.append(error)
+        if len(stop_errors) == 1:
+            raise stop_errors[0]
+        if stop_errors:
+            raise ExceptionGroup("controller stop failed", stop_errors)
 
         logger.debug("Controller stopped")
 

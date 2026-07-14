@@ -607,8 +607,11 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         logger.debug(f"Stopping spmd_id={self.spmd_id}")
         self._stopping = True
 
-        # Stop heartbeat
-        await self._stop_heartbeat()
+        shutdown_errors: list[Exception] = []
+        try:
+            await self._stop_heartbeat()
+        except Exception as error:
+            shutdown_errors.append(error)
 
         # Stop all workers
         stop_refs: list[tuple[int, Any]] = []
@@ -619,6 +622,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                 logger.error(
                     f"Failed to stop worker rank={rank} error={e} spmd_id={self.spmd_id}"
                 )
+                shutdown_errors.append(e)
 
         worker_handles = list(self._worker_handles.items())
 
@@ -632,6 +636,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                         f"Worker stop RPC failed rank={rank} error={result} "
                         f"spmd_id={self.spmd_id}"
                     )
+                    shutdown_errors.append(result)
 
         detach_refs: list[tuple[int, Any]] = []
         for rank, worker in worker_handles:
@@ -641,6 +646,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                 logger.error(
                     f"Failed to detach worker rank={rank} error={e} spmd_id={self.spmd_id}"
                 )
+                shutdown_errors.append(e)
 
         if detach_refs:
             detach_results = await asyncio.gather(
@@ -652,8 +658,14 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                         f"Worker detach RPC failed rank={rank} error={result} "
                         f"spmd_id={self.spmd_id}"
                     )
+                    shutdown_errors.append(result)
 
         self._worker_handles.clear()
+        if shutdown_errors:
+            raise ExceptionGroup(
+                f"SPMD {self.spmd_id!r} shutdown failed",
+                shutdown_errors,
+            )
 
     # =====================================================================
     # Snapshot Orchestration (Drain → Snapshot → Resume)

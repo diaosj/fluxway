@@ -287,7 +287,9 @@ class TestOwnerClassResolution:
         config = _InstantiableModel.get_spmd_config()  # type: ignore
 
         _instance_storage.clear()
-        SPMDWorker._pre_instantiate_operators(config, rank=0)  # type: ignore
+        SPMDWorker._pre_instantiate_operators(  # type: ignore
+            config, rank=0, operator_location="execution_actor"
+        )
 
         cls = _resolve_owner_class(
             config.operator_metas["run"].owner_class_module,
@@ -301,7 +303,9 @@ class TestOwnerClassResolution:
         _instance_storage.clear()
         caplog.set_level("DEBUG", logger="fluxway.spmd.worker.worker")
 
-        SPMDWorker._pre_instantiate_operators(config, rank=0)  # type: ignore
+        SPMDWorker._pre_instantiate_operators(  # type: ignore
+            config, rank=0, operator_location="execution_actor"
+        )
 
         begin_records = [
             record
