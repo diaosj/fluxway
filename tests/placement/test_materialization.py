@@ -1,0 +1,256 @@
+import asyncio
+from decimal import Decimal
+import pytest
+
+from fluxway.common.types import Graph
+from fluxway.placement import (
+    AFFINITY_FIRST_V1,
+    ClusterNode,
+    ClusterSnapshot,
+    PlacementGroupTimeoutError,
+    PlacementAttestationError,
+    PlacementMaterializationError,
+    PlacementPlanner,
+    PlacementRecipe,
+    PlacementRuntimeConfig,
+    ResourceProfile,
+    SPMDWorkerGroup,
+)
+from fluxway.control_plane.scheduler.pg_manager import PGManager
+from fluxway.spmd.driver import SPMDDriver
+from fluxway.placement.worker_group import ray_actor_options
+
+from .test_planner import graph_node, scenario
+
+
+class MultiAcceleratorSPMD: ...
+
+
+class FakePlacementGroup:
+    id = "fake-placement-group"
+
+    async def ready(self) -> None:
+        return None
+
+
+def test_pg_manager_materializes_one_pinned_job_placement_group(monkeypatch) -> None:
+    graph, recipe, snapshot_without_markers = scenario(2)
+    nodes = tuple(
+        ClusterNode(
+            node_id=node.node_id,
+            resources={
+                **node.resources,
+                f"node:10.0.0.{index + 1}": Decimal("1"),
+            },
+        )
+        for index, node in enumerate(snapshot_without_markers.nodes)
+    )
+    snapshot = ClusterSnapshot.from_nodes(nodes)
+    from fluxway.placement import PlacementPlanner
+
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    captured = {}
+
+    def create_pg(*, bundles, strategy):
+        captured["bundles"] = bundles
+        captured["strategy"] = strategy
+        return FakePlacementGroup()
+
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.placement_group", create_pg
+    )
+    manager = PGManager()
+
+    pg = asyncio.run(manager.create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1))
+
+    assert pg.id == "fake-placement-group"
+    assert captured["strategy"] == "STRICT_SPREAD"
+    assert len(captured["bundles"]) == len(plan.bundle_resources())
+    assert all(
+        len([key for key in bundle if key.startswith("node:")]) == 1
+        for bundle in captured["bundles"]
+    )
+    allocation = manager.get_worker_group("s1")
+    assert allocation.placement_group is pg
+    assert len(allocation.rank_to_bundle) == 12
+    assert allocation.expected_node_ids == tuple(
+        assignment.node_id
+        for assignment in plan.assignments
+        if assignment.spmd_id == "s1"
+    )
+
+
+def test_pg_manager_raises_typed_timeout_and_releases_pg(monkeypatch) -> None:
+    graph, recipe, snapshot_without_markers = scenario(1)
+    snapshot = ClusterSnapshot.from_nodes(
+        tuple(
+            ClusterNode(
+                node_id=node.node_id,
+                resources={
+                    **node.resources,
+                    f"node:10.0.1.{index + 1}": Decimal("1"),
+                },
+            )
+            for index, node in enumerate(snapshot_without_markers.nodes)
+        )
+    )
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    removed = []
+
+    class NeverReadyPlacementGroup:
+        async def ready(self) -> None:
+            await asyncio.Event().wait()
+
+    pg = NeverReadyPlacementGroup()
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.placement_group",
+        lambda **_: pg,
+    )
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.remove_placement_group",
+        removed.append,
+    )
+
+    with pytest.raises(PlacementGroupTimeoutError, match="timed out"):
+        asyncio.run(
+            PGManager().create_job_pg(plan=plan, snapshot=snapshot, timeout_s=0.001)
+        )
+
+    assert removed == [pg]
+
+
+def test_pg_manager_rejects_unexpressible_node_without_marker() -> None:
+    graph, recipe, snapshot = scenario(1)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+
+    with pytest.raises(PlacementMaterializationError, match="usable node resources"):
+        asyncio.run(
+            PGManager().create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1)
+        )
+
+
+def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> None:
+    graph = Graph(
+        nodes={"accelerated": graph_node("accelerated", MultiAcceleratorSPMD, 1)}
+    )
+    recipe = PlacementRecipe(
+        recipe_id="multi-accelerator",
+        version="1.0.0",
+        profiles={
+            MultiAcceleratorSPMD: ResourceProfile(
+                base={
+                    "GPU": 1,
+                    "accelerator_type:H100": Decimal("0.001"),
+                }
+            )
+        },
+        constraints=(),
+        objective=AFFINITY_FIRST_V1,
+    )
+    snapshot = ClusterSnapshot.from_nodes(
+        (
+            ClusterNode(
+                node_id="gpu",
+                resources={
+                    "GPU": 1,
+                    "accelerator_type:H100": Decimal("0.001"),
+                    "node:10.0.2.1": 1,
+                },
+            ),
+        )
+    )
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    captured = {}
+
+    def create_pg(*, bundles, strategy):
+        captured["bundles"] = bundles
+        return FakePlacementGroup()
+
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.placement_group", create_pg
+    )
+
+    asyncio.run(PGManager().create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1))
+
+    assert captured["bundles"] == [
+        {
+            "GPU": 1.0,
+            "accelerator_type:H100": 0.001,
+            "node:10.0.2.1": 0.0001,
+        }
+    ]
+
+
+def test_worker_group_attestation_rejects_rank_node_mismatch() -> None:
+    group = SPMDWorkerGroup(
+        spmd_id="attested",
+        placement_group=object(),
+        rank_to_bundle=(0, 1),
+        expected_node_ids=("node-a", "node-b"),
+        worker_resources={"CPU": Decimal("1")},
+    )
+
+    with pytest.raises(PlacementAttestationError, match="expected=.*actual"):
+        group.attest(("node-b", "node-a"))
+
+
+def test_recipe_worker_options_preserve_explicit_zero_accelerators() -> None:
+    driver = object.__new__(SPMDDriver.__ray_actor_class__)  # type: ignore[attr-defined]
+    driver.placement_group = object()
+    driver._runtime_env = None
+    driver.worker_resource = {"CPU": Decimal("0"), "GPU": Decimal("0")}
+
+    options = driver._build_worker_opts(0, "worker")
+
+    assert options["num_cpus"] == 0
+    assert options["num_gpus"] == 0
+
+
+def test_default_runtime_uses_zero_resource_driver_actors() -> None:
+    runtime = PlacementRuntimeConfig()
+
+    assert runtime.driver_resources == {}
+    assert ray_actor_options(runtime.driver_resources) == {
+        "num_cpus": 0,
+        "num_gpus": 0,
+    }
+
+
+def test_driver_resources_are_reserved_in_the_rank_zero_bundle(monkeypatch) -> None:
+    graph = Graph(nodes={"driver": graph_node("driver", MultiAcceleratorSPMD, 1)})
+    recipe = PlacementRecipe(
+        recipe_id="driver-resources",
+        version="1.0.0",
+        profiles={MultiAcceleratorSPMD: ResourceProfile(base={"CPU": 1})},
+        constraints=(),
+        objective=AFFINITY_FIRST_V1,
+    )
+    snapshot = ClusterSnapshot.from_nodes(
+        (
+            ClusterNode(
+                node_id="cpu",
+                resources={"CPU": 2, "node:10.0.3.1": 1},
+            ),
+        )
+    )
+    plan = PlacementPlanner(
+        solve_timeout_s=10,
+        driver_resources={"CPU": Decimal("0.5")},
+    ).resolve(graph, recipe, snapshot)
+    captured = {}
+
+    def create_pg(*, bundles, strategy):
+        captured["bundles"] = bundles
+        return FakePlacementGroup()
+
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.placement_group", create_pg
+    )
+    manager = PGManager()
+
+    asyncio.run(manager.create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1))
+
+    assert captured["bundles"] == [{"CPU": 1.5, "node:10.0.3.1": 0.0001}]
+    group = manager.get_worker_group("driver")
+    assert group.driver_bundle_index == 0
+    assert group.driver_resources == {"CPU": Decimal("0.5")}

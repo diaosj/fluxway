@@ -14,6 +14,7 @@ import ray
 
 from fluxway.control_plane.controller import create_controller
 from fluxway.control_plane.graph.functional import FunctionalGraph
+from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfile
 
 # Import helper nodes from the separate module so Ray can deserialize them.
 from tests.reader.helper_nodes import MockDataSource, SimpleProcessor, TypedGrainReader
@@ -58,7 +59,17 @@ async def test_reader_processor_data_flows():
     reader_id = next(n for n in task_graph.nodes if "Reader" in n)
     proc_id = next(n for n in task_graph.nodes if "Processor" in n)
 
-    controller = await create_controller(task_graph)
+    recipe = PlacementRecipe(
+        recipe_id="reader-e2e",
+        version="1.0.0",
+        profiles={
+            TypedGrainReader: ResourceProfile(base={"CPU": 1}),
+            SimpleProcessor: ResourceProfile(base={"CPU": 1}),
+        },
+        constraints=(),
+        objective=AFFINITY_FIRST_V1,
+    )
+    controller = await create_controller(task_graph, placement_recipe=recipe)
     try:
         for _ in range(_MAX_POLL_ROUNDS):
             await asyncio.sleep(_POLL_INTERVAL_S)

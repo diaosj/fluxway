@@ -18,10 +18,12 @@ async def test_driver_stop_waits_for_worker_shutdown():
             operator_metas={"compute": OperatorMeta(name="compute")},
             active_operator_names=("compute",),
         ),
-        placement_group=None,
+        placement_group=object(),
         worker_bundle_indices=[1, 2],
         controller_handle=None,
         graph_topology={},
+        worker_resource={"CPU": 0},
+        expected_node_ids=["node-a", "node-a"],
         checkpoint_backend=None,
     )
 
@@ -55,10 +57,12 @@ async def test_stop_heartbeat_joins_background_thread():
             operator_metas={"compute": OperatorMeta(name="compute")},
             active_operator_names=("compute",),
         ),
-        placement_group=None,
+        placement_group=object(),
         worker_bundle_indices=[1],
         controller_handle=None,
         graph_topology={},
+        worker_resource={"CPU": 0},
+        expected_node_ids=["node-a"],
         checkpoint_backend=None,
     )
 
@@ -85,10 +89,12 @@ def test_driver_ignores_worker_callbacks_while_stopping():
             operator_metas={"compute": OperatorMeta(name="compute")},
             active_operator_names=("compute",),
         ),
-        placement_group=None,
+        placement_group=object(),
         worker_bundle_indices=[1],
         controller_handle=MagicMock(),
         graph_topology={},
+        worker_resource={"CPU": 0},
+        expected_node_ids=["node-a"],
         checkpoint_backend=None,
     )
 

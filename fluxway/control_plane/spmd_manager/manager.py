@@ -16,17 +16,13 @@ Note: Controller layer only starts drivers. Workers are started by drivers.
 import asyncio
 from typing import Any
 
-try:
-    import ray  # noqa: F401
-    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-    RAY_AVAILABLE = True
-except ImportError:
-    RAY_AVAILABLE = False
-    PlacementGroupSchedulingStrategy = None
+import ray  # noqa: F401
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from fluxway.common.types import SPMDConfig
 from fluxway.common.utils.logging import get_logger
+from fluxway.placement import SPMDWorkerGroup
+from fluxway.placement.worker_group import ray_actor_options
 
 logger = get_logger(__name__)
 
@@ -44,6 +40,11 @@ class SPMDHandle:
         self._driver_handle: Any | None = None  # ray.ActorHandle
         self._config: SPMDConfig | None = None
         self._is_initialized: bool = False
+        self._attested_node_ids: tuple[str, ...] | None = None
+
+    @property
+    def attested_node_ids(self) -> tuple[str, ...] | None:
+        return self._attested_node_ids
 
     @property
     def driver_handle(self) -> Any | None:
@@ -139,12 +140,9 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         self,
         spmd_id: str,
         config: SPMDConfig,
-        placement_group: Any | None = None,
-        worker_bundle_indices: list[int] | None = None,
-        driver_bundle_index: int = 0,
+        worker_group: SPMDWorkerGroup,
         checkpoint_id: str | None = None,
-        worker_resource: Any | None = None,
-    ) -> SPMDHandle | None:
+    ) -> SPMDHandle:
         """
         Start an SPMD instance by creating its driver.
 
@@ -168,13 +166,6 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         handle = SPMDHandle(spmd_id)
         handle._config = config
 
-        if not RAY_AVAILABLE:
-            logger.warning(
-                f"Ray not available, creating mock SPMD handle for {spmd_id}"
-            )
-            self._spmd_handles[spmd_id] = handle
-            return handle
-
         try:
             # Import driver here to avoid circular imports
             from fluxway.spmd.driver import SPMDDriver
@@ -190,12 +181,13 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
 
             # Create driver actor with placement group
             driver_name = f"spmd_driver_{spmd_id}"
-            driver_opts: dict[str, Any] = {"name": driver_name, "num_cpus": 0.01}
-            if placement_group is not None:
-                driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(  # type: ignore
-                    placement_group=placement_group,
-                    placement_group_bundle_index=driver_bundle_index,
-                )
+            driver_opts: dict[str, Any] = {"name": driver_name}
+            driver_opts.update(ray_actor_options(worker_group.driver_resources))
+            driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=worker_group.placement_group,
+                placement_group_bundle_index=worker_group.driver_bundle_index,
+                placement_group_capture_child_tasks=False,
+            )
             # Driver is a control-plane actor: it must NOT inherit GPU-related
             # JAX env_vars (JAX_PLATFORMS=cuda,...) from the worker side,
             # otherwise pickle.loads of jax.Array on the driver eagerly
@@ -214,18 +206,22 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
             driver = spmd_driver_cls.options(**driver_opts).remote(  # type: ignore
                 spmd_id=spmd_id,
                 config=config,
-                placement_group=placement_group,
-                worker_bundle_indices=worker_bundle_indices
-                or list(range(1, config.num_workers + 1)),
+                placement_group=worker_group.placement_group,
+                worker_bundle_indices=list(worker_group.rank_to_bundle),
                 controller_handle=self._controller_handle,
                 graph_topology=graph_topology,
                 checkpoint_backend=self._checkpoint_backend,
-                worker_resource=worker_resource,
+                worker_resource=worker_group.worker_resources,
+                expected_node_ids=list(worker_group.expected_node_ids),
             )
 
             handle.set_driver_handle(driver)
 
-            driver.initialize.remote(checkpoint_id)
+            initialization = driver.initialize.remote(checkpoint_id)
+            await initialization
+            handle._attested_node_ids = tuple(
+                await driver.get_attested_node_ids.remote()
+            )
 
             # Register handle
             self._spmd_handles[spmd_id] = handle
@@ -233,7 +229,7 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
 
         except Exception as e:
             logger.error(f"Failed to start SPMD {spmd_id}: {e}")
-            return None
+            raise
 
     async def stop_spmd(
         self,
@@ -262,9 +258,8 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
             return
 
         try:
-            if RAY_AVAILABLE:
-                # Stop the driver and wait for its worker shutdown path.
-                await handle.call_driver("stop", save_checkpoint)
+            # Stop the driver and wait for its worker shutdown path.
+            await handle.call_driver("stop", save_checkpoint)
         except Exception as e:
             logger.error(f"Error stopping SPMD {spmd_id}: {e}")
         finally:
@@ -316,30 +311,13 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         """Get all registered SPMD IDs."""
         return list(self._spmd_handles.keys())
 
-    async def evict_spmd(self, spmd_id: str) -> str | None:
-        """
-        Evict an SPMD and return checkpoint ID.
-
-        Args:
-            spmd_id: ID of SPMD to evict
-
-        Returns:
-            Checkpoint ID for later restoration, or None on failure
-
-        TODO: Implement checkpoint saving
-        """
-        logger.warning(f"evict_spmd called for {spmd_id} - checkpoint not implemented")
-        await self.stop_spmd(spmd_id, save_checkpoint=True)
-        return None
-
     async def restore_spmd(
         self,
         spmd_id: str,
         config: SPMDConfig,
-        placement_group: Any | None = None,
-        worker_bundle_indices: list[int] | None = None,
+        worker_group: SPMDWorkerGroup,
         checkpoint_id: str | None = None,
-    ) -> SPMDHandle | None:
+    ) -> SPMDHandle:
         """
         Restore an SPMD from checkpoint.
 
@@ -363,8 +341,7 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         return await self.start_spmd(
             spmd_id=spmd_id,
             config=config,
-            placement_group=placement_group,
-            worker_bundle_indices=worker_bundle_indices,
+            worker_group=worker_group,
             checkpoint_id=checkpoint_id,
         )
 
@@ -390,16 +367,15 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         logger.debug(f"Established topology with {len(topology)} SPMDs")
 
         # Notify existing drivers of topology update
-        if RAY_AVAILABLE:
-            for spmd_id, handle in self._spmd_handles.items():
-                ## TODO(Chiave): Must ensure all drivers are is_initialized before registering predecessor/successor nodes
-                if handle.driver_handle is not None and handle.is_initialized:
-                    try:
-                        predecessors = self._reverse_topology.get(spmd_id, [])
-                        successors = self._topology.get(spmd_id, [])
-                        handle.call_driver("update_topology", predecessors, successors)
-                    except Exception as e:
-                        logger.error(f"Failed to update topology for {spmd_id}: {e}")
+        for spmd_id, handle in self._spmd_handles.items():
+            ## TODO(Chiave): Must ensure all drivers are is_initialized before registering predecessor/successor nodes
+            if handle.driver_handle is not None and handle.is_initialized:
+                try:
+                    predecessors = self._reverse_topology.get(spmd_id, [])
+                    successors = self._topology.get(spmd_id, [])
+                    handle.call_driver("update_topology", predecessors, successors)
+                except Exception as e:
+                    logger.error(f"Failed to update topology for {spmd_id}: {e}")
 
     def get_predecessors(self, spmd_id: str) -> list[str]:
         """
@@ -453,7 +429,7 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
                 except Exception as e:
                     results[spmd_id] = e
 
-        if RAY_AVAILABLE and refs:
+        if refs:
             spmd_ids = list(refs.keys())
             obj_refs = [refs[s] for s in spmd_ids]
             gathered = await asyncio.gather(*obj_refs, return_exceptions=True)

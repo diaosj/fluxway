@@ -21,10 +21,12 @@ def _make_driver():
     return driver_cls(
         spmd_id="spmd-a",
         config=config,
-        placement_group=None,
+        placement_group=object(),
         worker_bundle_indices=[],
         controller_handle=None,
         graph_topology={"predecessors": [], "successors": []},
+        worker_resource={"CPU": 0},
+        expected_node_ids=[],
     )
 
 
@@ -91,6 +93,7 @@ class FakeWorker:
 async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
     driver = _make_driver()
     driver.worker_bundle_indices = [0, 1, 2]
+    driver.expected_node_ids = ["node-a", "node-a", "node-b"]
     fake_workers = [FakeWorker("node-a"), FakeWorker("node-a"), FakeWorker("node-b")]
     worker_iter = iter(fake_workers)
 

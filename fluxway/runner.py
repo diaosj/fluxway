@@ -3,15 +3,9 @@ import sys
 from typing import Any
 from collections.abc import Callable, Awaitable
 import logging
+import ray
+
 from fluxway.common import asyncio_runtime
-
-try:
-    import ray
-
-    RAY_AVAILABLE = True
-except ImportError:
-    RAY_AVAILABLE = False
-    ray: Any = None
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +33,6 @@ def launch(
     entry_fn: Callable[..., Awaitable[Any]],
     *args: Any,
     ray_init_kwargs: dict[str, Any] | None = None,
-    num_cpus: int = 1,
     runtime_env: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> Any:
@@ -63,7 +56,6 @@ def launch(
                   Optional kwargs passed to ``ray.init()`` when Ray has not
                   been initialised yet.  Defaults to
                   ``ignore_reinit_error=True`` for Jupyter compatibility.
-        num_cpus: CPUs allocated to the sandbox task (default 1).
         runtime_env:
                   Optional Ray runtime_env dict forwarded to the sandbox task
                   (e.g. ``{"env_vars": {"MY_VAR": "1"}}``).
@@ -72,12 +64,6 @@ def launch(
     Returns:
         Whatever ``entry_fn`` returns.
     """
-    if not RAY_AVAILABLE:
-        raise RuntimeError(
-            "Ray is required by fluxway.launch.  "
-            "Install it with: pip install 'ray[default]'"
-        )
-
     if not ray.is_initialized():
         init_kw = (ray_init_kwargs or {}).copy()
         init_kw.setdefault("ignore_reinit_error", True)
@@ -96,7 +82,7 @@ def launch(
     sandbox_runtime_env["env_vars"] = dict(sandbox_env)
 
     task_options: dict[str, Any] = {
-        "num_cpus": num_cpus,
+        "num_cpus": 0,
         "num_gpus": 0,
         "runtime_env": sandbox_runtime_env,
     }

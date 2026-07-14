@@ -6,11 +6,8 @@ State transitions:
 - INITIALIZING -> ERROR (on INIT_FAILED)
 - READY -> RUNNING (on START)
 - RUNNING -> BLOCKED (on BLOCK_REQUESTED)
-- RUNNING -> ERROR (on WORKER_ERROR that can't be recovered)
+- RUNNING -> ERROR (on WORKER_ERROR)
 - BLOCKED -> RUNNING (on UNBLOCK_REQUESTED)
-- RUNNING -> RECOVERING (on WORKER_ERROR that triggers recovery)
-- RECOVERING -> RUNNING (on WORKER_RECOVERED)
-- RECOVERING -> ERROR (on recovery failed)
 - RUNNING -> COMPLETED (on ALL_WORKERS_COMPLETED or COMPLETE)
 """
 
@@ -42,11 +39,9 @@ class DriverStateMachine:
         (DriverState.INITIALIZING, DriverEvent.INIT_FAILED): DriverState.ERROR,
         (DriverState.READY, DriverEvent.START): DriverState.RUNNING,
         (DriverState.RUNNING, DriverEvent.BLOCK_REQUESTED): DriverState.BLOCKED,
-        (DriverState.RUNNING, DriverEvent.WORKER_ERROR): DriverState.RECOVERING,
+        (DriverState.RUNNING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.BLOCKED, DriverEvent.UNBLOCK_REQUESTED): DriverState.RUNNING,
-        (DriverState.BLOCKED, DriverEvent.WORKER_ERROR): DriverState.RECOVERING,
-        (DriverState.RECOVERING, DriverEvent.WORKER_RECOVERED): DriverState.RUNNING,
-        (DriverState.RECOVERING, DriverEvent.INIT_FAILED): DriverState.ERROR,
+        (DriverState.BLOCKED, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.RUNNING, DriverEvent.ALL_WORKERS_COMPLETED): DriverState.COMPLETED,
         (DriverState.RUNNING, DriverEvent.COMPLETE): DriverState.COMPLETED,
         # Drain → Drained → Snapshot → Running
@@ -85,7 +80,6 @@ class DriverStateMachine:
             DriverState.DRAINING: self._on_enter_draining,
             DriverState.DRAINED: self._on_enter_drained,
             DriverState.SNAPSHOTTING: self._on_enter_snapshotting,
-            DriverState.RECOVERING: self._on_enter_recovering,
             DriverState.COMPLETED: self._on_enter_completed,
             DriverState.ERROR: self._on_enter_error,
         }
@@ -103,7 +97,7 @@ class DriverStateMachine:
         Args:
             event: The event to trigger
             **kwargs: Additional event data
-                - rank: Worker rank (for WORKER_ERROR, WORKER_RECOVERED)
+                - rank: Worker rank (for WORKER_ERROR)
                 - error: Error message (for WORKER_ERROR, INIT_FAILED)
 
         Returns:
@@ -142,12 +136,6 @@ class DriverStateMachine:
                 logger.error(
                     f"Worker error in SPMD {self._driver.spmd_id}: {self._error_message}"
                 )
-
-            elif event == DriverEvent.WORKER_RECOVERED:
-                rank = kwargs.get("rank")
-                if rank is not None and rank in self._error_workers:
-                    del self._error_workers[rank]
-                logger.debug(f"Worker {rank} recovered in SPMD {self._driver.spmd_id}")
 
             elif event == DriverEvent.INIT_FAILED:
                 error = kwargs.get("error", "Initialization failed")
@@ -235,22 +223,6 @@ class DriverStateMachine:
     def _on_enter_snapshotting(self) -> None:
         """Called when entering SNAPSHOTTING state."""
         logger.debug(f"SPMD {self._driver.spmd_id} is snapshotting operator states")
-
-    def _on_enter_recovering(self) -> None:
-        """Called when entering RECOVERING state."""
-        logger.warning(f"SPMD {self._driver.spmd_id} is recovering")
-
-        # Try to recover error workers
-        with self._lock:
-            error_workers = list(self._error_workers.keys())
-
-        for rank in error_workers:
-            try:
-                success = self._driver._recover_worker(rank)
-                if success:
-                    self.trigger(DriverEvent.WORKER_RECOVERED, rank=rank)
-            except Exception as e:
-                logger.error(f"Failed to recover worker {rank}: {e}")
 
     def _on_enter_completed(self) -> None:
         """Called when entering COMPLETED state."""

@@ -42,7 +42,10 @@ def controller(mock_spmd_manager):
     graph_stub = MagicMock()
     graph_stub.nodes.keys.return_value = ["op1", "op2"]
 
-    ctrl = ControllerActor.__ray_actor_class__(graph=graph_stub)  # type: ignore[attr-defined]
+    ctrl = ControllerActor.__ray_actor_class__(  # type: ignore[attr-defined]
+        graph=graph_stub,
+        placement_recipe=MagicMock(),
+    )
     ctrl._spmd_manager = mock_spmd_manager
     ctrl._graph = graph_stub
 
@@ -68,7 +71,7 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
     await controller.report_driver_drained("op1")
     controller._checkpointer.save.assert_not_called()  # op2 not yet drained
 
-    # Driver 2 reports drained => Triggers ALL_DRIVERS_DRAINED => Checkpoint
+    # Driver 2 reports drained, completing the set and triggering checkpoint.
     await controller.report_driver_drained("op2")
 
     # We call this manually simulating the FSM dispatching it
@@ -161,14 +164,18 @@ async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release
 
 
 @pytest.mark.asyncio
-async def test_recovery_failed_transitions_through_failing(controller):
+async def test_driver_error_transitions_through_failing(controller):
     cleanup_gate = asyncio.Event()
-    controller._state_machine._state = ControllerState.BLOCKED
+    controller._state_machine._state = ControllerState.RUNNING
     controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
     controller._release_stopped_spmd_handles = MagicMock()
 
     transition_task = asyncio.create_task(
-        controller._state_machine.trigger_event(ControllerEvent.RECOVERY_FAILED)
+        controller._state_machine.trigger_event(
+            ControllerEvent.DRIVER_ERROR,
+            spmd_id="op1",
+            error="rank lost",
+        )
     )
     await asyncio.sleep(0)
     assert controller._state_machine.state == ControllerState.FAILING

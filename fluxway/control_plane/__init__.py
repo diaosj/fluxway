@@ -12,19 +12,13 @@ from .monitor import Monitor
 from .heartbeat import HeartbeatManager
 from .state_machine import ControllerStateMachine
 from .async_manager import AsyncStepManager
-from .controller import Controller, create_controller
+from .controller import Controller, ControllerActor, create_controller
 from .checkpointer import (
     FluxwayCheckpointer,
     WorkerCheckpointBackend,
     SafeTensorsBackend,
     OrbaxBackend,
 )
-
-try:
-    from .controller import ControllerActor
-except ImportError:
-    # Ray not available
-    ControllerActor = None  # type: ignore
 
 __all__ = [
     "GraphParser",

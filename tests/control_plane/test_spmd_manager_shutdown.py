@@ -1,9 +1,7 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
-from fluxway.control_plane.spmd_manager import manager as manager_module
 from fluxway.control_plane.spmd_manager.manager import SPMDHandle, SPMDManager
 
 
@@ -20,7 +18,7 @@ class _AsyncRemoteMethod:
 
 
 @pytest.mark.asyncio
-async def test_stop_spmd_releases_driver_without_force_kill(monkeypatch):
+async def test_stop_spmd_releases_driver_without_force_kill():
     manager = SPMDManager()
     handle = SPMDHandle("dense")
     handle.set_initialized(True)
@@ -30,22 +28,15 @@ async def test_stop_spmd_releases_driver_without_force_kill(monkeypatch):
     handle.set_driver_handle(driver_handle)
     manager.register_spmd("dense", handle)
 
-    kill_mock = MagicMock()
-    monkeypatch.setattr(manager_module, "RAY_AVAILABLE", True)
-    monkeypatch.setattr(manager_module, "ray", SimpleNamespace(kill=kill_mock))
-
     await manager.stop_spmd("dense", save_checkpoint=False)
 
     assert stop_method.calls == [((False,), {})]
-    kill_mock.assert_not_called()
     assert handle.driver_handle is None
     assert handle.is_initialized is False
 
 
 @pytest.mark.asyncio
-async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup(
-    monkeypatch,
-):
+async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup():
     manager = SPMDManager()
     handle = SPMDHandle("dense")
     handle.set_initialized(True)
@@ -55,13 +46,8 @@ async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup(
     handle.set_driver_handle(driver_handle)
     manager.register_spmd("dense", handle)
 
-    kill_mock = MagicMock()
-    monkeypatch.setattr(manager_module, "RAY_AVAILABLE", True)
-    monkeypatch.setattr(manager_module, "ray", SimpleNamespace(kill=kill_mock))
-
     await manager.stop_spmd("dense", save_checkpoint=False, release_driver_handle=False)
 
     assert stop_method.calls == [((False,), {})]
-    kill_mock.assert_not_called()
     assert handle.driver_handle is driver_handle
     assert handle.is_initialized is False

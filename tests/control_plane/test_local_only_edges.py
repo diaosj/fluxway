@@ -5,7 +5,7 @@ import pytest
 from fluxway.common.decorators import operator, spmd
 from fluxway.control_plane.graph.builder import Builder
 from fluxway.control_plane.graph.functional import FunctionalGraph
-from fluxway.control_plane.scheduler.scheduler import Scheduler
+from fluxway.control_plane.scheduler import build_topology
 
 _LOCAL_SPEC = {"type": "static", "axis": []}
 
@@ -50,7 +50,7 @@ def test_functional_graph_local_edge_marks_metadata_and_skips_global_topology():
     consume_meta = config.operator_metas["consume"]
     assert produce_meta.output_post_sharding["A"][0].local_only is True
     assert consume_meta.input_pre_sharding["A"][0].local_only is True
-    assert Scheduler()._build_topology(task_graph)["A"] == []
+    assert build_topology(task_graph)["A"] == []
 
 
 def test_builder_rejects_cross_node_local_only_edges():

@@ -34,7 +34,8 @@ dependencies = [
     "pydantic",
     "uvloop",
     "numpy>=1.22,<2.5",
-    "ray>=2.0.0",
+    "ray>=2.55.1",
+    "ortools>=9.12",
     "numba>=0.66.0",
 ]
 

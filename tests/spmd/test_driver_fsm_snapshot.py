@@ -58,6 +58,21 @@ class TestSnapshotHappyPath:
 
 
 class TestSnapshotErrorPaths:
+    def test_running_worker_error_fails_collective(self):
+        fsm, driver = _make_fsm()
+        fsm.trigger(DriverEvent.WORKER_ERROR, rank=0, error="crash")
+        assert fsm.state == DriverState.ERROR
+        driver._report_error.assert_called_once_with("Worker 0: crash")
+        driver._recover_worker.assert_not_called()
+
+    def test_blocked_worker_error_fails_collective(self):
+        fsm, driver = _make_fsm()
+        fsm.trigger(DriverEvent.BLOCK_REQUESTED)
+        fsm.trigger(DriverEvent.WORKER_ERROR, rank=0, error="crash")
+        assert fsm.state == DriverState.ERROR
+        driver._report_error.assert_called_once_with("Worker 0: crash")
+        driver._recover_worker.assert_not_called()
+
     def test_draining_worker_error_goes_to_error(self):
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)

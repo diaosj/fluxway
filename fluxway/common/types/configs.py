@@ -204,9 +204,6 @@ class SPMDConfig(FluxwayBaseSchema):
     # GPUs from the driver actor.
     driver_runtime_env: dict[str, Any] | None = None
 
-    # If true, worker will fail immediately upon error instead of attempting recovery.
-    fail_fast: bool = True
-
     # Transport backend for data plane RPC (e.g. "ray", "axon")
     transport_type: str = "ray"
 
@@ -1062,8 +1059,6 @@ class ControllerState(StrEnum):
     Lifecycle:
       INITIALIZING → PENDING → TOPOLOGY_REGISTERING → RUNNING
                                                        ↓
-                                                    BLOCKED ↔ RECOVERING
-                                                       ↓
                                                   COMPLETING / FAILING
                                                         ↓
                                                  COMPLETED / FAILED
@@ -1073,8 +1068,6 @@ class ControllerState(StrEnum):
     PENDING = "pending"  # Waiting for all drivers to init (workers_ready)
     TOPOLOGY_REGISTERING = "topology_registering"  # topology registration in progress
     RUNNING = "running"  # Normal execution
-    BLOCKED = "blocked"  # Task blocked (handling exceptions)
-    RECOVERING = "recovering"  # Recovering from errors
     COMPLETING = "completing"  # Final cleanup after successful execution
     FAILING = "failing"  # Final cleanup after unrecoverable failure
     COMPLETED = "completed"  # Task completed
@@ -1090,10 +1083,7 @@ class ControllerEvent(StrEnum):
         "all_spmds_topology_ready"  # All workers running after topology
     )
     DRIVER_ERROR = "driver_error"  # Driver heartbeat timeout or error
-    DRIVER_RECOVERED = "driver_recovered"  # Abnormal driver recovered
     ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
-    ALL_DRIVERS_DRAINED = "all_drivers_drained"  # All drivers reached DRAINED state
-    RECOVERY_FAILED = "recovery_failed"  # Recovery failed
     CLEANUP_FINISHED = "cleanup_finished"  # Terminal cleanup completed
 
 
@@ -1108,7 +1098,6 @@ class DriverState(StrEnum):
     DRAINED = "drained"  # Reached the drain target step
     SNAPSHOTTING = "snapshotting"  # Extracting operator states via save_state
     ERROR = "error"  # Error state
-    RECOVERING = "recovering"  # Recovering
     COMPLETED = "completed"  # Completed
 
 
@@ -1119,7 +1108,6 @@ class DriverEvent(StrEnum):
     INIT_FAILED = "init_failed"
     START = "start"
     WORKER_ERROR = "worker_error"
-    WORKER_RECOVERED = "worker_recovered"
     BLOCK_REQUESTED = "block_requested"
     UNBLOCK_REQUESTED = "unblock_requested"
     ALL_WORKERS_COMPLETED = "all_workers_completed"
@@ -1163,24 +1151,12 @@ class FlowControlState(FluxwayBaseSchema):
     epoch: int = 0
 
 
-class ErrorPolicy(FluxwayBaseSchema):
-    """Error handling policy for Controller-level error classification.
-
-    Decision priority:
-      1. recoverable_patterns match → recoverable (attempt restart)
-      2. No match → fall back to SPMDConfig.fail_fast
-    """
-
-    recoverable_patterns: list[str] = Field(default_factory=list)
-
-
 class HeartbeatConfig(FluxwayBaseSchema):
     """Heartbeat configuration."""
 
     heartbeat_interval: float = 5.0  # Heartbeat interval (seconds)
     heartbeat_timeout: float = 15.0  # Heartbeat timeout (seconds)
     max_missed_heartbeats: int = 3  # Maximum missed heartbeats before error
-    blocked_timeout: float = 300.0
 
 
 class CheckpointConfig(FluxwayBaseSchema):

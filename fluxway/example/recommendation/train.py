@@ -11,6 +11,7 @@ from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.controller import create_controller
 from fluxway.common.types import CheckpointConfig
 from fluxway.profiler import ProfilerDiagnostic
+from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfile
 
 from fluxway.example.recommendation.reader import RecommendationReader
 from fluxway.example.recommendation.input_spmd import InputSPMD
@@ -26,15 +27,17 @@ async def _print_resource_allocation_summary(controller):
         print("[Fluxway] Controller resource summary is empty.")
         return
 
-    print("[Fluxway] Controller resource summary:")
-    for spmd_id in sorted(summary):
-        item = summary[spmd_id]
-        print(
-            f"  - {spmd_id}: bundles={item['bundle_count']} "
-            f"workers={item['worker_count']} total_cpu={item['total_cpu']} "
-            f"total_memory_gb={item['total_memory_gb']} "
-            f"driver={item['driver_bundle']} worker={item['worker_bundle']}"
-        )
+    print(
+        "[Fluxway] Controller resource summary: "
+        f"recipe={summary['recipe_id']}@{summary['recipe_version']} "
+        f"digest={summary['recipe_digest']}"
+    )
+    counts = {}
+    for assignment in summary["assignments"]:
+        key = (assignment["spmd_id"], assignment["node_id"])
+        counts[key] = counts.get(key, 0) + 1
+    for (spmd_id, node_id), worker_count in sorted(counts.items()):
+        print(f"  - {spmd_id}: node={node_id} workers={worker_count}")
 
 
 def _build_profiler_config(args):
@@ -239,6 +242,18 @@ async def run_training(args):
         ckpt_dir="/tmp/fluxway_recsys_ckpt",
         interval_steps=args.checkpoint_interval,
     )
+    placement_recipe = PlacementRecipe(
+        recipe_id="recommendation-training",
+        version="1.0.0",
+        profiles={
+            RecommendationReader: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
+            InputSPMD: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
+            SparseEmbeddingSPMD: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
+            DenseSPMD: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
+        },
+        constraints=(),
+        objective=AFFINITY_FIRST_V1,
+    )
 
     profiler_config = _build_profiler_config(args)
     if profiler_config is not None:
@@ -247,6 +262,7 @@ async def run_training(args):
 
     controller = await create_controller(
         task_graph,
+        placement_recipe=placement_recipe,
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
         profiler_config=profiler_config,

@@ -30,6 +30,18 @@ flowchart TB
 
 控制平面不直接参与 tensor 切分、重组或发送。它只下发拓扑、sharding、operator metadata 和跨 SPMD 进度约束。
 
+### Placement
+
+`Controller` 接收版本化 `PlacementRecipe`。`PlacementPlanner` 将 Graph 中固定的 SPMD class、instance、DeviceMesh rank 与 Ray node resource snapshot 编译成有限 CP-SAT 模型。公开接口只包含 worker/node 集合表达式、数学约束和严格字典序 objective；逻辑 slot、rank mapping 和 solver variables 都是内部表示。
+
+placement 内部分为五个单向职责层：`mathematics.py` 定义 frozen AST，`models.py` 定义稳定报告与异常契约，`semantics.py` 解析集合并提供独立 attestation oracle，`compiler.py` 注册各 AST 节点的 CP-SAT lowering，`planner.py` 只编排模型组装、严格字典序求解和 materialization。新增 AST 节点通过类型注册 handler 扩展，不修改中心条件分派链。
+
+所有 SPMD 共用一个异构 Ray PlacementGroup。一个求解结果节点对应一个 composite bundle，bundle 使用 Ray 自动提供的 `node:<ip>` resource 精确绑定并采用 `STRICT_SPREAD`。`Controller` 是 PG 唯一 owner；`SPMDManager` 和 `SPMDDriver` 只借用 `SPMDWorkerGroup` 中的 rank-to-bundle 映射。
+
+`Controller` 负责 PlacementGroup 创建、释放和 attestation 协调；每个 driver 只上报各 rank 的实际 Ray node ID。
+
+配置、运行状态与错误处理见 [Placement Recipe](placement_recipe.md)；AST、objective 顺序、整数化和复杂度边界见 [Placement Mathematics](placement_mathematics.md)。
+
 ## SPMD Driver
 
 `SPMDDriver` 是每个 SPMD 的局部监督者：
@@ -39,7 +51,7 @@ flowchart TB
 - 汇总 worker committed watermark。
 - 在 checkpoint/drain/export/stop 前触发 worker fence。
 
-driver 不执行用户算子，也不构造 transport frame。
+driver 不执行用户算子，也不构造 transport frame。worker 错误由 driver 上报，整作业失败清理由 Controller 负责。
 
 ## Worker Scheduler
 

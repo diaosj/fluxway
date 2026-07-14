@@ -381,10 +381,12 @@ def _make_driver(spmd_id: str, controller_handle=None):
             },
             active_operator_names=("produce", "consume"),
         ),
-        placement_group=None,
+        placement_group=object(),
         worker_bundle_indices=[1],
         controller_handle=controller_handle,
         graph_topology={},
+        worker_resource={"CPU": 0},
+        expected_node_ids=["node-a"],
         checkpoint_backend=None,
     )
 
