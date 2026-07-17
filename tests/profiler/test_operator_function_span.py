@@ -3,6 +3,7 @@ import asyncio
 from fluxway.profiler.record import RECORD_WIDTH, TraceArena
 from fluxway.profiler.recorder import TraceRecorder
 from fluxway.profiler.user_api import activate_user_profiler
+from fluxway.resources import ResourceProfile
 from fluxway.spmd.worker.operator_manager.dispatcher import StandardDispatcher
 from fluxway.spmd.worker.operator_manager.operator_manager import OperatorManager
 
@@ -13,6 +14,7 @@ def _bare_manager(name: str, fn, *, coroutine_function: bool) -> OperatorManager
     manager._operator_is_coroutine_function = {name: coroutine_function}
     manager._dispatchers = {name: StandardDispatcher()}
     manager._static_args = {}
+    manager._ray_component_limits = ResourceProfile(base={}).ray_component_limits
     manager._rank = 0
     manager._world_size = 1
     manager._local_rank = 0

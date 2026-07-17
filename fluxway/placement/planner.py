@@ -423,6 +423,7 @@ class PlacementPlanner:
                     for worker in workers
                     for resource in (
                         set(worker.profile.base)
+                        | set(worker.profile.ray_component_limits)
                         | set(worker.driver_resources)
                         | (
                             set(worker.profile.scale.step)
@@ -437,7 +438,11 @@ class PlacementPlanner:
     def _allocation_vector_count(self, workers: tuple[_Worker, ...]) -> int:
         vectors: set[tuple[tuple[str, Decimal], ...]] = set()
         for worker in workers:
-            candidates = [worker.profile.base, worker.driver_resources]
+            candidates = [
+                worker.profile.base,
+                worker.profile.ray_component_limits,
+                worker.driver_resources,
+            ]
             if worker.profile.scale is not None:
                 candidates.append(worker.profile.scale.step)
             for candidate in candidates:
@@ -660,7 +665,7 @@ class PlacementPlanner:
     def _placement_resources(
         self, worker: _Worker, units: Mapping[str, int]
     ) -> dict[str, Decimal]:
-        resources = self._worker_resources(worker, units)
+        resources = dict(worker.profile.placement_resources_at(units[worker.spmd_id]))
         for resource, quantity in worker.driver_resources.items():
             resources[resource] = resources.get(resource, Decimal(0)) + quantity
         return resources
@@ -817,7 +822,7 @@ class PlacementPlanner:
                 usage_upper = sum(
                     resource_units.units(
                         resource,
-                        unit.profile.base.get(resource, Decimal(0)),
+                        unit.profile.placement_base.get(resource, Decimal(0)),
                     )
                     * unit.size
                     + resource_units.units(
@@ -844,7 +849,7 @@ class PlacementPlanner:
                 usage = sum(
                     resource_units.units(
                         resource,
-                        unit.profile.base.get(resource, Decimal(0)),
+                        unit.profile.placement_base.get(resource, Decimal(0)),
                     )
                     * assignments[(unit.index, node_index)]
                     + resource_units.units(
@@ -873,7 +878,7 @@ class PlacementPlanner:
             aggregate_upper = sum(
                 resource_units.units(
                     resource,
-                    worker.profile.base.get(resource, Decimal(0)),
+                    worker.profile.placement_base.get(resource, Decimal(0)),
                 )
                 + resource_units.units(
                     resource,
@@ -897,7 +902,7 @@ class PlacementPlanner:
             aggregate_usage = sum(
                 resource_units.units(
                     resource,
-                    worker.profile.base.get(resource, Decimal(0)),
+                    worker.profile.placement_base.get(resource, Decimal(0)),
                 )
                 + resource_units.units(
                     resource,
@@ -922,7 +927,7 @@ class PlacementPlanner:
             )
         unit_keys: set[tuple[tuple[str, int], ...]] = set()
         for profile in spmd_profiles.values():
-            vectors = [profile.base]
+            vectors = [profile.placement_base]
             if profile.scale is not None:
                 vectors.append(profile.scale.step)
             for vector in vectors:
@@ -1487,6 +1492,7 @@ class PlacementPlanner:
                         rank=worker.rank,
                         node_id=snapshot.nodes[node_index].node_id,
                         resources=self._worker_resources(worker, allocated_quanta),
+                        ray_component_limits=dict(worker.profile.ray_component_limits),
                         driver_resources=worker.driver_resources,
                     )
                 )
@@ -1573,6 +1579,8 @@ class PlacementPlanner:
         used: defaultdict[str, Decimal] = defaultdict(Decimal)
         for assignment in assignments:
             for resource, quantity in assignment.resources.items():
+                used[resource] += quantity
+            for resource, quantity in assignment.ray_component_limits.items():
                 used[resource] += quantity
             for resource, quantity in assignment.driver_resources.items():
                 used[resource] += quantity

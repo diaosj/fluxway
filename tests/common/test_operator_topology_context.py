@@ -7,6 +7,7 @@ from fluxway.common.decorators import (
 from fluxway.common.mesh import DeviceMesh
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.resources import ResourceProfile
 from tests.compiled_graph_fixtures import single_spmd_config
 
 
@@ -35,6 +36,18 @@ class TopologyAwareOperator:
             getattr(self, "node_rank", None),
             getattr(self, "num_nodes", None),
         )
+
+
+class RayComponentLimitsAwareOperator:
+    seen_in_init = None
+    ray_component_limits: object
+
+    def __init__(self):
+        type(self).seen_in_init = self.ray_component_limits
+
+    @operator(name="inspect_ray_component_limits")
+    def inspect_ray_component_limits(self):
+        return self.ray_component_limits
 
 
 def _clear_operator_instance():
@@ -70,6 +83,45 @@ def test_operator_context_exposes_topology_fields():
         assert ctx.local_world_size == 4
         assert ctx.node_rank == 0
         assert ctx.num_nodes == 2
+
+
+def test_operator_context_exposes_ray_component_limits_in_eager_execution():
+    ray_component_limits = ResourceProfile(
+        base={"CPU": 1}, ray_component_limits={"CPU": "0.5"}
+    ).ray_component_limits
+
+    with operator_context(
+        static_args={},
+        rank=0,
+        world_size=1,
+        ray_component_limits=ray_component_limits,
+    ):
+        assert get_current_context().ray_component_limits is ray_component_limits
+
+
+def test_preinstantiate_operator_exposes_compiled_ray_component_limits():
+    storage, _ = get_instance_storage()
+    storage.pop(id(RayComponentLimitsAwareOperator), None)
+    RayComponentLimitsAwareOperator.seen_in_init = None
+    operator_spec = RayComponentLimitsAwareOperator.inspect_ray_component_limits._fluxway_operator_spec.updated(
+        owner=RayComponentLimitsAwareOperator
+    )
+    profile = ResourceProfile(
+        base={"CPU": 1}, ray_component_limits={"CPU": "0.5", "memory": 1024}
+    )
+    config = single_spmd_config(
+        name="ray-component-limits-context",
+        spmd_id="metrics",
+        mesh=DeviceMesh(axis_names=("dp",), device_shape=(1,)),
+        operators={"inspect_ray_component_limits": operator_spec},
+        resource_profile=profile,
+    )
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+
+    worker_cls._pre_instantiate_operators(config, 0, static_args={})
+
+    assert RayComponentLimitsAwareOperator.seen_in_init is profile.ray_component_limits
 
 
 def test_operator_wrapper_sets_topology_fields_on_instance():

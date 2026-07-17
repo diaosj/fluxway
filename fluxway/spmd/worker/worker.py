@@ -764,6 +764,7 @@ class SPMDWorker:
             node_rank=0 if node_rank is None else node_rank,
             num_nodes=1 if num_nodes is None else num_nodes,
             rank0_address=rank0_address,
+            ray_component_limits=config.require_graph_view().resource_profile.ray_component_limits,
         ):
             storage, lock = get_instance_storage()
             for op_id in graph_view.operator_ids:
@@ -2722,18 +2723,43 @@ class SPMDWorker:
         )
         if recorder is None:
             spec = self._operator_user_callable_spec(op_name, step, operator_input)
-            return await self._local_step_plan_executor.user_callable_executor.execute(
-                spec
+            result = (
+                await self._local_step_plan_executor.user_callable_executor.execute(
+                    spec
+                )
             )
-        async with recorder.local_step_node(
-            spec=LOCAL_STEP_CALL_USER,
-            op_name=op_name,
-            step=step,
-        ):
-            spec = self._operator_user_callable_spec(op_name, step, operator_input)
-            return await self._local_step_plan_executor.user_callable_executor.execute(
-                spec
-            )
+        else:
+            async with recorder.local_step_node(
+                spec=LOCAL_STEP_CALL_USER,
+                op_name=op_name,
+                step=step,
+            ):
+                spec = self._operator_user_callable_spec(op_name, step, operator_input)
+                result = (
+                    await self._local_step_plan_executor.user_callable_executor.execute(
+                        spec
+                    )
+                )
+        self._validate_interleaved_source_result(op_name, step, result)
+        return result
+
+    def _validate_interleaved_source_result(
+        self,
+        op_name: str,
+        step: int,
+        result: Any,
+    ) -> None:
+        if result is not None:
+            return
+        operator = self.config.require_graph_view().operator(op_name)
+        if not operator.spec.is_source or not operator.spec.is_interleaved:
+            return
+        raise RuntimeError(
+            f"interleaved source {self.spmd_id}.{op_name} returned None at step "
+            f"{step}; one physical worker cannot terminate the shared "
+            "virtual-SPMD stream. Configure max_steps to the number of complete "
+            "global source steps so execution stops before an incomplete step."
+        )
 
     async def _local_plan_send_output(
         self,

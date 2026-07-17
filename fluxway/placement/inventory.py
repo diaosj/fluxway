@@ -26,6 +26,7 @@ class PlacementInventory:
             for declaration in self.declarations
             for vector in (
                 declaration.resource_profile.base,
+                declaration.resource_profile.ray_component_limits,
                 declaration.resource_profile.scale.step
                 if declaration.resource_profile.scale is not None
                 else {},

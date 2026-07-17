@@ -118,6 +118,7 @@ class _ResourceUnits:
             collect(node.resources)
         for worker in workers:
             collect(worker.profile.base)
+            collect(worker.profile.ray_component_limits)
             collect(worker.driver_resources)
             if worker.profile.scale is not None:
                 collect(worker.profile.scale.step)
@@ -324,7 +325,7 @@ class _ConstraintCompiler:
             worker = self._compiled.workers[worker_index]
             base = self._compiled.resource_units.units(
                 expression.resource,
-                worker.profile.base.get(expression.resource, Decimal(0)),
+                worker.profile.placement_base.get(expression.resource, Decimal(0)),
             )
             scale = worker.profile.scale
             term: cp_model.LinearExprT = base
@@ -685,7 +686,7 @@ class _ObjectiveCompiler:
         selected_spmds = self._resolver.scalable_spmd_ids(expression.workers)
         base_usage: defaultdict[str, int] = defaultdict(int)
         for worker in self._compiled.workers:
-            for resource, quantity in worker.profile.base.items():
+            for resource, quantity in worker.profile.placement_base.items():
                 base_usage[resource] += self._compiled.resource_units.units(
                     resource, quantity
                 )

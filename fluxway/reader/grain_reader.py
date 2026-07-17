@@ -17,6 +17,60 @@ except ImportError:
     grain = None
 
 
+if grain is not None:
+
+    class _CallableMapTransform(grain.MapTransform):
+        def __init__(self, transform: Any) -> None:
+            self._transform = transform
+
+        def map(self, element: Any) -> Any:
+            return self._transform(element)
+
+
+class StridedIndexSampler:
+    def __init__(
+        self,
+        base_sampler: Any,
+        *,
+        shard_index: int,
+        shard_count: int,
+        drop_remainder: bool,
+    ) -> None:
+        if shard_count <= 0:
+            raise ValueError(f"shard_count must be positive, got {shard_count}.")
+        if shard_index < 0 or shard_index >= shard_count:
+            raise ValueError(
+                f"shard_index {shard_index} must be in [0, {shard_count})."
+            )
+        self._base_sampler = base_sampler
+        self._shard_index = shard_index
+        self._shard_count = shard_count
+        base_length = len(base_sampler)
+        if drop_remainder:
+            base_length -= base_length % shard_count
+        self._base_length = base_length
+
+    def __len__(self) -> int:
+        remaining = self._base_length - self._shard_index
+        if remaining <= 0:
+            return 0
+        return (remaining + self._shard_count - 1) // self._shard_count
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(base_sampler={self._base_sampler!r}, "
+            f"shard_index={self._shard_index}, "
+            f"shard_count={self._shard_count}, "
+            f"base_length={self._base_length})"
+        )
+
+    def __getitem__(self, index: int) -> Any:
+        if index < 0 or index >= len(self):
+            raise IndexError(f"sampler index {index} must be in [0, {len(self)}).")
+        global_index = index * self._shard_count + self._shard_index
+        return self._base_sampler[global_index]
+
+
 @spmd()
 class GrainReader(BaseReader):
     """
@@ -71,9 +125,17 @@ class GrainReader(BaseReader):
         if data_source is None:
             raise ValueError("GrainReader requires 'data_source' in static_args.")
 
-        dataset = grain.MapDataset.source(data_source)
+        transformations = []
         for tx in static_args.get("transformations", []):
-            dataset = dataset.map(tx)
+            if isinstance(tx, grain.MapTransform):
+                transformations.append(tx)
+            elif callable(tx):
+                transformations.append(_CallableMapTransform(tx))
+            else:
+                raise TypeError(
+                    "GrainReader transformations must be callables or "
+                    f"grain.MapTransform instances, got {type(tx)!r}."
+                )
 
         num_logical_shards = static_args.get("num_logical_shards")
         if shard_index is not None and shard_count is not None:
@@ -84,23 +146,31 @@ class GrainReader(BaseReader):
         else:
             s_idx, s_cnt = rank, world_size
 
-        sampler = static_args.get("sampler") or grain.IndexSampler(
-            num_records=len(data_source),
-            shard_options=grain.ShardOptions(
+        sampler = static_args.get("sampler")
+        data_loader_shard_options = None
+        if sampler is None:
+            base_sampler = grain.IndexSampler(
+                num_records=len(data_source),
+                shard_options=grain.NoSharding(),
+                shuffle=static_args.get("shuffle", True),
+                seed=static_args.get("seed", 42),
+                num_epochs=static_args.get("num_epochs"),
+            )
+            sampler = StridedIndexSampler(
+                base_sampler,
                 shard_index=s_idx,
                 shard_count=s_cnt,
                 drop_remainder=static_args.get("drop_remainder", False),
-            ),
-            shuffle=static_args.get("shuffle", True),
-            seed=static_args.get("seed", 42),
-            num_epochs=static_args.get("num_epochs"),
-        )
+            )
+            data_loader_shard_options = grain.NoSharding()
 
         self._output_type = static_args.get("output_data_type")
         self._dataloader = grain.DataLoader(
-            data_source=dataset,
+            data_source=data_source,
             sampler=sampler,
+            operations=transformations,
             worker_count=static_args.get("num_threads", 0),
+            shard_options=data_loader_shard_options,
         )
         self._iterator = iter(self._dataloader)
 

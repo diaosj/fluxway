@@ -82,6 +82,8 @@ placement 内部分为六个单向职责层：`mathematics.py` 定义 frozen AST
 
 所有 SPMD 共用一个异构 Ray PlacementGroup。一个求解结果节点对应一个 composite bundle，bundle 使用 Ray 自动提供的 `node:<ip>` resource 精确绑定并采用 `STRICT_SPREAD`。`Controller` 是 PG 唯一 owner；`SPMDManager` 和 `SPMDDriver` 只借用 `SPMDWorkerGroup` 中的 rank-to-bundle 映射。
 
+`ResourceProfile.base` 和 `scale` 进入 Ray actor bundle，形成 Fluxway worker 的硬资源约束。`ResourceProfile.ray_component_limits` 只描述该 worker 触发的 Ray 原生组件软上限；它进入 placement 容量核算和 operator context，但不进入 PlacementGroup bundle，也不参与 worker node attestation。
+
 `Controller` 负责 PlacementGroup 创建、释放和 attestation 协调；每个 driver 只上报各 rank 的实际 Ray node ID。
 
 配置、运行状态与错误处理见 [Placement Recipe](placement_recipe.md)；AST、objective 顺序、整数化和复杂度边界见 [Placement Mathematics](placement_mathematics.md)。

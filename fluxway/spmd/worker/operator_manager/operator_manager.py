@@ -196,6 +196,7 @@ class OperatorManager:
         """
         self._config = config
         self._plan: SPMDGraphView = config.require_graph_view()
+        self._ray_component_limits = self._plan.resource_profile.ray_component_limits
         if spmd_id and spmd_id != config.spmd_id:
             raise ValueError(
                 f"OperatorManager SPMD ID {spmd_id!r} does not match config "
@@ -1108,6 +1109,7 @@ class OperatorManager:
             local_world_size=self._local_world_size,
             node_rank=self._node_rank,
             num_nodes=self._num_nodes,
+            ray_component_limits=self._ray_component_limits,
         ):
             yield
 

@@ -186,6 +186,61 @@ def test_interleaved_dependency_uses_active_unit_size():
     assert dependency.source_participating_count == 2
 
 
+def test_interleaved_source_requires_complete_units():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "interleaved source loader.loader mesh size 3 must be divisible by "
+            "interleave_unit_size 2"
+        ),
+    ):
+        _compile_interleaved_compiled_graph(
+            source_mesh=DeviceMesh(("data",), (3,)),
+            target_mesh=DeviceMesh(("data",), (1,)),
+            source_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+            target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+            interleave_unit_size=2,
+        )
+
+
+def test_interleaved_source_unit_contains_complete_trailing_mesh():
+    with pytest.raises(
+        ValueError,
+        match=(
+            "interleaved source loader.loader interleave_unit_size 1 must be "
+            "divisible by trailing mesh size 2"
+        ),
+    ):
+        _compile_interleaved_compiled_graph(
+            source_mesh=DeviceMesh(("data", "model"), (2, 2)),
+            target_mesh=DeviceMesh(("data",), (1,)),
+            source_sharding=ShardingSpec.chunk(PartitionSpec("data", "model")),
+            target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+            interleave_unit_size=1,
+        )
+
+
+def test_interleaved_source_balances_complete_units_across_steps():
+    dispatcher = InterleavedDispatcher(2)
+
+    owners = [
+        [rank for rank in range(6) if dispatcher.should_execute(rank, 6, step)]
+        for step in range(9)
+    ]
+
+    assert owners == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [0, 1],
+        [2, 3],
+        [4, 5],
+    ]
+
+
 @pytest.mark.asyncio
 async def test_inactive_interleaved_rank_does_not_send():
     worker_class = SPMDWorker.__ray_metadata__.modified_class

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
+from math import prod
 from typing import Any, Literal, cast
 from uuid import uuid4
 
@@ -967,6 +968,7 @@ class GraphCompiler:
         spmd_by_id = _index_spmds(spmds)
         declarations = _compile_spmd_declarations(spmd_by_id)
         specs_by_key = _index_operator_specs(spmds)
+        _validate_interleaved_source_topologies(declarations, specs_by_key)
         self._validate_generation(name, declarations, specs_by_key, dependencies)
         port_tuuids, output_uuids = _allocate_tuuids(
             specs_by_key,
@@ -1178,6 +1180,30 @@ def _index_operator_specs(
                 )
             indexed[OperatorKey(spmd.spmd_id, op_id)] = spec
     return indexed
+
+
+def _validate_interleaved_source_topologies(
+    declarations: Mapping[str, CompiledSPMDDeclaration],
+    specs_by_key: Mapping[OperatorKey, OperatorSpec],
+) -> None:
+    for key, spec in specs_by_key.items():
+        if not spec.is_source or not spec.is_interleaved:
+            continue
+        world_size = declarations[key.spmd_id].world_size
+        unit_size = spec.interleave_unit_size
+        if world_size % unit_size != 0:
+            raise ValueError(
+                f"interleaved source {key.spmd_id}.{key.op_id} mesh size "
+                f"{world_size} must be divisible by interleave_unit_size "
+                f"{unit_size}."
+            )
+        trailing_mesh_size = prod(declarations[key.spmd_id].mesh.shape[1:])
+        if unit_size % trailing_mesh_size != 0:
+            raise ValueError(
+                f"interleaved source {key.spmd_id}.{key.op_id} "
+                f"interleave_unit_size {unit_size} must be divisible by "
+                f"trailing mesh size {trailing_mesh_size}."
+            )
 
 
 def _allocate_tuuids(

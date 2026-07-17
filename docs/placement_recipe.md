@@ -267,6 +267,17 @@ assert ordinary.minimum == ordinary.base
 
 `base` 是每个 worker 必须获得的资源，也就是 `minimum`。固定资源没有 `scale`，所以 `maximum` 与 `minimum` 相同。
 
+`ray_component_limits` 是该 worker 触发的 Ray 原生组件的软资源上限，例如 Ray Data 的读、shuffle、join 或普通 Ray task。它参与 Fluxway placement 的容量核算，避免 Graph 声明超过集群可承载范围；但它不进入 Ray actor PlacementGroup bundle，也不表示 Fluxway 已经为这些组件预留了 node-local 资源。实际执行仍由 Ray 原生 scheduler 调度到集群自由资源上。
+
+```python
+metrics = ResourceProfile(
+    base={"CPU": 1},
+    ray_component_limits={"CPU": 2},
+)
+assert metrics.base["CPU"] == 1
+assert metrics.ray_component_limits["CPU"] == 2
+```
+
 `ResourceScale.step` 是每次额外分配给每个 worker 的资源。`max_steps` 是最多增加多少次，`weight` 越大，公平分配时优先级越高。
 
 每个资源的上限都按同一个公式计算：`maximum = base + step × max_steps`。没有写在 `step` 中的资源不会随 scale 增加。一个 step 中可以同时写 CPU、GPU、内存、显存和 custom resource，它们会按这个固定比例一起增长。

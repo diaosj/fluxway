@@ -81,9 +81,18 @@ def single_spmd_config(
     spmd_id: str,
     mesh: DeviceMesh,
     operators: Mapping[str, OperatorSpec],
+    resource_profile: ResourceProfile = COMPILED_GRAPH_FIXTURE_PROFILE,
 ) -> SPMDConfig:
-    plan = compile_test_graph(
+    plan = compile_graph(
         name=name,
-        spmds={spmd_id: (mesh, operators)},
+        spmds=(
+            compiled_spmd_spec(
+                spmd_id,
+                mesh,
+                operators,
+                resource_profile=resource_profile,
+            ),
+        ),
+        dependencies=(),
     )
     return spmd_config_from_graph(plan, spmd_id)

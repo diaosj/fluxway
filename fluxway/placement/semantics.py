@@ -356,6 +356,9 @@ class _AssignmentEvaluator:
         return sum(
             (
                 self._assignment(index).resources.get(expression.resource, Decimal(0))
+                + self._assignment(index).ray_component_limits.get(
+                    expression.resource, Decimal(0)
+                )
                 for index in self._resolver.worker_indices(expression.workers)
             ),
             Decimal(0),

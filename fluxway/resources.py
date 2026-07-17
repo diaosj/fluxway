@@ -102,10 +102,16 @@ class ResourceScale(ResourceModel):
 class ResourceProfile(ResourceModel):
     base: ResourceVector
     scale: ResourceScale | None = None
+    ray_component_limits: ResourceVector = Field(default_factory=dict)
 
     @field_validator("base", mode="before")
     @classmethod
     def validate_base(cls, value: Any) -> dict[str, Decimal]:
+        return normalize_resource_vector(value)
+
+    @field_validator("ray_component_limits", mode="before")
+    @classmethod
+    def validate_ray_component_limits(cls, value: Any) -> dict[str, Decimal]:
         return normalize_resource_vector(value)
 
     @property
@@ -116,6 +122,10 @@ class ResourceProfile(ResourceModel):
     def maximum(self) -> Mapping[str, Decimal]:
         steps = self.scale.max_steps if self.scale is not None else 0
         return self.resources_at(steps)
+
+    @property
+    def placement_base(self) -> Mapping[str, Decimal]:
+        return self._with_ray_component_limits(self.base)
 
     def resources_at(self, steps: int) -> Mapping[str, Decimal]:
         if isinstance(steps, bool) or not isinstance(steps, int):
@@ -132,3 +142,14 @@ class ResourceProfile(ResourceModel):
                     quantity * steps
                 )
         return FrozenResourceVector(resources)
+
+    def placement_resources_at(self, steps: int) -> Mapping[str, Decimal]:
+        return self._with_ray_component_limits(self.resources_at(steps))
+
+    def _with_ray_component_limits(
+        self, resources: Mapping[str, Decimal]
+    ) -> Mapping[str, Decimal]:
+        combined = dict(resources)
+        for resource, quantity in self.ray_component_limits.items():
+            combined[resource] = combined.get(resource, Decimal(0)) + quantity
+        return FrozenResourceVector(combined)

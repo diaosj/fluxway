@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from fluxway.common.decorators import data_type
 from fluxway.reader.grain_reader import GrainReader
+from fluxway.spmd.worker.operator_manager.dispatcher import InterleavedDispatcher
 
 
 @data_type()
@@ -37,6 +38,10 @@ class MockDataSource:
 
     def __getitem__(self, index: int):
         return self._data[index]
+
+
+def add_one_to_features(record):
+    return {"features": record["features"] + 1}
 
 
 def _make_reader(data_source, rank: int, world_size: int, **kwargs) -> GrainReader:
@@ -94,6 +99,73 @@ class TestGrainReaderSharding:
 
         assert len(batches) == 4
         assert all(isinstance(b, SimpleBatch) for b in batches)
+
+    def test_interleaved_readers_follow_global_batch_order(self):
+        ds = MockDataSource(10)
+        readers = [_make_reader(ds, rank=rank, world_size=2) for rank in range(2)]
+        dispatcher = InterleavedDispatcher(1)
+
+        actual = []
+        for step in range(10):
+            owners = [
+                rank for rank in range(2) if dispatcher.should_execute(rank, 2, step)
+            ]
+            assert len(owners) == 1
+            batch = readers[owners[0]].next_item()
+            assert batch is not None
+            actual.append(int(batch.features[0]))
+
+        assert actual == list(range(10))
+
+    def test_interleaved_units_read_consecutive_logical_shards(self):
+        ds = MockDataSource(12)
+        readers = [_make_reader(ds, rank=rank, world_size=4) for rank in range(4)]
+        dispatcher = InterleavedDispatcher(2)
+
+        actual = []
+        for step in range(6):
+            owners = [
+                rank for rank in range(4) if dispatcher.should_execute(rank, 4, step)
+            ]
+            assert len(owners) == 2
+            for owner in owners:
+                batch = readers[owner].next_item()
+                assert batch is not None
+                actual.append(int(batch.features[0]))
+
+        assert actual == list(range(12))
+
+    def test_strided_reader_checkpoint_restores_local_cursor(self):
+        ds = MockDataSource(10)
+        reader = _make_reader(ds, rank=0, world_size=2)
+        assert [int(reader.next_item().features[0]) for _ in range(2)] == [0, 2]
+        state = reader.save_state()
+
+        restored = _make_reader(ds, rank=0, world_size=2)
+        restored.restore_state(state)
+        batch = restored.next_item()
+
+        assert batch is not None
+        assert int(batch.features[0]) == 4
+
+    def test_strided_reader_drop_remainder_equalizes_shard_lengths(self):
+        ds = MockDataSource(5)
+        rank0 = _drain(_make_reader(ds, rank=0, world_size=2, drop_remainder=True))
+        rank1 = _drain(_make_reader(ds, rank=1, world_size=2, drop_remainder=True))
+
+        assert [int(batch.features[0]) for batch in rank0] == [0, 2]
+        assert [int(batch.features[0]) for batch in rank1] == [1, 3]
+
+    def test_callable_transformations_preserve_record_map_semantics(self):
+        ds = MockDataSource(4)
+        reader = _make_reader(
+            ds,
+            rank=0,
+            world_size=1,
+            transformations=[add_one_to_features],
+        )
+
+        assert [int(batch.features[0]) for batch in _drain(reader)] == [1, 2, 3, 4]
 
 
 @pytest.mark.skipif(grain is None, reason="google-grain not installed")

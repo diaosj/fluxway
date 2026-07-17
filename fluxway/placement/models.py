@@ -121,6 +121,7 @@ class WorkerAssignment(PlacementModel):
     rank: int
     node_id: str
     resources: dict[str, Decimal]
+    ray_component_limits: dict[str, Decimal] = Field(default_factory=dict)
     driver_resources: ResourceVector = Field(default_factory=dict)
 
 
@@ -183,6 +184,18 @@ class ResolvedPlacementPlan(PlacementModel):
         return {
             node_id: dict(sorted(resources.items()))
             for node_id, resources in sorted(bundles.items())
+        }
+
+    def ray_component_limit_resources(self) -> dict[str, dict[str, Decimal]]:
+        limits: dict[str, defaultdict[str, Decimal]] = {}
+        for assignment in self.assignments:
+            resources = limits.setdefault(assignment.node_id, defaultdict(Decimal))
+            for resource, quantity in assignment.ray_component_limits.items():
+                resources[resource] += quantity
+        return {
+            node_id: dict(sorted(resources.items()))
+            for node_id, resources in sorted(limits.items())
+            if any(quantity > 0 for quantity in resources.values())
         }
 
 

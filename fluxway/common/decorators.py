@@ -10,11 +10,13 @@ import inspect
 import logging
 import threading
 from contextlib import contextmanager
+from decimal import Decimal
 from dataclasses import dataclass, field
 from typing import Annotated, Any, TypeVar, Union, get_type_hints
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from fluxway.common.operator_initialization import operator_initialization_arguments
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
+from fluxway.resources import FrozenResourceVector, normalize_resource_vector
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +32,9 @@ class _OperatorContextState:
     node_rank: int = 0
     num_nodes: int = 1
     rank0_address: str | None = None
+    ray_component_limits: Mapping[str, Decimal] = field(
+        default_factory=lambda: FrozenResourceVector({})
+    )
 
 
 class _PicklableLock:
@@ -84,12 +89,20 @@ def operator_context(
     node_rank: int = 0,
     num_nodes: int = 1,
     rank0_address: str | None = None,
+    ray_component_limits: Mapping[str, Decimal] | None = None,
 ):
     """Context manager to inject operator runtime context into current coroutine/thread.
 
     Uses contextvars.ContextVar so each asyncio Task and each to_thread worker
     gets an isolated snapshot — no cross-coroutine state pollution.
     """
+    normalized_ray_component_limits = (
+        FrozenResourceVector({})
+        if ray_component_limits is None
+        else ray_component_limits
+        if isinstance(ray_component_limits, FrozenResourceVector)
+        else FrozenResourceVector(normalize_resource_vector(ray_component_limits))
+    )
     state = _OperatorContextState(
         static_args=static_args,
         rank=rank,
@@ -100,6 +113,7 @@ def operator_context(
         node_rank=node_rank,
         num_nodes=num_nodes,
         rank0_address=rank0_address,
+        ray_component_limits=normalized_ray_component_limits,
     )
     token = _operator_context_var.set(state)
     try:
@@ -446,6 +460,7 @@ _STATIC_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
         "num_nodes",
         "static_args",
         "rank0_address",
+        "ray_component_limits",
     }
 )
 _DYNAMIC_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset({"ctx"})
@@ -847,7 +862,8 @@ def spmd(
     Configure a class for SPMD distributed execution.
 
     Args:
-        resource_profile: Per-worker minimum and scalable Ray resources.
+        resource_profile: Per-worker Fluxway actor resources plus optional Ray
+                          component soft limits.
         runtime_env: Ray runtime_env dict for Driver/Worker actors.
                      Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
         driver_runtime_env: Dedicated Ray runtime_env for the SPMDDriver actor.
