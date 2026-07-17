@@ -1,10 +1,12 @@
 import asyncio
 import logging
 from decimal import Decimal
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import ray
 
+from fluxway.common.compiled_graph import CompiledGraph
 from fluxway.common.types import Graph
 from fluxway.control_plane.scheduler.pg_manager import PGManager
 from fluxway.placement import (
@@ -14,10 +16,11 @@ from fluxway.placement import (
     PlacementAttestationError,
     PlacementContractError,
     PlacementPlanner,
-    PlacementRecipe,
     PlacementRuntimeConfig,
     ResolvedPlacementPlan,
+    PlacementRecipe,
 )
+from fluxway.placement.inventory import PlacementInventory
 
 if TYPE_CHECKING:
     from fluxway.control_plane.spmd_manager import SPMDManager
@@ -25,16 +28,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def build_topology(graph: Graph) -> dict[str, list[str]]:
-    topology: dict[str, list[str]] = {name: [] for name in graph.nodes}
-    for edge in graph.edges:
+def build_topology(graph: CompiledGraph) -> dict[str, list[str]]:
+    topology: dict[str, list[str]] = {spmd.spmd_id: [] for spmd in graph.spmds}
+    for dependency in graph.dependencies:
+        edge = dependency.spec
         if edge.local_only:
             continue
         if (
-            edge.source_node in topology
-            and edge.target_node not in topology[edge.source_node]
+            edge.source.spmd_id in topology
+            and edge.target.spmd_id not in topology[edge.source.spmd_id]
         ):
-            topology[edge.source_node].append(edge.target_node)
+            topology[edge.source.spmd_id].append(edge.target.spmd_id)
     return topology
 
 
@@ -43,13 +47,20 @@ class Scheduler:
         self,
         spmd_manager: "SPMDManager | None" = None,
         *,
-        placement_recipe: PlacementRecipe | None = None,
+        graph: Graph,
+        placement_recipe: PlacementRecipe,
         placement_runtime: PlacementRuntimeConfig | None = None,
     ):
-        if placement_recipe is None:
-            raise PlacementContractError("Scheduler requires placement_recipe")
         self._spmd_manager = spmd_manager
         self._pg_manager = PGManager()
+        self._nodes = dict(graph.nodes)
+        self._placement_inventory = PlacementInventory.from_compiled_graph(
+            graph.require_compiled_graph()
+        )
+        if set(self._nodes) != set(self._placement_inventory.spmd_ids):
+            raise PlacementContractError(
+                "runtime nodes differ from compiled SPMD declarations"
+            )
         self._placement_recipe = placement_recipe
         self._placement_runtime = placement_runtime or PlacementRuntimeConfig()
         self._resolved_plan: ResolvedPlacementPlan | None = None
@@ -75,22 +86,13 @@ class Scheduler:
     def allocation_report(self) -> AllocationReport | None:
         return self._allocation_report
 
-    async def schedule(self, graph: Graph) -> None:
-        await self.allocate_resources(graph)
-        try:
-            self.build_and_establish_topology(graph)
-            await self.init_spmds(graph)
-        except Exception as error:
-            self.abort_initialization(error)
-            raise
-
-    async def allocate_resources(self, graph: Graph) -> None:
+    async def allocate_resources(self) -> None:
         snapshot = self._capture_snapshot()
         planner = self._planner()
         try:
             plan = await asyncio.to_thread(
                 planner.resolve,
-                graph,
+                self._placement_inventory,
                 self._placement_recipe,
                 snapshot,
             )
@@ -101,9 +103,9 @@ class Scheduler:
             plan, snapshot, status="PLANNED"
         )
         verified_snapshot = self._capture_snapshot()
-        if self._placement_snapshot_digest(
-            verified_snapshot
-        ) != self._placement_snapshot_digest(snapshot):
+        if self._placement_snapshot(verified_snapshot) != self._placement_snapshot(
+            snapshot
+        ):
             snapshot_error = PlacementContractError(
                 "Ray cluster resources changed between solve and placement-group creation"
             )
@@ -150,12 +152,13 @@ class Scheduler:
         }
         return ClusterSnapshot(nodes=nodes, available=available)
 
-    def _placement_snapshot_digest(self, snapshot: ClusterSnapshot) -> str:
-        requested_resources = set(self._placement_runtime.driver_resources)
-        for binding in self._placement_recipe.profiles:
-            requested_resources.update(binding.profile.base)
-            if binding.profile.scale is not None:
-                requested_resources.update(binding.profile.scale.step)
+    def _placement_snapshot(self, snapshot: ClusterSnapshot) -> ClusterSnapshot:
+        requested_resources = {
+            resource
+            for resource, quantity in self._placement_runtime.driver_resources.items()
+            if quantity > 0
+        }
+        requested_resources.update(self._placement_inventory.resource_names)
         projected_nodes = tuple(
             ClusterNode(
                 node_id=node.node_id,
@@ -175,9 +178,9 @@ class Scheduler:
         return ClusterSnapshot(
             nodes=projected_nodes,
             available=projected_available,
-        ).digest
+        )
 
-    async def init_spmds(self, graph: Graph) -> None:
+    async def init_spmds(self) -> None:
         if self._spmd_manager is None:
             raise PlacementContractError("SPMD manager is not configured")
         tasks = [
@@ -187,13 +190,11 @@ class Scheduler:
                 worker_group=self._pg_manager.get_worker_group(spmd_id),
                 checkpoint_id=None,
             )
-            for spmd_id, node in graph.nodes.items()
+            for spmd_id, node in self._nodes.items()
         ]
         try:
             handles = await asyncio.gather(*tasks)
-            attested_plan, attested_node_ids = self._attest_resolved_plan(
-                graph, handles
-            )
+            attested_plan, attested_node_ids = self._attest_resolved_plan(handles)
         except Exception as error:
             if self._cluster_snapshot is not None:
                 self._record_failure(error, self._cluster_snapshot, self._resolved_plan)
@@ -230,7 +231,7 @@ class Scheduler:
             self._pg_manager.release_job_pg()
 
     def _attest_resolved_plan(
-        self, graph: Graph, handles: list[Any]
+        self, handles: list[Any]
     ) -> tuple[ResolvedPlacementPlan, dict[str, tuple[str, ...]]]:
         plan = self._resolved_plan
         if plan is None:
@@ -238,7 +239,7 @@ class Scheduler:
                 "placement attestation requires a resolved Recipe plan"
             )
         attested_node_ids = {}
-        for spmd_id, handle in zip(graph.nodes, handles, strict=True):
+        for spmd_id, handle in zip(self._nodes, handles, strict=True):
             node_ids = handle.attested_node_ids
             if node_ids is None:
                 raise PlacementAttestationError(
@@ -248,7 +249,7 @@ class Scheduler:
         planner = self._planner()
         return (
             planner.attest(
-                graph,
+                self._placement_inventory,
                 self._placement_recipe,
                 self._require_snapshot(),
                 plan,
@@ -311,10 +312,10 @@ class Scheduler:
         )
         self._set_allocation_report(report)
 
-    def build_and_establish_topology(self, graph: Graph) -> None:
+    def establish_topology(self, topology: Mapping[str, list[str]]) -> None:
         if self._spmd_manager is None:
             raise PlacementContractError("SPMD manager is not configured")
-        self._spmd_manager.establish_topology(build_topology(graph))
+        self._spmd_manager.establish_topology(dict(topology))
 
     def release_resources(self) -> None:
         self._pg_manager.release_job_pg()

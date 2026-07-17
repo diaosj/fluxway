@@ -1,8 +1,15 @@
 import pytest
+from collections.abc import Mapping
 from decimal import Decimal
 
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types import Graph, Node, SPMDConfig
+from fluxway.common.compiled_graph import SPMDGraphSpec, compile_graph
+from fluxway.common.types import (
+    Graph,
+    Node,
+    SPMDConfig,
+)
+from fluxway.placement.inventory import PlacementInventory
 from fluxway.placement import (
     AFFINITY_FIRST_V1,
     affinity_constraints,
@@ -59,29 +66,76 @@ class SPMD4: ...
 class SPMD5: ...
 
 
-def graph_node(spmd_id: str, spmd_class: type, world_size: int) -> Node:
+def graph_node(
+    spmd_id: str,
+    spmd_class: type,
+    world_size: int,
+    resource_profile: ResourceProfile | None = None,
+) -> Node:
     return Node(
         name=spmd_id,
         spmd_config=SPMDConfig(
             spmd_id=spmd_id,
             mesh=DeviceMesh(("data",), device_shape=(world_size,)),
         ),
-        spmd_class_module=spmd_class.__module__,
-        spmd_class_qualname=spmd_class.__qualname__,
+        spmd_class=spmd_class,
+        resource_profile=resource_profile or ResourceProfile(base={"CPU": 1}),
     )
+
+
+def placement_graph(
+    nodes: Mapping[str, Node],
+    *,
+    name: str = "placement-test",
+) -> Graph:
+    graph_nodes = dict(nodes)
+    compiled_graph = compile_graph(
+        name=name,
+        spmds=tuple(
+            SPMDGraphSpec(
+                spmd_id=spmd_id,
+                spmd_class=node.spmd_class,
+                mesh=node.spmd_config.mesh,
+                resource_profile=node.resource_profile,
+                operators={},
+            )
+            for spmd_id, node in sorted(graph_nodes.items())
+        ),
+        dependencies=(),
+    )
+    return Graph(name=name, nodes=graph_nodes, compiled_graph=compiled_graph)
+
+
+def placement_inventory(graph: Graph) -> PlacementInventory:
+    return PlacementInventory.from_compiled_graph(graph.require_compiled_graph())
 
 
 def scenario(s4_world_size: int) -> tuple[Graph, PlacementRecipe, ClusterSnapshot]:
-    graph = Graph(
-        nodes={
-            "s0": graph_node("s0", SPMD0, 4),
-            "s1": graph_node("s1", SPMD1, 12),
-            "s2": graph_node("s2", SPMD2, 1),
-            "s3": graph_node("s3", SPMD3, 1),
-            "s4": graph_node("s4", SPMD4, s4_world_size),
-            "s5": graph_node("s5", SPMD5, 2),
-        }
-    )
+    graph_nodes = {
+        "s0": graph_node("s0", SPMD0, 4, ResourceProfile(base={"GPU": 1, "CPU": 1})),
+        "s1": graph_node("s1", SPMD1, 12, ResourceProfile(base={"GPU": 1, "CPU": 1})),
+        "s2": graph_node(
+            "s2",
+            SPMD2,
+            1,
+            ResourceProfile(
+                base={"CPU": 1},
+                scale=ResourceScale(step={"CPU": 1}, max_steps=100, weight=1),
+            ),
+        ),
+        "s3": graph_node(
+            "s3",
+            SPMD3,
+            1,
+            ResourceProfile(
+                base={"CPU": 1},
+                scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
+            ),
+        ),
+        "s4": graph_node("s4", SPMD4, s4_world_size),
+        "s5": graph_node("s5", SPMD5, 2),
+    }
+    graph = placement_graph(graph_nodes, name="placement")
     s0 = workers(SPMD0)
     s1 = workers(SPMD1)
     s3 = workers(SPMD3)
@@ -90,20 +144,6 @@ def scenario(s4_world_size: int) -> tuple[Graph, PlacementRecipe, ClusterSnapsho
     recipe = PlacementRecipe(
         recipe_id="six-spmd",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(base={"GPU": 1, "CPU": 1}),
-            SPMD1: ResourceProfile(base={"GPU": 1, "CPU": 1}),
-            SPMD2: ResourceProfile(
-                base={"CPU": 1},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=100, weight=1),
-            ),
-            SPMD3: ResourceProfile(
-                base={"CPU": 1},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
-            ),
-            SPMD4: ResourceProfile(base={"CPU": 1}),
-            SPMD5: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(
             subseteq(support(s3), support(s0)),
             subseteq(support(s4), support(s1)),
@@ -128,7 +168,9 @@ def scenario(s4_world_size: int) -> tuple[Graph, PlacementRecipe, ClusterSnapsho
 def test_planner_resolves_six_spmd_affinity(s4_world_size: int) -> None:
     graph, recipe, snapshot = scenario(s4_world_size)
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert sorted(plan.worker_counts_by_node("s1"), reverse=True) == [8, 4]
     assert plan.worker_counts_by_node("s0") == [4]
@@ -137,7 +179,7 @@ def test_planner_resolves_six_spmd_affinity(s4_world_size: int) -> None:
     assert len(plan.node_ids_for("s4")) == s4_world_size
     assert plan.allocated_quanta["s3"] == 2
     assert plan.allocated_quanta["s2"] == 15
-    assert plan.recipe_digest == recipe.digest
+    assert plan.recipe == recipe
     assert all(result.solve_duration > 0 for result in plan.objective_results)
     assert plan.objective_results[0].optimum_value == (2,)
     assert plan.objective_results[0].value_scale == 76 - s4_world_size
@@ -152,14 +194,16 @@ def test_planner_resolves_six_spmd_affinity(s4_world_size: int) -> None:
 def test_planner_places_single_s4_worker_on_dense_s1_node() -> None:
     graph, recipe, snapshot = scenario(1)
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     s4_node = next(iter(plan.node_ids_for("s4")))
     assert plan.worker_count("s1", s4_node) == 8
 
 
 def test_resource_profile_applies_to_multiple_instances_of_same_class() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "left": graph_node("left", SPMD2, 1),
             "right": graph_node("right", SPMD2, 1),
@@ -168,7 +212,6 @@ def test_resource_profile_applies_to_multiple_instances_of_same_class() -> None:
     recipe = PlacementRecipe(
         recipe_id="shared-profile",
         version="1.0.0",
-        profiles={SPMD2: ResourceProfile(base={"CPU": 1})},
         constraints=(equal(cardinality(support(workers(SPMD2))), 1),),
         objective=AFFINITY_FIRST_V1,
     )
@@ -176,7 +219,9 @@ def test_resource_profile_applies_to_multiple_instances_of_same_class() -> None:
         (ClusterNode(node_id="cpu", resources={"CPU": 2}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert {assignment.spmd_id for assignment in plan.assignments} == {
         "left",
@@ -186,11 +231,12 @@ def test_resource_profile_applies_to_multiple_instances_of_same_class() -> None:
 
 
 def test_planner_rejects_nonexclusive_requested_resources() -> None:
-    graph = Graph(nodes={"gpu": graph_node("gpu", SPMD0, 8)})
+    graph = placement_graph(
+        nodes={"gpu": graph_node("gpu", SPMD0, 8, ResourceProfile(base={"GPU": 1}))}
+    )
     recipe = PlacementRecipe(
         recipe_id="exclusive-cluster",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"GPU": 1})},
         constraints=(),
         objective=AFFINITY_FIRST_V1,
     )
@@ -203,11 +249,13 @@ def test_planner_rejects_nonexclusive_requested_resources() -> None:
     )
 
     with pytest.raises(PlacementContractError, match="exclusive"):
-        PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
 
 def test_planner_compiles_resource_and_set_constraints() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "left": graph_node("left", SPMD0, 1),
             "right": graph_node("right", SPMD1, 1),
@@ -218,10 +266,6 @@ def test_planner_compiles_resource_and_set_constraints() -> None:
     recipe = PlacementRecipe(
         recipe_id="constraint-algebra",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(base={"CPU": 1}),
-            SPMD1: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(
             disjoint(support(left), support(right)),
             equal(cardinality(support(left)), 1),
@@ -240,17 +284,27 @@ def test_planner_compiles_resource_and_set_constraints() -> None:
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.node_ids_for("left").isdisjoint(plan.node_ids_for("right"))
 
 
 def test_planner_minimizes_recipe_resource_quantum_fragmentation() -> None:
-    graph = Graph(nodes={"fractional": graph_node("fractional", SPMD0, 2)})
+    graph = placement_graph(
+        nodes={
+            "fractional": graph_node(
+                "fractional",
+                SPMD0,
+                2,
+                ResourceProfile(base={"CPU": Decimal("0.6")}),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="fragmentation",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"CPU": Decimal("0.6")})},
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -261,7 +315,9 @@ def test_planner_minimizes_recipe_resource_quantum_fragmentation() -> None:
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == 4
     assert plan.objective_results[0].value_scale == 3
@@ -272,11 +328,16 @@ def test_planner_minimizes_recipe_resource_quantum_fragmentation() -> None:
 
 
 def test_fragmentation_preserves_unusable_multidimensional_resources() -> None:
-    graph = Graph(nodes={"worker": graph_node("worker", SPMD0, 1)})
+    graph = placement_graph(
+        nodes={
+            "worker": graph_node(
+                "worker", SPMD0, 1, ResourceProfile(base={"CPU": 2, "GPU": 1})
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="multidimensional-fragmentation",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"CPU": 2, "GPU": 1})},
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -284,7 +345,9 @@ def test_fragmentation_preserves_unusable_multidimensional_resources() -> None:
         (ClusterNode(node_id="mixed", resources={"CPU": 2, "GPU": 2}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == 1
     assert plan.resource_fragmentation == {
@@ -293,12 +356,20 @@ def test_fragmentation_preserves_unusable_multidimensional_resources() -> None:
 
 
 def test_planner_accepts_resource_scalar_as_custom_objective() -> None:
-    graph = Graph(nodes={"worker": graph_node("worker", SPMD0, 1)})
+    graph = placement_graph(
+        nodes={
+            "worker": graph_node(
+                "worker",
+                SPMD0,
+                1,
+                ResourceProfile(base={"CPU": Decimal("1.5")}),
+            )
+        }
+    )
     worker = workers(SPMD0)
     recipe = PlacementRecipe(
         recipe_id="resource-objective",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"CPU": Decimal("1.5")})},
         constraints=(),
         objective=lexicographic(minimize(resource_usage(worker, "CPU"))),
     )
@@ -306,18 +377,28 @@ def test_planner_accepts_resource_scalar_as_custom_objective() -> None:
         (ClusterNode(node_id="cpu", resources={"CPU": 2}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == 3
 
 
 def test_fragmentation_normalizes_memory_by_allocation_quantum() -> None:
     gib = 1 << 30
-    graph = Graph(nodes={"worker": graph_node("worker", SPMD0, 1)})
+    graph = placement_graph(
+        nodes={
+            "worker": graph_node(
+                "worker",
+                SPMD0,
+                1,
+                ResourceProfile(base={"GPU": 1, "memory": gib}),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="memory-fragmentation",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"GPU": 1, "memory": gib})},
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -330,7 +411,9 @@ def test_fragmentation_normalizes_memory_by_allocation_quantum() -> None:
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == 1
     assert plan.objective_results[0].value_scale == 1
@@ -340,25 +423,31 @@ def test_fragmentation_normalizes_memory_by_allocation_quantum() -> None:
 
 
 def test_weighted_drf_matches_finite_leximin_oracle() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
-            "weighted": graph_node("weighted", SPMD0, 1),
-            "ordinary": graph_node("ordinary", SPMD1, 1),
+            "weighted": graph_node(
+                "weighted",
+                SPMD0,
+                1,
+                ResourceProfile(
+                    base={},
+                    scale=ResourceScale(step={"CPU": 1}, max_steps=3, weight=2),
+                ),
+            ),
+            "ordinary": graph_node(
+                "ordinary",
+                SPMD1,
+                1,
+                ResourceProfile(
+                    base={},
+                    scale=ResourceScale(step={"CPU": 1}, max_steps=3, weight=1),
+                ),
+            ),
         }
     )
     recipe = PlacementRecipe(
         recipe_id="weighted-drf-oracle",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(
-                base={},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=3, weight=2),
-            ),
-            SPMD1: ResourceProfile(
-                base={},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=3, weight=1),
-            ),
-        },
         constraints=(),
         objective=lexicographic(max_min(weighted_dominant_share(all_workers()))),
     )
@@ -366,7 +455,9 @@ def test_weighted_drf_matches_finite_leximin_oracle() -> None:
         (ClusterNode(node_id="cpu", resources={"CPU": 3}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.allocated_quanta == {"ordinary": 1, "weighted": 2}
     assert plan.objective_results[0].optimum_value == (2, 2)
@@ -374,7 +465,7 @@ def test_weighted_drf_matches_finite_leximin_oracle() -> None:
 
 
 def test_majorization_optimum_is_locked_before_later_objectives() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "source": graph_node("source", SPMD0, 1),
             "target": graph_node("target", SPMD1, 4),
@@ -386,10 +477,6 @@ def test_majorization_optimum_is_locked_before_later_objectives() -> None:
     recipe = PlacementRecipe(
         recipe_id="majorization-oracle",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(base={"CPU": 1}),
-            SPMD1: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(subseteq(support(source), support(target)),),
         objective=lexicographic(
             maximize_majorization(target_occupancy(relations)),
@@ -403,16 +490,26 @@ def test_majorization_optimum_is_locked_before_later_objectives() -> None:
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == (3, 1)
     assert sorted(plan.occupancy["target"].values(), reverse=True) == [3, 1]
 
 
 def test_affinity_graph_collects_relations_nested_in_boolean_constraints() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
-            "elastic": graph_node("elastic", SPMD0, 1),
+            "elastic": graph_node(
+                "elastic",
+                SPMD0,
+                1,
+                ResourceProfile(
+                    base={"CPU": 1},
+                    scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
+                ),
+            ),
             "target": graph_node("target", SPMD1, 1),
         }
     )
@@ -422,13 +519,6 @@ def test_affinity_graph_collects_relations_nested_in_boolean_constraints() -> No
     recipe = PlacementRecipe(
         recipe_id="nested-affinity",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(
-                base={"CPU": 1},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
-            ),
-            SPMD1: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(any_of(relation, negate(negate(relation))),),
         objective=AFFINITY_FIRST_V1,
     )
@@ -436,35 +526,41 @@ def test_affinity_graph_collects_relations_nested_in_boolean_constraints() -> No
         (ClusterNode(node_id="cpu", resources={"CPU": 4}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == (2,)
     assert plan.objective_results[1].optimum_value == ()
 
 
 def test_negated_subset_is_not_a_positive_affinity_relation() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
-            "left": graph_node("left", SPMD0, 1),
+            "left": graph_node(
+                "left",
+                SPMD0,
+                1,
+                ResourceProfile(
+                    base={"CPU": 1},
+                    scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
+                ),
+            ),
             "anchor": graph_node("anchor", SPMD1, 1),
-            "right": graph_node("right", SPMD2, 1),
+            "right": graph_node(
+                "right",
+                SPMD2,
+                1,
+                ResourceProfile(
+                    base={"CPU": 1},
+                    scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
+                ),
+            ),
         }
     )
-    profiles = {
-        SPMD0: ResourceProfile(
-            base={"CPU": 1},
-            scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
-        ),
-        SPMD1: ResourceProfile(base={"CPU": 1}),
-        SPMD2: ResourceProfile(
-            base={"CPU": 1},
-            scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
-        ),
-    }
     recipe = PlacementRecipe(
         recipe_id="negative-relation",
         version="1.0.0",
-        profiles=profiles,
         constraints=(
             negate(
                 subseteq(
@@ -482,7 +578,9 @@ def test_negated_subset_is_not_a_positive_affinity_relation() -> None:
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.allocated_quanta == {"anchor": 0, "left": 1, "right": 1}
     assert plan.objective_results[0].optimum_value == ()
@@ -490,7 +588,7 @@ def test_negated_subset_is_not_a_positive_affinity_relation() -> None:
 
 
 def test_affinity_scalar_constraints_are_compiled_and_attested() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "left": graph_node("left", SPMD0, 2),
             "right": graph_node("right", SPMD1, 1),
@@ -500,10 +598,6 @@ def test_affinity_scalar_constraints_are_compiled_and_attested() -> None:
     recipe = PlacementRecipe(
         recipe_id="affinity-scalar-constraints",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(base={"CPU": 1}),
-            SPMD1: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(
             relation,
             equal(affinity_coverage(affinity_constraints()), 1),
@@ -519,7 +613,8 @@ def test_affinity_scalar_constraints_are_compiled_and_attested() -> None:
     )
     planner = PlacementPlanner(solve_timeout_s=10)
 
-    plan = planner.resolve(graph, recipe, snapshot)
+    inventory = placement_inventory(graph)
+    plan = planner.resolve(inventory, recipe, snapshot)
     actual_node_ids = {
         spmd_id: tuple(
             assignment.node_id
@@ -528,14 +623,23 @@ def test_affinity_scalar_constraints_are_compiled_and_attested() -> None:
         )
         for spmd_id in graph.nodes
     }
-    attested = planner.attest(graph, recipe, snapshot, plan, actual_node_ids)
+    attested = planner.attest(inventory, recipe, snapshot, plan, actual_node_ids)
 
     assert all(result.satisfied for result in plan.constraint_results)
     assert all(result.satisfied for result in attested.constraint_results)
 
 
 def test_resource_fragmentation_constraint_uses_exact_normalized_value() -> None:
-    graph = Graph(nodes={"fragment": graph_node("fragment", SPMD0, 1)})
+    graph = placement_graph(
+        nodes={
+            "fragment": graph_node(
+                "fragment",
+                SPMD0,
+                1,
+                ResourceProfile(base={"CPU": 2, "GPU": 1}),
+            )
+        }
+    )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="node", resources={"CPU": 2, "GPU": 2}),)
     )
@@ -544,16 +648,15 @@ def test_resource_fragmentation_constraint_uses_exact_normalized_value() -> None
         return PlacementRecipe(
             recipe_id=f"fragmentation-equals-{expected}",
             version="1.0.0",
-            profiles={SPMD0: ResourceProfile(base={"CPU": 2, "GPU": 1})},
             constraints=(equal(resource_fragmentation(), expected),),
             objective=lexicographic(minimize(resource_fragmentation())),
         )
 
     planner = PlacementPlanner(solve_timeout_s=10)
     with pytest.raises(PlacementInfeasibleError):
-        planner.resolve(graph, recipe(0), snapshot)
+        planner.resolve(placement_inventory(graph), recipe(0), snapshot)
 
-    plan = planner.resolve(graph, recipe(1), snapshot)
+    plan = planner.resolve(placement_inventory(graph), recipe(1), snapshot)
 
     assert plan.resource_fragmentation_score == 1
     assert plan.resource_fragmentation_scale == 1

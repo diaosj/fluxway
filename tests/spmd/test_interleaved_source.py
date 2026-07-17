@@ -1,362 +1,220 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import numpy as np
 import pytest
-from unittest.mock import AsyncMock, patch
 
-from fluxway.spmd.worker.worker import SPMDWorker
-from fluxway.common.types.configs import (
-    SPMDConfig,
-    OperatorMeta,
-    EdgeShardingInfo,
-    ArgumentType,
-    SPMDTopology,
-    SPMDTopologyInfo,
+from fluxway.common.compiled_graph import (
+    DependencySpec,
+    OperatorKey,
+    OperatorPort,
+    TensorTransfer,
+    compile_graph,
 )
-from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.decorators import spmd, operator as fw_operator
+from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.spmd.worker.data_plane import (
     SuccessorRouteContext,
     build_step_frame_groups,
     compile_send_plan,
 )
+from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
+from fluxway.spmd.worker.operator_manager.dispatcher import (
+    ExecutionStatus,
+    InterleavedDispatcher,
+)
+from fluxway.spmd.worker.worker import SPMDWorker
+from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
-def _build_frame_groups_with_plan(
+def _compile_interleaved_compiled_graph(
     *,
-    op_name,
-    rank,
-    mesh,
-    flat_results,
-    output_uuids,
-    output_sharding,
-    successor_contexts,
-    tuuid_to_name,
-    step_tuuid_cache,
-    exec_step,
-    sender_spmd_code,
-    sender_world_size,
-    interleave_unit_size,
+    source_mesh: DeviceMesh,
+    target_mesh: DeviceMesh,
+    source_sharding: ShardingSpec,
+    target_sharding: ShardingSpec,
+    interleave_unit_size: int,
 ):
+    loader = OperatorSpec(
+        name="loader",
+        is_source=True,
+        is_interleaved=True,
+        interleave_unit_size=interleave_unit_size,
+        output_arguments={"data": ("t1",)},
+        output_sharding={"t1": source_sharding},
+    )
+    processor = OperatorSpec(
+        name="processor",
+        input_arguments={"data": ("t1",)},
+        input_sharding={"t1": target_sharding},
+    )
+    return compile_graph(
+        name="interleaved-source",
+        spmds=(
+            compiled_spmd_spec("loader", source_mesh, {"loader": loader}),
+            compiled_spmd_spec("processor", target_mesh, {"processor": processor}),
+        ),
+        dependencies=(
+            DependencySpec(
+                source=OperatorKey("loader", "loader"),
+                target=OperatorKey("processor", "processor"),
+                transfers=(TensorTransfer(OperatorPort("t1"), OperatorPort("t1")),),
+            ),
+        ),
+    )
+
+
+def _build_interleaved_frames(
+    *,
+    compiled_graph,
+    rank: int,
+    interleave_unit_size: int,
+    exec_step: int,
+) -> None:
+    source_plan = compiled_graph.spmd("loader")
     compiled_plan = compile_send_plan(
-        op_name=op_name,
+        graph_view=source_plan,
+        source_op_id="loader",
         rank=rank,
-        mesh=mesh,
-        output_uuids=tuple(output_uuids),
-        output_sharding=output_sharding,
-        successor_contexts=tuple(successor_contexts),
-        tuuid_to_name=tuuid_to_name,
-        sender_spmd_code=sender_spmd_code,
-        sender_world_size=sender_world_size,
+        successor_contexts=(
+            SuccessorRouteContext(
+                context_index=0,
+                dependencies=source_plan.outgoing,
+                effective_rank=rank % interleave_unit_size,
+            ),
+        ),
+        sender_spmd_code=1,
         interleave_unit_size=interleave_unit_size,
     )
-    return build_step_frame_groups(
+    build_step_frame_groups(
         compiled_plan=compiled_plan,
-        flat_results=flat_results,
-        step_tuuid_cache=step_tuuid_cache,
+        flat_results=[np.ones((10, 10))],
+        step_transfer_cache={},
         exec_step=exec_step,
     )
 
 
-@spmd(mesh_axis_names=("data", "mp"), mesh_axis_shapes=(2, 2))
-class _LoaderOp:
-    @fw_operator(name="loader", is_source=True)
-    def loader(self):
-        return {"t1": np.ones((10, 10))}
-
-
-@spmd(mesh_axis_names=("data",), mesh_axis_shapes=(2,))
-class _ProcessorOp:
-    @fw_operator(name="processor")
-    def processor(self, t1: np.ndarray | None = None):
-        pass
-
-
-def _meta_to_topology(meta: OperatorMeta) -> dict[str, SPMDTopology]:
-    """Helper for unit tests to derive topology from OperatorMeta."""
-    top_dict = {}
-    top = SPMDTopology()
-    for pred_id, edges in meta.input_pre_sharding.items():
-        if edges:
-            e = edges[0]
-            top.predecessors[pred_id] = SPMDTopologyInfo(
-                spmd_id=pred_id,
-                tuuid_sharding=e.tuuid_sharding,
-                tuuid_map=e.tuuid_map,
-                is_interleaved=e.is_interleaved,
-                interleave_unit_size=e.interleave_unit_size,
-                mesh=e.mesh,
-                world_size=e.mesh.size if getattr(e, "mesh", None) else 0,
-            )
-    for succ_id, edges in meta.output_post_sharding.items():
-        if edges:
-            e = edges[0]
-            top.successors[succ_id] = SPMDTopologyInfo(
-                spmd_id=succ_id,
-                tuuid_sharding=e.tuuid_sharding,
-                tuuid_map=e.tuuid_map,
-                is_interleaved=e.is_interleaved,
-                interleave_unit_size=e.interleave_unit_size,
-                mesh=e.mesh,
-                world_size=e.mesh.size if getattr(e, "mesh", None) else 0,
-            )
-    top_dict[meta.name] = top
-    return top_dict
-
-
-@pytest.mark.asyncio
-async def test_multi_worker_interleaved_unit_mesh_inheritance():
-    """
-    Verify that interleaved units correctly inherit the sub-mesh structure.
-    Loader (4 ranks, mesh (2,2)) -> Processor (2 ranks)
-    """
-    loader_mesh = DeviceMesh(
-        axis_names=("data", "mp"), device_shape=(2, 2), device_ids=[0, 1, 2, 3]
+def test_multi_worker_interleaved_unit_mesh_inheritance():
+    source_mesh = DeviceMesh(
+        axis_names=("data", "mp"),
+        device_shape=(2, 2),
+        device_ids=[0, 1, 2, 3],
     )
-    processor_mesh = DeviceMesh(
-        axis_names=("data",), device_shape=(2,), device_ids=[0, 1]
-    )
-
-    sharding = ShardingSpec.chunk(PartitionSpec("data", "mp"))
-    edge_info = EdgeShardingInfo(
-        is_interleaved=True,
+    target_mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
+    compiled_graph = _compile_interleaved_compiled_graph(
+        source_mesh=source_mesh,
+        target_mesh=target_mesh,
+        source_sharding=ShardingSpec.chunk(PartitionSpec("data", "mp")),
+        target_sharding=ShardingSpec.chunk(PartitionSpec()),
         interleave_unit_size=2,
-        tuuid_sharding={1001: sharding},
-        tuuid_map={"t1": 1001},
-        mesh=loader_mesh,
     )
 
-    loader_meta = OperatorMeta(
-        name="loader",
-        is_source=True,
-        is_interleaved=True,
-        interleave_unit_size=2,
-        output_arguments={ArgumentType.DATA.value: ["t1"]},
-        output_uuids=[1001],
-        output_sharding={1001: sharding},
-        output_post_sharding={"processor": [edge_info]},
-        owner_class_module=_LoaderOp.__module__,
-        owner_class_qualname=_LoaderOp.__qualname__,
-    )
-
-    processor_meta = OperatorMeta(
-        name="processor",
-        input_arguments={ArgumentType.DATA.value: ["t1"]},
-        input_sharding={"t1": ShardingSpec.chunk(PartitionSpec())},
-        input_pre_sharding={"loader": [edge_info]},
-        owner_class_module=_ProcessorOp.__module__,
-        owner_class_qualname=_ProcessorOp.__qualname__,
-    )
-
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-
-    # Instantiate Loader Workers
-    loader_workers = []
-    for rank in range(4):
-        config = SPMDConfig(
-            mesh=loader_mesh,
-            spmd_id="loader",
-            operators={"loader": "loader"},
-            operator_metas={"loader": loader_meta, "processor": processor_meta},
-            topology=_meta_to_topology(loader_meta),
-            active_operator_names=("loader", "loader", "processor"),
-        )
-        w = cls(config, rank=rank)
-        w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
-        w.register_spmd_code_map(1, {1: "loader", 2: "processor"})
-        w._successor_handlers = {"processor": {0: AsyncMock(), 1: AsyncMock()}}
-        loader_workers.append(w)
-
-    # Instantiate Processor Workers (for shard count check)
-    processor_workers = []
-    for rank in range(2):
-        config = SPMDConfig(
-            mesh=processor_mesh,
-            spmd_id="processor",
-            operators={"processor": "processor"},
-            operator_metas={"loader": loader_meta, "processor": processor_meta},
-            topology=_meta_to_topology(processor_meta),
-            active_operator_names=("processor", "loader", "processor"),
-        )
-        w = cls(config, rank=rank)
-        w.setup_and_start(local_rank=rank, local_world_size=2, node_rank=0, num_nodes=1)
-        processor_workers.append(w)
-
-    assert processor_workers[0]._op_manager is not None
-    shards_dict = processor_workers[0]._op_manager.get_expected_tensor_shards(
-        "processor"
-    )
-    assert shards_dict[1001] == 2, (
-        f"Target processor should expect 2 shards, got {shards_dict}"
-    )
-
-    # 2. BUILD STEP 0: Unit 0 (Ranks 0, 1) active
-    with patch("fluxway.spmd.worker.data_plane.AsyncDataDistributor") as mock_dist_cls:
-        mock_dist = mock_dist_cls.return_value
-        mock_dist.build_transport_frame_args.return_value = []
-
-        for w in loader_workers[:2]:
-            succ_info = w.op_manager.get_successor_info("loader", "processor")
-            assert succ_info is not None
-            _build_frame_groups_with_plan(
-                op_name="loader",
-                rank=w.rank,
-                mesh=w._mesh,
-                flat_results=[np.ones((10, 10))],
-                output_uuids=[1001],
-                output_sharding={1001: sharding},
-                successor_contexts=[
-                    SuccessorRouteContext(
-                        context_index=0,
-                        spmd_id="processor",
-                        info=succ_info,
-                        effective_rank=w.rank % edge_info.interleave_unit_size,
-                    )
-                ],
-                tuuid_to_name={1001: "t1"},
-                step_tuuid_cache={},
-                exec_step=0,
-                sender_spmd_code=1,
-                sender_world_size=4,
-                interleave_unit_size=loader_meta.interleave_unit_size,
-            )
-
-        assert mock_dist.plan_and_shard.call_count == 2
-        assert mock_dist.build_transport_frame_args.call_count == 2
-        assert [
-            call.kwargs["sender_rank"]
-            for call in mock_dist.build_transport_frame_args.call_args_list
-        ] == [0, 1]
-        found_u0 = False
-        for call in mock_dist.plan_and_shard.call_args_list:
-            source_spec = call.args[1]
-            if list(source_spec.mesh.device_ids.flatten()) == [0, 1]:
-                assert source_spec.mesh.shape == (1, 2)
-                assert source_spec.mesh.axis_names == ("data", "mp")
-                found_u0 = True
-        assert found_u0, "Unit 0 sub-mesh distribution not found"
-
-    # 3. BUILD STEP 1: Unit 1 (Ranks 2, 3) active
-    with patch("fluxway.spmd.worker.data_plane.AsyncDataDistributor") as mock_dist_cls:
-        mock_dist = mock_dist_cls.return_value
-        mock_dist.build_transport_frame_args.return_value = []
-
-        for w in loader_workers[2:]:
-            succ_info = w.op_manager.get_successor_info("loader", "processor")
-            assert succ_info is not None
-            _build_frame_groups_with_plan(
-                op_name="loader",
-                rank=w.rank,
-                mesh=w._mesh,
-                flat_results=[np.ones((10, 10))],
-                output_uuids=[1001],
-                output_sharding={1001: sharding},
-                successor_contexts=[
-                    SuccessorRouteContext(
-                        context_index=0,
-                        spmd_id="processor",
-                        info=succ_info,
-                        effective_rank=w.rank % edge_info.interleave_unit_size,
-                    )
-                ],
-                tuuid_to_name={1001: "t1"},
-                step_tuuid_cache={},
-                exec_step=1,
-                sender_spmd_code=1,
-                sender_world_size=4,
-                interleave_unit_size=loader_meta.interleave_unit_size,
-            )
-
-        assert mock_dist.plan_and_shard.call_count == 2
-        assert mock_dist.build_transport_frame_args.call_count == 2
-        assert [
-            call.kwargs["sender_rank"]
-            for call in mock_dist.build_transport_frame_args.call_args_list
-        ] == [2, 3]
-        found_u1 = False
-        for call in mock_dist.plan_and_shard.call_args_list:
-            source_spec = call.args[1]
-            if list(source_spec.mesh.device_ids.flatten()) == [2, 3]:
-                found_u1 = True
-        assert found_u1, "Unit 1 sub-mesh distribution not found"
-
-
-@pytest.mark.asyncio
-async def test_single_worker_interleaved_unit():
-    loader_mesh = DeviceMesh(axis_names=("data",), device_shape=(4,))
-    sharding = ShardingSpec.chunk(PartitionSpec("data"))
-    edge = EdgeShardingInfo(
-        is_interleaved=True,
-        interleave_unit_size=4,
-        tuuid_sharding={2001: sharding},
-        tuuid_map={"t1": 2001},
-        mesh=loader_mesh,
-    )
-    loader_meta = OperatorMeta(
-        name="loader",
-        is_source=True,
-        is_interleaved=True,
-        interleave_unit_size=1,
-        output_arguments={ArgumentType.DATA.value: ["t1"]},
-        output_uuids=[2001],
-        output_sharding={2001: sharding},
-        output_post_sharding={"processor": [edge]},
-        owner_class_module=_LoaderOp.__module__,
-        owner_class_qualname=_LoaderOp.__qualname__,
-    )
-
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-
-    loader_workers = []
-    for rank in range(4):
-        config = SPMDConfig(
-            mesh=loader_mesh,
-            spmd_id="loader",
-            operators={"loader": "loader"},
-            operator_metas={"loader": loader_meta},
-            topology=_meta_to_topology(loader_meta),
-            active_operator_names=("loader", "loader"),
-        )
-        w = cls(config, rank=rank)
-        w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
-        w.register_spmd_code_map(1, {1: "loader", 2: "processor"})
-        w._successor_handlers = {"processor": {0: AsyncMock()}}
-        loader_workers.append(w)
-
-    with patch("fluxway.spmd.worker.data_plane.AsyncDataDistributor") as mock_dist_cls:
-        mock_dist = mock_dist_cls.return_value
-        mock_dist.build_transport_frame_args.return_value = []
-
-        w = loader_workers[0]
-        succ_info = w.op_manager.get_successor_info("loader", "processor")
-        assert succ_info is not None
-        _build_frame_groups_with_plan(
-            op_name="loader",
-            rank=w.rank,
-            mesh=w._mesh,
-            flat_results=[np.ones((10, 10))],
-            output_uuids=[2001],
-            output_sharding={2001: sharding},
-            successor_contexts=[
-                SuccessorRouteContext(
-                    context_index=0,
-                    spmd_id="processor",
-                    info=succ_info,
-                    effective_rank=w.rank % edge.interleave_unit_size,
+    for exec_step, ranks, expected_device_ids in (
+        (0, (0, 1), [0, 1]),
+        (1, (2, 3), [2, 3]),
+    ):
+        with patch(
+            "fluxway.spmd.worker.data_plane.AsyncDataDistributor"
+        ) as distributor_cls:
+            distributor = distributor_cls.return_value
+            distributor.build_transport_frame_args.return_value = []
+            for rank in ranks:
+                _build_interleaved_frames(
+                    compiled_graph=compiled_graph,
+                    rank=rank,
+                    interleave_unit_size=2,
+                    exec_step=exec_step,
                 )
-            ],
-            tuuid_to_name={2001: "t1"},
-            step_tuuid_cache={},
-            exec_step=0,
-            sender_spmd_code=1,
-            sender_world_size=4,
-            interleave_unit_size=loader_meta.interleave_unit_size,
-        )
-        assert mock_dist.plan_and_shard.call_count == 1
-        assert mock_dist.build_transport_frame_args.call_count == 1
-        assert mock_dist.build_transport_frame_args.call_args.kwargs["sender_rank"] == 0
 
-        source_spec = mock_dist.plan_and_shard.call_args.args[1]
-        assert source_spec.mesh.shape == (1,)
-        assert list(source_spec.mesh.device_ids.flatten()) == [0]
+        assert distributor.plan_and_shard.call_count == 2
+        assert distributor.build_transport_frame_args.call_count == 2
+        assert [
+            call.kwargs["sender_rank"]
+            for call in distributor.build_transport_frame_args.call_args_list
+        ] == list(ranks)
+        for call in distributor.plan_and_shard.call_args_list:
+            source_spec = call.args[1]
+            assert source_spec.mesh.shape == (1, 2)
+            assert source_spec.mesh.axis_names == ("data", "mp")
+            assert list(source_spec.mesh.device_ids.flatten()) == expected_device_ids
+
+
+def test_single_worker_interleaved_unit():
+    source_mesh = DeviceMesh(axis_names=("data",), device_shape=(4,))
+    target_mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
+    compiled_graph = _compile_interleaved_compiled_graph(
+        source_mesh=source_mesh,
+        target_mesh=target_mesh,
+        source_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        interleave_unit_size=1,
+    )
+
+    with patch(
+        "fluxway.spmd.worker.data_plane.AsyncDataDistributor"
+    ) as distributor_cls:
+        distributor = distributor_cls.return_value
+        distributor.build_transport_frame_args.return_value = []
+        _build_interleaved_frames(
+            compiled_graph=compiled_graph,
+            rank=0,
+            interleave_unit_size=1,
+            exec_step=0,
+        )
+
+    distributor.plan_and_shard.assert_called_once()
+    distributor.build_transport_frame_args.assert_called_once()
+    assert distributor.build_transport_frame_args.call_args.kwargs["sender_rank"] == 0
+    source_spec = distributor.plan_and_shard.call_args.args[1]
+    assert source_spec.mesh.shape == (1,)
+    assert list(source_spec.mesh.device_ids.flatten()) == [0]
+
+
+def test_interleaved_dependency_uses_active_unit_size():
+    compiled_graph = _compile_interleaved_compiled_graph(
+        source_mesh=DeviceMesh(("data",), (4,)),
+        target_mesh=DeviceMesh(("data",), (1,)),
+        source_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        interleave_unit_size=2,
+    )
+    dependency = compiled_graph.dependencies[0]
+
+    assert dependency.source_world_size == 4
+    assert dependency.source_participating_count == 2
+
+
+@pytest.mark.asyncio
+async def test_inactive_interleaved_rank_does_not_send():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_class)
+    worker.rank = 2
+    worker._world_size = 4
+    worker._completed_step_count = {"loader": 0}
+    worker._mailbox = WorkerMailbox()
+    worker._op_manager = SimpleNamespace(
+        get_dispatcher=lambda _name: InterleavedDispatcher(2)
+    )
+    worker._drain_cond = asyncio.Condition()
+    worker._drain_target_count = None
+    worker._barriers_declared = {("loader", 0): True}
+    worker._operator_send_context = lambda _name: (_ for _ in ()).throw(
+        AssertionError("inactive rank must not access a send plan")
+    )
+
+    result = await worker_class._execute_operator_prepare_input(worker, "loader", 0)
+
+    assert result.status is ExecutionStatus.INACTIVE
+    assert not worker_class._result_requires_send(worker, result)
+    assert (
+        await worker_class._send_output(
+            worker,
+            "loader",
+            result,
+            exec_step=0,
+            step_transfer_cache={},
+        )
+        == ()
+    )

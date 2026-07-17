@@ -937,28 +937,15 @@ class TorchBackend(TensorBackend):
 
 class JaxBackend(TensorBackend):
     def __init__(self):
-        import jax.numpy as jnp
         import jax
+        import jax.numpy as jnp
 
         self._jnp = jnp
         self._jax = jax
-
-        # Prefer an x64 context manager so that an explicitly requested
-        # 64-bit dtype (e.g. ``jnp.int64``) is preserved rather than being
-        # silently downcast to 32-bit when the global ``jax_enable_x64``
-        # flag is False. This is critical for transport paths that carry
-        # large integer IDs (e.g. hashed feature keys) which would overflow
-        # int32. Falls back to a no-op if the experimental API is absent.
-        try:
-            from jax import enable_x64 as _enable_x64
-
-            self._x64_cm = _enable_x64
-        except ImportError:
-            self._x64_cm = contextlib.nullcontext
+        self._enable_x64 = jax.enable_x64
 
     def _x64_scope(self):
-        """Return a context manager that enables JAX x64 mode locally."""
-        return self._x64_cm()
+        return self._enable_x64()
 
     def name(self) -> str:
         return "jax"
@@ -974,17 +961,11 @@ class JaxBackend(TensorBackend):
 
     def adopt(self, x: Any) -> Any:
         """Zero-copy adopt foreign tensor as a jax.Array."""
-        # Native fast path: anything already produced by jax stays put.
         if isinstance(x, self._jax.Array):
             return x
-        # DLPack zero-copy from torch / cupy / numpy >=1.23.
-        if hasattr(x, "__dlpack__"):
-            try:
-                return self._jax.dlpack.from_dlpack(x)
-            except Exception:
-                pass
-        # numpy / list fallback.
         with self._x64_scope():
+            if hasattr(x, "__dlpack__"):
+                return self._jax.dlpack.from_dlpack(x)
             return self._jnp.asarray(x)
 
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
@@ -1060,7 +1041,8 @@ class JaxBackend(TensorBackend):
         return tensor.size
 
     def cast(self, tensor: Any, dtype: Any) -> Any:
-        return tensor.astype(dtype)
+        with self._x64_scope():
+            return tensor.astype(dtype)
 
     def item(self, tensor: Any) -> Any:
         return tensor.item()
@@ -1249,14 +1231,13 @@ class JaxBackend(TensorBackend):
         return JAXViewWrapper(tensor, cursor) if cursor is not None else tensor
 
     def from_dlpack(self, dlpack_capsule: Any) -> Any:
-        import jax  # type: ignore
-
         capsule_obj = (
             dlpack_capsule
             if hasattr(dlpack_capsule, "__dlpack__")
             else DLPackObject(dlpack_capsule)
         )
-        return jax.dlpack.from_dlpack(capsule_obj)
+        with self._x64_scope():
+            return self._jax.dlpack.from_dlpack(capsule_obj)
 
     def to_dlpack(self, x: Any) -> Any:
         return x.__dlpack__()
@@ -1504,6 +1485,13 @@ class HybridBackend(TensorBackend):
     """
 
     def __init__(self, default_device: str = "cpu", enable_numba_jit: bool = True):
+        if default_device not in ("cpu", "cuda", "gpu"):
+            raise ValueError(
+                "HybridBackend.default_device must be 'cpu' or 'cuda', "
+                f"got {default_device!r}."
+            )
+        if default_device == "gpu":
+            default_device = "cuda"
         self._cp = None
         self._use_jit = enable_numba_jit and _NUMBA_AVAILABLE
         self._default_device = default_device
@@ -1564,10 +1552,13 @@ class HybridBackend(TensorBackend):
         """
         target_is_gpu = self._default_device in ("gpu", "cuda") and self._cp is not None
         cp_mod = self._cp
+        if target_is_gpu:
+            assert cp_mod is not None
 
         # Native fast paths.
         if isinstance(x, np.ndarray):
             if target_is_gpu:
+                assert cp_mod is not None
                 return cp_mod.asarray(x)  # H2D, unavoidable
             return x
         if cp_mod is not None and isinstance(x, cp_mod.ndarray):
@@ -1595,6 +1586,7 @@ class HybridBackend(TensorBackend):
         # Foreign DLPack-capable arrays (jax.Array, torch.Tensor, ...).
         if hasattr(x, "__dlpack__"):
             if target_is_gpu:
+                assert cp_mod is not None
                 try:
                     return cp_mod.from_dlpack(x)
                 except Exception:
@@ -1608,12 +1600,15 @@ class HybridBackend(TensorBackend):
         # Last-resort device-aware fallback (zero-copy when possible).
         if is_torch_tensor:
             if target_is_gpu and not torch_on_cuda:
+                assert cp_mod is not None
                 return cp_mod.asarray(x.detach().cpu().numpy())
             if target_is_gpu and torch_on_cuda:
+                assert cp_mod is not None
                 return cp_mod.asarray(x.detach())
             # target=cpu
             return np.asarray(x.detach().cpu())
         if target_is_gpu:
+            assert cp_mod is not None
             return cp_mod.asarray(x)
         return np.asarray(x)
 
@@ -1858,6 +1853,27 @@ class HybridBackend(TensorBackend):
         total_repeat_length: int | None = None,
     ) -> Any:
         lib = self._lib_for(x)
+        if (
+            self._cp is not None
+            and lib is self._cp
+            and isinstance(repeats, self._cp.ndarray)
+            and repeats.ndim == 1
+        ):
+            if x.ndim != 1 or dim not in (None, 0):
+                raise ValueError(
+                    "CuPy vector repeat requires a 1D input and dim=None or dim=0."
+                )
+            if total_repeat_length is None:
+                total_repeat_length = int(self._cp.sum(repeats).item())
+            if x.shape[0] == 0:
+                return self._cp.zeros((total_repeat_length,), dtype=x.dtype)
+            boundaries = self._cp.cumsum(repeats)
+            positions = self._cp.arange(total_repeat_length, dtype=self._cp.int32)
+            source_indices = self._cp.searchsorted(boundaries, positions, side="right")
+            valid = source_indices < x.shape[0]
+            safe_indices = self._cp.where(valid, source_indices, 0)
+            return self._cp.where(valid, x[safe_indices], 0)
+
         result = lib.repeat(x, repeats, axis=dim)
         if total_repeat_length is not None:
             repeat_dim = dim if dim is not None else 0
@@ -2127,6 +2143,14 @@ def set_backend(name: str):
         _BACKEND = HybridBackend()
     else:
         raise ValueError(f"Unknown backend: {name}")
+
+
+def set_hybrid_device(device: str) -> None:
+    global _BACKEND
+    _BACKEND = HybridBackend(
+        default_device=device,
+        enable_numba_jit=device == "cpu",
+    )
 
 
 @contextlib.contextmanager

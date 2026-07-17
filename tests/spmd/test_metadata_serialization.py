@@ -1,7 +1,7 @@
 """
-Tests for OperatorMeta serialization behavior.
+Tests for OperatorSpec serialization behavior.
 
-These tests verify that OperatorMeta modifications survive cross-process
+These tests verify that OperatorSpec modifications survive cross-process
 serialization (pickle), which is critical for Ray-based worker communication.
 
 Background:
@@ -12,7 +12,7 @@ Background:
     This means modifications to function attributes (like _flux_operator_meta)
     made after class definition are lost when the function is sent to workers.
 
-    The solution is to store OperatorMeta explicitly in SPMDConfig fields
+    The solution is to store OperatorSpec explicitly in SPMDConfig fields
     rather than relying on function attributes.
 """
 
@@ -27,19 +27,21 @@ import pytest
 
 sys.path.append(os.getcwd())
 
-from fluxway.common.types.configs import (
-    SPMDConfig,
-    OperatorMeta,
-    EdgeShardingInfo,
-    ArgumentType,
+from fluxway.common.compiled_graph import (
+    compile_graph,
 )
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types.configs import SPMDConfig
+from fluxway.common.operator_policy import ArgumentType
+from fluxway import OperatorSpec
+from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.decorators import (
     operator,
     spmd,
     _instance_storage,
-    _resolve_owner_class,
 )
 from fluxway.spmd.worker.worker import SPMDWorker
+from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
 def dummy_my_function():
@@ -73,9 +75,9 @@ class TestPickleBehavior:
         Cross-process pickle loses function attribute modifications.
 
         This is the root cause of the sharding metadata issue:
-        - Control plane modifies OperatorMeta on functions
+        - Control plane modifies OperatorSpec on functions
         - Ray sends SPMDConfig (with functions) to workers via pickle
-        - Workers import module fresh, getting original OperatorMeta
+        - Workers import module fresh, getting original OperatorSpec
         """
         # Create a temporary module file
         with tempfile.NamedTemporaryFile(
@@ -162,11 +164,6 @@ def dummy_op(x):
     return x
 
 
-@operator(name="free_step", static_argument=["x"])
-def _free_step_operator(self, x):
-    return x
-
-
 @spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
 class _ResolvableModel:
     @operator(name="forward", static_argument=["x"])
@@ -181,130 +178,125 @@ class _InstantiableModel:
         return x
 
 
-class TestOperatorMetaSerialization:
-    """Tests for OperatorMeta serialization in SPMDConfig using actual types."""
+def _compiled_class_config(spmd_class: type, spmd_id: str) -> SPMDConfig:
+    declaration = spmd_class.get_spmd_config()
+    graph = compile_graph(
+        name=f"{spmd_id}-owner-transport",
+        spmds=(
+            compiled_spmd_spec(
+                spmd_id=spmd_id,
+                spmd_class=spmd_class,
+                mesh=declaration.mesh,
+                operators=declaration.operator_specs,
+            ),
+        ),
+        dependencies=(),
+    )
+    return declaration.model_copy(
+        update={"spmd_id": spmd_id, "graph_view": graph.spmd(spmd_id)}
+    )
+
+
+class TestOperatorSpecSerialization:
+    """Tests for OperatorSpec serialization in SPMDConfig using actual types."""
 
     def test_real_pydantic_model_preserves_modifications_in_pickle(self):
         """
-        OperatorMeta (Pydantic model) preserves modifications when pickled.
+        OperatorSpec (Pydantic model) preserves modifications when pickled.
         """
-        # Create and modify meta
-        meta = OperatorMeta(name="test_op", input_arguments=None, output_arguments=None)
-        edge_info = EdgeShardingInfo(tuuid_sharding={123: "some_spec"})
-        meta.input_pre_sharding["Preprocessing"] = [edge_info]
+        meta = OperatorSpec(name="test_op", input_arguments=None, output_arguments=None)
+        updated = meta.updated(requires_worker_process=True)
 
         # Pickle and unpickle
-        pickled = pickle.dumps(meta)
+        pickled = pickle.dumps(updated)
         restored = pickle.loads(pickled)
 
-        # Modifications ARE preserved for Pydantic models
-        assert list(restored.input_pre_sharding.keys()) == ["Preprocessing"]
-        assert restored.input_pre_sharding["Preprocessing"][0].tuuid_sharding == {
-            123: "some_spec"
-        }
+        assert restored == updated
+        assert restored.requires_worker_process is True
+        assert meta.requires_worker_process is False
 
     def test_real_spmd_config_preserves_modifications(self):
         """
-        SPMDConfig with explicit meta fields preserves OperatorMeta modifications.
+        SPMDConfig with explicit meta fields preserves OperatorSpec modifications.
         """
-        meta = OperatorMeta(
+        meta = OperatorSpec(
             name="test_op",
             input_arguments={ArgumentType.DATA.value: ["input"]},
             output_arguments={ArgumentType.DATA.value: ["output"]},
+            input_sharding={"input": ShardingSpec.chunk(PartitionSpec())},
+            output_sharding={"output": ShardingSpec.chunk(PartitionSpec())},
         )
-
-        # Create config with explicit meta; operators stores method name, not callable
+        mesh = DeviceMesh(("data",), (1,))
+        plan = compile_graph(
+            name="metadata-serialization",
+            spmds=(
+                compiled_spmd_spec(
+                    spmd_id="model",
+                    mesh=mesh,
+                    operators={"test_op": meta},
+                ),
+            ),
+            dependencies=(),
+        )
         config = SPMDConfig(
-            operators={"test_op": "test_op"},
-            operator_metas={"test_op": meta},
-            active_operator_names=("test_op", "test_op"),
+            spmd_id="model",
+            mesh=mesh,
+            operator_specs={"test_op": meta},
+            graph_view=plan.spmd("model"),
         )
-
-        # Modify meta after config creation (simulating Builder linking)
-        edge_info = EdgeShardingInfo(tuuid_sharding={123: "sharded_spec"})
-        meta.input_pre_sharding["SourceSPMD"] = [edge_info]
 
         # Pickle and unpickle (simulating Ray serialization)
         pickled = pickle.dumps(config)
         restored = pickle.loads(pickled)
 
-        # op_metas preserves modifications
-        assert "test_op" in restored.operator_metas
-        assert list(restored.operator_metas["test_op"].input_pre_sharding.keys()) == [
-            "SourceSPMD"
-        ]
-        assert restored.operator_metas["test_op"].input_pre_sharding["SourceSPMD"][
-            0
-        ].tuuid_sharding == {123: "sharded_spec"}
+        assert "test_op" in restored.operator_specs
+        restored_operator = restored.require_graph_view().operator("test_op")
+        assert restored_operator.spec is restored.operator_specs["test_op"]
+        assert restored_operator.input_sharding == meta.input_sharding
+        assert restored_operator.output_sharding == meta.output_sharding
 
 
-class TestOwnerClassResolution:
-    """Tests verifying that owner class info survives pickle and resolves correctly."""
+class TestOwnerClassTransport:
+    """Tests verifying that owner classes survive worker transport."""
 
-    def test_free_function_operator_meta_has_empty_owner_fields(self):
-        meta = _free_step_operator._fluxway_operator_meta
-        assert meta.owner_class_qualname == ""
-        assert meta.owner_class_module == ""
+    def test_free_function_operator_remains_unbound(self):
+        wrapped = operator(name="free_step", static_argument=["x"])(dummy_op)
+        assert wrapped._fluxway_operator_spec.owner is None
 
     def test_class_method_operator_meta_records_owner_info(self):
-        @spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
-        class MyModel:
-            @operator(name="train_step", static_argument=["x"])
-            def train_step(self, x):
-                return x
-
-        config = MyModel.get_spmd_config()  # type: ignore
-        meta = config.operator_metas["train_step"]
-        assert "MyModel" in meta.owner_class_qualname
+        config = _ResolvableModel.get_spmd_config()  # type: ignore
+        meta = config.operator_specs["forward"]
+        assert meta.owner is _ResolvableModel
+        assert meta.owner_class_qualname == "_ResolvableModel"
         assert meta.owner_class_module == __name__
 
-    def test_resolve_owner_class_returns_same_object(self):
-        config = _ResolvableModel.get_spmd_config()  # type: ignore
-        meta = config.operator_metas["forward"]
-        resolved = _resolve_owner_class(
-            meta.owner_class_module, meta.owner_class_qualname
-        )
-        assert resolved is _ResolvableModel
-
-    def test_resolve_owner_class_is_stable_across_calls(self):
-        config = _ResolvableModel.get_spmd_config()  # type: ignore
-        meta = config.operator_metas["forward"]
-        first = _resolve_owner_class(meta.owner_class_module, meta.owner_class_qualname)
-        second = _resolve_owner_class(
-            meta.owner_class_module, meta.owner_class_qualname
-        )
-        assert first is second
-
-    def test_owner_info_survives_pickle(self):
+    def test_owner_class_survives_pickle(self):
         config = _ResolvableModel.get_spmd_config()  # type: ignore
         restored_config = pickle.loads(pickle.dumps(config))
 
-        meta = restored_config.operator_metas["forward"]
-        assert meta.owner_class_qualname != ""
-        assert meta.owner_class_module != ""
+        meta = restored_config.operator_specs["forward"]
+        assert meta.owner is _ResolvableModel
 
     def test_pre_instantiate_operators_uses_owner_meta(self):
-        config = _InstantiableModel.get_spmd_config()  # type: ignore
+        config = _compiled_class_config(_InstantiableModel, "instantiable")
 
         _instance_storage.clear()
         SPMDWorker._pre_instantiate_operators(  # type: ignore
-            config, rank=0, operator_location="execution_actor"
+            config, rank=0, static_args={}
         )
 
-        cls = _resolve_owner_class(
-            config.operator_metas["run"].owner_class_module,
-            config.operator_metas["run"].owner_class_qualname,
-        )
+        cls = config.operator_specs["run"].owner
+        assert cls is not None
         assert id(cls) in _instance_storage
 
     def test_pre_instantiate_operators_logs_init_boundaries(self, caplog):
-        config = _InstantiableModel.get_spmd_config()  # type: ignore
+        config = _compiled_class_config(_InstantiableModel, "instantiable")
 
         _instance_storage.clear()
         caplog.set_level("DEBUG", logger="fluxway.spmd.worker.worker")
 
         SPMDWorker._pre_instantiate_operators(  # type: ignore
-            config, rank=0, operator_location="execution_actor"
+            config, rank=0, static_args={}
         )
 
         begin_records = [

@@ -1,6 +1,30 @@
 import pytest
 import numpy as np
-from fluxway.common.tensor_backend import get_backend, use_backend
+from fluxway.common.tensor_backend import JaxBackend, get_backend, use_backend
+
+
+def test_jax_dlpack_import_preserves_uint64_with_local_scope():
+    source = np.array([2**40], dtype=np.uint64)
+
+    adopted = JaxBackend().adopt(source)
+
+    assert adopted.dtype == np.uint64
+    assert int(adopted[0]) == 2**40
+
+
+def test_jax_adopt_propagates_broken_dlpack_error():
+    class BrokenDLPackTensor:
+        dtype = np.dtype(np.float32)
+        shape = (1,)
+
+        def __dlpack__(self, stream=None):
+            raise RuntimeError("broken DLPack exporter")
+
+        def __dlpack_device__(self):
+            return (1, 0)
+
+    with pytest.raises(RuntimeError, match="broken DLPack exporter"):
+        JaxBackend().adopt(BrokenDLPackTensor())
 
 
 def test_jax_dlpack_slice_multidim():

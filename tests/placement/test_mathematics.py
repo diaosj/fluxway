@@ -34,7 +34,7 @@ class SPMD1: ...
 class SPMD5: ...
 
 
-def test_recipe_round_trip_preserves_formal_placement_program() -> None:
+def test_recipe_preserves_direct_spmd_class_references() -> None:
     s0 = workers(SPMD0)
     s1 = workers(SPMD1)
     s5 = workers(SPMD5)
@@ -46,36 +46,23 @@ def test_recipe_round_trip_preserves_formal_placement_program() -> None:
     recipe = PlacementRecipe(
         recipe_id="formal-placement",
         version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(base={"GPU": 1, "CPU": 1}),
-            SPMD1: ResourceProfile(
-                base={"GPU": 1, "CPU": 1},
-                scale=ResourceScale(
-                    step={"CPU": Decimal("0.5")},
-                    max_steps=4,
-                    weight=Decimal("2"),
-                ),
-            ),
-            SPMD5: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=constraints,
         objective=lexicographic(minimize(cardinality(support(s0)))),
     )
 
-    restored = PlacementRecipe.model_validate_json(recipe.model_dump_json())
-
-    assert restored == recipe
-    assert restored.digest == recipe.digest
-    assert [binding.spmd.qualname for binding in recipe.profiles] == [
-        "SPMD0",
-        "SPMD1",
-        "SPMD5",
-    ]
+    assert constraints[0].left.workers.source.spmd.spmd_class is SPMD5
+    assert constraints[0].right.workers.spmd.spmd_class is SPMD0
+    assert hash(recipe) == hash(recipe)
 
 
 def test_resource_vectors_reject_inexact_float() -> None:
     with pytest.raises(ValidationError, match="Decimal"):
         ResourceProfile(base={"CPU": 0.5})
+
+
+def test_cluster_resources_share_resource_profile_validation() -> None:
+    with pytest.raises(ValidationError):
+        ClusterNode(node_id="node", resources={"CPU": True})
 
 
 def test_resource_fragmentation_is_a_hard_constraint_scalar() -> None:
@@ -96,21 +83,11 @@ def test_ast_is_frozen() -> None:
         expression.kind = "changed"  # type: ignore[misc]
 
 
-def test_recipe_resource_vectors_are_deeply_frozen() -> None:
-    recipe = PlacementRecipe(
-        recipe_id="deeply-frozen",
-        version="1.0.0",
-        profiles={
-            SPMD0: ResourceProfile(
-                base={"CPU": 1},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=1, weight=1),
-            )
-        },
-        constraints=(),
-        objective=AFFINITY_FIRST_V1,
+def test_resource_vectors_are_deeply_frozen() -> None:
+    profile = ResourceProfile(
+        base={"CPU": 1},
+        scale=ResourceScale(step={"CPU": 1}, max_steps=1, weight=1),
     )
-    digest = recipe.digest
-    profile = recipe.profiles[0].profile
 
     with pytest.raises(TypeError):
         profile.base["CPU"] = Decimal("2")  # type: ignore[index]
@@ -118,7 +95,7 @@ def test_recipe_resource_vectors_are_deeply_frozen() -> None:
     with pytest.raises(TypeError):
         profile.scale.step["CPU"] = Decimal("2")  # type: ignore[index]
 
-    assert recipe.digest == digest
+    assert profile.base["CPU"] == 1
 
 
 def test_cluster_snapshot_is_canonical_under_node_permutation() -> None:
@@ -129,10 +106,9 @@ def test_cluster_snapshot_is_canonical_under_node_permutation() -> None:
     reverse = ClusterSnapshot.from_nodes((right, left))
 
     assert forward == reverse
-    assert forward.digest == reverse.digest
 
 
-def test_standard_objective_is_a_serializable_ast() -> None:
+def test_standard_objective_is_a_typed_ast() -> None:
     assert [objective.kind for objective in AFFINITY_FIRST_V1.objectives] == [
         "max_min",
         "max_min",
@@ -157,7 +133,7 @@ def test_formal_placement_language_is_exported_at_package_root() -> None:
     assert fluxway.AFFINITY_FIRST_V1 is AFFINITY_FIRST_V1
 
 
-def test_recipe_normalizer_canonicalizes_constraint_conjunction() -> None:
+def test_recipe_preserves_expert_constraint_order() -> None:
     s0 = support(workers(SPMD0))
     s1 = support(workers(SPMD1))
     first = subseteq(s0, s1)
@@ -165,15 +141,7 @@ def test_recipe_normalizer_canonicalizes_constraint_conjunction() -> None:
     common = {
         "recipe_id": "canonical",
         "version": "1.0.0",
-        "profiles": {
-            SPMD0: ResourceProfile(base={"CPU": 1}),
-            SPMD1: ResourceProfile(base={"CPU": 1}),
-        },
         "objective": AFFINITY_FIRST_V1,
     }
     left = PlacementRecipe(**common, constraints=(first, second, first))
-    right = PlacementRecipe(**common, constraints=(second, first))
-
-    assert left.normalized == right.normalized
-    assert left.digest == right.digest
-    assert len(left.normalized.constraints) == 2
+    assert left.constraints == (first, second, first)

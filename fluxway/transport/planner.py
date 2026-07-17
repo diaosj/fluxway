@@ -46,6 +46,25 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 
+@dataclass(frozen=True, slots=True)
+class DestinationAssignment:
+    ranks: Any
+    entity_count: int
+    target_rank_count: int
+
+    def __post_init__(self) -> None:
+        if type(self.entity_count) is not int or self.entity_count < 0:
+            raise ValueError(
+                "Destination assignment entity count must be a non-negative int."
+            )
+        if type(self.target_rank_count) is not int:
+            raise TypeError("Destination assignment target rank count must be an int.")
+        if self.target_rank_count <= 0:
+            raise ValueError(
+                "Destination assignment target rank count must be positive."
+            )
+
+
 @dataclass
 class TransportPlan:
     """Pure tensor description of a transport schedule.
@@ -66,6 +85,7 @@ class TransportPlan:
     send_counts: Any
     target_num_workers: int
     replication_factor: int = 1
+    invalid_destination_count: Any | None = None
 
     @property
     def is_replicated(self) -> bool:
@@ -136,6 +156,103 @@ class TransportPlanner:
             send_counts=send_counts,
             target_num_workers=target_num_workers,
             replication_factor=replica_size,
+        )
+
+    @staticmethod
+    def compute_destination_assignment(
+        assignment: DestinationAssignment,
+    ) -> TransportPlan:
+        ranks = assignment.ranks
+        entity_count = assignment.entity_count
+        target_rank_count = assignment.target_rank_count
+        if isinstance(ranks, int | np.integer):
+            target_rank = int(ranks)
+            if not 0 <= target_rank < target_rank_count:
+                raise ValueError(
+                    "Constant destination rank is outside the target domain: "
+                    f"rank={target_rank} target_rank_count={target_rank_count}."
+                )
+            counts = np.zeros((target_rank_count,), dtype=np.int32)
+            counts[target_rank] = entity_count
+            return TransportPlan(
+                sort_indices=None,
+                dest_devices=np.asarray([[target_rank]], dtype=np.int32),
+                send_counts=counts,
+                target_num_workers=target_rank_count,
+                invalid_destination_count=np.int32(0),
+            )
+        if isinstance(ranks, np.ndarray):
+            return _compute_numpy_destination_assignment(assignment)
+
+        backend = get_backend()
+        shape = backend.shape(ranks)
+        if len(shape) == 0:
+            rank_axis = backend.arange(
+                0,
+                target_rank_count,
+                dtype=backend.int32(),
+                device="cpu",
+            )
+            is_target = (ranks >= 0) * (ranks < target_rank_count)
+            send_counts = (
+                backend.cast(
+                    rank_axis == ranks,
+                    backend.int32(),
+                )
+                * entity_count
+            )
+            return TransportPlan(
+                sort_indices=None,
+                dest_devices=backend.reshape(ranks, (1, 1)),
+                send_counts=send_counts,
+                target_num_workers=target_rank_count,
+                invalid_destination_count=backend.cast(
+                    is_target == 0,
+                    backend.int32(),
+                ),
+            )
+        if len(shape) != 1:
+            raise ValueError(
+                f"Destination assignment must be scalar or 1D, got shape={shape}."
+            )
+        capacity = int(shape[0])
+        if entity_count > capacity:
+            raise ValueError(
+                f"Destination assignment entity_count={entity_count} exceeds "
+                f"rank vector length={capacity}."
+            )
+        positions = backend.arange(
+            0,
+            capacity,
+            dtype=backend.int32(),
+            device="cpu",
+        )
+        is_entity = positions < entity_count
+        is_target = (ranks >= 0) * (ranks < target_rank_count)
+        is_sentinel = ranks == target_rank_count
+        is_protocol_value = backend.where(
+            is_entity,
+            (is_target + is_sentinel) > 0,
+            is_sentinel,
+        )
+        invalid_destination_count = backend.sum(
+            backend.cast(is_protocol_value == 0, backend.int32())
+        )
+        safe_ranks = backend.where(is_target, ranks, target_rank_count)
+        sort_indices = backend.argsort(safe_ranks, dim=0, stable=True)
+        count_indices = backend.where(is_target, ranks, 0)
+        send_counts = _bincount(
+            backend,
+            count_indices,
+            weights=backend.cast(is_target, backend.float32()),
+            minlength=target_rank_count,
+        )
+        return TransportPlan(
+            sort_indices=sort_indices,
+            dest_devices=backend.reshape(safe_ranks, (-1, 1)),
+            send_counts=backend.cast(send_counts, backend.int32()),
+            target_num_workers=target_rank_count,
+            invalid_destination_count=invalid_destination_count,
         )
 
     @staticmethod
@@ -395,6 +512,62 @@ class TransportPlanner:
 # ============================================================
 # Internal helpers
 # ============================================================
+
+
+def _compute_numpy_destination_assignment(
+    assignment: DestinationAssignment,
+) -> TransportPlan:
+    ranks = assignment.ranks
+    entity_count = assignment.entity_count
+    target_rank_count = assignment.target_rank_count
+    if not np.issubdtype(ranks.dtype, np.integer):
+        raise TypeError(
+            f"Destination ranks must use an integer dtype, got {ranks.dtype}."
+        )
+    if ranks.ndim == 0:
+        return TransportPlanner.compute_destination_assignment(
+            DestinationAssignment(
+                ranks=int(ranks),
+                entity_count=entity_count,
+                target_rank_count=target_rank_count,
+            )
+        )
+    if ranks.ndim != 1:
+        raise ValueError(
+            f"Destination assignment must be scalar or 1D, got shape={ranks.shape}."
+        )
+    capacity = int(ranks.shape[0])
+    if entity_count > capacity:
+        raise ValueError(
+            f"Destination assignment entity_count={entity_count} exceeds "
+            f"rank vector length={capacity}."
+        )
+    entity_ranks = ranks[:entity_count]
+    padding_ranks = ranks[entity_count:]
+    invalid_entities = np.flatnonzero(
+        (entity_ranks < 0) | (entity_ranks > target_rank_count)
+    )
+    invalid_padding = np.flatnonzero(padding_ranks != target_rank_count)
+    if invalid_entities.size or invalid_padding.size:
+        raise ValueError(
+            "Destination assignment must contain target ranks in its entity region "
+            f"and sentinel {target_rank_count} in its padding region: "
+            f"invalid_entity_offsets={invalid_entities.tolist()} "
+            f"invalid_padding_offsets={invalid_padding.tolist()}."
+        )
+    send_counts = np.bincount(
+        entity_ranks[entity_ranks < target_rank_count],
+        minlength=target_rank_count,
+    ).astype(np.int32, copy=False)
+    already_grouped = ranks.size < 2 or bool(np.all(ranks[1:] >= ranks[:-1]))
+    sort_indices = None if already_grouped else np.argsort(ranks, kind="stable")
+    return TransportPlan(
+        sort_indices=sort_indices,
+        dest_devices=ranks.reshape(-1, 1),
+        send_counts=send_counts,
+        target_num_workers=target_rank_count,
+        invalid_destination_count=np.int32(0),
+    )
 
 
 def _bincount(

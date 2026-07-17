@@ -5,6 +5,7 @@ Device Mesh Abstraction.
 from __future__ import annotations
 
 import numpy as np
+from types import MappingProxyType
 from typing import Any
 
 
@@ -19,6 +20,11 @@ class DeviceMesh:
         axis_names (Tuple[str, ...]): Names for each axis of the mesh.
         device_ids (np.ndarray): Array of physical device IDs (ranks) with shape `shape`.
     """
+
+    _frozen: bool
+    axis_map: dict[str, int] | MappingProxyType[str, int]
+    size_map: dict[str, int] | MappingProxyType[str, int]
+    _inverse_map: dict[int, tuple[int, ...]] | MappingProxyType[int, tuple[int, ...]]
 
     def __init__(
         self,
@@ -36,6 +42,7 @@ class DeviceMesh:
                         If provided as a multi-dimensional array, device_shape will be inferred.
                         If provided as a 1D array and device_shape is given, it will be reshaped.
         """
+        object.__setattr__(self, "_frozen", False)
         self._axis_names = tuple(axis_names)
 
         # Determine device_ids and shape
@@ -94,6 +101,55 @@ class DeviceMesh:
             rank = int(x)  # type: ignore
             self._inverse_map[rank] = it.multi_index
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError("frozen DeviceMesh cannot be modified")
+        object.__setattr__(self, name, value)
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
+
+    def copy(self) -> DeviceMesh:
+        return DeviceMesh(
+            axis_names=self.axis_names,
+            device_shape=self.shape,
+            device_ids=np.array(self.device_ids, dtype=np.int32, copy=True),
+        )
+
+    def frozen_copy(self) -> DeviceMesh:
+        return self if self._frozen else self.copy().freeze()
+
+    def freeze(self) -> DeviceMesh:
+        if self._frozen:
+            return self
+        if not isinstance(self.device_ids, np.ndarray):
+            raise TypeError("only host DeviceMesh instances can be frozen")
+        self.device_ids.setflags(write=False)
+        self.axis_map = MappingProxyType(dict(self.axis_map))
+        self.size_map = MappingProxyType(dict(self.size_map))
+        self._inverse_map = MappingProxyType(dict(self._inverse_map))
+        object.__setattr__(self, "_frozen", True)
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> DeviceMesh:
+        if self._frozen:
+            return self
+        copied = self.copy()
+        memo[id(self)] = copied
+        return copied
+
+    def __reduce__(self):
+        return (
+            _restore_device_mesh,
+            (
+                self.axis_names,
+                self.shape,
+                np.array(self.device_ids, dtype=np.int32, copy=True),
+                self._frozen,
+            ),
+        )
+
     @property
     def ndim(self) -> int:
         return len(self._shape)
@@ -151,40 +207,42 @@ class DeviceMesh:
         """Convert physical ranks to multi-dimensional logical coordinates."""
         from fluxway.common.tensor_backend import get_backend
 
-        try:
-            backend = get_backend()
-            return backend.unravel_index(ranks, self.shape)
-        except Exception:
-            # Fallback for simple numpy usage if backend fails or not set
-            return np.unravel_index(ranks, self.shape)
+        return get_backend().unravel_index(ranks, self.shape)
 
     def flatten(self) -> list[int]:
         """Return a flattened list of physical device IDs."""
-        from fluxway.common.tensor_backend import get_backend
-
-        try:
-            backend = get_backend()
-            # If device_ids is tracer, to_numpy will fail, but flatten() usage implies host-side often.
-            # If used in JIT, we return list? No, JIT can't return list of ints derived from tracers.
-            # Assume flatten is for eager use.
-            return backend.to_numpy(self.device_ids).flatten().tolist()
-        except Exception:
-            return self.device_ids.flatten().tolist()
+        if not isinstance(self.device_ids, np.ndarray):
+            raise TypeError("DeviceMesh.flatten requires host device IDs")
+        return self.device_ids.flatten().tolist()
 
     def __repr__(self) -> str:
         return f"DeviceMesh(shape={self.shape}, axis_names={self.axis_names})"
 
     def __hash__(self):
-        return hash((self.shape, self.axis_names))
+        return hash((self.shape, self.axis_names, self.device_ids.tobytes()))
 
     def __eq__(self, other):
         if not isinstance(other, DeviceMesh):
             return False
-        return self.shape == other.shape and self.axis_names == other.axis_names
+        return (
+            self.shape == other.shape
+            and self.axis_names == other.axis_names
+            and np.array_equal(self.device_ids, other.device_ids)
+        )
 
     def to_backend_mesh(self, backend_engine: Any = None):
         """Convert to the mesh representation of the corresponding backend framework (e.g. JAX Mesh or PyTorch DeviceMesh)."""
         raise NotImplementedError("Backend conversion not implemented yet.")
+
+
+def _restore_device_mesh(
+    axis_names: tuple[str, ...],
+    shape: tuple[int, ...],
+    device_ids: np.ndarray,
+    frozen: bool,
+) -> DeviceMesh:
+    mesh = DeviceMesh(axis_names, shape, device_ids)
+    return mesh.freeze() if frozen else mesh
 
 
 # JAX Pytree Registration
@@ -199,6 +257,7 @@ try:
     def _dm_unflatten(aux_data, children):
         # Reconstruct without invoking __init__ (avoids numpy conversion of Tracers)
         obj = object.__new__(DeviceMesh)
+        object.__setattr__(obj, "_frozen", False)
         obj._shape, obj._axis_names = aux_data
         obj.device_ids = children[0]
 

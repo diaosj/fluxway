@@ -4,9 +4,9 @@ Fluxway normally keeps user code away from the `SPMDWorker` actor event loop.
 The scheduler, mailbox receiver, prepare runtime, and delivery runtime must keep
 making progress while user operators run.
 
-Some classes still must execute inside the SPMD worker process. Use
-`@fluxway.requires_worker_process` only when the class initializes or owns
-process-local runtime state.
+Every stateful operator class is instantiated once inside its planned SPMD
+worker process. Use `@fluxway.requires_worker_process` when construction
+depends on worker topology or initializes process-local runtime state.
 
 ```python
 import jax
@@ -28,23 +28,40 @@ Common reasons:
 - `jax.distributed.initialize`
 - process-local GPU or accelerator runtime state
 - libraries that must be initialized in the same process as the SPMD worker
-- native handles that cannot move to a separate Ray execution actor
+- native handles whose construction requires final rank and node information
 
-Do not add it to ordinary stateful operators. `@requires_worker_process` keeps
-state in the worker process, so the class must be designed for that lifecycle.
+Ordinary stateful operators need no marker because their owner instance already
+belongs to the SPMD worker. The marker makes the construction requirement
+explicit and enables validation of process-local initialization.
 
 ## Runtime Semantics
 
-`@requires_worker_process` does not mean synchronous inline execution on the
-Ray actor event loop. Fluxway submits process-affine `CALL` nodes to
-`WorkerProcessCallRuntime`:
+Stateful ownership does not mean inline execution on the Ray actor event loop.
+Fluxway asynchronously submits every ordinary Python `CALL` node to its named
+lane in `WorkerProcessCallRuntime` from the first invocation. Stateful and
+process-affine callables use the same path even when they return an awaitable:
 
 - the actor event loop submits work and awaits a future
-- synchronous user code runs in the same process on a worker-local thread
+- ordinary Python callables run in the same process on worker-local threads
 - if the callable returns an awaitable, the runtime completes it inside the
   worker thread
 - `contextvars` such as rank/world/step are propagated
 - exceptions propagate back to the LocalStepPlan and poison the worker normally
+
+Fluxway selects the execution lane once per call. With profiling enabled,
+`user_callable.execute` records end-to-end latency including queue wait, while
+`user_callable.function_run` records the actual operator function invocation,
+excluding lane queueing and worker context setup. For worker execution,
+`worker_process_call.thread_run` records the exact worker-thread execution
+interval. Profiling observes the selected lane and does not dispatch it again.
+
+Every coroutine function uses the `COROUTINE_ASYNC` execution mode and may run
+cooperatively on the actor event loop. State and process affinity do not change
+this selection: `StatePolicy` controls access to mutable state, while
+`@requires_worker_process` controls object construction and lifetime. A
+coroutine must yield during waits and must not hide blocking work inside
+`async def`; ordinary Python functions are submitted asynchronously to their
+named worker-process lane from the first invocation.
 
 This preserves event-loop progress for:
 
@@ -59,6 +76,11 @@ is an event-loop isolation mechanism, not a promise of CPU parallel speedup.
 JAX, CuPy, native kernels, Ray RPC waits, and many I/O paths can still overlap
 because they release the GIL or are backend driven.
 
+On free-threaded CPython 3.14 and later, the same named worker-process lanes can
+run Python bytecode in parallel. Fluxway does not expose a second execution
+mode for this interpreter capability; lane isolation and scheduling semantics
+remain identical across CPython builds.
+
 ## State And Resource Rules
 
 `AsyncPolicy` controls concurrency:
@@ -71,7 +93,8 @@ because they release the GIL or are backend driven.
 If a process-affine class has mutable Python state and is not explicitly
 thread-safe, use the default `AsyncPolicy.sync()` or `StatePolicy.exclusive()`.
 
-Process-affine does not forbid local overlap. A `@requires_worker_process` class
+Process-affine construction does not forbid local overlap. A
+`@requires_worker_process` class
 may expose stateless helper operators with `StatePolicy.thread_safe()` while
 keeping model/state mutating operators exclusive. The recommendation
 `DenseSPMD` uses this split:

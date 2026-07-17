@@ -5,7 +5,7 @@ import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types import Graph, Node, SPMDConfig
+from fluxway.common.types import Node, SPMDConfig
 from fluxway.placement import (
     AFFINITY_FIRST_V1,
     PlacementGroupTimeoutError,
@@ -16,6 +16,7 @@ from fluxway.placement import (
 )
 from fluxway.control_plane.scheduler import Scheduler
 from fluxway.control_plane.scheduler.pg_manager import PGManager
+from .test_planner import placement_graph, placement_inventory
 
 
 class RayIntegrationSPMD: ...
@@ -41,7 +42,7 @@ def test_plain_ray_cluster_materializes_recipe() -> None:
         ray.init(num_cpus=2, include_dashboard=False)
     scheduler = None
     try:
-        graph = Graph(
+        graph = placement_graph(
             nodes={
                 "worker": Node(
                     name="worker",
@@ -49,26 +50,26 @@ def test_plain_ray_cluster_materializes_recipe() -> None:
                         spmd_id="worker",
                         mesh=DeviceMesh(("data",), device_shape=(1,)),
                     ),
-                    spmd_class_module=RayIntegrationSPMD.__module__,
-                    spmd_class_qualname=RayIntegrationSPMD.__qualname__,
+                    spmd_class=RayIntegrationSPMD,
+                    resource_profile=ResourceProfile(base={"CPU": 1}),
                 )
             }
         )
         recipe = PlacementRecipe(
             recipe_id="plain-ray",
             version="1.0.0",
-            profiles={RayIntegrationSPMD: ResourceProfile(base={"CPU": 1})},
             constraints=(),
             objective=AFFINITY_FIRST_V1,
         )
         scheduler = Scheduler(
+            graph=graph,
             placement_recipe=recipe,
             placement_runtime=PlacementRuntimeConfig(
                 solve_timeout_s=10, pg_timeout_s=10
             ),
         )
 
-        assert asyncio.run(scheduler.allocate_resources(graph)) is None
+        assert asyncio.run(scheduler.allocate_resources()) is None
         assert scheduler.allocation_report is not None
         assert scheduler.allocation_report.status == "PG_READY"
         worker_group = scheduler.pg_manager.get_worker_group("worker")
@@ -104,7 +105,11 @@ def test_plain_ray_cluster_materializes_multiple_accelerator_resources() -> None
         )
     scheduler = None
     try:
-        graph = Graph(
+        resources = {
+            "accelerator_type:H100": 1,
+            "accelerator_type:TPU": 1,
+        }
+        graph = placement_graph(
             nodes={
                 "accelerated": Node(
                     name="accelerated",
@@ -112,30 +117,26 @@ def test_plain_ray_cluster_materializes_multiple_accelerator_resources() -> None
                         spmd_id="accelerated",
                         mesh=DeviceMesh(("data",), device_shape=(1,)),
                     ),
-                    spmd_class_module=MultiAcceleratorIntegrationSPMD.__module__,
-                    spmd_class_qualname=MultiAcceleratorIntegrationSPMD.__qualname__,
+                    spmd_class=MultiAcceleratorIntegrationSPMD,
+                    resource_profile=ResourceProfile(base=resources),
                 )
             }
         )
-        resources = {
-            "accelerator_type:H100": 1,
-            "accelerator_type:TPU": 1,
-        }
         recipe = PlacementRecipe(
             recipe_id="plain-ray-multi-accelerator",
             version="1.0.0",
-            profiles={MultiAcceleratorIntegrationSPMD: ResourceProfile(base=resources)},
             constraints=(),
             objective=AFFINITY_FIRST_V1,
         )
         scheduler = Scheduler(
+            graph=graph,
             placement_recipe=recipe,
             placement_runtime=PlacementRuntimeConfig(
                 solve_timeout_s=10, pg_timeout_s=10
             ),
         )
 
-        assert asyncio.run(scheduler.allocate_resources(graph)) is None
+        assert asyncio.run(scheduler.allocate_resources()) is None
         worker_group = scheduler.pg_manager.get_worker_group("accelerated")
         node_id = ray.get(
             report_node_id.options(
@@ -163,7 +164,7 @@ def test_plain_ray_cluster_surfaces_real_pg_timeout() -> None:
     blocker = None
     manager = PGManager()
     try:
-        graph = Graph(
+        graph = placement_graph(
             nodes={
                 "worker": Node(
                     name="worker",
@@ -171,26 +172,28 @@ def test_plain_ray_cluster_surfaces_real_pg_timeout() -> None:
                         spmd_id="worker",
                         mesh=DeviceMesh(("data",), device_shape=(1,)),
                     ),
-                    spmd_class_module=RayIntegrationSPMD.__module__,
-                    spmd_class_qualname=RayIntegrationSPMD.__qualname__,
+                    spmd_class=RayIntegrationSPMD,
+                    resource_profile=ResourceProfile(base={"CPU": 1}),
                 )
             }
         )
         recipe = PlacementRecipe(
             recipe_id="plain-ray-timeout",
             version="1.0.0",
-            profiles={RayIntegrationSPMD: ResourceProfile(base={"CPU": 1})},
             constraints=(),
             objective=AFFINITY_FIRST_V1,
         )
         scheduler = Scheduler(
+            graph=graph,
             placement_recipe=recipe,
             placement_runtime=PlacementRuntimeConfig(
                 solve_timeout_s=10, pg_timeout_s=10
             ),
         )
         snapshot = scheduler._capture_snapshot()
-        plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        plan = PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
         blocker = CPUBlocker.remote()  # type: ignore[attr-defined] # pylint: disable=no-member
         assert ray.get(blocker.ready.remote()) is True  # type: ignore[attr-defined]
 

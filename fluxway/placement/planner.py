@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import math
 import time
@@ -13,7 +12,7 @@ from typing import Any, cast
 
 from ortools.sat.python import cp_model
 
-from fluxway.common.types import Graph
+from fluxway.resources import normalize_resource_vector
 
 from .compiler import (
     _CompiledModel,
@@ -59,8 +58,8 @@ from .models import (
     DEFAULT_MAX_MODEL_VARIABLES,
     DEFAULT_MAX_OBJECTIVE_COMPONENTS,
     DEFAULT_MAX_SORTING_COMPARATORS,
-    normalize_resources,
 )
+from .inventory import PlacementInventory
 from .semantics import _AssignmentEvaluator, _ExpressionResolver
 
 logger = logging.getLogger(__name__)
@@ -90,7 +89,7 @@ class PlacementPlanner:
         if solve_timeout_s <= 0:
             raise ValueError("solve_timeout_s must be positive")
         self._solve_timeout_s = solve_timeout_s
-        self._driver_resources = normalize_resources(driver_resources or {})
+        self._driver_resources = normalize_resource_vector(driver_resources or {})
         limits = {
             "max_objective_components": max_objective_components,
             "max_sorting_comparators": max_sorting_comparators,
@@ -455,32 +454,29 @@ class PlacementPlanner:
 
     def resolve(
         self,
-        graph: Graph,
+        inventory: PlacementInventory,
         recipe: PlacementRecipe,
         snapshot: ClusterSnapshot,
     ) -> ResolvedPlacementPlan:
         deadline = time.monotonic() + self._solve_timeout_s
-        recipe = recipe.normalized
         logger.info(
-            "placement.recipe.selected recipe_id=%s version=%s digest=%s",
+            "placement.recipe.selected recipe_id=%s version=%s",
             recipe.recipe_id,
             recipe.version,
-            recipe.digest,
         )
         logger.info(
             "placement.capacity.snapshot nodes=%s available=%s",
             len(snapshot.nodes),
             snapshot.available,
         )
-        self._require_exclusive_resources(recipe, snapshot)
-        workers = self._expand_workers(graph, recipe)
-        resolver = _ExpressionResolver(graph, workers, recipe.constraints)
+        self._require_exclusive_resources(inventory, snapshot)
+        workers = self._expand_workers(inventory)
+        resolver = _ExpressionResolver(inventory, workers, recipe.constraints)
         logger.info(
-            "placement.program.normalized constraints=%s workers=%s digest=%s ast=%s",
+            "placement.problem.created constraints=%s workers=%s recipe=%r",
             len(recipe.constraints),
             len(workers),
-            recipe.digest,
-            json.dumps(recipe.model_dump(mode="json"), sort_keys=True),
+            recipe,
         )
         units = self._placement_units(workers, resolver, recipe)
         self._require_complexity(recipe, resolver, workers, units, snapshot)
@@ -516,8 +512,7 @@ class PlacementPlanner:
         plan = ResolvedPlacementPlan(
             recipe_id=recipe.recipe_id,
             recipe_version=recipe.version,
-            recipe_digest=recipe.digest,
-            normalized_recipe=recipe,
+            recipe=recipe,
             assignments=assignments,
             allocated_quanta=allocated_quanta,
             objective_results=objective_results,
@@ -538,14 +533,23 @@ class PlacementPlanner:
 
     def _require_exclusive_resources(
         self,
-        recipe: PlacementRecipe,
+        inventory: PlacementInventory,
         snapshot: ClusterSnapshot,
     ) -> None:
-        requested = set(self._driver_resources)
-        for binding in recipe.profiles:
-            requested.update(binding.profile.base)
-            if binding.profile.scale is not None:
-                requested.update(binding.profile.scale.step)
+        requested = {
+            resource
+            for resource, quantity in self._driver_resources.items()
+            if quantity > 0
+        }
+        requested.update(inventory.resource_names)
+        cluster_resources = {
+            resource for node in snapshot.nodes for resource in node.resources
+        }
+        missing = sorted(requested - cluster_resources)
+        if missing:
+            raise PlacementContractError(
+                f"Ray cluster does not expose requested resources: {missing}"
+            )
         nonexclusive = {}
         for resource in sorted(requested):
             total = sum(
@@ -566,19 +570,18 @@ class PlacementPlanner:
 
     def attest(
         self,
-        graph: Graph,
+        inventory: PlacementInventory,
         recipe: PlacementRecipe,
         snapshot: ClusterSnapshot,
         plan: ResolvedPlacementPlan,
         actual_node_ids: Mapping[str, tuple[str, ...]],
     ) -> ResolvedPlacementPlan:
-        recipe = recipe.normalized
-        if plan.recipe_digest != recipe.digest:
+        if plan.recipe != recipe:
             raise PlacementAttestationError(
-                "resolved plan and attestation Recipe digests differ"
+                "resolved plan and attestation Recipe differ"
             )
-        workers = self._expand_workers(graph, recipe)
-        resolver = _ExpressionResolver(graph, workers, recipe.constraints)
+        workers = self._expand_workers(inventory)
+        resolver = _ExpressionResolver(inventory, workers, recipe.constraints)
         expected_spmd_ids = {worker.spmd_id for worker in workers}
         if set(actual_node_ids) != expected_spmd_ids:
             raise PlacementAttestationError(
@@ -622,60 +625,28 @@ class PlacementPlanner:
             plan.resource_fragmentation_score,
             plan.resource_fragmentation_scale,
         )
-        return plan.model_copy(
-            update={
-                "assignments": assignments,
-                "constraint_results": constraint_results,
-                "occupancy": occupancy,
-                "support": support,
-            }
+        return cast(
+            ResolvedPlacementPlan,
+            plan.model_copy(
+                update={
+                    "assignments": assignments,
+                    "constraint_results": constraint_results,
+                    "occupancy": occupancy,
+                    "support": support,
+                }
+            ),
         )
 
-    def _expand_workers(
-        self, graph: Graph, recipe: PlacementRecipe
-    ) -> tuple[_Worker, ...]:
-        profiles = {
-            (binding.spmd.module, binding.spmd.qualname): binding.profile
-            for binding in recipe.profiles
-        }
-        graph_classes: defaultdict[tuple[str, str], list[str]] = defaultdict(list)
-        for spmd_id, node in graph.nodes.items():
-            if node.spmd_class_module is None or node.spmd_class_qualname is None:
-                raise PlacementContractError(
-                    f"Graph SPMD {spmd_id!r} has no stable class identity"
-                )
-            graph_classes[(node.spmd_class_module, node.spmd_class_qualname)].append(
-                spmd_id
-            )
-        missing_profiles = [
-            spmd_id
-            for class_ref, spmd_ids in graph_classes.items()
-            if class_ref not in profiles
-            for spmd_id in spmd_ids
-        ]
-        if missing_profiles:
-            raise PlacementContractError(
-                f"SPMDs have no resource profile: {sorted(missing_profiles)}"
-            )
-        unmatched_profiles = sorted(set(profiles) - set(graph_classes))
-        if unmatched_profiles:
-            raise PlacementContractError(
-                f"resource profiles do not match Graph classes: {unmatched_profiles}"
-            )
+    def _expand_workers(self, inventory: PlacementInventory) -> tuple[_Worker, ...]:
         workers: list[_Worker] = []
-        for spmd_id, node in sorted(graph.nodes.items()):
-            class_ref = cast(
-                tuple[str, str],
-                (node.spmd_class_module, node.spmd_class_qualname),
-            )
-            profile = profiles[class_ref]
-            for rank in range(node.spmd_config.num_workers):
+        for declaration in inventory.declarations:
+            for rank in range(declaration.world_size):
                 workers.append(
                     _Worker(
                         index=len(workers),
-                        spmd_id=spmd_id,
+                        spmd_id=declaration.spmd_id,
                         rank=rank,
-                        profile=profile,
+                        profile=declaration.resource_profile,
                         driver_resources=(self._driver_resources if rank == 0 else {}),
                     )
                 )
@@ -684,13 +655,7 @@ class PlacementPlanner:
     def _worker_resources(
         self, worker: _Worker, units: Mapping[str, int]
     ) -> dict[str, Decimal]:
-        resources = dict(worker.profile.base)
-        if worker.profile.scale is not None:
-            for resource, quantity in worker.profile.scale.step.items():
-                resources[resource] = resources.get(resource, Decimal(0)) + (
-                    quantity * units[worker.spmd_id]
-                )
-        return resources
+        return dict(worker.profile.resources_at(units[worker.spmd_id]))
 
     def _placement_resources(
         self, worker: _Worker, units: Mapping[str, int]
@@ -1030,9 +995,9 @@ class PlacementPlanner:
                         f"node {node.node_id!r} {resource!r} fragmentation upper bound"
                     ),
                 )
-                packed = sum(
-                    unit.get(resource, 0) * count
-                    for unit, count in zip(allocation_units, pack_counts, strict=True)
+                packed = cp_model.LinearExpr.weighted_sum(
+                    pack_counts,
+                    [unit.get(resource, 0) for unit in allocation_units],
                 )
                 residual = -node_usage[(node_index, resource)] + resource_units.units(
                     resource, node.resources.get(resource, Decimal(0))
@@ -1043,7 +1008,7 @@ class PlacementPlanner:
                     fragmentation_upper // fragmentation_weights[resource],
                     f"fragmentation_{node_index}_{resource}",
                 )
-                model.add(remainder == residual - packed)
+                model.add(remainder + packed == residual)
                 fragmentation[(node_index, resource)] = remainder
         compiled = _CompiledModel(
             model=model,
@@ -1116,7 +1081,7 @@ class PlacementPlanner:
                 "incident_spmds=%s isolated_spmds=%s",
                 index,
                 objective.kind,
-                json.dumps(objective.model_dump(mode="json"), sort_keys=True),
+                repr(objective),
                 sorted(resolver.incident_spmd_ids()),
                 sorted(set(resolver.spmd_ids) - resolver.incident_spmd_ids()),
             )

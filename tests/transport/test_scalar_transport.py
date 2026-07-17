@@ -9,7 +9,7 @@ from fluxway.common.tensor_backend import set_backend
 from fluxway.common.types.sharding import ShardingConfig
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.transport.communication import AsyncDataDistributor
-from fluxway.transport.manifest import EDGE_EXPECTED_COUNT, FRAME_SENDER_SPMD_CODE
+from fluxway.transport.manifest import ENTRY_EXPECTED_COUNT, FRAME_SENDER_SPMD_CODE
 
 
 @pytest.fixture(autouse=True)
@@ -41,7 +41,7 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
             source=source_spec,
             target=target_spec,
             send_fn=send_fn,
-            tuuid=20,
+            transfer_codes=20,
             step=1,
             sender_spmd_code=9,
             sender_rank=rank,
@@ -56,5 +56,5 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
     assert set(captured1) == {1}
     assert int(captured0[0][0].frame_i32[FRAME_SENDER_SPMD_CODE]) == 9
     assert int(captured1[1][0].frame_i32[FRAME_SENDER_SPMD_CODE]) == 9
-    assert int(captured0[0][0].edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
+    assert int(captured0[0][0].entry_i32[0, ENTRY_EXPECTED_COUNT]) == 1
     assert np.asarray(captured0[0][1][0]).shape == ()

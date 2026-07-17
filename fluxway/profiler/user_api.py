@@ -75,6 +75,14 @@ class UserProfilerHandle:
             attrs_json=_attrs_json(attrs),
         )
 
+    def function_scope(self) -> Any:
+        return self._recorder.user_callable_function_run(
+            op_name=self._op_name,
+            step=self._step,
+            rank=self._rank,
+            execution_mode=self._execution_mode,
+        )
+
 
 def enabled() -> bool:
     return _ACTIVE_USER_PROFILER.get() is not None
@@ -92,6 +100,13 @@ def event(name: str, **attrs: Any) -> None:
     if handle is None:
         return
     handle.event(name, attrs)
+
+
+def function_scope() -> Any:
+    handle = _ACTIVE_USER_PROFILER.get()
+    if handle is None:
+        return _NOOP_SCOPE
+    return handle.function_scope()
 
 
 @contextmanager

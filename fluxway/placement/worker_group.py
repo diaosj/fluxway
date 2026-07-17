@@ -15,12 +15,24 @@ def ray_actor_options(resources: Mapping[str, Decimal]) -> dict[str, Any]:
     memory = values.pop("memory", 0)
     if memory > 0:
         options["memory"] = memory
+    object_store_memory = values.pop("object_store_memory", 0)
+    if object_store_memory > 0:
+        options["object_store_memory"] = object_store_memory
     custom = {
         resource: quantity for resource, quantity in values.items() if quantity > 0
     }
     if custom:
         options["resources"] = custom
     return options
+
+
+def worker_tensor_device(resources: Mapping[str, Decimal]) -> str:
+    gpu_quantity = resources.get("GPU", Decimal(0))
+    if gpu_quantity < 0:
+        raise ValueError(
+            f"GPU resource quantity must be non-negative, got {gpu_quantity}."
+        )
+    return "cuda" if gpu_quantity > 0 else "cpu"
 
 
 def attest_node_ids(

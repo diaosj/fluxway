@@ -1,183 +1,272 @@
-import sys
-import os
+from typing import Any
+from unittest.mock import AsyncMock
+
 import numpy as np
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
-sys.path.append(os.getcwd())
-
-from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.configs import (
-    ArgumentType,
-    OperatorMeta,
-    SPMDConfig,
-    SPMDTopology,
-    SPMDTopologyInfo,
+from fluxway.common.compiled_graph import (
+    DependencySpec,
+    OperatorKey,
+    OperatorPort,
+    TensorTransfer,
 )
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.rpc.protocol import TransportFrameEnvelope
 from fluxway.spmd.worker.worker import SPMDWorker
-from fluxway.transport.manifest import EmptyKind, PayloadRole, TransportFrameBuilder
+from fluxway.transport.manifest import (
+    PayloadRole,
+    TensorEntryKind,
+    TransportFrameBuilder,
+)
+from tests.compiled_graph_fixtures import (
+    compile_test_graph,
+    spmd_config_from_graph,
+)
 
 
-def _make_test_config(mesh: DeviceMesh, spmd_id: str = "") -> SPMDConfig:
-    """Create a minimal SPMDConfig with a no-op 'test_op' operator registered."""
-    meta = OperatorMeta(name="test_op", input_arguments=None, output_arguments=None)
+class _IntegrationOperators:
+    def produce_one(self) -> dict[str, Any]:
+        return {"x": np.asarray([1.0])}
 
-    def dummy_fn():
-        pass
+    def produce_two(self) -> dict[str, Any]:
+        return {"x": np.asarray([1.0]), "y": np.asarray([2.0])}
 
-    return SPMDConfig(
-        mesh=mesh,
-        spmd_id=spmd_id,
-        operators={"test_op": "test_op"},
-        operator_metas={"test_op": meta},
-        active_operator_names=("test_op",),
+    def test_op(self, x: Any) -> Any:
+        return x
+
+    def compute(self, x: Any, y: Any) -> tuple[Any, Any]:
+        return x, y
+
+    def control_target(self) -> None:
+        return None
+
+
+def _worker_class():
+    metadata = getattr(SPMDWorker, "__ray_metadata__", None)
+    return metadata.modified_class if metadata else SPMDWorker
+
+
+def _single_transfer_plan(mesh: DeviceMesh):
+    sharding = ShardingSpec.chunk(PartitionSpec())
+    return compile_test_graph(
+        name="worker-single-transfer",
+        spmds={
+            "source": (
+                mesh,
+                {
+                    "produce_one": OperatorSpec(
+                        name="produce_one",
+                        owner=_IntegrationOperators,
+                        is_source=True,
+                        output_arguments={"data": ("x",)},
+                        output_sharding={"x": sharding},
+                    )
+                },
+            ),
+            "target": (
+                mesh,
+                {
+                    "test_op": OperatorSpec(
+                        name="test_op",
+                        owner=_IntegrationOperators,
+                        input_arguments={"data": ("x",)},
+                        input_sharding={"x": sharding},
+                    )
+                },
+            ),
+        },
+        dependencies=(
+            DependencySpec(
+                source=OperatorKey("source", "produce_one"),
+                target=OperatorKey("target", "test_op"),
+                transfers=(TensorTransfer(OperatorPort("x"), OperatorPort("x")),),
+            ),
+        ),
     )
 
 
-@pytest.fixture
-def mock_mesh():
-    return DeviceMesh(axis_names=("data",), device_shape=(1,))
+def _bundled_transfer_plan(mesh: DeviceMesh):
+    sharding = ShardingSpec.chunk(PartitionSpec("data"))
+    return compile_test_graph(
+        name="worker-bundled-transfer",
+        spmds={
+            "source": (
+                mesh,
+                {
+                    "produce_two": OperatorSpec(
+                        name="produce_two",
+                        owner=_IntegrationOperators,
+                        is_source=True,
+                        output_arguments={"data": ("x", "y")},
+                        output_sharding={"x": sharding, "y": sharding},
+                    )
+                },
+            ),
+            "target": (
+                mesh,
+                {
+                    "compute": OperatorSpec(
+                        name="compute",
+                        owner=_IntegrationOperators,
+                        input_arguments={"data": ("x", "y")},
+                        input_sharding={"x": sharding, "y": sharding},
+                    )
+                },
+            ),
+        },
+        dependencies=(
+            DependencySpec(
+                source=OperatorKey("source", "produce_two"),
+                target=OperatorKey("target", "compute"),
+                transfers=(
+                    TensorTransfer(OperatorPort("x"), OperatorPort("x")),
+                    TensorTransfer(OperatorPort("y"), OperatorPort("y")),
+                ),
+            ),
+        ),
+    )
 
 
-@pytest.fixture
-def worker_config(mock_mesh):
-    return _make_test_config(mock_mesh, spmd_id="test_spmd")
+def _control_config(mesh: DeviceMesh):
+    plan = compile_test_graph(
+        name="worker-control",
+        spmds={
+            "target": (
+                mesh,
+                {
+                    "control_target": OperatorSpec(
+                        name="control_target",
+                        owner=_IntegrationOperators,
+                    )
+                },
+            )
+        },
+        dependencies=(),
+    )
+    return spmd_config_from_graph(plan, "target")
 
 
 @pytest.mark.asyncio
-async def test_worker_receive_transport_frame_dispatches_to_mailbox(worker_config):
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-    worker = cls(worker_config, rank=0, spmd_id="test_spmd")
+async def test_worker_receive_transport_frame_dispatches_to_mailbox():
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
+    plan = _single_transfer_plan(mesh)
+    config = spmd_config_from_graph(plan, "target")
+    worker = _worker_class()(config, rank=0, spmd_id="target")
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
-    worker.register_spmd_code_map(1, {1: "src_spmd"})
-
-    assert worker._op_manager is not None
-    worker._op_manager.get_operators_for_tuuid = MagicMock(return_value=["test_op"])
-    worker._op_manager.get_expected_tensor_shards = MagicMock(return_value={42: 1})
-    worker._op_manager.get_expected_control_arg_names = MagicMock(return_value=[])
-    worker._op_manager.get_operator_metadata = MagicMock(return_value=None)
+    worker.register_spmd_code_map(1, {1: "source"})
+    transfer_code = plan.dependencies[0].transfers[0].transfer_code
 
     test_data = np.array([1.0, 2.0])
     builder = TransportFrameBuilder(
-        step=0, sender_spmd_code=1, sender_rank=0, sender_world_size=1
+        step=0,
+        sender_spmd_code=1,
+        sender_rank=0,
+        sender_world_size=1,
     )
-    edge = builder.add_edge(
-        tuuid=42,
+    entry_index = builder.add_tensor_transfer_entry(
+        transfer_code=transfer_code,
         meta_state=0,
-        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
-        min_rows=0,
+        tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
         source_step=0,
     )
-    builder.add_payload(edge, PayloadRole.VALUES, test_data, 2)
+    builder.add_payload(entry_index, PayloadRole.VALUES, test_data, 2)
     frame = builder.build()
+
     await worker.receive_transport_frames(
         (
             TransportFrameEnvelope(
                 header=frame.header,
-                payload_segments=tuple(frame.payload_segments),
+                payload_segments=frame.payload_segments,
             ),
         )
     )
 
-    stored = await worker._mailbox.get_tensor_shard_views("test_op", 42, 0)
-    assert ("src_spmd", 0) in stored
-    np.testing.assert_array_equal(stored[("src_spmd", 0)][0].flat_values, test_data)
+    stored = await worker._mailbox.get_tensor_shard_views(
+        "test_op",
+        transfer_code,
+        0,
+    )
+    assert ("source", 0) in stored
+    np.testing.assert_array_equal(stored[("source", 0)][0].flat_values, test_data)
 
 
 @pytest.mark.asyncio
-async def test_worker_receive_bundled_frame_dispatches_all_edges_to_mailbox():
+async def test_worker_receive_bundled_frame_dispatches_all_transfers_to_mailbox():
     mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
-    input_spec = ShardingSpec.chunk(PartitionSpec("data"))
-    meta = OperatorMeta(
-        name="compute",
-        input_arguments={ArgumentType.DATA.value: ["x", "y"]},
-        input_sharding={"x": input_spec, "y": input_spec},
-        output_arguments=None,
-    )
-    config = SPMDConfig(
-        mesh=mesh,
-        operators={"compute": "compute"},
-        operator_metas={"compute": meta},
-        topology={
-            "compute": SPMDTopology(
-                predecessors={
-                    "s0": SPMDTopologyInfo(
-                        spmd_id="s0",
-                        world_size=2,
-                        mesh=mesh,
-                        tuuid_sharding={998: input_spec, 999: input_spec},
-                        tuuid_map={"x": 998, "y": 999},
-                    )
-                }
-            )
-        },
-        active_operator_names=("compute", "compute"),
-    )
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-    worker = cls(config, rank=0)
+    plan = _bundled_transfer_plan(mesh)
+    config = spmd_config_from_graph(plan, "target")
+    worker = _worker_class()(config, rank=0, spmd_id="target")
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
-    worker.register_spmd_code_map(3, {3: "s0"})
+    worker.register_spmd_code_map(3, {3: "source"})
+    input_codes = worker.op_manager.get_input_transfer_codes("compute")
 
     first = np.array([1, 2])
     second = np.array([3, 4])
     builder = TransportFrameBuilder(
-        step=1, sender_spmd_code=3, sender_rank=0, sender_world_size=2
+        step=1,
+        sender_spmd_code=3,
+        sender_rank=0,
+        sender_world_size=2,
     )
-    first_edge = builder.add_edge(
-        tuuid=998,
-        meta_state=0,
-        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
-        min_rows=0,
-        expected_count=1,
-        source_step=1,
-    )
-    builder.add_payload(first_edge, PayloadRole.VALUES, first, 2)
-    second_edge = builder.add_edge(
-        tuuid=999,
-        meta_state=0,
-        empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
-        min_rows=0,
-        expected_count=1,
-        source_step=1,
-    )
-    builder.add_payload(second_edge, PayloadRole.VALUES, second, 2)
+    for transfer_code, payload in (
+        (input_codes["compute.x"], first),
+        (input_codes["compute.y"], second),
+    ):
+        entry_index = builder.add_tensor_transfer_entry(
+            transfer_code=transfer_code,
+            meta_state=0,
+            tensor_kind=TensorEntryKind.TENSOR,
+            expected_count=1,
+            source_step=1,
+        )
+        builder.add_payload(entry_index, PayloadRole.VALUES, payload, len(payload))
     frame = builder.build()
 
     await worker.receive_transport_frames(
         (
             TransportFrameEnvelope(
                 header=frame.header,
-                payload_segments=tuple(frame.payload_segments),
+                payload_segments=frame.payload_segments,
             ),
         )
     )
 
-    first_stored = await worker._mailbox.get_tensor_shard_views("compute", 998, 1)
-    second_stored = await worker._mailbox.get_tensor_shard_views("compute", 999, 1)
-    np.testing.assert_array_equal(first_stored[("s0", 0)][0].flat_values, first)
-    np.testing.assert_array_equal(second_stored[("s0", 0)][0].flat_values, second)
+    first_stored = await worker._mailbox.get_tensor_shard_views(
+        "compute",
+        input_codes["compute.x"],
+        1,
+    )
+    second_stored = await worker._mailbox.get_tensor_shard_views(
+        "compute",
+        input_codes["compute.y"],
+        1,
+    )
+    np.testing.assert_array_equal(first_stored[("source", 0)][0].flat_values, first)
+    np.testing.assert_array_equal(second_stored[("source", 0)][0].flat_values, second)
 
 
 @pytest.mark.asyncio
-async def test_worker_receive_control_dispatches_to_mailbox(worker_config):
-    """Verify that receive_control correctly calls deposit_control_arguments on the mailbox."""
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-    worker = cls(worker_config, rank=0, spmd_id="test_spmd")
+async def test_worker_receive_control_dispatches_to_mailbox():
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
+    config = _control_config(mesh)
+    worker = _worker_class()(config, rank=0, spmd_id="target")
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
-
     worker._mailbox.deposit_control_arguments = AsyncMock()
-    worker._ensure_step_declared = lambda *a, **kw: None
+    worker._ensure_step_declared = lambda *args, **kwargs: None
 
-    await worker.receive_control(op_name="test_op", step=3, names=["lr"], values=[0.01])
+    await worker.receive_control(
+        op_name="control_target",
+        step=3,
+        names=["lr"],
+        values=[0.01],
+    )
 
-    worker._mailbox.deposit_control_arguments.assert_called_once()
-    _, kwargs = worker._mailbox.deposit_control_arguments.call_args
-    assert kwargs.get("names") == [
-        "lr"
-    ] or worker._mailbox.deposit_control_arguments.call_args[0][2:4] == (["lr"], [0.01])
+    worker._mailbox.deposit_control_arguments.assert_awaited_once_with(
+        "control_target",
+        step=3,
+        names=["lr"],
+        values=[0.01],
+    )

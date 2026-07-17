@@ -20,8 +20,8 @@ import functools
 import inspect
 import os
 from pathlib import Path
-import time
-from typing import Any
+from typing import Any, TypeVar
+from collections.abc import Callable
 
 import numpy as np
 import ray
@@ -31,6 +31,7 @@ from fluxway.common.types import (
     ControllerEvent,
     ControllerState,
     DriverHeartbeat,
+    ExecutionFailure,
     FlowControlState,
     Graph,
     HeartbeatConfig,
@@ -38,13 +39,14 @@ from fluxway.common.types import (
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
 from fluxway.control_plane.monitor import Monitor
-from fluxway.control_plane.scheduler import Scheduler
+from fluxway.control_plane.scheduler import Scheduler, build_topology
 from fluxway.control_plane.spmd_manager import SPMDManager, SPMDHandle
 from fluxway.control_plane.state_manager import StateManager
 from fluxway.control_plane.heartbeat import HeartbeatManager
 from fluxway.control_plane.flow_control import FlowControlManager
 from fluxway.control_plane.state_machine import ControllerStateMachine
 from fluxway.control_plane.async_manager import AsyncStepManager
+from fluxway.control_plane.errors import ExecutionFailedError
 from fluxway.common.types import CheckpointConfig
 from fluxway.common.types.drain import DrainStrategy, GraphModeDrainStrategy
 from fluxway.rpc.protocol import DataPlaneRegistry
@@ -60,7 +62,10 @@ from fluxway.placement import (
 logger = get_logger(__name__)
 
 
-def require_manager(manager_attr: str):
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def require_manager(manager_attr: str) -> Callable[[_F], _F]:
     """
     Decorator to ensure that a manager component is initialized before calling
     the method.
@@ -73,41 +78,43 @@ def require_manager(manager_attr: str):
       raise RuntimeError unconditionally.
     """
 
-    def decorator(func):
+    def decorator(func: _F) -> _F:
         if inspect.iscoroutinefunction(func):
 
             @functools.wraps(func)
-            async def async_wrapper(self, *args, **kwargs):
+            async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                self = args[0]
                 if getattr(self, manager_attr) is None:
                     if not self._initialized:
                         logger.warning(
                             f"{func.__name__} called before controller initialized, dropping"
                         )
-                        return
+                        return None
                     raise RuntimeError(
                         f"{manager_attr.strip('_')} is None after initialization "
                         f"when calling {func.__name__}"
                     )
-                return await func(self, *args, **kwargs)
+                return await func(*args, **kwargs)
 
-            return async_wrapper
+            return async_wrapper  # type: ignore[return-value]
         else:
 
             @functools.wraps(func)
-            def sync_wrapper(self, *args, **kwargs):
+            def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+                self = args[0]
                 if getattr(self, manager_attr) is None:
                     if not self._initialized:
                         logger.warning(
                             f"{func.__name__} called before controller initialized, dropping"
                         )
-                        return
+                        return None
                     raise RuntimeError(
                         f"{manager_attr.strip('_')} is None after initialization "
                         f"when calling {func.__name__}"
                     )
-                return func(self, *args, **kwargs)
+                return func(*args, **kwargs)
 
-            return sync_wrapper
+            return sync_wrapper  # type: ignore[return-value]
 
     return decorator
 
@@ -202,12 +209,12 @@ class ControllerActor:
     def __init__(
         self,
         graph: Graph,
+        placement_recipe: PlacementRecipe,
         heartbeat_config: HeartbeatConfig | None = None,
         async_step_config: AsyncStepConfig | None = None,
         checkpoint_config: CheckpointConfig | None = None,
         transport_config: dict[str, str] | None = None,
         profiler_config: Any | None = None,
-        placement_recipe: PlacementRecipe | None = None,
         placement_runtime: PlacementRuntimeConfig | None = None,
     ):
         """
@@ -225,6 +232,7 @@ class ControllerActor:
         ensure_logging_configured()
 
         self._graph = graph
+        self._placement_recipe = placement_recipe
         self._heartbeat_config = heartbeat_config or HeartbeatConfig()
         self._async_step_config = async_step_config or AsyncStepConfig()
         self._checkpoint_config = checkpoint_config
@@ -238,16 +246,19 @@ class ControllerActor:
 
         self._monitor = Monitor()
         self._state_manager = StateManager()
-        if placement_recipe is None:
-            raise PlacementContractError("ControllerActor requires placement_recipe")
         self._scheduler = Scheduler(
             spmd_manager=None,
+            graph=graph,
             placement_recipe=placement_recipe,
             placement_runtime=placement_runtime or PlacementRuntimeConfig(),
         )
         self._state_machine = ControllerStateMachine(self)
-        self._async_step_manager = AsyncStepManager(graph, self._async_step_config)
-        self._flow_control_manager = FlowControlManager(graph, self._async_step_config)
+        self._async_step_manager = AsyncStepManager(
+            self._graph, self._async_step_config
+        )
+        self._flow_control_manager = FlowControlManager(
+            self._graph, self._async_step_config
+        )
         # snapshot_id → {expected, received, metadata, event}
         self._pending_snapshots: dict[str, Any] = {}
 
@@ -256,7 +267,9 @@ class ControllerActor:
 
         # Track source nodes (entry points)
         self._source_nodes = (
-            graph.source_nodes if graph.source_nodes else self._find_source_nodes()
+            self._graph.source_nodes
+            if self._graph.source_nodes
+            else self._find_source_nodes()
         )
 
         self._initialized = False
@@ -267,29 +280,20 @@ class ControllerActor:
         self._last_requested_drain_target: int = 0
         self._last_completed_drain_target: int = 0
         self._drained_drivers: set = set()
-        self._start_sources_when_running: bool = False
+        self._ready_event = asyncio.Event()
 
-        logger.debug(f"ControllerActor created with {len(graph.nodes)} nodes")
+        logger.debug(f"ControllerActor created with {len(self._graph.nodes)} nodes")
 
     def _find_source_nodes(self) -> list[str]:
         """Find nodes with no predecessors (source nodes)."""
-        all_targets = set()
-        for edge in self._graph.edges:
-            all_targets.add(edge.target_node)
-
-        source_nodes = []
-        for node_name in self._graph.nodes:
-            if node_name not in all_targets:
-                source_nodes.append(node_name)
-
-        return source_nodes
+        return list(self._graph.require_compiled_graph().source_spmd_ids)
 
     def get_resource_allocation_summary(self) -> dict[str, Any]:
         """Expose scheduler resource summaries for debugging and inspection."""
         if self.scheduler.allocation_report is not None:
-            return self.scheduler.allocation_report.model_dump(mode="json")
+            return self.scheduler.allocation_report.model_dump(exclude={"recipe"})
         if self.scheduler.resolved_plan is not None:
-            return self.scheduler.resolved_plan.model_dump(mode="json")
+            return self.scheduler.resolved_plan.model_dump(exclude={"recipe"})
         raise PlacementContractError("resource allocation has not been resolved")
 
     async def initialize(self) -> bool:
@@ -376,9 +380,9 @@ class ControllerActor:
                         node.spmd_config.max_steps = limit
                         logger.debug(f"Assigned max_steps={limit} to node {node_id}")
 
+                    node.spmd_config.auto_start_source_operators = False
                     if self._drain_strategy is not None:
                         node.spmd_config.requires_drain_at_startup = True
-                        node.spmd_config.auto_start_source_operators = False
 
             # Register SPMDs for heartbeat monitoring
             for node_name in self._graph.nodes:
@@ -386,7 +390,7 @@ class ControllerActor:
 
             # Allocate resources
             if profiler_recorder is None:
-                await self.scheduler.allocate_resources(self._graph)
+                await self.scheduler.allocate_resources()
             else:
                 async with profiler_recorder.spmd_manager_placement_group_create(
                     spmd_id="*",
@@ -396,28 +400,32 @@ class ControllerActor:
                         if node.spmd_config is not None
                     ),
                 ):
-                    await self.scheduler.allocate_resources(self._graph)
+                    await self.scheduler.allocate_resources()
 
             # Build and establish topology data structure
             # (adjacency lists only, no remote calls to drivers)
             if profiler_recorder is None:
-                self.scheduler.build_and_establish_topology(self._graph)
+                self.scheduler.establish_topology(
+                    build_topology(self._graph.require_compiled_graph())
+                )
             else:
                 async with profiler_recorder.controller_topology_registration(
                     spmd_count=len(self._graph.nodes),
-                    edge_count=len(self._graph.edges),
+                    edge_count=len(self._graph.require_compiled_graph().dependencies),
                 ):
-                    self.scheduler.build_and_establish_topology(self._graph)
+                    self.scheduler.establish_topology(
+                        build_topology(self._graph.require_compiled_graph())
+                    )
 
             # Start SPMDs (fire-and-forget, readiness tracked via heartbeat)
             if profiler_recorder is None:
-                await self.scheduler.init_spmds(self._graph)
+                await self.scheduler.init_spmds()
             else:
                 async with profiler_recorder.spmd_manager_driver_start(
                     spmd_id="*",
                     worker_count=len(self._graph.nodes),
                 ):
-                    await self.scheduler.init_spmds(self._graph)
+                    await self.scheduler.init_spmds()
 
             # Transition state machine: INITIALIZING → PENDING
             await self.state_machine.trigger_event(ControllerEvent.INIT_COMPLETE)
@@ -440,6 +448,61 @@ class ControllerActor:
         finally:
             if span is not None:
                 await span.__aexit__(None, None, None)
+
+    async def start(self, resume: str | int | None = None) -> int | None:
+        """
+        Main execution entry point.
+        Sequence: Initialize -> wait READY -> restore -> START -> drain -> start source.
+        """
+        if self._initialized:
+            raise RuntimeError("Controller is already initialized or started")
+
+        try:
+            # 1. Initialize
+            await self.initialize()
+
+            # 2. Wait for READY
+            await self._ready_event.wait()
+            if self.state_machine.state != ControllerState.READY:
+                raise RuntimeError(
+                    f"Failed to reach READY state, current state: {self.state_machine.state}"
+                )
+
+            # 3. Restore
+            restored_step = None
+            if resume is not None:
+                if self._checkpointer is None:
+                    raise ValueError("Cannot resume without a checkpoint_config")
+                restored_step = await self._checkpointer.restore(resume)
+
+            # 4. Trigger START -> RUNNING
+            success = await self.state_machine.trigger_event(ControllerEvent.START)
+            if not success:
+                raise RuntimeError("Failed to transition to RUNNING from READY")
+
+            # 5. Issue initial drain
+            if getattr(self, "_issue_initial_drain", None):
+                await self._issue_initial_drain()
+
+            # 6. Start source operators
+            start_sources = getattr(self, "start_source_operators", None)
+            if start_sources:
+                await start_sources()
+
+            return restored_step
+
+        except Exception as e:
+            logger.error(f"Failed during controller start: {e}")
+            from fluxway.common.types import ExecutionFailure
+
+            await self.state_machine.trigger_event(
+                ControllerEvent.DRIVER_ERROR,
+                spmd_id="controller",
+                failure=ExecutionFailure.from_exception(
+                    spmd_id="controller", rank=None, phase="STARTUP", exception=e
+                ),
+            )
+            raise
 
     # =====================================================================
     # Properties (as methods for Ray Actor)
@@ -1143,6 +1206,7 @@ class ControllerActor:
         from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
         from fluxway.profiler.record import TraceMetadata
         from fluxway.profiler.filtering import filter_steady_state_records
+        from fluxway.profiler.graph_symbols import GraphTraceSymbols
 
         merged = np.vstack(records)
         metadata = TraceMetadata(
@@ -1160,6 +1224,9 @@ class ControllerActor:
             merged,
             output,
             metadata=metadata,
+            graph_symbols=GraphTraceSymbols.from_compiled_graph(
+                self._graph.require_compiled_graph()
+            ),
         )
         return str(output)
 
@@ -1195,17 +1262,17 @@ class ControllerActor:
     # SPMD Error Handling
     # =====================================================================
 
-    async def report_spmd_error(self, spmd_id: str, error: str) -> None:
+    async def report_spmd_error(self, spmd_id: str, failure: ExecutionFailure) -> None:
         """
         Receive error report from a driver.
 
         Args:
             spmd_id: SPMD identifier
-            error: Error message
+            failure: Structured execution failure
         """
-        logger.error(f"SPMD {spmd_id} reported error: {error}")
+        logger.error(f"SPMD {spmd_id} reported error: {failure}")
         await self.state_machine.trigger_event(
-            ControllerEvent.DRIVER_ERROR, spmd_id=spmd_id, error=error
+            ControllerEvent.DRIVER_ERROR, spmd_id=spmd_id, failure=failure
         )
 
     @require_spmd_manager
@@ -1339,12 +1406,9 @@ class ControllerActor:
 
         await self.state_machine.trigger_event(ControllerEvent.ALL_SPMDS_TOPOLOGY_READY)
 
-    async def _on_driver_error(self, spmd_id: str, error: str) -> None:
+    async def _on_driver_error(self, spmd_id: str, failure: ExecutionFailure) -> None:
         """Callback when a driver has an error."""
-        logger.error(f"Driver {spmd_id} error: {error}")
-        await self.state_machine.trigger_event(
-            ControllerEvent.DRIVER_ERROR, spmd_id=spmd_id, error=error
-        )
+        await self.report_spmd_error(spmd_id, failure)
 
     # =====================================================================
     # Internal Methods for State Machine
@@ -1520,30 +1584,14 @@ class ControllerActor:
         except Exception as error:
             cleanup_errors.append(error)
 
-        for spmd_id in self.spmd_manager.get_all_spmd_ids():
-            try:
-                if self._profiler_runtime.enabled:
-                    async with self._profiler_runtime.recorder.spmd_manager_driver_stop(
-                        spmd_id=spmd_id,
-                    ):
-                        await self.spmd_manager.stop_spmd(
-                            spmd_id,
-                            save_checkpoint=False,
-                            release_driver_handle=False,
-                        )
-                else:
-                    await self.spmd_manager.stop_spmd(
-                        spmd_id,
-                        save_checkpoint=False,
-                        release_driver_handle=False,
-                    )
-            except Exception as e:
-                logger.error(f"Error stopping SPMD {spmd_id}: {e}")
-                cleanup_errors.append(e)
-            try:
-                self.heartbeat_manager.unregister_spmd(spmd_id)
-            except Exception as error:
-                cleanup_errors.append(error)
+        spmd_cleanup_errors = await asyncio.gather(
+            *(
+                self._stop_and_unregister_spmd(spmd_id)
+                for spmd_id in self.spmd_manager.get_all_spmd_ids()
+            )
+        )
+        for errors in spmd_cleanup_errors:
+            cleanup_errors.extend(errors)
 
         if self.scheduler.pg_manager.has_job_pg:
             try:
@@ -1552,6 +1600,32 @@ class ControllerActor:
                 cleanup_errors.append(error)
         if cleanup_errors:
             raise ExceptionGroup("SPMD cleanup failed", cleanup_errors)
+
+    async def _stop_and_unregister_spmd(self, spmd_id: str) -> tuple[Exception, ...]:
+        errors: list[Exception] = []
+        try:
+            stop_spmd = functools.partial(
+                self.spmd_manager.stop_spmd,
+                spmd_id,
+                save_checkpoint=False,
+                release_driver_handle=False,
+            )
+            if self._profiler_runtime.enabled:
+                async with self._profiler_runtime.recorder.spmd_manager_driver_stop(
+                    spmd_id=spmd_id,
+                ):
+                    await stop_spmd()
+            else:
+                await stop_spmd()
+        except Exception as error:
+            logger.error(f"Error stopping SPMD {spmd_id}: {error}")
+            errors.append(error)
+        finally:
+            try:
+                self.heartbeat_manager.unregister_spmd(spmd_id)
+            except Exception as error:
+                errors.append(error)
+        return tuple(errors)
 
     async def _finalize_runtime(self, *, export_profiler_trace: bool) -> None:
         cleanup_errors: list[Exception] = []
@@ -1642,7 +1716,11 @@ class ControllerActor:
             timeout: Maximum time to wait (None for infinite)
 
         Returns:
-            True if completed successfully, False if failed or timeout
+            True if completed successfully
+
+        Raises:
+            ExecutionFailedError: The execution reached FAILED.
+            TimeoutError: The timeout elapsed before a terminal state.
         """
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.controller_completion(
@@ -1654,30 +1732,18 @@ class ControllerActor:
     async def _wait_for_completion_unprofiled(
         self, timeout: float | None = None
     ) -> bool:
-        start_time = time.time()
-
-        while True:
-            state = self.state_machine.state
-
-            if state == ControllerState.COMPLETED:
-                return True
-
-            if state == ControllerState.FAILED:
-                return False
-
-            if timeout is not None:
-                elapsed = time.time() - start_time
-                if elapsed >= timeout:
-                    logger.warning("Timeout waiting for completion")
-                    return False
-
-            await asyncio.sleep(1.0)
+        state = await self.state_machine.wait_until_terminal(timeout)
+        if state == ControllerState.COMPLETED:
+            return True
+        if state == ControllerState.FAILED:
+            raise ExecutionFailedError(self.state_machine.get_failures())
+        raise RuntimeError(f"Unexpected terminal state: {state}")
 
 
 async def create_controller(
     graph: Graph,
     *,
-    placement_recipe: PlacementRecipe | None = None,
+    placement_recipe: PlacementRecipe,
     placement_runtime: PlacementRuntimeConfig | None = None,
     heartbeat_config: HeartbeatConfig | None = None,
     async_step_config: AsyncStepConfig | None = None,
@@ -1692,7 +1758,8 @@ async def create_controller(
     This is the main entry point for creating a Controller.
 
     Args:
-        graph: The task graph built using Builder
+        graph: The static execution Graph.
+        placement_recipe: Resource placement constraints and objectives.
         heartbeat_config: Optional heartbeat configuration
         async_step_config: Optional async step configuration
         checkpoint_config: Optional checkpoint configuration
@@ -1706,20 +1773,22 @@ async def create_controller(
     Raises:
         RuntimeError: If initialization fails
     """
-    if placement_recipe is None:
-        raise PlacementContractError("create_controller requires placement_recipe")
+    if not isinstance(graph, Graph):
+        raise TypeError("create_controller requires a Graph")
+    if not isinstance(placement_recipe, PlacementRecipe):
+        raise TypeError("create_controller requires a PlacementRecipe")
     if placement_runtime is None:
         placement_runtime = PlacementRuntimeConfig()
 
     # Create the actor
     controller = ControllerActor.options(runtime_env=runtime_env).remote(  # type: ignore[attr-defined]
         graph=graph,
+        placement_recipe=placement_recipe,
         heartbeat_config=heartbeat_config,
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
         transport_config=transport_config,
         profiler_config=profiler_config,
-        placement_recipe=placement_recipe,
         placement_runtime=placement_runtime,
     )
 
@@ -1731,5 +1800,4 @@ async def create_controller(
     return controller
 
 
-# Alias for backwards compatibility
 Controller = ControllerActor

@@ -1,38 +1,61 @@
 from __future__ import annotations
 
-import hashlib
-import json
-from collections.abc import Mapping, Sequence
-from decimal import Decimal
-from types import MappingProxyType
-from typing import Annotated, Any, Literal, cast, overload
+from collections.abc import Iterable, Mapping, Sequence
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    Protocol,
+    cast,
+    overload,
+    runtime_checkable,
+)
 
 from pydantic import (
-    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
-    PlainSerializer,
     field_validator,
     model_validator,
 )
 
 
 class PlacementModel(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid", validate_default=True)
+    model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        frozen=True,
+        extra="forbid",
+        validate_default=True,
+    )
+
+
+@runtime_checkable
+class SPMDRef(Protocol):
+    @property
+    def spmd_id(self) -> str: ...
+
+    @property
+    def spmd_class(self) -> type: ...
 
 
 class SPMDClassRef(PlacementModel):
-    module: str
-    qualname: str
+    spmd_class: type
 
     @classmethod
     def from_type(cls, value: type) -> SPMDClassRef:
-        return cls(module=value.__module__, qualname=value.__qualname__)
+        return cls(spmd_class=value)
+
+    @property
+    def module(self) -> str:
+        return self.spmd_class.__module__
+
+    @property
+    def qualname(self) -> str:
+        return self.spmd_class.__qualname__
 
 
 class WorkerSetExpr(PlacementModel):
-    kind: str
+    kind: Any
 
 
 class WorkersExpr(WorkerSetExpr):
@@ -105,7 +128,7 @@ type WorkerSet = Annotated[
 
 
 class VectorExpr(PlacementModel):
-    kind: str
+    kind: Any
 
 
 class OccupancyExpr(VectorExpr):
@@ -130,7 +153,7 @@ type Vector = Annotated[
 
 
 class NodeSetExpr(PlacementModel):
-    kind: str
+    kind: Any
 
 
 class SupportExpr(NodeSetExpr):
@@ -161,7 +184,7 @@ type NodeSet = Annotated[
 
 
 class ScalarExpr(PlacementModel):
-    kind: str
+    kind: Any
 
 
 class IntegerExpr(ScalarExpr):
@@ -219,7 +242,7 @@ type Scalar = Annotated[
 
 
 class Constraint(PlacementModel):
-    kind: str
+    kind: Any
 
 
 class SubsetEqConstraint(Constraint):
@@ -280,7 +303,7 @@ type ConstraintNode = Annotated[
 
 
 class Objective(PlacementModel):
-    kind: str
+    kind: Any
 
 
 class MinimizeObjective(Objective):
@@ -326,204 +349,44 @@ class LexicographicObjective(PlacementModel):
         return value
 
 
-def _resource_vector(value: Any) -> dict[str, Decimal]:
-    if not isinstance(value, Mapping):
-        raise ValueError("resource vector must be a mapping")
-    result: dict[str, Decimal] = {}
-    for resource, quantity in value.items():
-        if not isinstance(resource, str) or not resource:
-            raise ValueError("resource names must be non-empty strings")
-        if isinstance(quantity, float):
-            raise ValueError("resource quantities must use int or Decimal, not float")
-        if isinstance(quantity, bool) or not isinstance(quantity, (int, str, Decimal)):
-            raise ValueError("resource quantities must use int or Decimal")
-        decimal = Decimal(quantity)
-        if decimal < 0:
-            raise ValueError("resource quantities must be non-negative")
-        result[resource] = decimal
-    return dict(sorted(result.items()))
-
-
-def _freeze_resource_vector(
-    value: Mapping[str, Decimal],
-) -> Mapping[str, Decimal]:
-    return MappingProxyType(dict(value))
-
-
-type ResourceVector = Annotated[
-    Mapping[str, Decimal],
-    AfterValidator(_freeze_resource_vector),
-    PlainSerializer(lambda value: dict(value), return_type=dict),
-]
-
-
-class ResourceScale(PlacementModel):
-    step: ResourceVector
-    max_steps: int = Field(ge=0)
-    weight: Decimal = Field(gt=Decimal(0))
-
-    @field_validator("step", mode="before")
-    @classmethod
-    def validate_step(cls, value: Any) -> dict[str, Decimal]:
-        result = _resource_vector(value)
-        if not result or all(quantity == 0 for quantity in result.values()):
-            raise ValueError("scale step must contain a positive resource quantity")
-        return result
-
-    @field_validator("weight", mode="before")
-    @classmethod
-    def validate_weight(cls, value: Any) -> Decimal:
-        if isinstance(value, float):
-            raise ValueError("weight must use int or Decimal, not float")
-        return Decimal(value)
-
-
-class ResourceProfile(PlacementModel):
-    base: ResourceVector
-    scale: ResourceScale | None = None
-
-    @field_validator("base", mode="before")
-    @classmethod
-    def validate_base(cls, value: Any) -> dict[str, Decimal]:
-        return _resource_vector(value)
-
-
-class ResourceProfileBinding(PlacementModel):
-    spmd: SPMDClassRef
-    profile: ResourceProfile
-
-
-_COMMUTATIVE_ITEMS = {
-    "worker_union",
-    "node_union",
-    "node_intersection",
-    "all_of",
-    "any_of",
-}
-_COMMUTATIVE_BINARY = {"disjoint", "equal"}
-
-
-def _canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-
-def _deduplicated_ordered(values: Sequence[Any]) -> list[Any]:
-    by_json = {_canonical_json(value): value for value in values}
-    return [by_json[key] for key in sorted(by_json)]
-
-
-def _normalize_ast_json(value: Any) -> Any:
-    if isinstance(value, list):
-        return [_normalize_ast_json(item) for item in value]
-    if not isinstance(value, Mapping):
-        return value
-    normalized = {key: _normalize_ast_json(item) for key, item in value.items()}
-    kind = normalized.get("kind")
-    if kind in _COMMUTATIVE_ITEMS:
-        items = normalized.get("items")
-        if not isinstance(items, list):
-            raise ValueError(f"{kind} AST must contain an items list")
-        flattened = []
-        for item in items:
-            if isinstance(item, Mapping) and item.get("kind") == kind:
-                nested = item.get("items")
-                if not isinstance(nested, list):
-                    raise ValueError(f"nested {kind} AST must contain an items list")
-                flattened.extend(nested)
-            else:
-                flattened.append(item)
-        normalized["items"] = _deduplicated_ordered(flattened)
-    if kind in _COMMUTATIVE_BINARY:
-        operands = _deduplicated_ordered([normalized["left"], normalized["right"]])
-        if len(operands) == 2:
-            normalized["left"], normalized["right"] = operands
-    return normalized
-
-
 class PlacementRecipe(PlacementModel):
     recipe_id: str = Field(min_length=1)
     version: str = Field(min_length=1)
-    profiles: tuple[ResourceProfileBinding, ...]
     constraints: tuple[ConstraintNode, ...]
     objective: LexicographicObjective
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_profiles(cls, value: Any) -> Any:
-        if not isinstance(value, Mapping):
-            return value
-        profiles = value.get("profiles")
-        if not isinstance(profiles, Mapping):
-            return value
-        bindings = []
-        for spmd, profile in profiles.items():
-            if not isinstance(spmd, type):
-                raise ValueError("profile keys must be SPMD classes")
-            bindings.append(
-                ResourceProfileBinding(
-                    spmd=SPMDClassRef.from_type(spmd), profile=profile
-                )
-            )
-        normalized = dict(value)
-        normalized["profiles"] = tuple(
-            sorted(
-                bindings,
-                key=lambda binding: (binding.spmd.module, binding.spmd.qualname),
-            )
-        )
-        return normalized
 
-    @model_validator(mode="after")
-    def validate_profile_uniqueness(self) -> PlacementRecipe:
-        refs = [
-            (binding.spmd.module, binding.spmd.qualname) for binding in self.profiles
-        ]
-        if len(refs) != len(set(refs)):
-            raise ValueError("each SPMD class must have exactly one resource profile")
-        return self
-
-    @property
-    def normalized(self) -> PlacementRecipe:
-        return PlacementRecipe.model_validate(self._normalized_payload())
-
-    def _normalized_payload(self) -> dict[str, Any]:
-        payload = cast(
-            dict[str, Any], _normalize_ast_json(self.model_dump(mode="json"))
-        )
-        constraints = payload.get("constraints")
-        if not isinstance(constraints, list):
-            raise ValueError("PlacementRecipe constraints must serialize as a list")
-        payload["constraints"] = _deduplicated_ordered(constraints)
-        profiles = payload.get("profiles")
-        if not isinstance(profiles, list):
-            raise ValueError("PlacementRecipe profiles must serialize as a list")
-        payload["profiles"] = sorted(
-            profiles,
-            key=lambda binding: (
-                binding["spmd"]["module"],
-                binding["spmd"]["qualname"],
-            ),
-        )
-        return payload
-
-    @property
-    def digest(self) -> str:
-        payload = json.dumps(
-            self._normalized_payload(),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+def workers(spmd: type | SPMDRef) -> WorkersExpr:
+    spmd_class = spmd.spmd_class if isinstance(spmd, SPMDRef) else spmd
+    if not isinstance(spmd_class, type):
+        raise TypeError("workers expects an SPMD class or reference")
+    return WorkersExpr(spmd=SPMDClassRef.from_type(spmd_class))
 
 
-def workers(spmd: type) -> WorkersExpr:
-    if not isinstance(spmd, type):
-        raise TypeError("workers expects an SPMD class")
-    return WorkersExpr(spmd=SPMDClassRef.from_type(spmd))
-
-
-def instance(spmd_id: str) -> InstanceExpr:
+def instance(spmd: str | SPMDRef) -> InstanceExpr:
+    spmd_id = spmd.spmd_id if isinstance(spmd, SPMDRef) else spmd
     return InstanceExpr(spmd_id=spmd_id)
+
+
+type WorkerSetSource = WorkerSet | type | SPMDRef | Iterable[WorkerSet | type | SPMDRef]
+
+
+def _worker_set(source: WorkerSetSource) -> WorkerSet:
+    if isinstance(source, WorkerSetExpr):
+        return cast(WorkerSet, source)
+    if isinstance(source, SPMDRef):
+        return instance(source)
+    if isinstance(source, type):
+        return workers(source)
+    if hasattr(source, "__iter__") and not isinstance(source, (str, bytes, Mapping)):
+        items = tuple(cast(Iterable, source))
+        if not items:
+            raise ValueError("worker-set reference collection must not be empty")
+        return WorkerUnionExpr(items=tuple(_worker_set(item) for item in items))
+    raise TypeError(
+        "expected a worker-set expression, SPMD class, SPMD reference, "
+        "or a non-empty iterable of them"
+    )
 
 
 def all_workers() -> AllWorkersExpr:
@@ -542,40 +405,53 @@ def isolated_spmds(relations: AffinityConstraintSetExpr) -> IsolatedSPMDsExpr:
     return IsolatedSPMDsExpr(relations=relations)
 
 
-def rank(source: WorkerSetExpr, index: int) -> RankExpr:
-    return RankExpr(source=cast(WorkerSet, source), index=index)
+def rank(source: WorkerSetSource, index: int) -> RankExpr:
+    return RankExpr(source=cast(WorkerSet, _worker_set(source)), index=index)
 
 
-def ranks(source: WorkerSetExpr, indices: Sequence[int]) -> RanksExpr:
-    return RanksExpr(source=cast(WorkerSet, source), indices=tuple(indices))
+def ranks(source: WorkerSetSource, indices: Sequence[int]) -> RanksExpr:
+    return RanksExpr(
+        source=cast(WorkerSet, _worker_set(source)), indices=tuple(indices)
+    )
 
 
-def occupancy(source: WorkerSetExpr) -> OccupancyExpr:
-    return OccupancyExpr(workers=cast(WorkerSet, source))
+def occupancy(source: WorkerSetSource) -> OccupancyExpr:
+    return OccupancyExpr(workers=cast(WorkerSet, _worker_set(source)))
 
 
 def target_occupancy(relations: AffinityConstraintSetExpr) -> TargetOccupancyExpr:
     return TargetOccupancyExpr(relations=relations)
 
 
-def support(source: WorkerSetExpr | OccupancyExpr) -> SupportExpr:
-    workers_expr = source.workers if isinstance(source, OccupancyExpr) else source
+def support(
+    source: WorkerSetSource | OccupancyExpr,
+) -> SupportExpr:
+    workers_expr = (
+        source.workers if isinstance(source, OccupancyExpr) else _worker_set(source)
+    )
     return SupportExpr(workers=cast(WorkerSet, workers_expr))
 
 
 @overload
-def union(*items: WorkerSetExpr) -> WorkerUnionExpr: ...
+def union(*items: WorkerSetExpr | type | SPMDRef) -> WorkerUnionExpr: ...
 
 
 @overload
 def union(*items: NodeSetExpr) -> NodeUnionExpr: ...
 
 
-def union(*items: WorkerSetExpr | NodeSetExpr) -> WorkerUnionExpr | NodeUnionExpr:
+def union(
+    *items: WorkerSetExpr | NodeSetExpr | type | SPMDRef,
+) -> WorkerUnionExpr | NodeUnionExpr:
     if not items:
         raise ValueError("union requires at least one expression")
-    if all(isinstance(item, WorkerSetExpr) for item in items):
-        return WorkerUnionExpr(items=tuple(items))  # type: ignore[arg-type]
+    if all(isinstance(item, (WorkerSetExpr, type, SPMDRef)) for item in items):
+        return WorkerUnionExpr(
+            items=cast(
+                tuple[WorkerSet, ...],
+                tuple(_worker_set(cast(WorkerSetSource, item)) for item in items),
+            )
+        )
     if all(isinstance(item, NodeSetExpr) for item in items):
         return NodeUnionExpr(items=tuple(items))  # type: ignore[arg-type]
     raise TypeError("union expressions must have the same mathematical type")
@@ -595,20 +471,24 @@ def cardinality(source: NodeSetExpr) -> CardinalityExpr:
     return CardinalityExpr(nodes=cast(NodeSet, source))
 
 
-def resource_usage(source: WorkerSetExpr, resource: str) -> ResourceUsageExpr:
-    return ResourceUsageExpr(workers=cast(WorkerSet, source), resource=resource)
+def resource_usage(source: WorkerSetSource, resource: str) -> ResourceUsageExpr:
+    return ResourceUsageExpr(
+        workers=cast(WorkerSet, _worker_set(source)), resource=resource
+    )
 
 
 def resource_capacity(source: NodeSetExpr, resource: str) -> ResourceCapacityExpr:
     return ResourceCapacityExpr(nodes=cast(NodeSet, source), resource=resource)
 
 
-def allocated_quanta(source: WorkerSetExpr) -> AllocatedQuantaExpr:
-    return AllocatedQuantaExpr(workers=cast(WorkerSet, source))
+def allocated_quanta(source: WorkerSetSource) -> AllocatedQuantaExpr:
+    return AllocatedQuantaExpr(workers=cast(WorkerSet, _worker_set(source)))
 
 
-def weighted_dominant_share(source: WorkerSetExpr) -> WeightedDominantShareExpr:
-    return WeightedDominantShareExpr(workers=cast(WorkerSet, source))
+def weighted_dominant_share(
+    source: WorkerSetSource,
+) -> WeightedDominantShareExpr:
+    return WeightedDominantShareExpr(workers=cast(WorkerSet, _worker_set(source)))
 
 
 def affinity_coverage(relations: AffinityConstraintSetExpr) -> AffinityCoverageExpr:
@@ -636,6 +516,17 @@ def disjoint(left: NodeSetExpr, right: NodeSetExpr) -> DisjointConstraint:
 
 
 def equal(
+    left: NodeSetExpr | ScalarExpr | int,
+    right: NodeSetExpr | ScalarExpr | int,
+    *others: NodeSetExpr | ScalarExpr | int,
+) -> EqualConstraint | AllOfConstraint:
+    constraints = tuple(_binary_equal(left, operand) for operand in (right, *others))
+    if len(constraints) == 1:
+        return constraints[0]
+    return AllOfConstraint(items=constraints)
+
+
+def _binary_equal(
     left: NodeSetExpr | ScalarExpr | int,
     right: NodeSetExpr | ScalarExpr | int,
 ) -> EqualConstraint:

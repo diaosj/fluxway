@@ -9,7 +9,7 @@ import numpy as np
 
 @dataclass(frozen=True, slots=True)
 class FrameTableCapacity:
-    edge_count: int = 0
+    entry_count: int = 0
     payload_count: int = 0
     shape_count: int = 0
     global_shape_count: int = 0
@@ -18,7 +18,7 @@ class FrameTableCapacity:
 
     def __post_init__(self) -> None:
         for name in (
-            "edge_count",
+            "entry_count",
             "payload_count",
             "shape_count",
             "global_shape_count",
@@ -51,11 +51,11 @@ class FrameTableKernel:
         return grown
 
     def i32_table_from_byte_buffer(
-        self, buffer: bytearray, rows: int, width: int, name: str
+        self, buffer: bytearray, entries: int, width: int, name: str
     ) -> np.ndarray:
-        self._require_nonnegative(rows, name)
+        self._require_nonnegative(entries, name)
         self._require_positive(width, f"{name}_width")
-        slots = rows * width
+        slots = entries * width
         if slots * np.dtype(np.int32).itemsize > len(buffer):
             raise ValueError(
                 f"{name} requested {slots} int32 slots from buffer with "
@@ -64,7 +64,7 @@ class FrameTableKernel:
         return (
             np.frombuffer(buffer, dtype=np.int32, count=slots)
             .copy()
-            .reshape(rows, width)
+            .reshape(entries, width)
         )
 
     def i32_vector_from_byte_buffer(

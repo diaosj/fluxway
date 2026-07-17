@@ -13,15 +13,10 @@ State transitions:
 
 import logging
 import threading
-from typing import TYPE_CHECKING
 from collections.abc import Callable
-
 from typing import Any
 
-from fluxway.common.types import DriverState, DriverEvent
-
-if TYPE_CHECKING:
-    pass
+from fluxway.common.types import DriverEvent, DriverState, ExecutionFailure
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +32,9 @@ class DriverStateMachine:
     _TRANSITIONS = {
         (DriverState.INITIALIZING, DriverEvent.INIT_COMPLETE): DriverState.READY,
         (DriverState.INITIALIZING, DriverEvent.INIT_FAILED): DriverState.ERROR,
+        (DriverState.INITIALIZING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.READY, DriverEvent.START): DriverState.RUNNING,
+        (DriverState.READY, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.RUNNING, DriverEvent.BLOCK_REQUESTED): DriverState.BLOCKED,
         (DriverState.RUNNING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.BLOCKED, DriverEvent.UNBLOCK_REQUESTED): DriverState.RUNNING,
@@ -68,9 +65,8 @@ class DriverStateMachine:
         self._state = DriverState.INITIALIZING
         self._lock = threading.Lock()
 
-        # Track error information
-        self._error_workers: dict[int, str] = {}  # rank -> error_message
-        self._error_message: str | None = None
+        self._worker_failures: dict[int, ExecutionFailure] = {}
+        self._failure: ExecutionFailure | None = None
 
         # Callbacks for state entry
         self._entry_callbacks: dict[DriverState, Callable[[], None]] = {
@@ -90,6 +86,10 @@ class DriverStateMachine:
         with self._lock:
             return self._state
 
+    @classmethod
+    def can_transition(cls, state: DriverState, event: DriverEvent) -> bool:
+        return (state, event) in cls._TRANSITIONS
+
     def trigger(self, event: DriverEvent, **kwargs) -> bool:
         """
         Trigger a state transition event.
@@ -97,8 +97,7 @@ class DriverStateMachine:
         Args:
             event: The event to trigger
             **kwargs: Additional event data
-                - rank: Worker rank (for WORKER_ERROR)
-                - error: Error message (for WORKER_ERROR, INIT_FAILED)
+                - failure: Structured execution failure
 
         Returns:
             True if transition occurred, False otherwise
@@ -121,26 +120,29 @@ class DriverStateMachine:
                 )
                 return False
 
-            if key not in self._TRANSITIONS:
+            if not self.can_transition(current, event):
                 logger.debug(f"No transition for: {current} + {event}. Ignoring event.")
                 return False
 
             next_state = self._TRANSITIONS[key]
 
-            # Handle event-specific data
-            if event == DriverEvent.WORKER_ERROR:
-                rank = kwargs.get("rank", -1)
-                error = kwargs.get("error", "Unknown error")
-                self._error_workers[rank] = error
-                self._error_message = f"Worker {rank}: {error}"
+            if next_state is DriverState.ERROR:
+                failure = self._failure_for_event(event, kwargs)
+                if event is DriverEvent.WORKER_ERROR:
+                    worker_rank = failure.rank
+                    if worker_rank is None:
+                        raise ValueError("WORKER_ERROR failure requires a worker rank.")
+                else:
+                    worker_rank = None
+                if self._failure is None:
+                    self._failure = failure
+                if worker_rank is not None:
+                    self._worker_failures[worker_rank] = failure
                 logger.error(
-                    f"Worker error in SPMD {self._driver.spmd_id}: {self._error_message}"
+                    "Driver failure in SPMD %s: %s",
+                    self._driver.spmd_id,
+                    failure,
                 )
-
-            elif event == DriverEvent.INIT_FAILED:
-                error = kwargs.get("error", "Initialization failed")
-                self._error_message = error
-                logger.error(f"Init failed for SPMD {self._driver.spmd_id}: {error}")
 
             # Perform state transition
             old_state = self._state
@@ -153,12 +155,53 @@ class DriverStateMachine:
         # Execute entry callback (outside lock to prevent deadlock)
         entry_callback = self._entry_callbacks.get(next_state)
         if entry_callback:
-            try:
-                entry_callback()
-            except Exception as e:
-                logger.error(f"Error in entry callback for {next_state}: {e}")
+            entry_callback()
 
         return True
+
+    def _failure_for_event(
+        self,
+        event: DriverEvent,
+        event_data: dict[str, Any],
+    ) -> ExecutionFailure:
+        failure = event_data.get("failure")
+        if failure is not None:
+            if not isinstance(failure, ExecutionFailure):
+                raise TypeError(
+                    f"{event.name} failure must be ExecutionFailure, "
+                    f"got {type(failure).__name__}."
+                )
+            if failure.spmd_id != self._driver.spmd_id:
+                raise ValueError(
+                    f"{event.name} failure SPMD {failure.spmd_id!r} does not match "
+                    f"driver {self._driver.spmd_id!r}."
+                )
+            return failure
+        if event is DriverEvent.WORKER_ERROR:
+            raise TypeError("WORKER_ERROR requires failure=ExecutionFailure(...).")
+        if event is DriverEvent.INIT_FAILED:
+            return ExecutionFailure(
+                spmd_id=self._driver.spmd_id,
+                rank=None,
+                op_name=None,
+                step=None,
+                phase="DRIVER_INITIALIZATION",
+                exception_type="DriverInitializationFailed",
+                message="SPMD driver initialization failed.",
+                traceback=None,
+            )
+        if event is DriverEvent.SNAPSHOT_FAILED:
+            return ExecutionFailure(
+                spmd_id=self._driver.spmd_id,
+                rank=None,
+                op_name=None,
+                step=None,
+                phase="SNAPSHOT",
+                exception_type="SnapshotFailed",
+                message="SPMD snapshot failed.",
+                traceback=None,
+            )
+        raise ValueError(f"Driver event {event.name} cannot enter ERROR.")
 
     def get_state(self) -> DriverState:
         """Get current state (alias for property)."""
@@ -180,15 +223,14 @@ class DriverStateMachine:
         """Check if driver has completed."""
         return self.state == DriverState.COMPLETED
 
-    def get_error_workers(self) -> dict[int, str]:
-        """Get workers currently in error state."""
+    @property
+    def failure(self) -> ExecutionFailure | None:
         with self._lock:
-            return dict(self._error_workers)
+            return self._failure
 
-    def get_error_message(self) -> str | None:
-        """Get the latest error message."""
+    def get_worker_failures(self) -> dict[int, ExecutionFailure]:
         with self._lock:
-            return self._error_message
+            return dict(self._worker_failures)
 
     # =========================================================================
     # State entry callbacks
@@ -233,13 +275,15 @@ class DriverStateMachine:
     def _on_enter_error(self) -> None:
         """Called when entering ERROR state."""
         logger.error(f"SPMD {self._driver.spmd_id} entered ERROR state")
-        # Report error to controller
-        self._driver._report_error(self._error_message or "Unknown error")
+        failure = self.failure
+        if failure is None:
+            raise RuntimeError("ERROR state requires an ExecutionFailure.")
+        self._driver._report_error(failure)
 
     def reset(self) -> None:
         """Reset state machine to initial state."""
         with self._lock:
             self._state = DriverState.INITIALIZING
-            self._error_workers.clear()
-            self._error_message = None
+            self._worker_failures.clear()
+            self._failure = None
         logger.debug(f"SPMD {self._driver.spmd_id} state machine reset")

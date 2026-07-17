@@ -96,3 +96,32 @@ class MissingTraceMetadata(ProfilerError):
             metadata_kind=metadata_kind,
             ident=ident,
         )
+
+
+class MissingGraphTraceSymbol(ProfilerError):
+    code = "missing_graph_trace_symbol"
+
+    def __init__(self, *, symbol_kind: str, identity: object) -> None:
+        super().__init__(
+            "Compiled graph identity has no profiler symbol.",
+            symbol_kind=symbol_kind,
+            identity=identity,
+        )
+
+
+class GraphTraceSymbolConflict(ProfilerError):
+    code = "graph_trace_symbol_conflict"
+
+    def __init__(
+        self,
+        *,
+        symbol_kind: str,
+        identity: object,
+        detail: str,
+    ) -> None:
+        super().__init__(
+            "Compiled graph identities produced inconsistent profiler symbols.",
+            symbol_kind=symbol_kind,
+            identity=identity,
+            detail=detail,
+        )

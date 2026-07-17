@@ -4,7 +4,9 @@ from fluxway.profiler.config import ProfilerConfig, ProfilerDiagnostic
 from fluxway.profiler.errors import (
     CausalClockViolation,
     ClockSyncUnstable,
+    GraphTraceSymbolConflict,
     MissingAxonNativeHlc,
+    MissingGraphTraceSymbol,
     MissingTraceMetadata,
     ProfilerBufferExhausted,
 )
@@ -15,7 +17,9 @@ from fluxway.profiler.user_api import enabled, event, scope
 __all__ = [
     "CausalClockViolation",
     "ClockSyncUnstable",
+    "GraphTraceSymbolConflict",
     "MissingAxonNativeHlc",
+    "MissingGraphTraceSymbol",
     "MissingTraceMetadata",
     "ProfilerBufferExhausted",
     "ProfilerConfig",

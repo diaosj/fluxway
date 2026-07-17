@@ -15,7 +15,10 @@ from fluxway.spmd.driver.credit import (
 class FlowControlManager:
     def __init__(self, graph: Graph, config: AsyncStepConfig | None = None):
         self._epoch = 0
-        self._credit_edges = build_credit_edges(graph, config or AsyncStepConfig())
+        self._credit_edges = build_credit_edges(
+            graph.require_compiled_graph(),
+            config or AsyncStepConfig(),
+        )
         self._edges_by_target_op: dict[tuple[str, str], list[CreditEdge]] = defaultdict(
             list
         )

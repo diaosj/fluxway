@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
@@ -10,6 +9,7 @@ from fractions import Fraction
 from functools import singledispatchmethod
 
 from ortools.sat.python import cp_model
+from fluxway.resources import ResourceProfile
 
 from .mathematics import (
     AffinityCoverageExpr,
@@ -32,7 +32,6 @@ from .mathematics import (
     PlacementModel,
     ResourceCapacityExpr,
     ResourceFragmentationExpr,
-    ResourceProfile,
     ResourceUsageExpr,
     ScalarExpr,
     SubsetEqConstraint,
@@ -156,9 +155,9 @@ class _CompiledModel:
     units: tuple[_PlacementUnit, ...]
     worker_to_unit: dict[int, int]
     resource_units: _ResourceUnits
-    worker_set_cache: dict[str, tuple[int, ...]]
-    occupancy_cache: dict[tuple[str, int], cp_model.LinearExprT]
-    support_cache: dict[tuple[str, int], cp_model.IntVar]
+    worker_set_cache: dict[PlacementModel, tuple[int, ...]]
+    occupancy_cache: dict[tuple[PlacementModel, int], cp_model.LinearExprT]
+    support_cache: dict[tuple[PlacementModel, int], cp_model.IntVar]
     allocated_quanta: dict[str, cp_model.IntVar]
     node_usage: dict[tuple[int, str], cp_model.LinearExprT]
     fragmentation: dict[tuple[int, str], cp_model.IntVar]
@@ -193,10 +192,8 @@ class _ConstraintCompiler:
         self._literal_index = 0
         self._scalar_index = 0
 
-    def _key(self, expression: PlacementModel) -> str:
-        return json.dumps(
-            expression.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-        )
+    def _key(self, expression: PlacementModel) -> PlacementModel:
+        return expression
 
     def worker_indices(self, expression: WorkerSetExpr) -> tuple[int, ...]:
         key = self._key(expression)

@@ -16,8 +16,11 @@ Usage:
         tensor: torch.Tensor
 
     # Use tuple-based mesh with user-defined axis names
-    @fluxway.spmd(
-        resource={"nums_cpu": 4, "nums_gpu": 2},
+    from fluxway.common.decorators import spmd
+    from fluxway import ResourceProfile
+
+    @spmd(
+        resource_profile=ResourceProfile(base={"CPU": 4, "GPU": 2}),
         mesh_axis_names=("data", "model"),
         mesh_axis_shapes=(4, 2),
         max_async_steps=10
@@ -34,36 +37,33 @@ __version__ = "0.1.0"
 from fluxway.common.utils.logging import ensure_logging_configured
 
 # Import decorators for top-level access
-from fluxway.common.decorators import data_type, spmd, operator, requires_worker_process
+from fluxway.common.decorators import data_type, operator, requires_worker_process
 from fluxway.common.bind import bind_spmd
 
 # Import common types
 from fluxway.common.types import (
     SPMDConfig,
-    AsyncPolicy,
-    StatePolicy,
-    SchedulePolicy,
     Graph,
     Node,
-    Edge,
-    ResourceSpec,
     # Sharding types
     ShardingSpec,
     PhysicalLayout,
     PartitionSpec,
     ChunkPartition,
     CyclicPartition,
-    IndexedPartition,
+    FunctionPartition,
     GreedyPartition,
+    ExecutionFailure,
 )
 
 # Import control plane components
-from fluxway.control_plane import GraphParser, Builder, create_controller
+from fluxway.control_plane import Builder, ExecutionFailedError, start, GraphExecution
 
 # Import runner
-from fluxway.runner import launch
+from fluxway.runner import run_in_sandbox
+from fluxway.common.operator_spec import OperatorSpec
 from fluxway import profiler
-from fluxway.visualization import graph_manifest, view_graph, visualize_graph
+from fluxway.visualization import view_graph, visualize_graph
 from fluxway.placement import (
     AFFINITY_FIRST_V1,
     PlacementRecipe,
@@ -77,6 +77,7 @@ from fluxway.placement import (
     PlacementSolveTimeoutError,
     ResourceProfile,
     ResourceScale,
+    SPMDRef,
     allocated_quanta,
     affinity_constraints,
     affinity_coverage,
@@ -117,37 +118,33 @@ __all__ = [
     # Version
     "__version__",
     # Runner
-    "launch",
+    "run_in_sandbox",
     # Decorators
     "data_type",
-    "spmd",
     "operator",
     "profiler",
     "requires_worker_process",
     "bind_spmd",
+    "OperatorSpec",
     # Types
     "PartitionSpec",
     "SPMDConfig",
-    "AsyncPolicy",
-    "StatePolicy",
-    "SchedulePolicy",
     "Graph",
     "Node",
-    "Edge",
-    "ResourceSpec",
+    "ExecutionFailure",
+    "ExecutionFailedError",
     # Sharding
     "ShardingSpec",
     "PhysicalLayout",
     "PartitionSpec",
     "ChunkPartition",
     "CyclicPartition",
-    "IndexedPartition",
+    "FunctionPartition",
     "GreedyPartition",
     # Control Plane
-    "GraphParser",
     "Builder",
-    "create_controller",
-    "graph_manifest",
+    "start",
+    "GraphExecution",
     "visualize_graph",
     "view_graph",
     "AFFINITY_FIRST_V1",
@@ -162,6 +159,7 @@ __all__ = [
     "PlacementSolveTimeoutError",
     "ResourceProfile",
     "ResourceScale",
+    "SPMDRef",
     "allocated_quanta",
     "affinity_constraints",
     "affinity_coverage",

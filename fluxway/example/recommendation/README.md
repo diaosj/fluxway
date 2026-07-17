@@ -51,8 +51,7 @@ rsync -av --progress \
   "$HOME/Downloads/recommendation-graph/"
 ```
 
-Keep `manifest.json` beside `model_explorer.json`; it is the canonical source
-for matching Model Explorer identifiers with the copied Perfetto trace. Follow
+Follow
 [Computation Graph Visualization](../../../docs/graph_visualization.md#copy-to-a-mac)
 for the Mac Python environment, local Model Explorer server, `.pftrace` copy,
 and Perfetto steps.

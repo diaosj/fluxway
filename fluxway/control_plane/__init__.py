@@ -4,7 +4,7 @@
 from fluxway.common.utils.logging import ensure_logging_configured
 
 
-from .graph import GraphParser, Builder
+from .graph import Builder
 from .scheduler import Scheduler
 from .spmd_manager import SPMDManager, SPMDHandle
 from .state_manager import StateManager
@@ -12,7 +12,8 @@ from .monitor import Monitor
 from .heartbeat import HeartbeatManager
 from .state_machine import ControllerStateMachine
 from .async_manager import AsyncStepManager
-from .controller import Controller, ControllerActor, create_controller
+from .errors import ExecutionFailedError
+from .execution import start, GraphExecution
 from .checkpointer import (
     FluxwayCheckpointer,
     WorkerCheckpointBackend,
@@ -21,7 +22,6 @@ from .checkpointer import (
 )
 
 __all__ = [
-    "GraphParser",
     "Builder",
     "Scheduler",
     "SPMDManager",
@@ -31,9 +31,9 @@ __all__ = [
     "HeartbeatManager",
     "ControllerStateMachine",
     "AsyncStepManager",
-    "Controller",
-    "ControllerActor",
-    "create_controller",
+    "ExecutionFailedError",
+    "start",
+    "GraphExecution",
     "FluxwayCheckpointer",
     "WorkerCheckpointBackend",
     "SafeTensorsBackend",

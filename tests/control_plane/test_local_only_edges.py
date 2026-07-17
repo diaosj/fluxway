@@ -6,11 +6,16 @@ from fluxway.common.decorators import operator, spmd
 from fluxway.control_plane.graph.builder import Builder
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.scheduler import build_topology
+from fluxway.resources import ResourceProfile
 
 _LOCAL_SPEC = {"type": "static", "axis": []}
 
 
-@spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(2,),
+)
 class _LocalOnlySPMD:
     @operator(name="produce", output_sharding={"x": _LOCAL_SPEC})
     def produce(self) -> dict:
@@ -34,23 +39,19 @@ def test_functional_graph_local_edge_marks_metadata_and_skips_global_topology():
         node = graph.node("A", _LocalOnlySPMD)
         produced = node.produce()
         node.consume(x=produced.x, local=True)
-        task_graph = graph.compile()
+        task_graph = graph.build()
 
-    assert len(task_graph.edges) == 1
-    edge = task_graph.edges[0]
+    assert len(task_graph.dependency_specs) == 1
+    edge = task_graph.dependency_specs[0]
     assert edge.local_only is True
 
     config = task_graph.nodes["A"].spmd_config
-    successor = config.topology["produce"].successors["A"]
-    predecessor = config.topology["consume"].predecessors["A"]
-    assert successor.local_only is True
-    assert predecessor.local_only is True
+    plan = config.require_graph_view()
+    assert plan.outgoing[0] is plan.incoming[0]
+    assert plan.outgoing[0].spec is edge
+    assert plan.outgoing[0].spec.local_only is True
 
-    produce_meta = config.operator_metas["produce"]
-    consume_meta = config.operator_metas["consume"]
-    assert produce_meta.output_post_sharding["A"][0].local_only is True
-    assert consume_meta.input_pre_sharding["A"][0].local_only is True
-    assert build_topology(task_graph)["A"] == []
+    assert build_topology(task_graph.require_compiled_graph())["A"] == []
 
 
 def test_builder_rejects_cross_node_local_only_edges():
@@ -70,7 +71,7 @@ def test_builder_rejects_cross_node_local_only_edges():
         )
 
 
-def test_builder_rejects_mixed_local_and_remote_same_self_successor():
+def test_builder_preserves_independent_locality_for_exact_dependencies():
     builder = Builder()
     builder.add_node("A", _LocalOnlySPMD)
     builder.add_func_edge(
@@ -83,12 +84,17 @@ def test_builder_rejects_mixed_local_and_remote_same_self_successor():
         local_only=True,
     )
 
-    with pytest.raises(ValueError, match="Cannot mix local_only and remote edges"):
-        builder.add_func_edge(
-            "A",
-            "produce",
-            "A",
-            "consume_remote",
-            source_output="x",
-            target_input="x",
-        )
+    builder.add_func_edge(
+        "A",
+        "produce",
+        "A",
+        "consume_remote",
+        source_output="x",
+        target_input="x",
+    )
+
+    plan = builder.build("mixed-locality").compiled_graph
+    assert tuple(dependency.spec.local_only for dependency in plan.dependencies) == (
+        True,
+        False,
+    )

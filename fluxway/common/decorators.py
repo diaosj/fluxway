@@ -5,9 +5,7 @@ Provides @operator and @data_type decorators to manage metadata and transport.
 """
 
 import contextvars
-import copy
 import functools
-import importlib
 import inspect
 import logging
 import threading
@@ -15,6 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Annotated, Any, TypeVar, Union, get_type_hints
 from collections.abc import Callable
+from fluxway.common.operator_initialization import operator_initialization_arguments
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
 
 logger = logging.getLogger(__name__)
@@ -72,14 +71,6 @@ def get_instance_storage() -> tuple[dict[int, Any], Any]:
     import fluxway.common.decorators as fd
 
     return fd._instance_storage, fd._instance_storage_lock
-
-
-def _resolve_owner_class(module_name: str, class_qualname: str) -> type:
-    module = importlib.import_module(module_name)
-    cls = module
-    for part in class_qualname.split("."):
-        cls = getattr(cls, part)
-    return cls  # type: ignore
 
 
 @contextmanager
@@ -445,18 +436,6 @@ def _resolve_output_sharding(
     )
 
 
-def _normalize_sharding_values(sharding: dict) -> dict:
-    result: dict = {}
-    for k, v in sharding.items():
-        if isinstance(v, dict):
-            result[k] = v
-        elif hasattr(v, "as_dict"):
-            result[k] = v.as_dict()
-        else:
-            result[k] = v.__dict__
-    return result
-
-
 _STATIC_CONTEXT_ATTR_NAMES: frozenset[str] = frozenset(
     {
         "rank",
@@ -480,8 +459,8 @@ def requires_worker_process(cls: type) -> type:
     """Run a stateful operator class inside its owning SPMD worker process.
 
     Use this for operators that initialize process-local systems such as
-    ``jax.distributed.initialize``. Ordinary stateful operators should not need
-    this decorator; Fluxway can run them in an isolated execution actor.
+    ``jax.distributed.initialize``. The marker declares that construction
+    depends on worker-process topology being available before execution starts.
     """
     setattr(cls, _WORKER_PROCESS_PROTOCOL_ATTR, True)
     return cls
@@ -521,8 +500,8 @@ def _validate_worker_process_marker(cls: type) -> None:
         f"{cls.__module__}.{cls.__qualname__} calls jax.distributed.initialize "
         "but is not marked with @fluxway.requires_worker_process.\n"
         "Fix: add @fluxway.requires_worker_process above the class definition. "
-        "This tells Fluxway to run the operator inside the SPMD worker process "
-        "instead of moving it to an isolated Ray execution actor."
+        "This declares that operator construction depends on worker-process "
+        "topology initialization."
     )
 
 
@@ -544,27 +523,10 @@ def _inject_context_properties(cls: type) -> None:
     setattr(cls, sentinel, True)
 
 
-def _build_init_kwargs(cls: type, static_args: dict) -> dict:
-    try:
-        init_sig = inspect.signature(cls.__init__)
-        init_params = set(init_sig.parameters.keys()) - {"self"}
-        has_var_kw = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for p in init_sig.parameters.values()
-        )
-        return (
-            dict(static_args)
-            if has_var_kw
-            else {k: v for k, v in static_args.items() if k in init_params}
-        )
-    except (ValueError, TypeError):
-        return {}
-
-
 class _OperatorWrapper:
     def __init__(self, func: Callable, meta: Any):
         self.func = func
-        self._fluxway_operator_meta = meta
+        self._fluxway_operator_spec = meta
         self._cls = None
         functools.update_wrapper(self, func)
 
@@ -591,7 +553,9 @@ class _OperatorWrapper:
                         inst = owner.__new__(owner)
                         for attr in _STATIC_CONTEXT_ATTR_NAMES:
                             inst.__dict__[attr] = getattr(ctx, attr)
-                        init_kwargs = _build_init_kwargs(owner, ctx.static_args or {})
+                        init_kwargs = operator_initialization_arguments(
+                            owner, ctx.static_args or {}
+                        )
                         inst.__init__(**init_kwargs)
                         storage[instance_key] = inst
             return storage[id(owner)]
@@ -602,14 +566,14 @@ class _OperatorWrapper:
             async def async_bound_method(*args, **kwargs):
                 return await self.func(_get_or_create_instance(), *args, **kwargs)
 
-            async_bound_method._fluxway_operator_meta = self._fluxway_operator_meta  # type: ignore
+            async_bound_method._fluxway_operator_spec = self._fluxway_operator_spec  # type: ignore
             return async_bound_method
 
         @functools.wraps(self.func)
         def bound_method(*args, **kwargs):
             return self.func(_get_or_create_instance(), *args, **kwargs)
 
-        bound_method._fluxway_operator_meta = self._fluxway_operator_meta  # type: ignore
+        bound_method._fluxway_operator_spec = self._fluxway_operator_spec  # type: ignore
         return bound_method
 
     def __call__(self, *args, **kwargs):
@@ -627,11 +591,6 @@ def operator(
     data_argument: list[str] | None = None,
     static_argument: list[str] | None = None,
     periodic_barrier: int | None = None,
-    max_inflight_steps: int = 0,
-    local_pipeline_depth: int = 1,
-    commit_policy: str = "ordered",
-    state_access: str = "exclusive",
-    state_resource: str | None = None,
     is_source: bool | None = None,
     barrier_config: Any | None = None,
     async_policy: Any | None = None,
@@ -657,11 +616,6 @@ def operator(
             data_argument,
             static_argument,
             periodic_barrier,
-            max_inflight_steps,
-            local_pipeline_depth,
-            commit_policy,
-            state_access,
-            state_resource,
             is_source,
             barrier_config,
             async_policy,
@@ -679,11 +633,6 @@ def operator(
             data_argument,
             static_argument,
             periodic_barrier,
-            max_inflight_steps,
-            local_pipeline_depth,
-            commit_policy,
-            state_access,
-            state_resource,
             is_source,
             barrier_config,
             async_policy,
@@ -701,24 +650,17 @@ def _create_operator_wrapper(
     data_argument,
     static_argument,
     periodic_barrier,
-    max_inflight_steps,
-    local_pipeline_depth,
-    commit_policy,
-    state_access,
-    state_resource,
     is_source,
     barrier_config=None,
     async_policy=None,
 ):
-    from fluxway.common.types.configs import (
+    from fluxway.common.operator_policy import (
         ArgumentType,
         AsyncPolicy,
-        OperatorMeta,
         StandardBarrierConfig,
         PeriodicBarrierConfig,
-        SchedulePolicy,
-        StatePolicy,
     )
+    from fluxway.common.operator_spec import OperatorSpec
 
     sig = inspect.signature(func)
     data_params, has_var_keyword = _classify_sig_params(
@@ -779,118 +721,20 @@ def _create_operator_wrapper(
             f"(Data or Control), but found {len(final_tensors)} Data fields and {len(final_states)} "
             f"Control fields.\nFix: Use a @data_type with exactly one field for streaming/periodic processing."
         )
-    if async_policy is None:
-        if local_pipeline_depth <= 0:
-            raise ValueError(
-                f"Fluxway Operator Error: local_pipeline_depth for operator '{name}' "
-                f"must be positive, got {local_pipeline_depth}."
-            )
-        if commit_policy not in ("ordered", "relaxed"):
-            raise ValueError(
-                f"Fluxway Operator Error: commit_policy for operator '{name}' must be "
-                f"'ordered' or 'relaxed', got {commit_policy!r}."
-            )
-        if state_access not in ("exclusive", "thread_safe"):
-            raise ValueError(
-                f"Fluxway Operator Error: state_access for operator '{name}' must be "
-                f"'exclusive' or 'thread_safe', got {state_access!r}."
-            )
-    if async_policy is not None:
-        if not isinstance(async_policy, AsyncPolicy):
-            raise ValueError(
-                f"Fluxway Operator Error: async_policy for operator '{name}' must be an AsyncPolicy, "
-                f"got {type(async_policy).__name__}."
-            )
-        legacy_overrides = []
-        if max_inflight_steps != 0:
-            legacy_overrides.append("max_inflight_steps")
-        if local_pipeline_depth != 1:
-            legacy_overrides.append("local_pipeline_depth")
-        if commit_policy != "ordered":
-            legacy_overrides.append("commit_policy")
-        if state_access != "exclusive":
-            legacy_overrides.append("state_access")
-        if state_resource is not None:
-            legacy_overrides.append("state_resource")
-        if periodic_barrier is not None:
-            legacy_overrides.append("periodic_barrier")
-        if barrier_config is not None:
-            legacy_overrides.append("barrier_config")
-        if legacy_overrides:
-            raise ValueError(
-                f"Fluxway Operator Error: operator '{name}' cannot combine async_policy "
-                f"with legacy async arguments: {', '.join(legacy_overrides)}."
-            )
-        normalized_async_policy = async_policy
-        normalized_state_policy = async_policy.state
-        normalized_schedule_policy = async_policy.schedule
-        max_async_lag = async_policy.max_staleness_limit()
-        if async_policy.mode in ("pipelined", "pipeline_parallel"):
-            max_async_lag = async_policy.depth - 1
-        local_pipeline_depth = async_policy.depth
-        commit_policy = async_policy.commit
-        state_access = normalized_state_policy.access
-        state_resource = normalized_state_policy.resource
-        max_inflight_steps = max_async_lag or 0
-        local_dag_policy = "inline" if async_policy.mode == "sync" else "prepare_ready"
-        input_policy = "exact"
-    else:
-        normalized_state_policy = StatePolicy(
-            access=state_access,
-            resource=state_resource,
-        )
-        normalized_schedule_policy = SchedulePolicy.fifo()
-        if local_pipeline_depth == 1 and commit_policy == "ordered":
-            normalized_async_policy = AsyncPolicy.sync()
-        else:
-            normalized_async_policy = AsyncPolicy.pipelined(
-                depth=local_pipeline_depth,
-                commit=commit_policy,
-                state=normalized_state_policy,
-                schedule=normalized_schedule_policy,
-            )
-        max_async_lag = max_inflight_steps if max_inflight_steps > 0 else None
-        local_dag_policy = "inline"
-        input_policy = "exact"
-    if local_pipeline_depth <= 0:
+    normalized_async_policy = (
+        AsyncPolicy.sync() if async_policy is None else async_policy
+    )
+    if not isinstance(normalized_async_policy, AsyncPolicy):
         raise ValueError(
-            f"Fluxway Operator Error: local_pipeline_depth for operator '{name}' "
-            f"must be positive, got {local_pipeline_depth}."
+            f"Fluxway Operator Error: async_policy for operator '{name}' must be an AsyncPolicy, "
+            f"got {type(normalized_async_policy).__name__}."
         )
-    if commit_policy not in ("ordered", "relaxed"):
-        raise ValueError(
-            f"Fluxway Operator Error: commit_policy for operator '{name}' must be "
-            f"'ordered' or 'relaxed', got {commit_policy!r}."
-        )
-    if state_access not in ("exclusive", "thread_safe"):
-        raise ValueError(
-            f"Fluxway Operator Error: state_access for operator '{name}' must be "
-            f"'exclusive' or 'thread_safe', got {state_access!r}."
-        )
-    if state_resource is not None and not isinstance(state_resource, str):
-        raise ValueError(
-            f"Fluxway Operator Error: state_resource for operator '{name}' must be "
-            f"a string or None, got {type(state_resource).__name__}."
-        )
-    if state_access == "thread_safe" and state_resource is not None:
-        raise ValueError(
-            f"Fluxway Operator Error: state_resource for operator '{name}' cannot "
-            f"be combined with state_access='thread_safe'. Use "
-            f"state_access='exclusive' when a named serialized resource is needed."
-        )
-    if normalized_schedule_policy.kind == "deadline_boost" and max_async_lag is None:
-        raise ValueError(
-            f"Fluxway Operator Error: SchedulePolicy.deadline_boost for operator "
-            f"'{name}' requires bounded stale max_async_lag."
-        )
+    runtime_policy = normalized_async_policy.compile()
     _is_class_method = "." in func.__qualname__
-    if state_access == "thread_safe" and (
-        not _is_class_method or "<locals>" in func.__qualname__
-    ):
+    if runtime_policy.state_access == "thread_safe" and not _is_class_method:
         raise ValueError(
             f"Fluxway Operator Error: state_access='thread_safe' for operator "
-            f"'{name}' is only valid on import-stable class methods with an "
-            f"explicit state owner."
+            f"'{name}' is only valid on class methods with an explicit state owner."
         )
 
     if _is_fluxway_data_type(return_tp):
@@ -903,39 +747,26 @@ def _create_operator_wrapper(
     else:
         output_args = None
 
-    meta = OperatorMeta(
+    spec = OperatorSpec(
         name=name,
-        owner_class_qualname=func.__qualname__.rsplit(".", 1)[0]
-        if _is_class_method
-        else "",
-        owner_class_module=func.__module__ if _is_class_method else "",
+        owner=None,
+        method_name=func.__name__,
         is_source=is_source,
-        priority=normalized_schedule_policy.base_priority,
-        max_inflight_steps=max_inflight_steps,
         async_policy=normalized_async_policy,
-        input_policy=input_policy,
-        local_dag_policy=local_dag_policy,
-        state_policy=normalized_state_policy,
-        schedule_policy=normalized_schedule_policy,
-        max_async_lag=max_async_lag,
-        local_pipeline_depth=local_pipeline_depth,
-        commit_policy=commit_policy,
-        state_access=state_access,
-        state_resource=state_resource,
         input_arguments={
             ArgumentType.CONTROL.value: final_states,
             ArgumentType.DATA.value: final_tensors,
             ArgumentType.STATIC.value: list(final_statics),
         },
-        output_arguments=output_args,
-        input_sharding=_normalize_sharding_values(resolved_input),
-        output_sharding=_normalize_sharding_values(resolved_output),
+        output_arguments={} if output_args is None else output_args,
+        input_sharding=resolved_input,
+        output_sharding=resolved_output,
         input_param_map=input_param_map,
         output_param_map=output_param_map,
         input_treedefs=input_treedefs,
         output_treedef=(
             meta_output_treedef
-            if meta_output_treedef
+            if meta_output_treedef is not None
             else (
                 tree_flatten_type(return_tp)
                 if _is_fluxway_data_type(return_tp)
@@ -953,10 +784,10 @@ def _create_operator_wrapper(
         ),
     )
 
-    wrapper = _OperatorWrapper(func, meta)
+    wrapper = _OperatorWrapper(func, spec)
 
     # Expose meta on the wrapper for framework inspection
-    wrapper._fluxway_operator_meta = meta
+    wrapper._fluxway_operator_spec = spec
 
     # We return the descriptor directly. It will naturally act like a staticmethod
     # while gaining access to the owner class via the __get__ protocol.
@@ -1006,19 +837,17 @@ def data_type():
 
 
 def spmd(
-    resource: dict[str, Any] | None = None,
+    resource_profile: Any | None = None,
     runtime_env: dict[str, Any] | None = None,
     driver_runtime_env: dict[str, Any] | None = None,
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
-    priority: Any = None,
-    placement_strategy: Any = None,
 ):
     """
     Configure a class for SPMD distributed execution.
 
     Args:
-        resource: Resource requirements (num_cpus, num_gpus, memory_gb).
+        resource_profile: Per-worker minimum and scalable Ray resources.
         runtime_env: Ray runtime_env dict for Driver/Worker actors.
                      Example: {"env_vars": {"JAX_PLATFORMS": "gpu"}}
         driver_runtime_env: Dedicated Ray runtime_env for the SPMDDriver actor.
@@ -1028,43 +857,34 @@ def spmd(
                             specific resources (rare).
         mesh_axis_names: Axis names for the execution mesh.
         mesh_axis_shapes: Shape of the execution mesh.
-        priority: Resource priority for scheduling (HIGH/MID/LOW).
-        placement_strategy: Per-node placement strategy for affinity scheduling
-                           (PACK/SPREAD/STRICT_PACK/STRICT_SPREAD).
     """
-    from fluxway.common.types import ResourceSpec, SPMDConfig
+    from fluxway.common.types import SPMDConfig
+    from fluxway.resources import ResourceProfile
     from fluxway.common.mesh import DeviceMesh
 
     T = TypeVar("T")
 
-    res_spec = None
-    if resource:
-        res_spec = ResourceSpec(
-            num_cpus=resource.get("num_cpus", 1),
-            num_gpus=resource.get("num_gpus", 0),
-            memory_gb=resource.get("memory_gb", 0.0),
-        )
+    if resource_profile is not None and not isinstance(
+        resource_profile, ResourceProfile
+    ):
+        raise TypeError("resource_profile must be a ResourceProfile")
 
     mesh = None
     if mesh_axis_names and mesh_axis_shapes:
         mesh = DeviceMesh(axis_names=mesh_axis_names, device_shape=mesh_axis_shapes)
 
     def decorator(cls: type[T]) -> type[T]:
-        cls._resource = res_spec  # type: ignore
+        cls._resource_profile = resource_profile  # type: ignore
         cls._mesh = mesh  # type: ignore
         cls._runtime_env = runtime_env  # type: ignore
         cls._driver_runtime_env = driver_runtime_env  # type: ignore
-        cls._priority = priority  # type: ignore
-        cls._placement_strategy = placement_strategy  # type: ignore
 
-        cls.get_resource = classmethod(lambda c: c._resource)  # type: ignore
+        cls.get_resource_profile = classmethod(lambda c: c._resource_profile)  # type: ignore
         cls.get_mesh = classmethod(lambda c: c._mesh)  # type: ignore
         cls.get_runtime_env = classmethod(lambda c: c._runtime_env)  # type: ignore
         cls.get_driver_runtime_env = classmethod(lambda c: c._driver_runtime_env)  # type: ignore
         cls.get_num_workers = classmethod(lambda c: c._mesh.size if c._mesh else 1)  # type: ignore
         cls.is_fluxway_spmd = classmethod(lambda c: True)  # type: ignore
-        cls.get_priority = classmethod(lambda c: c._priority)  # type: ignore
-        cls.get_placement_strategy = classmethod(lambda c: c._placement_strategy)  # type: ignore
 
         original_new = cls.__new__
 
@@ -1084,38 +904,45 @@ def spmd(
         cls.__new__ = __new__  # type: ignore
 
         def get_spmd_config(c) -> "SPMDConfig":
-            from fluxway.common.types import SPMDConfig, OperatorMeta
+            from fluxway.common.types import SPMDConfig
+            from fluxway.common.operator_spec import OperatorSpec
 
             # Pass 1: walk the full MRO to collect operator metadata from _OperatorWrapper.
             # A subclass may override a method with a plain function, losing the wrapper.
             # We scan from the bottom of MRO up so that the most-derived _OperatorWrapper
             # (if any) wins, but we never discard metadata just because the attr was already
             # seen as a plain function in a more-derived class.
-            wrapper_meta: dict[
-                str, tuple[str, OperatorMeta, type]
-            ] = {}  # attr_name -> (op_name, meta, owner_cls)
+            wrapper_specs: dict[str, tuple[str, OperatorSpec, type]] = {}
             for klass in reversed(c.__mro__):
                 for attr_name, attr in klass.__dict__.items():
                     if not isinstance(attr, _OperatorWrapper):
                         continue
-                    meta = attr._fluxway_operator_meta
-                    if not isinstance(meta, OperatorMeta):
-                        continue
-                    wrapper_meta[attr_name] = (meta.name, copy.deepcopy(meta), klass)
+                    spec = attr._fluxway_operator_spec
+                    if not isinstance(spec, OperatorSpec):
+                        raise TypeError(
+                            f"operator {c.__qualname__}.{attr_name} does not carry "
+                            "an OperatorSpec"
+                        )
+                    wrapper_specs[attr_name] = (spec.name, spec, klass)
 
             # Pass 2: for each discovered operator, resolve the attr_name that the final
             # class actually exposes (may be a plain override — that is fine, the framework
             # only needs to know the correct attr_name for dispatch and the metadata).
-            operators, metas = {}, {}
-            for attr_name, (op_name, meta, owner_cls) in wrapper_meta.items():
-                operators[op_name] = attr_name
-                meta.requires_worker_process = _is_worker_process_required(owner_cls)
-                metas[op_name] = meta
+            operator_specs = {}
+            for attr_name, (op_name, spec, owner_cls) in wrapper_specs.items():
+                operator_specs[op_name] = spec.model_copy(
+                    update={
+                        "owner": c,
+                        "method_name": attr_name,
+                        "requires_worker_process": _is_worker_process_required(
+                            owner_cls
+                        ),
+                    }
+                )
 
             return SPMDConfig(
                 mesh=c._mesh,
-                operators=operators,
-                operator_metas=metas,
+                operator_specs=operator_specs,
                 runtime_env=c._runtime_env,
                 driver_runtime_env=c._driver_runtime_env,
             )
@@ -1127,28 +954,24 @@ def spmd(
 
 
 def spmd_source(
-    resource: dict[str, Any] | None = None,
+    resource_profile: Any | None = None,
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
     runtime_env: dict[str, Any] | None = None,
     driver_runtime_env: dict[str, Any] | None = None,
-    priority: Any = None,
-    placement_strategy: Any = None,
 ):
     """
     Configure a class as an SPMD source.
     Operators defined within will automatically inherit source and interleaving traits.
     """
     base_decorator = spmd(
-        resource=resource,
+        resource_profile=resource_profile,
         mesh_axis_names=mesh_axis_names,
         mesh_axis_shapes=mesh_axis_shapes,
         runtime_env=runtime_env,
         driver_runtime_env=driver_runtime_env,
-        priority=priority,
-        placement_strategy=placement_strategy,
     )
 
     def decorator(cls):
@@ -1157,10 +980,16 @@ def spmd_source(
 
         def new_get_config(c):
             config = orig_get_config()
-            for meta in config.operator_metas.values():
-                meta.is_source = True
-                meta.is_interleaved = interleaved
-                meta.interleave_unit_size = interleave_unit_size
+            config.operator_specs = {
+                name: spec.model_copy(
+                    update={
+                        "is_source": True,
+                        "is_interleaved": interleaved,
+                        "interleave_unit_size": interleave_unit_size,
+                    }
+                )
+                for name, spec in config.operator_specs.items()
+            }
             return config
 
         cls.get_spmd_config = classmethod(new_get_config)

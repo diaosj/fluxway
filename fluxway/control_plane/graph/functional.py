@@ -1,6 +1,8 @@
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from typing import Any, Optional
+
+from fluxway.common.types import Graph
 from fluxway.control_plane.graph.builder import Builder
 
 
@@ -18,13 +20,11 @@ class OpHandle:
         node_id: str,
         op_name: str,
         graph: "FunctionalGraph",
-        tuuids: dict[str, int],
         output_name: str | None = None,
     ):
         self.node_id = node_id
         self.op_name = op_name
         self._graph = graph
-        self.tuuids = tuuids
         self.output_name = output_name
 
     def __getattr__(self, name: str) -> "OpHandle":
@@ -33,7 +33,6 @@ class OpHandle:
             self.node_id,
             self.op_name,
             self._graph,
-            tuuids=self.tuuids,
             output_name=name,
         )
 
@@ -56,6 +55,14 @@ class NodeProxy:
         self.node_id = node_id
         self._graph = graph
 
+    @property
+    def spmd_id(self) -> str:
+        return self.node_id
+
+    @property
+    def spmd_class(self) -> type:
+        return self._graph._builder._nodes[self.node_id].spmd_class
+
     def __getattr__(self, op_name: str) -> Callable[..., OpHandle]:
         """
         Intercepts method calls to dynamically construct graph edges.
@@ -63,7 +70,7 @@ class NodeProxy:
 
         def _call_op(
             *args: OpHandle,
-            condition_fn: Callable[..., bool] | None = None,
+            condition_fn: Callable[..., bool | Awaitable[bool]] | None = None,
             local: bool = False,
             **kwargs,
         ) -> OpHandle:
@@ -71,9 +78,9 @@ class NodeProxy:
             target_node = self._graph._builder._nodes.get(self.node_id)
             all_target_args = []
             if target_node:
-                target_meta = target_node.spmd_config.operator_metas.get(op_name)
+                target_meta = target_node.spmd_config.operator_specs.get(op_name)
                 if target_meta:
-                    from fluxway.common.types.configs import ArgumentType
+                    from fluxway.common.operator_policy import ArgumentType
 
                     data_args = target_meta.get_arguments(
                         is_output=False, arg_type=ArgumentType.DATA
@@ -95,23 +102,15 @@ class NodeProxy:
                 src_node = self._graph._builder._nodes.get(in_handle.node_id)
                 src_output_names = []
                 if src_node:
-                    src_meta = src_node.spmd_config.operator_metas.get(
+                    src_meta = src_node.spmd_config.operator_specs.get(
                         in_handle.op_name
                     )
                     if src_meta:
-                        from fluxway.common.types.configs import ArgumentType
+                        from fluxway.common.operator_policy import ArgumentType
 
                         src_output_names = src_meta.get_arguments(
                             is_output=True, arg_type=ArgumentType.DATA
                         )
-
-                # Check if the handle already has UUIDs.
-                # In the new TUUID-driven architecture, this is mandatory.
-                if not in_handle.tuuids:
-                    raise RuntimeError(
-                        f"OpHandle from {in_handle.node_id}.{in_handle.op_name} "
-                        f"is missing mandatory UUIDs. This should not happen."
-                    )
 
                 # If specific output field is not selected, and source has exactly one tensor output, infer it.
                 inferred_source_output = in_handle.output_name
@@ -152,11 +151,11 @@ class NodeProxy:
                 src_node = self._graph._builder._nodes.get(in_handle.node_id)
                 src_output_names = []
                 if src_node:
-                    src_meta = src_node.spmd_config.operator_metas.get(
+                    src_meta = src_node.spmd_config.operator_specs.get(
                         in_handle.op_name
                     )
                     if src_meta:
-                        from fluxway.common.types.configs import ArgumentType
+                        from fluxway.common.operator_policy import ArgumentType
 
                         src_output_names = src_meta.get_arguments(
                             is_output=True, arg_type=ArgumentType.DATA
@@ -178,29 +177,7 @@ class NodeProxy:
                     local_only=local,
                 )
 
-            # 3. Handle Outputs: Retrieve pre-assigned UUIDs from the Builder
-            # These were assigned during add_node() and are the canonical IDs.
-            output_uuids = {}
-            if target_node:
-                target_meta = target_node.spmd_config.operator_metas.get(op_name)
-                if target_meta:
-                    from fluxway.common.types.configs import ArgumentType
-
-                    out_args = target_meta.get_arguments(
-                        is_output=True, arg_type=ArgumentType.DATA
-                    )
-                    for out_name in out_args:
-                        u_key = (self.node_id, op_name, "out", out_name)
-                        if u_key not in self._graph._builder._tuuid_slots:
-                            # Safety check: ensure builder assigned it
-                            raise RuntimeError(
-                                f"TUUID for {u_key} not found in Builder registry."
-                            )
-                        output_uuids[out_name] = self._graph._builder._tuuid_slots[
-                            u_key
-                        ]
-
-            return OpHandle(self.node_id, op_name, self._graph, tuuids=output_uuids)
+            return OpHandle(self.node_id, op_name, self._graph)
 
         return _call_op
 
@@ -224,7 +201,7 @@ class FunctionalGraph:
             h_reward = env.compute_reward(h_action)
             h_train = actor.train_step(h_reward)
 
-            task_graph = graph.compile()
+            task_graph = graph.build()
     """
 
     _current: ContextVar[Optional["FunctionalGraph"]] = ContextVar(
@@ -272,7 +249,7 @@ class FunctionalGraph:
         mesh_axis_names: tuple | None = None,
         mesh_shape: tuple | None = None,
         num_workers: int = 1,
-        resource: dict[str, Any] | None = None,
+        resource_profile: Any | None = None,
         description: str = "",
         **reader_kwargs: Any,
     ) -> NodeProxy:
@@ -285,7 +262,7 @@ class FunctionalGraph:
             mesh_axis_names: Axis names for the execution mesh.
             mesh_shape: Shape of the execution mesh.
             num_workers: Number of workers when no explicit mesh is given.
-            resource: Optional resource requirements dict.
+            resource_profile: Optional ResourceProfile override.
             description: Human-readable description.
             **reader_kwargs: Additional static args (data_source, shuffle, etc.)
                              forwarded to the reader via static_args at runtime.
@@ -296,17 +273,36 @@ class FunctionalGraph:
             mesh_axis_names=mesh_axis_names,
             mesh_shape=mesh_shape,
             num_workers=num_workers,
-            resource=resource,
+            resource_profile=resource_profile,
             description=description,
             **reader_kwargs,
         )
         return NodeProxy(name, self)
 
-    def compile(self, graph_name: str | None = None) -> Any:
-        """
-        Compiles the defined functional flow into a concrete Fluxway Graph.
+    def add_dependency(
+        self,
+        source: OpHandle,
+        target: OpHandle,
+        *,
+        condition_fn: Callable[..., bool | Awaitable[bool]] | None = None,
+        local: bool = False,
+    ) -> OpHandle:
+        if not isinstance(source, OpHandle) or not isinstance(target, OpHandle):
+            raise TypeError("add_dependency requires source and target OpHandle values")
+        if source._graph is not self or target._graph is not self:
+            raise ValueError(
+                "add_dependency handles must belong to this FunctionalGraph"
+            )
+        self._builder.add_func_edge(
+            source_node=source.node_id,
+            source_op=source.op_name,
+            target_node=target.node_id,
+            target_op=target.op_name,
+            tensor_map={},
+            condition_fn=condition_fn,
+            local_only=local,
+        )
+        return target
 
-        Returns:
-            The compiled Graph object ready for execution.
-        """
+    def build(self, graph_name: str | None = None) -> Graph:
         return self._builder.build(name=graph_name or self.name)

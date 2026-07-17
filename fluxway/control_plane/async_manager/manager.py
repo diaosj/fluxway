@@ -12,6 +12,10 @@ class AsyncStepManager:
         self._spmd_steps: dict[str, SPMDOpStep] = {
             node_name: SPMDOpStep(spmd_id=node_name) for node_name in graph.nodes
         }
+        self._operator_ids_by_spmd = {
+            spmd_id: graph.require_compiled_graph().spmd(spmd_id).operator_ids
+            for spmd_id in graph.require_compiled_graph().spmd_ids
+        }
         self._lock = threading.Lock()
 
     def report_op_completed(
@@ -25,10 +29,6 @@ class AsyncStepManager:
                 spmd_progress.completed_step_count.get(op_name, 0),
                 completed_count,
             )
-
-    @staticmethod
-    def _active_operator_names(node) -> tuple[str, ...]:
-        return node.spmd_config.require_active_operator_names()
 
     def get_spmd_steps(self, spmd_id: str) -> SPMDOpStep | None:
         with self._lock:
@@ -45,8 +45,6 @@ class AsyncStepManager:
         with self._lock:
             global_max_steps = self._config.max_steps
             for node_id, node in self._graph.nodes.items():
-                if node.spmd_config is None:
-                    continue
                 node_max_steps = node.spmd_config.max_steps
                 if node_max_steps is None:
                     node_max_steps = global_max_steps
@@ -55,7 +53,7 @@ class AsyncStepManager:
                 spmd_progress = self._spmd_steps.get(node_id)
                 if spmd_progress is None:
                     return False
-                for op_name in self._active_operator_names(node):
+                for op_name in self._operator_ids_by_spmd[node_id]:
                     if (
                         spmd_progress.completed_step_count.get(op_name, 0)
                         < node_max_steps

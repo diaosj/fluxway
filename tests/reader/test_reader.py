@@ -12,7 +12,7 @@ import os
 import pytest
 import ray
 
-from fluxway.control_plane.controller import create_controller
+import fluxway
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfile
 
@@ -45,8 +45,13 @@ def _build_graph() -> FunctionalGraph:
         data_source=MockDataSource(_DATA_SIZE),
         shuffle=False,
         num_epochs=1,
+        resource_profile=ResourceProfile(base={"CPU": 1}),
     )
-    processor = graph.node("Processor", SimpleProcessor)
+    processor = graph.node(
+        "Processor",
+        SimpleProcessor,
+        resource_profile=ResourceProfile(base={"CPU": 1}),
+    )
     processor.process(batch=reader.read())
     return graph
 
@@ -54,32 +59,26 @@ def _build_graph() -> FunctionalGraph:
 @pytest.mark.asyncio
 async def test_reader_processor_data_flows():
     """Both Reader and Processor must make progress within the timeout."""
-    task_graph = _build_graph().compile("ReaderE2E")
-
-    reader_id = next(n for n in task_graph.nodes if "Reader" in n)
-    proc_id = next(n for n in task_graph.nodes if "Processor" in n)
-
     recipe = PlacementRecipe(
         recipe_id="reader-e2e",
         version="1.0.0",
-        profiles={
-            TypedGrainReader: ResourceProfile(base={"CPU": 1}),
-            SimpleProcessor: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(),
         objective=AFFINITY_FIRST_V1,
     )
-    controller = await create_controller(task_graph, placement_recipe=recipe)
+    graph = _build_graph().build("ReaderE2E")
+    reader_id = next(n for n in graph.nodes if "Reader" in n)
+    proc_id = next(n for n in graph.nodes if "Processor" in n)
+    execution = await fluxway.start(graph, placement_recipe=recipe)
     try:
         for _ in range(_MAX_POLL_ROUNDS):
             await asyncio.sleep(_POLL_INTERVAL_S)
-            progress = await controller.get_async_step_progress.remote()
+            progress = await execution.progress()
             reader_steps = progress.get(reader_id, {})
             proc_steps = progress.get(proc_id, {})
             if reader_steps.get("read", 0) > 0 and proc_steps.get("process", 0) > 0:
                 break
 
-        progress = await controller.get_async_step_progress.remote()
+        progress = await execution.progress()
         reader_steps = progress.get(reader_id, {})
         proc_steps = progress.get(proc_id, {})
 
@@ -90,7 +89,7 @@ async def test_reader_processor_data_flows():
             f"Processor {proc_id} never consumed data. Async progress: {proc_steps}"
         )
     finally:
-        await controller.stop.remote()
+        await execution.cancel()
 
 
 if __name__ == "__main__":

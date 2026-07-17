@@ -4,32 +4,32 @@ from types import SimpleNamespace
 
 import pytest
 
-from fluxway.spmd.worker.worker import SPMDWorker
-from fluxway.common.types.configs import SPMDConfig
+from fluxway import OperatorSpec
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_policy import ArgumentType
 from fluxway.profiler.record import TraceArena
 from fluxway.profiler.recorder import TraceRecorder
+from fluxway.spmd.worker.worker import SPMDWorker
+from tests.compiled_graph_fixtures import single_spmd_config
 
 
 def _make_config(mesh, *op_names):
-    from fluxway.common.types.configs import OperatorMeta, ArgumentType
-
-    metas = {}
+    operators = {}
     for name in op_names:
-        meta = OperatorMeta(
+        operator = OperatorSpec(
             name=name,
             input_arguments={ArgumentType.DATA.value: ["in"]},
             output_arguments={ArgumentType.DATA.value: ["out"]},
             input_sharding={"in": {"type": "replicated"}},
             output_sharding={"out": {"type": "replicated"}},
         )
-        metas[name] = meta
+        operators[name] = operator
 
-    return SPMDConfig(
+    return single_spmd_config(
+        name="worker-backpressure",
         spmd_id="test",
         mesh=mesh,
-        operator_metas=metas,
-        active_operator_names=tuple(op_names),
+        operators=operators,
     )
 
 

@@ -29,6 +29,7 @@ from fluxway.common.types import (
     DriverHeartbeat,
     DriverState,
     DriverStatus,
+    ExecutionFailure,
     FlowControlState,
     HeartbeatConfig,
     ReaderState,
@@ -51,8 +52,11 @@ from fluxway.spmd.worker import SPMDWorker
 from fluxway.profiler import ProfilerRuntimeFactory
 from fluxway.profiler.recorder import DRIVER_REGISTER_TOPOLOGY
 from fluxway.placement import PlacementAttestationError
-from fluxway.placement.worker_group import attest_node_ids
-from fluxway.placement.worker_group import ray_actor_options
+from fluxway.placement.worker_group import (
+    attest_node_ids,
+    ray_actor_options,
+    worker_tensor_device,
+)
 
 from fluxway.common.utils.logging import get_logger
 
@@ -116,7 +120,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             sync_policy=MaxSkewSyncPolicy(config.max_worker_step_skew),
         )
         self.spmd_synchronizer.register_expected_ops(
-            list(config.require_active_operator_names())
+            config.require_graph_view().operator_ids
         )
 
         self.monitor = SPMDMonitor(spmd_id)
@@ -242,7 +246,15 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             )
         except Exception as e:
             logger.error(f"Initialization failed error={e} spmd_id={self.spmd_id}")
-            self.state_machine.trigger(DriverEvent.INIT_FAILED, error=str(e))
+            self.state_machine.trigger(
+                DriverEvent.INIT_FAILED,
+                failure=ExecutionFailure.from_exception(
+                    spmd_id=self.spmd_id,
+                    rank=None,
+                    phase="DRIVER_INITIALIZATION",
+                    exception=e,
+                ),
+            )
             raise
         finally:
             if span is not None:
@@ -298,6 +310,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                     spmd_id=self.spmd_id,
                     driver_handle=self_handle,
                     checkpoint_backend=self._checkpoint_backend,
+                    tensor_device=worker_tensor_device(self.worker_resource),
                 )
 
                 self._worker_handles[rank] = worker
@@ -965,9 +978,9 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             f"status={heartbeat.status.name} spmd_id={self.spmd_id}"
         )
 
-        # Check for worker error
-        if heartbeat.error_message:
-            self._handle_worker_error(rank, heartbeat.error_message)
+        if heartbeat.failure is not None:
+            self.receive_worker_failure(rank, heartbeat.failure)
+            return
 
         # Check if all workers have reported heartbeat (workers_ready)
         if not self._workers_ready:
@@ -999,11 +1012,33 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                 if self.state_machine.state == DriverState.READY:
                     self.state_machine.trigger(DriverEvent.START)
 
-    def _handle_worker_error(self, rank: int, error: str) -> None:
-        """Handle worker error."""
-        logger.error(f"Worker error rank={rank} error={error} spmd_id={self.spmd_id}")
-
-        self.state_machine.trigger(DriverEvent.WORKER_ERROR, rank=rank, error=error)
+    def receive_worker_failure(self, rank: int, failure: ExecutionFailure) -> None:
+        if self._stopping:
+            logger.debug(
+                "Ignoring worker failure during shutdown rank=%s spmd_id=%s",
+                rank,
+                self.spmd_id,
+            )
+            return
+        if not isinstance(failure, ExecutionFailure):
+            raise TypeError(
+                "receive_worker_failure requires ExecutionFailure, "
+                f"got {type(failure).__name__}."
+            )
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            raise ValueError(f"Worker failure rank must be non-negative, got {rank!r}.")
+        if failure.spmd_id != self.spmd_id:
+            raise ValueError(
+                f"Worker failure SPMD {failure.spmd_id!r} does not match "
+                f"driver {self.spmd_id!r}."
+            )
+        if failure.rank != rank:
+            raise ValueError(
+                f"Worker failure rank {failure.rank!r} does not match "
+                f"reported rank {rank}."
+            )
+        logger.error("Worker failure rank=%s failure=%s", rank, failure)
+        self.state_machine.trigger(DriverEvent.WORKER_ERROR, failure=failure)
 
     # =====================================================================
     # Worker Op Completion Handling
@@ -1268,7 +1303,21 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                         )
                         self.state_machine.trigger(
                             DriverEvent.INIT_FAILED,
-                            error=f"Worker init timeout after {elapsed:.1f}s",
+                            failure=ExecutionFailure(
+                                spmd_id=self.spmd_id,
+                                rank=None,
+                                op_name=None,
+                                step=None,
+                                phase="DRIVER_INITIALIZATION",
+                                exception_type="WorkerInitializationTimeout",
+                                message=(
+                                    f"Worker initialization timed out after "
+                                    f"{elapsed:.3f}s; "
+                                    f"{len(self._worker_heartbeat_times)}/"
+                                    f"{self.config.num_workers} workers reported."
+                                ),
+                                traceback=None,
+                            ),
                         )
             except Exception as e:
                 logger.error(
@@ -1285,13 +1334,45 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         # Count healthy workers
         healthy_count = 0
         current_time = time.time()
+        timed_out_rank: int | None = None
+        timed_out_elapsed = 0.0
         for rank in range(self.config.num_workers):
             last_time = self._worker_heartbeat_times.get(rank, 0)
-            if current_time - last_time < self._heartbeat_config.heartbeat_timeout:
+            elapsed = current_time - last_time
+            if elapsed < self._heartbeat_config.heartbeat_timeout:
                 healthy_count += 1
+            elif timed_out_rank is None:
+                timed_out_rank = rank
+                timed_out_elapsed = elapsed
 
-        # Determine status
-        if self.state_machine.is_error():
+        driver_state = self.state_machine.state
+        if (
+            timed_out_rank is not None
+            and driver_state is not DriverState.INITIALIZING
+            and self.state_machine.can_transition(
+                driver_state,
+                DriverEvent.WORKER_ERROR,
+            )
+        ):
+            self.receive_worker_failure(
+                timed_out_rank,
+                ExecutionFailure(
+                    spmd_id=self.spmd_id,
+                    rank=timed_out_rank,
+                    op_name=None,
+                    step=None,
+                    phase="WORKER_HEARTBEAT",
+                    exception_type="WorkerHeartbeatTimeout",
+                    message=(
+                        f"Worker heartbeat timed out after {timed_out_elapsed:.3f}s; "
+                        f"limit is {self._heartbeat_config.heartbeat_timeout:.3f}s."
+                    ),
+                    traceback=None,
+                ),
+            )
+            driver_state = self.state_machine.state
+
+        if driver_state is DriverState.ERROR:
             status = DriverStatus.ERROR
         elif healthy_count < self.config.num_workers:
             status = DriverStatus.WARNING
@@ -1302,8 +1383,12 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             spmd_id=self.spmd_id,
             timestamp=time.time(),
             status=status,
-            state=self.state_machine.state,
-            error_message=self.state_machine.get_error_message(),
+            state=driver_state,
+            failure=(
+                self.state_machine.failure
+                if driver_state is DriverState.ERROR
+                else None
+            ),
             num_workers=self.config.num_workers,
             healthy_num_workers=healthy_count,
             workers_ready=self._workers_ready,
@@ -1335,13 +1420,10 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                     f"Failed to report completion error={e} spmd_id={self.spmd_id}"
                 )
 
-    def _report_error(self, error: str) -> None:
+    def _report_error(self, failure: ExecutionFailure) -> None:
         """Report error to controller."""
         if self.controller_handle is not None:
-            try:
-                self.controller_handle.report_spmd_error.remote(self.spmd_id, error)
-            except Exception as e:
-                logger.error(f"Failed to report error error={e} spmd_id={self.spmd_id}")
+            self.controller_handle.report_spmd_error.remote(self.spmd_id, failure)
 
     # =====================================================================
     # Topology Update
@@ -1379,7 +1461,8 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             "num_workers": self.config.num_workers,
             "completed_step_count": self.spmd_synchronizer.get_spmd_steps(),
             "locked_ops": self.spmd_synchronizer.get_locked_ops(),
-            "error_workers": self.state_machine.get_error_workers(),
+            "failure": self.state_machine.failure,
+            "worker_failures": self.state_machine.get_worker_failures(),
         }
 
         return status

@@ -24,6 +24,7 @@ from fluxway.transport.communication import (
     SrcSideView,
     derive_src_side_view,
 )
+from fluxway.transport.routing import TransportRoutingMode, select_routing_source
 
 
 @pytest.fixture(autouse=True)
@@ -279,7 +280,19 @@ def test_distributor_last_src_view_populated_after_plan():
     tt = _build_chunked_tensor(local_shape=(12,), global_shape=(24,))
     dist = AsyncDataDistributor(local_rank=0)
     assert dist.last_src_view is None
-    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=12, tuuid=1)
+    dist.plan_and_shard(
+        local_data=tt,
+        source=src,
+        target=dst,
+        routing_source=select_routing_source(
+            tensor=tt,
+            source=src,
+            target=dst,
+            mode=TransportRoutingMode.ALGEBRAIC,
+        ),
+        capacity=12,
+        transfer_codes=1,
+    )
 
     view = dist.last_src_view
     assert view is not None
@@ -309,7 +322,19 @@ def test_distributor_expected_n_for_dst_static_chunk():
 
     tt = _build_chunked_tensor(local_shape=(12,), global_shape=(24,))
     dist = AsyncDataDistributor(local_rank=0)
-    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=12, tuuid=2)
+    dist.plan_and_shard(
+        local_data=tt,
+        source=src,
+        target=dst,
+        routing_source=select_routing_source(
+            tensor=tt,
+            source=src,
+            target=dst,
+            mode=TransportRoutingMode.ALGEBRAIC,
+        ),
+        capacity=12,
+        transfer_codes=2,
+    )
 
     src_world = src_mesh.size
     for d in range(dst_mesh.size):
@@ -335,7 +360,19 @@ def test_distributor_expected_n_for_dst_data_driven_falls_back():
     keys = jnp.arange(0, 6, dtype=jnp.int32)
     tt = TransportTensor(keys, global_shape=(12,), source_step=0)
     dist = AsyncDataDistributor(local_rank=0)
-    dist.plan_and_shard(local_data=tt, source=src, target=dst, capacity=6, tuuid=3)
+    dist.plan_and_shard(
+        local_data=tt,
+        source=src,
+        target=dst,
+        routing_source=select_routing_source(
+            tensor=tt,
+            source=src,
+            target=dst,
+            mode=TransportRoutingMode.ALGEBRAIC,
+        ),
+        capacity=6,
+        transfer_codes=3,
+    )
 
     view = dist.last_src_view
     assert view is not None

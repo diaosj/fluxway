@@ -73,6 +73,7 @@ class AxonNativeHlcBridge:
     def receive_result(self, carrier: TraceCarrier, result: Any) -> TraceCarrier:
         physical = getattr(result, "native_hlc_physical_ns", None)
         logical = getattr(result, "native_hlc_logical", None)
+        metadata = None
         if physical is None or logical is None:
             metadata = getattr(result, "metadata", None)
             if metadata is not None:

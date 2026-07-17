@@ -5,10 +5,9 @@ from fluxway.common.decorators import (
     operator_context,
 )
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.configs import SPMDConfig
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
-import pytest
+from tests.compiled_graph_fixtures import single_spmd_config
 
 
 class TopologyAwareOperator:
@@ -42,6 +41,18 @@ def _clear_operator_instance():
     storage, _ = get_instance_storage()
     storage.pop(id(TopologyAwareOperator), None)
     TopologyAwareOperator.seen_in_init = None
+
+
+def _topology_config():
+    operator_spec = TopologyAwareOperator.inspect._fluxway_operator_spec.updated(
+        owner=TopologyAwareOperator
+    )
+    return single_spmd_config(
+        name="operator-topology-context",
+        spmd_id="spmd-a",
+        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
+        operators={"inspect": operator_spec},
+    )
 
 
 def test_operator_context_exposes_topology_fields():
@@ -80,20 +91,14 @@ def test_operator_wrapper_sets_topology_fields_on_instance():
 
 def test_preinstantiate_operator_sets_topology_fields_in_init():
     _clear_operator_instance()
-    meta = TopologyAwareOperator.inspect._fluxway_operator_meta
-    config = SPMDConfig(
-        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
-        operators={"inspect": "inspect"},
-        operator_metas={"inspect": meta},
-        active_operator_names=("inspect", "inspect"),
-    )
+    config = _topology_config()
 
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     worker_cls = cls.modified_class if cls else SPMDWorker
     worker_cls._pre_instantiate_operators(  # type: ignore
         config,
         3,
-        operator_location="execution_actor",
+        static_args={},
         local_rank=1,
         local_world_size=4,
         node_rank=0,
@@ -130,27 +135,21 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
         assert instance.local_rank == 1  # plain attr, ignores context
 
 
-@pytest.mark.asyncio
-async def test_operator_manager_execute_preserves_topology_fields():
+def test_operator_manager_execute_preserves_topology_fields():
     _clear_operator_instance()
-    meta = TopologyAwareOperator.inspect._fluxway_operator_meta
-    config = SPMDConfig(
-        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
-        operators={"inspect": "inspect"},
-        operator_metas={"inspect": meta},
-        active_operator_names=("inspect", "inspect"),
-    )
+    config = _topology_config()
     manager = OperatorManager(
         config,
         rank=3,
         spmd_id="spmd-a",
+        static_args={},
         local_rank=1,
         local_world_size=4,
         node_rank=0,
         num_nodes=2,
     )
 
-    result = await manager.execute_async("inspect", step=0)
+    result = manager.execute("inspect", step=0)
 
     assert result == (3, 8, 1, 4, 0, 2)
 

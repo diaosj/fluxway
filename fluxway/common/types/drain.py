@@ -7,12 +7,6 @@ the persistence mechanism (like Checkpointing).
 """
 
 from abc import ABC, abstractmethod
-from enum import StrEnum
-
-
-class DrainMode(StrEnum):
-    GRAPH = "graph"
-    EAGER = "eager"
 
 
 class DrainStrategy(ABC):
@@ -46,19 +40,3 @@ class GraphModeDrainStrategy(DrainStrategy):
 
     def get_next_drain_target(self, current_completed_step: int) -> int | None:
         return current_completed_step + self.interval_steps
-
-
-class EagerModeDrainStrategy(DrainStrategy):
-    """
-    (TODO) Eager mode: drain immediately at a specified step or operate step-by-step.
-    In the future, this will receive dynamic step targets from the eagerness shell.
-    """
-
-    def __init__(self):
-        pass
-
-    def get_initial_drain_target(self, baseline: int = 0) -> int | None:
-        raise NotImplementedError("Eager mode drain is not yet implemented")
-
-    def get_next_drain_target(self, current_completed_step: int) -> int | None:
-        raise NotImplementedError("Eager mode drain is not yet implemented")

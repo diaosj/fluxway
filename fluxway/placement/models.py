@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
@@ -9,11 +7,12 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 
+from fluxway.resources import ResourceVector, normalize_resource_vector
+
 from .mathematics import (
     ConstraintNode,
     PlacementModel,
     PlacementRecipe,
-    ResourceVector,
 )
 
 
@@ -52,21 +51,6 @@ DEFAULT_MAX_MODEL_VARIABLES = 500_000
 DEFAULT_MAX_MODEL_CONSTRAINTS = 1_000_000
 
 
-def normalize_resources(value: Any) -> dict[str, Decimal]:
-    if not isinstance(value, Mapping):
-        raise ValueError("resources must be a mapping")
-    normalized: dict[str, Decimal] = {}
-    for resource, quantity in value.items():
-        if not isinstance(resource, str) or not resource:
-            raise ValueError("resource names must be non-empty strings")
-        if isinstance(quantity, float):
-            raise ValueError("resource quantities must use int or Decimal")
-        normalized[resource] = Decimal(quantity)
-        if normalized[resource] < 0:
-            raise ValueError("resource quantities must be non-negative")
-    return dict(sorted(normalized.items()))
-
-
 class ClusterNode(PlacementModel):
     node_id: str = Field(min_length=1)
     resources: dict[str, Decimal]
@@ -74,7 +58,7 @@ class ClusterNode(PlacementModel):
     @field_validator("resources", mode="before")
     @classmethod
     def validate_resources(cls, value: Any) -> dict[str, Decimal]:
-        return normalize_resources(value)
+        return normalize_resource_vector(value)
 
 
 class ClusterSnapshot(PlacementModel):
@@ -84,7 +68,7 @@ class ClusterSnapshot(PlacementModel):
     @field_validator("available", mode="before")
     @classmethod
     def validate_available(cls, value: Any) -> dict[str, Decimal]:
-        return normalize_resources(value)
+        return normalize_resource_vector(value)
 
     @field_validator("nodes")
     @classmethod
@@ -111,13 +95,6 @@ class ClusterSnapshot(PlacementModel):
                 available[resource] += quantity
         return cls(nodes=node_tuple, available=dict(available))
 
-    @property
-    def digest(self) -> str:
-        payload = json.dumps(
-            self.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
 
 class PlacementRuntimeConfig(PlacementModel):
     solve_timeout_s: float = Field(default=30, gt=0)
@@ -136,7 +113,7 @@ class PlacementRuntimeConfig(PlacementModel):
     @field_validator("driver_resources", mode="before")
     @classmethod
     def validate_driver_resources(cls, value: Any) -> dict[str, Decimal]:
-        return normalize_resources(value)
+        return normalize_resource_vector(value)
 
 
 class WorkerAssignment(PlacementModel):
@@ -164,8 +141,7 @@ class ConstraintResult(PlacementModel):
 class ResolvedPlacementPlan(PlacementModel):
     recipe_id: str
     recipe_version: str
-    recipe_digest: str
-    normalized_recipe: PlacementRecipe
+    recipe: PlacementRecipe
     assignments: tuple[WorkerAssignment, ...]
     allocated_quanta: dict[str, int]
     objective_results: tuple[ObjectiveResult, ...]
@@ -244,12 +220,10 @@ class AllocationReport(ResolvedPlacementPlan):
         capacity: ClusterSnapshot,
         error: Exception,
     ) -> AllocationReport:
-        normalized = recipe.normalized
         return cls(
-            recipe_id=normalized.recipe_id,
-            recipe_version=normalized.version,
-            recipe_digest=normalized.digest,
-            normalized_recipe=normalized,
+            recipe_id=recipe.recipe_id,
+            recipe_version=recipe.version,
+            recipe=recipe,
             assignments=(),
             allocated_quanta={},
             objective_results=(),

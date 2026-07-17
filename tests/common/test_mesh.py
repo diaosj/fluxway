@@ -105,3 +105,14 @@ def test_invalid_access():
 
     with pytest.raises(ValueError, match="dim does not match"):
         mesh.get_rank((0, 0, 0))
+
+
+def test_jax_pytree_unflatten_restores_mutable_mesh_state():
+    jax = pytest.importorskip("jax")
+    mesh = DeviceMesh(("worker",), (2,))
+
+    leaves, tree = jax.tree_util.tree_flatten(mesh)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
+
+    assert restored.is_frozen is False
+    assert restored.frozen_copy().is_frozen is True

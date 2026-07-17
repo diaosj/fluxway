@@ -3,12 +3,14 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import argparse
+from pathlib import Path
 import time
 
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import AsyncStepConfig
+import fluxway
 from fluxway.control_plane.graph.functional import FunctionalGraph
-from fluxway.control_plane.controller import create_controller
+from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
 from fluxway.common.types import CheckpointConfig
 from fluxway.profiler import ProfilerDiagnostic
 from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfile
@@ -18,19 +20,18 @@ from fluxway.example.recommendation.input_spmd import InputSPMD
 from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
 from fluxway.example.recommendation.dense_spmd import DenseSPMD
 
-from fluxway import launch
+from fluxway import run_in_sandbox
 
 
-async def _print_resource_allocation_summary(controller):
-    summary = await controller.get_resource_allocation_summary.remote()
+async def _print_resource_allocation_summary(execution):
+    summary = execution.allocation
     if not summary:
         print("[Fluxway] Controller resource summary is empty.")
         return
 
     print(
         "[Fluxway] Controller resource summary: "
-        f"recipe={summary['recipe_id']}@{summary['recipe_version']} "
-        f"digest={summary['recipe_digest']}"
+        f"recipe={summary['recipe_id']}@{summary['recipe_version']}"
     )
     counts = {}
     for assignment in summary["assignments"]:
@@ -104,6 +105,25 @@ def _build_ray_init_kwargs(args):
     return ray_init_kwargs or None
 
 
+def _clear_checkpoint_dir(checkpoint_dir: str | Path) -> None:
+    CheckpointDirectory.clear(checkpoint_dir)
+
+
+def _jax_runtime_env(platform: str) -> dict[str, dict[str, str]]:
+    return {
+        "env_vars": {
+            "JAX_PLATFORMS": platform,
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+        }
+    }
+
+
+def _dense_runtime_env(num_gpus: int) -> dict[str, dict[str, str]]:
+    if num_gpus < 0:
+        raise ValueError(f"num_gpus must be non-negative, got {num_gpus}")
+    return _jax_runtime_env("cuda" if num_gpus > 0 else "cpu")
+
+
 def _export_graph_visualization(task_graph, args) -> None:
     if args.graph_visualization_dir is None:
         return
@@ -123,18 +143,8 @@ async def run_training(args):
         raise ValueError(
             f"--dense-step-delay-ms must be non-negative, got {args.dense_step_delay_ms}."
         )
-    cpu_runtime_env = {
-        "env_vars": {
-            "CUDA_VISIBLE_DEVICES": "",
-            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-        }
-    }
-    gpu_runtime_env = {
-        "env_vars": {
-            "JAX_PLATFORMS": "cuda",
-            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-        }
-    }
+    cpu_runtime_env = _jax_runtime_env("cpu")
+    dense_runtime_env = _dense_runtime_env(args.num_gpus)
 
     r"""
             reader
@@ -184,8 +194,14 @@ async def run_training(args):
             embed_dim=16,
             dense_stats_dim=2,
             diagnostic_step_delay_ms=args.dense_step_delay_ms,
-            runtime_env=gpu_runtime_env,
-            resource={"num_gpus": getattr(args, "num_gpus", 1)},
+            runtime_env=dense_runtime_env,
+            resource_profile=ResourceProfile(
+                base={
+                    "CPU": 1,
+                    "GPU": args.num_gpus,
+                    "memory": 1024**3,
+                }
+            ),
         )
 
         h_raw = reader.read()
@@ -229,7 +245,13 @@ async def run_training(args):
         table2.update(grads=h_scatter.grad2)  # type: ignore
         dense.update(dense_grad=h_scatter.dense_grad, local=True)  # type: ignore
 
-        task_graph = graph.compile()
+        placement_recipe = PlacementRecipe(
+            recipe_id="recommendation-training",
+            version="1.0.0",
+            constraints=(),
+            objective=AFFINITY_FIRST_V1,
+        )
+        task_graph = graph.build()
 
     _apply_data_plane_config(task_graph, args)
     _export_graph_visualization(task_graph, args)
@@ -239,48 +261,33 @@ async def run_training(args):
     checkpoint_config = CheckpointConfig(
         force_write=True,
         backend="orbax",
-        ckpt_dir="/tmp/fluxway_recsys_ckpt",
+        ckpt_dir=args.checkpoint_dir,
         interval_steps=args.checkpoint_interval,
     )
-    placement_recipe = PlacementRecipe(
-        recipe_id="recommendation-training",
-        version="1.0.0",
-        profiles={
-            RecommendationReader: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
-            InputSPMD: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
-            SparseEmbeddingSPMD: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
-            DenseSPMD: ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
-        },
-        constraints=(),
-        objective=AFFINITY_FIRST_V1,
-    )
-
     profiler_config = _build_profiler_config(args)
     if profiler_config is not None:
         print(f"[Fluxway] Profiler trace run directory: {profiler_config.run_dir}")
         print(f"[Fluxway] Profiler trace output file: {profiler_config.output_path}")
 
-    controller = await create_controller(
+    execution = await fluxway.start(
         task_graph,
         placement_recipe=placement_recipe,
         async_step_config=async_step_config,
         checkpoint_config=checkpoint_config,
         profiler_config=profiler_config,
+        resume="latest",
     )
-    await _print_resource_allocation_summary(controller)
+    await _print_resource_allocation_summary(execution)
 
-    restored_step = await controller.restore_checkpoint.remote()
+    restored_step = execution.restored_step
     if restored_step is not None:
         print(f"[Fluxway] Resumed from checkpoint at step {restored_step}.")
 
     print(f"[Fluxway] Running to reach total {args.max_steps} steps …")
-    completed = await controller.wait_for_completion.remote()
+    await execution.wait()
 
-    await controller.stop_checkpointer.remote()
-    if completed:
-        print("[Fluxway] Training completed up to target steps.")
-    else:
-        print("[Fluxway] Training failed or timed out.")
+    await execution.cancel()
+    print("[Fluxway] Training completed up to target steps.")
 
 
 def main():
@@ -294,6 +301,11 @@ def main():
         default=2,
         dest="checkpoint_interval",
         help="Save a checkpoint every N steps",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default="/tmp/fluxway_recsys_ckpt",
+        help="Checkpoint directory for this training run",
     )
     parser.add_argument(
         "--dp",
@@ -436,13 +448,10 @@ def main():
         help="Override local ray.init num_gpus for this example run",
     )
     args = parser.parse_args()
-    if getattr(args, "clear_ckpt", False):
-        import shutil
+    if args.clear_ckpt:
+        _clear_checkpoint_dir(args.checkpoint_dir)
 
-        print("Clearing existing checkpoints in /tmp/fluxway_recsys_ckpt...")
-        shutil.rmtree("/tmp/fluxway_recsys_ckpt", ignore_errors=True)
-
-    launch(
+    run_in_sandbox(
         run_training,
         args,
         ray_init_kwargs=_build_ray_init_kwargs(args),

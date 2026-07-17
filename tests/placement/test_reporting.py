@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fluxway.common.types import Graph
 from fluxway.placement import (
     AFFINITY_FIRST_V1,
     ClusterNode,
@@ -22,9 +21,9 @@ from fluxway.placement import (
     support,
     workers,
 )
-from fluxway.control_plane.scheduler import Scheduler
+from fluxway.control_plane.scheduler import Scheduler, build_topology
 
-from .test_planner import scenario
+from .test_planner import graph_node, placement_graph, placement_inventory, scenario
 
 
 def test_planner_logs_each_constraint_once(caplog) -> None:
@@ -32,7 +31,9 @@ def test_planner_logs_each_constraint_once(caplog) -> None:
     from fluxway.placement import PlacementPlanner
 
     with caplog.at_level(logging.INFO):
-        PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
     messages = [record.getMessage() for record in caplog.records]
     validated = [
@@ -44,7 +45,7 @@ def test_planner_logs_each_constraint_once(caplog) -> None:
     event_order = [
         "placement.recipe.selected",
         "placement.capacity.snapshot",
-        "placement.program.normalized",
+        "placement.problem.created",
         "placement.constraint.validated",
         "placement.objective.started",
         "placement.objective.completed",
@@ -67,21 +68,21 @@ def test_scheduler_exposes_pg_ready_allocation_report(monkeypatch) -> None:
         return fake_pg
 
     scheduler = Scheduler(
+        graph=graph,
         placement_recipe=recipe,
         placement_runtime=PlacementRuntimeConfig(solve_timeout_s=10, pg_timeout_s=7),
     )
     monkeypatch.setattr(scheduler, "_capture_snapshot", lambda: snapshot)
     monkeypatch.setattr(scheduler.pg_manager, "create_job_pg", create_job_pg)
 
-    asyncio.run(scheduler.allocate_resources(graph))
+    asyncio.run(scheduler.allocate_resources())
 
     report = scheduler.allocation_report
     assert report is not None
     assert report.status == "PG_READY"
     assert report.pg_id == "pg-1"
-    assert report.recipe_digest == recipe.digest
+    assert report.recipe == recipe
     assert report.capacity == snapshot
-    assert report.normalized_recipe == recipe.normalized
     assert [result.satisfied for result in report.constraint_results] == [
         True,
     ] * len(recipe.constraints)
@@ -99,6 +100,7 @@ def test_scheduler_marks_report_ready_after_all_workers_attest(
     spmd_manager = AsyncMock()
     scheduler = Scheduler(
         spmd_manager=spmd_manager,
+        graph=graph,
         placement_recipe=recipe,
         placement_runtime=PlacementRuntimeConfig(solve_timeout_s=10, pg_timeout_s=7),
     )
@@ -109,7 +111,7 @@ def test_scheduler_marks_report_ready_after_all_workers_attest(
     monkeypatch.setattr(scheduler, "_capture_snapshot", lambda: snapshot)
     monkeypatch.setattr(scheduler.pg_manager, "create_job_pg", create_job_pg)
     with caplog.at_level(logging.INFO):
-        asyncio.run(scheduler.allocate_resources(graph))
+        asyncio.run(scheduler.allocate_resources())
         assert scheduler.resolved_plan is not None
         groups = {}
         for spmd_id, node in graph.nodes.items():
@@ -144,7 +146,7 @@ def test_scheduler_marks_report_ready_after_all_workers_attest(
             "get_worker_group",
             lambda spmd_id: groups[spmd_id],
         )
-        asyncio.run(scheduler.init_spmds(graph))
+        asyncio.run(scheduler.init_spmds())
 
     assert scheduler.allocation_report is not None
     assert scheduler.allocation_report.status == "READY"
@@ -161,14 +163,13 @@ def test_scheduler_marks_report_ready_after_all_workers_attest(
 
 
 def test_invalid_rank_is_not_logged_as_validated(caplog) -> None:
-    from .test_planner import SPMD0, graph_node
+    from .test_planner import SPMD0
 
-    placement_graph = Graph(nodes={"worker": graph_node("worker", SPMD0, 1)})
+    graph = placement_graph(nodes={"worker": graph_node("worker", SPMD0, 1)})
     worker = workers(SPMD0)
     recipe = PlacementRecipe(
         recipe_id="invalid-rank",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"CPU": 1})},
         constraints=(subseteq(support(rank(worker, 1)), support(worker)),),
         objective=AFFINITY_FIRST_V1,
     )
@@ -177,7 +178,9 @@ def test_invalid_rank_is_not_logged_as_validated(caplog) -> None:
     )
 
     with caplog.at_level(logging.INFO), pytest.raises(PlacementContractError):
-        PlacementPlanner(solve_timeout_s=10).resolve(placement_graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
     assert not any(
         record.getMessage().startswith("placement.constraint.validated")
@@ -188,13 +191,16 @@ def test_invalid_rank_is_not_logged_as_validated(caplog) -> None:
 def test_infeasible_scheduler_run_records_one_failed_summary(
     monkeypatch, caplog
 ) -> None:
-    from .test_planner import SPMD0, graph_node
+    from .test_planner import SPMD0
 
-    graph = Graph(nodes={"worker": graph_node("worker", SPMD0, 1)})
+    graph = placement_graph(
+        nodes={
+            "worker": graph_node("worker", SPMD0, 1, ResourceProfile(base={"CPU": 2}))
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="infeasible-report",
         version="1.0.0",
-        profiles={SPMD0: ResourceProfile(base={"CPU": 2})},
         constraints=(),
         objective=AFFINITY_FIRST_V1,
     )
@@ -202,13 +208,14 @@ def test_infeasible_scheduler_run_records_one_failed_summary(
         (ClusterNode(node_id="cpu", resources={"CPU": 1}),)
     )
     scheduler = Scheduler(
+        graph=graph,
         placement_recipe=recipe,
         placement_runtime=PlacementRuntimeConfig(solve_timeout_s=10, pg_timeout_s=7),
     )
     monkeypatch.setattr(scheduler, "_capture_snapshot", lambda: snapshot)
 
     with caplog.at_level(logging.INFO), pytest.raises(PlacementInfeasibleError):
-        asyncio.run(scheduler.allocate_resources(graph))
+        asyncio.run(scheduler.allocate_resources())
 
     assert scheduler.allocation_report is not None
     assert scheduler.allocation_report.status == "FAILED"
@@ -229,6 +236,7 @@ def test_topology_failure_releases_job_pg_and_records_one_failed_summary(
     spmd_manager.establish_topology.side_effect = ValueError("topology failed")
     scheduler = Scheduler(
         spmd_manager=spmd_manager,
+        graph=graph,
         placement_recipe=recipe,
         placement_runtime=PlacementRuntimeConfig(solve_timeout_s=10),
     )
@@ -246,11 +254,19 @@ def test_topology_failure_releases_job_pg_and_records_one_failed_summary(
         removed.append,
     )
 
+    async def initialize_static_graph() -> None:
+        await scheduler.allocate_resources()
+        try:
+            scheduler.establish_topology(build_topology(graph.require_compiled_graph()))
+        except Exception as error:
+            scheduler.abort_initialization(error)
+            raise
+
     with (
         caplog.at_level(logging.INFO),
         pytest.raises(ValueError, match="topology failed"),
     ):
-        asyncio.run(scheduler.schedule(graph))
+        asyncio.run(initialize_static_graph())
 
     assert scheduler.allocation_report is not None
     assert scheduler.allocation_report.status == "FAILED"

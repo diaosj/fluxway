@@ -38,7 +38,9 @@ def _make_worker_stub():
         _plan_tasks=set(),
         spmd_id="test_spmd",
         rank=0,
-        config=types.SimpleNamespace(operator_metas={}),
+        config=types.SimpleNamespace(operator_specs={}),
+        _operator_specs={},
+        _op_manager=object(),
     )
     stub._execution_queues = {"__default__": stub._execution_queue}
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
@@ -54,7 +56,8 @@ def _make_worker_stub():
     stub._local_step_plan_executor = types.SimpleNamespace(
         user_callable_executor=types.SimpleNamespace(shutdown=AsyncMock())
     )
-    stub._actor_owned_operator_names = lambda: set()
+    stub._operator_instance = types.MethodType(raw_cls._operator_instance, stub)
+    stub._operator_instances = types.MethodType(raw_cls._operator_instances, stub)
     stub._shutdown_local_operator_instances = types.MethodType(
         raw_cls._shutdown_local_operator_instances, stub
     )
@@ -165,18 +168,11 @@ class TestStopWakesDrainCondition:
                 shutdown_count += 1
 
         operator = Operator()
-        operator_meta = types.SimpleNamespace(
-            owner_class_module=Operator.__module__,
-            owner_class_qualname=Operator.__qualname__,
-        )
+        operator_meta = types.SimpleNamespace(owner=Operator)
         stub.config = types.SimpleNamespace(
-            operator_metas={"step": operator_meta, "flush": operator_meta}
+            operator_specs={"step": operator_meta, "flush": operator_meta}
         )
-        stub._actor_owned_operator_names = lambda: set()
-        monkeypatch.setattr(
-            "fluxway.spmd.worker.worker._resolve_owner_class",
-            lambda *_: Operator,
-        )
+        stub._operator_specs = stub.config.operator_specs
         monkeypatch.setattr(
             "fluxway.spmd.worker.worker.get_instance_storage",
             lambda: ({id(Operator): operator}, threading.Lock()),
@@ -202,28 +198,17 @@ class TestStopWakesDrainCondition:
             def on_shutdown(self) -> None:
                 calls.append("healthy")
 
-        classes = {
-            "FailingOperator": FailingOperator,
-            "HealthyOperator": HealthyOperator,
-        }
         instances = {
             id(FailingOperator): FailingOperator(),
             id(HealthyOperator): HealthyOperator(),
         }
         stub.config = types.SimpleNamespace(
-            operator_metas={
-                name: types.SimpleNamespace(
-                    owner_class_module="test",
-                    owner_class_qualname=name,
-                )
-                for name in classes
+            operator_specs={
+                "failing": types.SimpleNamespace(owner=FailingOperator),
+                "healthy": types.SimpleNamespace(owner=HealthyOperator),
             }
         )
-        stub._actor_owned_operator_names = lambda: set()
-        monkeypatch.setattr(
-            "fluxway.spmd.worker.worker._resolve_owner_class",
-            lambda _, qualname: classes[qualname],
-        )
+        stub._operator_specs = stub.config.operator_specs
         monkeypatch.setattr(
             "fluxway.spmd.worker.worker.get_instance_storage",
             lambda: (instances, threading.Lock()),

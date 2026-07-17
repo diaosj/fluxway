@@ -3,8 +3,8 @@ Fluxway is a Flexible Large-scale Unified eXchange designed to maximize Workload
 
 ## Documentation
 
-- [Placement Recipe](docs/placement_recipe.md): configure resources, affinity,
-  objectives, runtime limits, and diagnostics.
+- [Placement Recipe](docs/placement_recipe.md): declare per-SPMD resources and
+  configure affinity, objectives, runtime limits, and diagnostics.
 - [Placement Mathematics](docs/placement_mathematics.md): formal semantics and
   solver boundaries for Recipe authors.
 - [Architecture](docs/ARCHITECTURE.md): control-plane and runtime ownership.
@@ -23,4 +23,5 @@ fluxway.view_graph(bundle)
 ```
 
 See [Computation Graph Visualization](docs/graph_visualization.md) for Model
-Explorer usage, remote viewing, trace correlation, and bundle semantics.
+Explorer usage, dependency and transfer colors, potential-overlap layout,
+remote viewing, trace correlation, and bundle semantics.

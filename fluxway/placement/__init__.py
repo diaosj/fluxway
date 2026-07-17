@@ -6,9 +6,8 @@ from .mathematics import (
     NodeSetExpr,
     Objective,
     PlacementRecipe,
-    ResourceProfile,
-    ResourceScale,
     ScalarExpr,
+    SPMDRef,
     VectorExpr,
     WorkerSetExpr,
     all_of,
@@ -46,6 +45,7 @@ from .mathematics import (
     weighted_dominant_share,
     workers,
 )
+from fluxway.resources import ResourceProfile, ResourceScale
 from .models import (
     AllocationReport,
     ClusterNode,
@@ -77,6 +77,7 @@ __all__ = [
     "ResourceProfile",
     "ResourceScale",
     "ScalarExpr",
+    "SPMDRef",
     "VectorExpr",
     "WorkerSetExpr",
     "all_of",

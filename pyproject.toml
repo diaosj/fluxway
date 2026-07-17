@@ -55,17 +55,8 @@ jax = [
     "orbax",
     "grain",
 ]
-cuda11 = [
-    "cupy-cuda11x>=13.0.0",
-]
-cuda12 = [
+cuda = [
     "cupy-cuda12x>=13.0.0",
-]
-cuda13 = [
-    "cupy-cuda13x>=13.0.0",
-]
-standard = [
-    "cupy>=13.0.0",
 ]
 profiler = [
     "perfetto",
@@ -140,3 +131,25 @@ python_version = "3.12"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+
+[tool.pyrefly]
+ignore-missing-imports = [
+    "cupy",
+    "etils",
+    "flax",
+    "grain",
+    "grain.python",
+    "jax",
+    "jax.numpy",
+    "jax.sharding",
+    "jax.tree_util",
+    "numba",
+    "numpy",
+    "orbax",
+    "orbax.checkpoint",
+    "pydantic",
+    "pytest",
+    "ray",
+    "safetensors",
+    "safetensors.numpy",
+]

@@ -37,6 +37,11 @@ def gpu_backend():
     return b
 
 
+def test_hybrid_backend_rejects_unknown_default_device():
+    with pytest.raises(ValueError, match="default_device"):
+        HybridBackend(default_device="automatic")
+
+
 # ============================================================
 # CPU Mode — Numba JIT Verification (NO FALLBACK)
 # ============================================================

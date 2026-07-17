@@ -7,9 +7,10 @@ import sparse_embedding.checkpoint  # type: ignore
 
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator, requires_worker_process
-from fluxway.common.types import AsyncPolicy, SchedulePolicy, StatePolicy
+from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy, StatePolicy
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
+from fluxway import ResourceProfile
 from fluxway.example.recommendation.data_types import LookupOutput
 
 logger = get_logger(__name__)
@@ -25,7 +26,7 @@ def _balanced_counts(total: int, shard_count: int) -> list[int]:
 
 
 @spmd(
-    resource={"num_cpus": 1, "memory_gb": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("shard",),
 )
 @requires_worker_process
@@ -146,7 +147,11 @@ class SparseEmbeddingSPMD:
         ),
         data_argument=["unique_ids"],
         input_sharding={
-            "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
+            "unique_ids": {
+                "type": "dynamic",
+                "axis": ["shard"],
+                "strategy": "modulo",
+            }
         },
         output_sharding={
             "sparse_features": {
@@ -257,13 +262,3 @@ class SparseEmbeddingSPMD:
             f"[SparseEmbeddingSPMD.update] rank={self.rank} step={step} "
             f"grad_norm={float(np.linalg.norm(grads_np)):.4f}"
         )
-
-
-def hash_routing(tensor, mesh):
-    if isinstance(tensor, TransportTensor) and tensor.routing_indices is not None:
-        val = tensor.routing_indices
-    else:
-        val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
-    partitioner = se.ModuloPartitioner(num_shards=mesh.size)
-    shard_ids_dlm = partitioner.partition(val)
-    return get_backend().from_dlpack(shard_ids_dlm)

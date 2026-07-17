@@ -28,13 +28,57 @@ flowchart TB
 
 `Controller` 负责图生命周期、资源调度、driver 管理、心跳和全局错误传播。`AsyncStepManager` 只处理跨 SPMD ahead limit：某个 SPMD/operator 允许跑多远由 `AsyncPolicy` lowering 后的上限决定，实际放行仍通过现有 block/unblock 机制完成。
 
-控制平面不直接参与 tensor 切分、重组或发送。它只下发拓扑、sharding、operator metadata 和跨 SPMD 进度约束。
+控制平面不直接参与 tensor 切分、重组或发送。Graph build 只编译一次
+`CompiledGraph`，每个 worker 接收对应的 `SPMDGraphView` 投影以及跨 SPMD
+进度约束。
+
+### SPMD Registry And Execution Modes
+
+Builder 中的 Graph node 收集真实 Python class、`SPMDConfig` 和 `ResourceProfile`。build 完成后，frozen `CompiledSPMDDeclaration` 是 SPMD identity、mesh 和资源的唯一编译事实；`SPMDGraphView` 直接引用该对象。`OperatorSpec` 从 decorator 声明、Graph 编译到 worker 执行保持同一个 frozen 模型，不再 lowering 为第二套 runtime metadata。
+
+Graph、Recipe、SPMD class、静态参数、condition function 和动态 routing function 都通过 Ray actor 参数直接传输。Fluxway 不建立 JSON 对象重建协议，也不要求 class、lambda、局部函数或闭包能通过字符串重新导入。每个 rank worker 构造一份 owner 实例，同一 owner class 的全部 operator 共享这份对象；state resource 只决定锁。
+
+运行时控制面和数据面不使用 JSON 传输对象。仓库中的 JSON 只存在于明确的外部格式 adapter：Graph visualization bundle、Perfetto 用户属性、safetensors metadata、示例 Reader 状态和业务 JSONL trace。它们面向磁盘或第三方工具，不参与 Ray actor、Graph、Recipe、operator 或 tensor 运行时通信。
+
+`AsyncPolicy` 是异步调度语义的唯一事实来源。`common.schedule_semantics`
+在初始化冷路径将 phase policy 编译为不可变 gate 和 relation；worker 热路径
+与 Model Explorer overlap projection 复用同一编译结果，不分别实现 phase
+ordering。
+
+静态图 build 后，`CompiledGraph` 是 SPMD declaration、operator identity、dependency 和 tensor
+transfer 的唯一编译事实来源。`DependencySpec` 保存逻辑 operator 依赖，
+`CompiledDependency` 和 `CompiledTensorTransfer` 只增加 dependency/transfer code、TUUID、
+mesh 和 world size 等编译结果。零条 tensor transfer 表示纯执行顺序依赖。
+worker route、Model Explorer projection 和 profiler identity 都从 compiled graph
+派生，不允许反向重建或双写。condition callable 作为原生 Python 对象由 Ray
+传输，不转换为字符串 ID。
+
+`CompiledTensorTransfer.source_sharding/target_sharding` 保留用户声明的
+mirror/follow 关系。GraphCompiler 沿完整端口引用图求闭包后，producer 侧非引用执行
+几何只保存在 canonical `CompiledLogicalTensor.effective_sharding`，target port 侧只保存在
+`CompiledOperator.effective_input_sharding`；transfer 不复制这两项。TUUID 只承担 logical
+tensor 的 wire identity，不承担运行时 sharding 推导。编译器对引用闭包做 memoized DFS，
+循环、缺失端口和当前未实现的非 identity dimension map 都在启动前用
+`SPMD.operator:port` 链抛错。`SPMDGraphView` 按引用传递闭包投影同一批 canonical logical
+tensor 对象，Worker 不重建 TUUID-to-sharding 映射。
+
+placement 从 `CompiledGraph` 的 declaration 建立 inventory，不读取 build 后仍可变的 Graph node 字段；Ray actor 生命周期使用 Graph node 中的运行参数和同一个 compiled declaration。
+静态 Graph 在启动前解析 dependency、condition、tensor tree 和 sharding，worker
+从固定的 `SPMDGraphView` 构造并缓存 runtime route；step 热循环中没有
+execution-mode 分派，也没有 referential sharding DFS。future eager generation
+继续调用同一个 `GraphCompiler`，因此 graph/eager 共享 transfer ABI 和错误语义。
+
+`Scheduler` 构造器接收 Graph 和 Recipe，并分别公开资源分配、topology 注册和 SPMD 启动步骤。静态 Controller 使用 `build_topology(compiled_graph)` 提供邻接关系；未来 eager adapter 可以跳过静态邻接关系并复用同一组资源与 actor 生命周期方法。
+
+未来 eager adapter 负责运行时 invocation、dynamic tensor layout 和 route plan，但必须复用同一个 SPMD registry、PlacementPlanner、PlacementGroup、SPMDDriver 和 SPMDWorker。eager 不能复制资源分配或 actor 生命周期实现。当前版本没有提供半成品 eager 入口。
 
 ### Placement
 
-`Controller` 接收版本化 `PlacementRecipe`。`PlacementPlanner` 将 Graph 中固定的 SPMD class、instance、DeviceMesh rank 与 Ray node resource snapshot 编译成有限 CP-SAT 模型。公开接口只包含 worker/node 集合表达式、数学约束和严格字典序 objective；逻辑 slot、rank mapping 和 solver variables 都是内部表示。
+`create_controller(graph, placement_recipe=...)` 在同一次 Ray actor 创建中传输 Graph 和 Recipe。`PlacementPlanner` 接收由 compiled declarations 建立的 `PlacementInventory`、Recipe 和 Ray node resource snapshot，不依赖 dependency；dependency 只属于执行拓扑。
 
-placement 内部分为五个单向职责层：`mathematics.py` 定义 frozen AST，`models.py` 定义稳定报告与异常契约，`semantics.py` 解析集合并提供独立 attestation oracle，`compiler.py` 注册各 AST 节点的 CP-SAT lowering，`planner.py` 只编排模型组装、严格字典序求解和 materialization。新增 AST 节点通过类型注册 handler 扩展，不修改中心条件分派链。
+公开 placement 接口只包含 worker/node 集合表达式、数学约束和严格字典序 objective；逻辑 slot、rank mapping 和 solver variables 都是内部表示。资源声明属于独立的 `fluxway.resources` 模块，数学 Recipe 不保存第二份 class-to-profile 映射。
+
+placement 内部分为六个单向职责层：`mathematics.py` 定义 frozen AST，`inventory.py` 从 compiled declarations 建立只含 placement 所需字段的内部视图，`models.py` 定义报告与异常契约，`semantics.py` 解析集合并提供独立 attestation oracle，`compiler.py` 注册各 AST 节点的 CP-SAT lowering，`planner.py` 只编排模型组装、严格字典序求解和 materialization。新增 AST 节点通过类型注册 handler 扩展，不修改中心条件分派链。
 
 所有 SPMD 共用一个异构 Ray PlacementGroup。一个求解结果节点对应一个 composite bundle，bundle 使用 Ray 自动提供的 `node:<ip>` resource 精确绑定并采用 `STRICT_SPREAD`。`Controller` 是 PG 唯一 owner；`SPMDManager` 和 `SPMDDriver` 只借用 `SPMDWorkerGroup` 中的 rank-to-bundle 映射。
 
@@ -95,7 +139,7 @@ WAIT -> CALL -> SEND -> BARRIER
 
 `fluxway/spmd/worker/runtime.py` 是 worker-local lifecycle owner：
 
-- `WorkerProcessCallRuntime`：让 `@requires_worker_process` 的同步用户代码在线程 runtime 中执行；event loop 只 await future。
+- `WorkerProcessCallRuntime`：将普通 Python callable 异步提交到线程 runtime；event loop 只 await future。
 - `LocalInputPrepareRuntime`：管理 mailbox-triggered prepare token、后台 assemble、consume、cancel、drain。
 - `OutboundDeliveryRuntime`：管理 `LocalSendToken` 注册、delivery semaphore、delivery task、异常 poison、drain/checkpoint/export/stop fence。
 
@@ -116,9 +160,28 @@ tensor 组装由 worker-local assembly 模块负责：
 transport 层拥有 routing、sharding、frame template 和 batch plan：
 
 - `AsyncDataDistributor.plan_and_shard()` 负责 sharding/split。
+- `TransportRoutingMode.ALGEBRAIC/RECEIPT` 明确选择代数几何或 receipt 路由；
+  transport 不再从 `PhysicalLayout` 猜测 mirror 语义。
 - `TransportFrameTemplate` 缓存可模板化的 header/table 骨架。
 - `TransportBatchPlan` 按 transport 语义把 frame groups 转成 batch。
 - data-plane executor 只消费 compiled send plan 和 transport batch，不重新实现 target grouping 或 frame construction。
+
+`TransportFrame.entry_i32` 只包含三类固定宽度 entry：tensor transfer、
+ordering completion、dependency decision。dependency decision 以
+`DependencyDecision.PROCEED/SKIP` 表达，使用 dependency code 作为 identity。
+tensor transfer 的状态只有 `TensorEntryKind.TENSOR`、
+`TensorEntryKind.ROUTING_MISS` 和
+`TensorEntryKind.COMPLETED_WITHOUT_TENSOR`；合法的零元素 tensor 仍属于
+`TensorEntryKind.TENSOR`。ordering completion 与 dependency decision 不描述
+tensor，因此固定使用 `TensorEntryKind.NOT_APPLICABLE`。operator 异常不会编码成
+tensor entry。target 收齐同一 dependency 的全部
+source rank decision 后要求一致，混合 decision 直接抛协议异常。`SKIP` 只旁路该
+dependency 的 tensor 输入，其他因果 dependency 仍须完成。condition 可以直接作用于
+没有 tensor transfer 的 dependency：`PROCEED` 完成该因果依赖，`SKIP` 跳过 target
+step。上游 operator 被跳过时，所有下游 dependency 都传播 `SKIP`，不会把 ordering-only
+dependency 伪装成成功完成。condition 可以直接返回严格 `bool`，也可以返回最终解析为
+严格 `bool` 的 awaitable；graph 与 future eager adapter 复用同一个 async evaluator，
+无 condition 的 graph step 不创建 coroutine。
 
 static-to-static 只 patch step 和 payload refs。dynamic 路径只缓存稳定 schema/tuuid/role 骨架；shape/count/routing/origin/inverse/payload 每 step 输入。
 
@@ -135,8 +198,21 @@ step commit 和 delivery completion 分离：
 
 - `SEND` 返回 `LocalSendToken` 表示 delivery 已注册。
 - `BARRIER` 不等待 frame build、batch RPC 或 receiver deposit。
-- delivery 异常由 `OutboundDeliveryRuntime` poison worker。
 - drain/checkpoint/export/stop 是唯一等待 registered delivery 的 fence。
+
+`ExecutionFailure` 是运行时失败的唯一事实。first failure 在 Worker 中一次性锁存
+SPMD、rank、operator、step、phase、异常类型、消息和 traceback；user CALL、SEND、
+background delivery 与 scheduler 异常复用同一入口。锁存后 Worker 停止新 step admission、
+唤醒所有 execution lane、取消未完成任务，并立即调用 Driver 的
+`receive_worker_failure`。heartbeat 只携带同一个对象，不复制 error string。
+
+Driver 的 worker heartbeat timeout 和 Controller 的 driver heartbeat timeout 也构造
+`ExecutionFailure`。Controller 在 `INITIALIZING`、`PENDING`、
+`TOPOLOGY_REGISTERING` 或 `RUNNING` 收到首错后都进入 `FAILING`，并发停止全部
+SPMD。业务方等待成功时得到
+`True`，失败时得到包含结构化失败的 `ExecutionFailedError`，调用超时时得到内置
+`TimeoutError`。异常绝不表示为 tensor entry，因此 graph 成功热路径不新增错误
+frame、mailbox polling 或逐 tensor 分支；future eager 复用同一控制面 ABI。
 
 checkpoint、heartbeat、driver report 只读取 contiguous committed watermark。
 

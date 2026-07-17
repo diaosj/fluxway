@@ -11,15 +11,18 @@ from fluxway.common.types.sharding import P, ShardingSpec
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.transport.communication import AsyncDataDistributor
 from fluxway.transport.manifest import (
-    EDGE_EMPTY_KIND,
-    EDGE_EXPECTED_COUNT,
-    EDGE_META_STATE,
-    FRAME_EDGE_COUNT,
+    ENTRY_EXPECTED_COUNT,
+    ENTRY_META_STATE,
+    ENTRY_ROUTE_CODE,
+    ENTRY_TENSOR_KIND,
+    FRAME_ENTRY_COUNT,
+    FRAME_FLAGS,
     FRAME_PAYLOAD_COUNT,
     FRAME_SENDER_SPMD_CODE,
-    EmptyKind,
+    FrameFlag,
     PAYLOAD_ROLE,
     PayloadRole,
+    TensorEntryKind,
 )
 
 
@@ -64,7 +67,7 @@ def test_async_distributor_uses_only_flat_frame_abi():
             local_data=data,
             source=spec,
             target=spec,
-            tuuid=17,
+            transfer_codes=17,
             step=3,
             sender_spmd_code=5,
             sender_rank=0,
@@ -78,9 +81,14 @@ def test_async_distributor_uses_only_flat_frame_abi():
         segments,
     ) = captured[0]
     assert int(header.frame_i32[FRAME_SENDER_SPMD_CODE]) == 5
-    assert int(header.frame_i32[FRAME_EDGE_COUNT]) == 1
+    assert int(header.frame_i32[FRAME_FLAGS]) == int(FrameFlag.TENSOR_TRANSFER)
+    assert int(header.entry_i32[0, ENTRY_ROUTE_CODE]) == 17
+    assert TensorEntryKind(int(header.entry_i32[0, ENTRY_TENSOR_KIND])) is (
+        TensorEntryKind.TENSOR
+    )
+    assert int(header.frame_i32[FRAME_ENTRY_COUNT]) == 1
     assert int(header.frame_i32[FRAME_PAYLOAD_COUNT]) == 1
-    assert header.edge_i32.dtype == np.int32
+    assert header.entry_i32.dtype == np.int32
     assert header.payload_i32.dtype == np.int32
     assert header.shape_i32.dtype == np.int32
     assert header.global_shape_i64.dtype == np.int64
@@ -92,8 +100,8 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
     mesh = DeviceMesh(axis_names=("x",), device_shape=(1,), device_ids=np.array([0]))
     spec = ShardingSpec.chunk(P("x")).bind(mesh)
     dense = TransportTensor(
-        jnp.arange(4, dtype=jnp.float32),
-        global_shape=(4,),
+        jnp.arange(2, dtype=jnp.float32),
+        global_shape=(2,),
         source_step=4,
     )
     ragged = TransportTensor(
@@ -103,8 +111,8 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
         source_step=4,
     )
     origin = TransportTensor(
-        jnp.arange(3, dtype=jnp.float32),
-        origin_indices=jnp.array([7, 8, 9], dtype=jnp.int64),
+        jnp.arange(2, dtype=jnp.float32),
+        origin_indices=jnp.array([7, 8], dtype=jnp.int32),
         global_shape=(10,),
         source_step=4,
     )
@@ -115,7 +123,7 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
             local_data=[dense, ragged, origin],
             source=spec,
             target=spec,
-            tuuid=[21, 22, 23],
+            transfer_codes=[21, 22, 23],
             step=4,
             sender_spmd_code=2,
             sender_rank=0,
@@ -124,12 +132,13 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
 
     (_results, _sort), captured = asyncio.run(run_test())
     header, _payload_iovs = captured[0]
-    edge_i32 = header.edge_i32
+    entry_i32 = header.entry_i32
     payload_i32 = header.payload_i32
-    assert int(edge_i32[0, EDGE_META_STATE]) == 0
-    assert ragged_level_count(int(edge_i32[1, EDGE_META_STATE])) == 1
-    assert bool(int(edge_i32[1, EDGE_META_STATE]) & 1)
-    assert int(edge_i32[2, EDGE_META_STATE]) == 2
+    assert entry_i32[:, ENTRY_ROUTE_CODE].tolist() == [21, 22, 23]
+    assert int(entry_i32[0, ENTRY_META_STATE]) == 0
+    assert ragged_level_count(int(entry_i32[1, ENTRY_META_STATE])) == 1
+    assert bool(int(entry_i32[1, ENTRY_META_STATE]) & 1)
+    assert int(entry_i32[2, ENTRY_META_STATE]) == 2
     assert payload_i32[:, PAYLOAD_ROLE].tolist() == [
         int(PayloadRole.VALUES),
         int(PayloadRole.VALUES),
@@ -163,7 +172,7 @@ def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():
             local_data=data,
             source=source_spec,
             target=target_spec,
-            tuuid=91,
+            transfer_codes=91,
             step=7,
             sender_spmd_code=3,
             sender_rank=0,
@@ -173,10 +182,10 @@ def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0, 1}
     for header, payload_iovs in captured.values():
-        assert int(header.frame_i32[FRAME_EDGE_COUNT]) == 1
+        assert int(header.frame_i32[FRAME_ENTRY_COUNT]) == 1
         assert int(header.frame_i32[FRAME_PAYLOAD_COUNT]) == 3
-        assert int(header.edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
-        assert ragged_level_count(int(header.edge_i32[0, EDGE_META_STATE])) == 2
+        assert int(header.entry_i32[0, ENTRY_EXPECTED_COUNT]) == 1
+        assert ragged_level_count(int(header.entry_i32[0, ENTRY_META_STATE])) == 2
         assert header.payload_i32[:, PAYLOAD_ROLE].tolist() == [
             int(PayloadRole.VALUES),
             int(PayloadRole.RAGGED_LENGTHS),
@@ -202,7 +211,7 @@ def test_transport_frame_static_manifest_emits_only_real_producers():
             local_data=data,
             source=source_spec,
             target=target_spec,
-            tuuid=92,
+            transfer_codes=92,
             step=8,
             sender_spmd_code=1,
             sender_rank=0,
@@ -211,11 +220,11 @@ def test_transport_frame_static_manifest_emits_only_real_producers():
 
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0, 1}
-    assert int(captured[0][0].edge_i32[0, EDGE_EXPECTED_COUNT]) == 1
-    assert int(captured[1][0].edge_i32[0, EDGE_EXPECTED_COUNT]) == 2
+    assert int(captured[0][0].entry_i32[0, ENTRY_EXPECTED_COUNT]) == 1
+    assert int(captured[1][0].entry_i32[0, ENTRY_EXPECTED_COUNT]) == 2
 
 
-def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
+def test_transport_frame_dynamic_manifest_marks_unrouted_targets_as_routing_miss():
     src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
     dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("y",))
     source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
@@ -232,7 +241,7 @@ def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
             local_data=data,
             source=source_spec,
             target=target_spec,
-            tuuid=93,
+            transfer_codes=93,
             step=9,
             sender_spmd_code=1,
             sender_rank=0,
@@ -242,11 +251,76 @@ def test_transport_frame_dynamic_manifest_uses_all_sender_protocol_empty():
     (_results, _sort), captured = asyncio.run(run_test())
     assert set(captured) == {0, 1, 2, 3}
     for frame in captured.values():
-        edge_i32 = frame[0].edge_i32
-        assert int(edge_i32[0, EDGE_EXPECTED_COUNT]) == src_mesh.size
-    assert int(captured[2][0].edge_i32[0, EDGE_EMPTY_KIND]) == int(
-        EmptyKind.PROTOCOL_EMPTY
+        entry_i32 = frame[0].entry_i32
+        assert int(entry_i32[0, ENTRY_EXPECTED_COUNT]) == src_mesh.size
+    assert int(captured[2][0].entry_i32[0, ENTRY_TENSOR_KIND]) == int(
+        TensorEntryKind.ROUTING_MISS
     )
-    assert int(captured[3][0].edge_i32[0, EDGE_EMPTY_KIND]) == int(
-        EmptyKind.PROTOCOL_EMPTY
+    assert int(captured[3][0].entry_i32[0, ENTRY_TENSOR_KIND]) == int(
+        TensorEntryKind.ROUTING_MISS
     )
+
+
+def test_dynamic_zero_tensor_is_routing_miss_not_completed_without_tensor():
+    src_mesh = DeviceMesh(device_shape=(2,), axis_names=("x",))
+    dst_mesh = DeviceMesh(device_shape=(4,), axis_names=("y",))
+    source_spec = ShardingSpec.chunk(P("x")).bind(src_mesh)
+    target_spec = ShardingSpec.hash(P("y")).bind(dst_mesh)
+    data = TransportTensor(
+        jnp.empty((0,), dtype=jnp.int32),
+        global_shape=(0,),
+        source_step=10,
+    )
+
+    async def run_test():
+        return await _capture_frame(
+            AsyncDataDistributor(local_rank=0),
+            local_data=data,
+            source=source_spec,
+            target=target_spec,
+            transfer_codes=94,
+            step=10,
+            sender_spmd_code=1,
+            sender_rank=0,
+            sender_world_size=src_mesh.size,
+        )
+
+    (_results, _sort), captured = asyncio.run(run_test())
+
+    assert set(captured) == {0, 1, 2, 3}
+    assert {
+        TensorEntryKind(int(header.entry_i32[0, ENTRY_TENSOR_KIND]))
+        for header, _ in captured.values()
+    } == {TensorEntryKind.ROUTING_MISS}
+
+
+@pytest.mark.parametrize(
+    ("method_name", "expected_kind"),
+    [
+        ("plan_routing_miss", TensorEntryKind.ROUTING_MISS),
+        (
+            "plan_completed_without_tensor",
+            TensorEntryKind.COMPLETED_WITHOUT_TENSOR,
+        ),
+    ],
+)
+def test_absent_tensor_planning_preserves_causal_kind(method_name, expected_kind):
+    distributor = AsyncDataDistributor(local_rank=0)
+    getattr(distributor, method_name)(
+        target_rank=0,
+        expected_count=1,
+        transfer_code=94,
+        payload=np.empty((0,), dtype=np.int32),
+        source_step=10,
+    )
+
+    target_rank, header, payloads = distributor.build_transport_frame_args(
+        step=10,
+        sender_spmd_code=1,
+        sender_rank=0,
+        sender_world_size=1,
+    )[0]
+
+    assert target_rank == 0
+    assert TensorEntryKind(int(header.entry_i32[0, ENTRY_TENSOR_KIND])) is expected_kind
+    assert payloads[0].shape == (0,)

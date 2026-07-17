@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 
-from fluxway.common.types.configs import OperatorMeta, OperatorContext
+from fluxway.common.types.configs import OperatorContext
+from fluxway.common.operator_spec import OperatorSpec
 
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -12,8 +13,9 @@ class ExecutionStatus(Enum):
 
     SUCCESS = auto()
     SKIPPED = auto()
+    INACTIVE = auto()
     STALE_AFTER_RESTORE = auto()
-    EMPTY_PROPAGATION = auto()
+    COMPLETED_WITHOUT_TENSOR = auto()
 
 
 @dataclass
@@ -98,7 +100,7 @@ class InterleavedDispatcher(ExecutionDispatcher):
         )
 
 
-def create_dispatcher(meta: OperatorMeta) -> ExecutionDispatcher:
+def create_dispatcher(meta: OperatorSpec) -> ExecutionDispatcher:
     """Factory to create dispatcher strategy based on operator metadata."""
     if getattr(meta, "is_interleaved", False):
         return InterleavedDispatcher(

@@ -15,11 +15,14 @@ from fluxway.spmd.worker.data_plane import CompiledSendPlan, CompiledSuccessorRo
 from fluxway.spmd.worker.data_plane_executor import (
     BatchingDataPlaneExecutor,
     _TargetBatchQueue,
-    build_and_send_step_frames,
 )
 from fluxway.transport.manifest import (
-    EDGE_WIDTH,
+    ENTRY_WIDTH,
     PAYLOAD_WIDTH,
+    PayloadRole,
+    PROTOCOL_VERSION,
+    TensorEntryKind,
+    TransportFrameBuilder,
     TransportFrameHeader,
 )
 
@@ -38,8 +41,11 @@ class _Handler(DataPlaneCallable):
 
 def _empty_header(step: int = 0) -> TransportFrameHeader:
     return TransportFrameHeader(
-        frame_i32=np.array([1, step, 0, 0, 1, 0, 0, 0], dtype=np.int32),
-        edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
+        frame_i32=np.array(
+            [PROTOCOL_VERSION, step, 0, 0, 1, 0, 0, 0],
+            dtype=np.int32,
+        ),
+        entry_i32=np.zeros((0, ENTRY_WIDTH), dtype=np.int32),
         payload_i32=np.zeros((0, PAYLOAD_WIDTH), dtype=np.int32),
         shape_i32=np.zeros((0,), dtype=np.int32),
         global_shape_i64=np.zeros((0,), dtype=np.int64),
@@ -50,12 +56,13 @@ def _empty_header(step: int = 0) -> TransportFrameHeader:
 def _compiled_plan() -> CompiledSendPlan:
     return CompiledSendPlan(
         op_name="op",
+        source_spmd_id="source",
         rank=0,
         sender_spmd_code=1,
         sender_world_size=1,
         successor_routes=(),
         output_count=1,
-        tuuid_to_name=None,
+        transfer_code_to_name={},
     )
 
 
@@ -127,9 +134,10 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         build_threads.append(threading.get_ident())
         header = TransportFrameHeader(
             frame_i32=np.array(
-                [1, kwargs["exec_step"], 0, 0, 1, 0, 0, 0], dtype=np.int32
+                [PROTOCOL_VERSION, kwargs["exec_step"], 0, 0, 1, 0, 0, 0],
+                dtype=np.int32,
             ),
-            edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
+            entry_i32=np.zeros((0, ENTRY_WIDTH), dtype=np.int32),
             payload_i32=np.zeros((0, PAYLOAD_WIDTH), dtype=np.int32),
             shape_i32=np.zeros((0,), dtype=np.int32),
             global_shape_i64=np.zeros((0,), dtype=np.int64),
@@ -149,6 +157,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
     handler = _Handler()
     compiled_plan = CompiledSendPlan(
         op_name="op",
+        source_spmd_id="source",
         rank=0,
         sender_spmd_code=1,
         sender_world_size=1,
@@ -161,7 +170,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
             ),
         ),
         output_count=0,
-        tuuid_to_name=None,
+        transfer_code_to_name={},
     )
     delivery_tasks = []
 
@@ -170,14 +179,16 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         delivery_tasks.append(task)
         return task
 
-    result = await build_and_send_step_frames(
+    executor = BatchingDataPlaneExecutor()
+    result = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
         flat_results=[],
-        step_tuuid_cache={},
+        step_transfer_cache={},
         exec_step=3,
         successor_handlers=({0: handler},),
         source_spmd_id="source",
         batch_max_frames=8,
+        batch_flush_us=0,
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 3, "op"),
         profiler_recorder=runtime.recorder,
@@ -206,18 +217,24 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
 ):
     def fake_build_step_frame_groups(**kwargs):
         step = kwargs["exec_step"]
-        frame_i32 = np.array([1, step, 7, 0, 1, 0, 1, 0], dtype=np.int32)
-        payload_i32 = np.zeros((1, 8), dtype=np.int32)
-        payload_i32[0] = np.array([0, 6, 1, 0, 1, 1, 0, 0], dtype=np.int32)
-        header = TransportFrameHeader(
-            frame_i32=frame_i32,
-            edge_i32=np.zeros((0, EDGE_WIDTH), dtype=np.int32),
-            payload_i32=payload_i32,
-            shape_i32=np.array([1], dtype=np.int32),
-            global_shape_i64=np.zeros((0,), dtype=np.int64),
-            compact_i64=np.zeros((0,), dtype=np.int64),
+        payload = np.array([step], dtype=np.float32)
+        builder = TransportFrameBuilder(
+            step=step,
+            sender_spmd_code=7,
+            sender_rank=0,
+            sender_world_size=1,
         )
-        return [(0, (0, header, (np.array([step], dtype=np.float32),)))]
+        entry_index = builder.add_tensor_transfer_entry(
+            transfer_code=1,
+            meta_state=0,
+            tensor_kind=TensorEntryKind.TENSOR,
+            expected_count=1,
+            source_step=step,
+            global_shape=(1,),
+        )
+        builder.add_payload(entry_index, PayloadRole.VALUES, payload, valid_count=1)
+        frame = builder.build()
+        return [(0, (0, frame.header, frame.payload_segments))]
 
     monkeypatch.setattr(
         executor_module,
@@ -243,6 +260,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
 
     compiled_plan = CompiledSendPlan(
         op_name="op",
+        source_spmd_id="source",
         rank=0,
         sender_spmd_code=7,
         sender_world_size=1,
@@ -255,7 +273,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
             ),
         ),
         output_count=1,
-        tuuid_to_name=None,
+        transfer_code_to_name={},
     )
     handle = AxonHandle()
     axon = AxonDataPlane(handle, sender_spmd_code=7)
@@ -267,10 +285,10 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         delivery_tasks.append(task)
         return task
 
-    first = await executor.send_step_frames(
+    first = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
         flat_results=[],
-        step_tuuid_cache={},
+        step_transfer_cache={},
         exec_step=4,
         successor_handlers=({0: axon},),
         source_spmd_id="source",
@@ -279,10 +297,10 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 4, "op"),
     )
-    second = await executor.send_step_frames(
+    second = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
         flat_results=[],
-        step_tuuid_cache={},
+        step_transfer_cache={},
         exec_step=5,
         successor_handlers=({0: axon},),
         source_spmd_id="source",

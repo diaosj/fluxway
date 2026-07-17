@@ -4,15 +4,10 @@ from .configs import (
     # SPMD Configuration
     SPMDConfig,
     # Graph Builder Types
-    Edge,
     Node,
     Graph,
     GraphValidationResult,
     # Resource and Scheduling Types
-    ResourceSpec,
-    PlacementPlan,
-    PlacementStrategy,
-    ResourcePriority,
     DriverResourceSpec,
     # State Management Types
     GlobalState,
@@ -22,19 +17,7 @@ from .configs import (
     LogicalHandle,
     ActualHandle,
     NodeView,
-    # Operator metadata
-    EdgeShardingInfo,
-    OperatorMeta,
-    AsyncPolicy,
-    StatePolicy,
-    SchedulePolicy,
-    ArgumentType,
     NodeType,
-    # Barrier Types
-    BarrierType,
-    BarrierConfig,
-    StandardBarrierConfig,
-    PeriodicBarrierConfig,
     # Driver and Worker Status Types
     DriverStatus,
     WorkerStatus,
@@ -68,40 +51,30 @@ from .sharding import (
     PartitionStrategy,
     ChunkPartition,
     CyclicPartition,
-    IndexedPartition,
     IndexedChunkPartition,
     IndexedModuloPartition,
     GreedyPartition,
+    FunctionPartition,
+    ShardingConfig,
     ShardingSpec,
     PhysicalLayout,
 )
 
 # Unified tensor wrapper
 from .tensor import TransportTensor
+from .failure import ExecutionFailure
 
 # Operator interfaces
 from .operator import StatefulOperatorProtocol
-from .manifest import (
-    ComputationGraphManifest,
-    ManifestOperatorFacts,
-    OperatorArguments,
-    OperatorFacts,
-    OperatorPort,
-    ResourceFacts,
-    SPMDFacts,
-    TransferFacts,
-)
+from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.compiled_graph import DependencySpec
 
 __all__ = [
     "SPMDConfig",
-    "Edge",
+    "DependencySpec",
     "Node",
     "Graph",
     "GraphValidationResult",
-    "ResourceSpec",
-    "PlacementPlan",
-    "PlacementStrategy",
-    "ResourcePriority",
     "DriverResourceSpec",
     "GlobalState",
     "SPMDState",
@@ -109,17 +82,7 @@ __all__ = [
     "LogicalHandle",
     "ActualHandle",
     "NodeView",
-    "EdgeShardingInfo",
-    "OperatorMeta",
-    "AsyncPolicy",
-    "StatePolicy",
-    "SchedulePolicy",
-    "ArgumentType",
     "NodeType",
-    "BarrierType",
-    "BarrierConfig",
-    "StandardBarrierConfig",
-    "PeriodicBarrierConfig",
     "DriverStatus",
     "WorkerStatus",
     "ControllerState",
@@ -145,20 +108,15 @@ __all__ = [
     "PartitionStrategy",
     "ChunkPartition",
     "CyclicPartition",
-    "IndexedPartition",
     "IndexedChunkPartition",
     "IndexedModuloPartition",
     "GreedyPartition",
+    "FunctionPartition",
+    "ShardingConfig",
     "ShardingSpec",
     "PhysicalLayout",
     "TransportTensor",
+    "ExecutionFailure",
     "StatefulOperatorProtocol",
-    "ComputationGraphManifest",
-    "ManifestOperatorFacts",
-    "OperatorArguments",
-    "OperatorFacts",
-    "OperatorPort",
-    "ResourceFacts",
-    "SPMDFacts",
-    "TransferFacts",
+    "OperatorSpec",
 ]

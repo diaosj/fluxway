@@ -52,6 +52,22 @@ def test_multiple_symmetry_receipts_concatenate_values():
     assert jnp.array_equal(result.sender_rank_tags, jnp.array([0, 1, 2, 3]))
 
 
+def test_symmetry_receipt_rejects_mixed_rank_domains_on_concatenate():
+    left = SymmetryReceipt(2, jnp.array([0, 1], dtype=jnp.int32))
+    right = SymmetryReceipt(3, jnp.array([2], dtype=jnp.int32))
+
+    with pytest.raises(ValueError, match="rank domains"):
+        SymmetryReceipt.concatenate([left, right], [2, 1])
+
+
+def test_transport_tensor_rejects_receipt_length_mismatch():
+    with pytest.raises(ValueError, match="receipt length"):
+        TransportTensor(
+            jnp.array([[1.0], [2.0]], dtype=jnp.float32),
+            receipt=SymmetryReceipt(2, jnp.array([0], dtype=jnp.int32)),
+        )
+
+
 def test_flat_ragged_conversion():
     data = [[1.0, 2.0], [3.0, 4.0, 5.0]]
     tensor = TransportTensor.from_lists(data)

@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from collections import defaultdict
 from typing import Any
 
+from fluxway.common.compiled_graph import CompiledDependency, CompiledGraph
+
 
 @dataclass(frozen=True, slots=True)
 class CreditUpdate:
@@ -90,50 +92,51 @@ class UpstreamCreditState:
         }
 
 
-def edge_credit_id(edge: Any) -> str:
-    source_op = edge.source_op
-    target_op = edge.target_op
+def edge_credit_id(edge: CompiledDependency) -> str:
+    source = edge.spec.source
+    target = edge.spec.target
+    source_op = source.op_id
+    target_op = target.op_id
     if not source_op or not target_op:
         raise ValueError(
             "Flow-control credit edges require source_op and target_op: "
-            f"{edge.source_node}->{edge.target_node} source_op={source_op!r} "
+            f"{source.spmd_id}->{target.spmd_id} source_op={source_op!r} "
             f"target_op={target_op!r}."
         )
-    return f"{edge.source_node}.{source_op}->{edge.target_node}.{target_op}"
+    return f"{source.spmd_id}.{source_op}->{target.spmd_id}.{target_op}"
 
 
-def build_credit_edges(graph: Any, async_step_config: Any) -> tuple[CreditEdge, ...]:
+def build_credit_edges(
+    graph: CompiledGraph,
+    async_step_config: Any,
+) -> tuple[CreditEdge, ...]:
     credit_edges: list[CreditEdge] = []
     default_limit = int(getattr(async_step_config, "default_max_inflight_steps", 1))
     if default_limit < 0:
         raise ValueError(
             f"default_max_inflight_steps must be non-negative, got {default_limit}."
         )
-    for edge in graph.edges:
-        if getattr(edge, "local_only", False):
+    for dependency in graph.dependencies:
+        edge = dependency.spec
+        if edge.local_only:
             continue
-        if not edge.source_op or not edge.target_op:
+        if not edge.source.op_id or not edge.target.op_id:
             raise ValueError(
                 "Non-local flow-control edges require explicit source_op and target_op: "
-                f"{edge.source_node}->{edge.target_node}."
+                f"{edge.source.spmd_id}->{edge.target.spmd_id}."
             )
-        limit = default_limit
-        target_node = graph.nodes.get(edge.target_node)
-        if target_node is not None and target_node.spmd_config is not None:
-            meta = target_node.spmd_config.operator_metas.get(edge.target_op)
-            if meta is not None:
-                limit = int(getattr(meta, "max_inflight_steps", limit))
+        limit = dependency.target_operator.spec.runtime_policy.max_inflight_steps
         if limit < 0:
             raise ValueError(
-                f"Credit edge {edge_credit_id(edge)!r} has negative max_inflight_steps={limit}."
+                f"Credit edge {edge_credit_id(dependency)!r} has negative max_inflight_steps={limit}."
             )
         credit_edges.append(
             CreditEdge(
-                edge_id=edge_credit_id(edge),
-                source_spmd_id=edge.source_node,
-                source_op=edge.source_op,
-                target_spmd_id=edge.target_node,
-                target_op=edge.target_op,
+                edge_id=edge_credit_id(dependency),
+                source_spmd_id=edge.source.spmd_id,
+                source_op=edge.source.op_id,
+                target_spmd_id=edge.target.spmd_id,
+                target_op=edge.target.op_id,
                 max_inflight_steps=limit,
             )
         )

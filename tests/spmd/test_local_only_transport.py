@@ -9,7 +9,13 @@ from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.control_plane.graph.builder import Builder
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.rpc.protocol import LocalWorkerDataPlane, RayActorDataPlane
-from fluxway.spmd.worker.data_plane import CompiledSendPlan, CompiledSuccessorRoute
+from fluxway.resources import ResourceProfile
+from fluxway.spmd.worker.data_plane import (
+    CompiledDependencyCondition,
+    CompiledDependencyDecisionRoute,
+    CompiledSendPlan,
+    CompiledSuccessorRoute,
+)
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.data_plane_executor import _validate_local_only_batch
 from fluxway.spmd.worker.operator_manager.dispatcher import (
@@ -17,13 +23,18 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
 )
 from fluxway.spmd.worker.operator_manager import OperatorManager
-from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.spmd.worker.worker import SPMDWorker, _compile_transport_send_context
 from fluxway.transport.communication import TransportFrameBatch
+from fluxway.transport.manifest import DependencyDecision
 
 _LOCAL_SPEC = {"type": "static", "axis": []}
 
 
-@spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(2,))
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(2,),
+)
 class _LocalOnlyTransportSPMD:
     @operator(name="produce", output_sharding={"x": _LOCAL_SPEC})
     def produce(self) -> dict:
@@ -42,7 +53,7 @@ async def _receive_control(_op_name, _step, _names, _values):
     return None
 
 
-def _local_only_config():
+def _local_only_config(*, condition_fn=None):
     builder = Builder()
     builder.add_node("A", _LocalOnlyTransportSPMD)
     builder.add_func_edge(
@@ -53,8 +64,15 @@ def _local_only_config():
         source_output="x",
         target_input="x",
         local_only=True,
+        condition_fn=condition_fn,
     )
     return builder.build("local_only_transport").nodes["A"].spmd_config
+
+
+def _only_expected_transfer_code(op_manager, op_name):
+    expected = op_manager.get_expected_transfer_shards(op_name)
+    assert len(expected) == 1
+    return next(iter(expected))
 
 
 def _bind_direct_local_fast_path(stub, raw_cls):
@@ -64,9 +82,11 @@ def _bind_direct_local_fast_path(stub, raw_cls):
     stub._on_step_ready = lambda _op_name, _step: None
     for name in (
         "_compiled_assemble_plan",
-        "_direct_local_input_tuuids",
+        "_direct_local_input_transfer_codes",
         "_uses_direct_local_input_fast_path",
         "_deposit_direct_local_input",
+        "_deposit_local_only_orderings",
+        "_deposit_local_only_dependency_decisions",
     ):
         setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
 
@@ -74,10 +94,12 @@ def _bind_direct_local_fast_path(stub, raw_cls):
 def test_local_only_successor_uses_direct_worker_data_plane():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
-    op_manager = OperatorManager(config, rank=0, spmd_id="A")
+    op_manager = OperatorManager(config, rank=0, spmd_id="A", static_args={})
     stub = types.SimpleNamespace(
         spmd_id="A",
         rank=0,
+        config=config,
+        _graph_view=config.require_graph_view(),
         _world_size=config.num_workers,
         _mesh=config.mesh,
         _local_spmd_code=3,
@@ -112,6 +134,30 @@ def test_local_only_successor_uses_direct_worker_data_plane():
     assert send_context.compiled_plan.successor_routes[0].local_only is True
 
 
+def test_conditional_local_only_input_uses_mailbox_causal_barrier():
+    config = _local_only_config(condition_fn=lambda _result: True)
+    op_manager = OperatorManager(config, rank=0, spmd_id="A", static_args={})
+    raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
+    stub = types.SimpleNamespace(
+        spmd_id="A",
+        rank=0,
+        _world_size=config.num_workers,
+        _op_manager=op_manager,
+        op_manager=op_manager,
+        _assemble_plan_cache={},
+    )
+    stub._compiled_assemble_plan = types.MethodType(
+        raw_cls._compiled_assemble_plan,
+        stub,
+    )
+    stub._direct_local_input_transfer_codes = types.MethodType(
+        raw_cls._direct_local_input_transfer_codes,
+        stub,
+    )
+
+    assert stub._direct_local_input_transfer_codes("consume") == set()
+
+
 def test_local_only_batch_rejects_non_local_rank():
     route = CompiledSuccessorRoute(
         context_index=0,
@@ -122,12 +168,13 @@ def test_local_only_batch_rejects_non_local_rank():
     )
     plan = CompiledSendPlan(
         op_name="produce",
+        source_spmd_id="A",
         rank=0,
         sender_spmd_code=3,
         sender_world_size=2,
         successor_routes=(route,),
         output_count=1,
-        tuuid_to_name=None,
+        transfer_code_to_name={},
     )
     batch = TransportFrameBatch(
         context_index=0,
@@ -144,11 +191,13 @@ def test_local_only_batch_rejects_non_local_rank():
 async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
-    op_manager = OperatorManager(config, rank=1, spmd_id="A")
+    op_manager = OperatorManager(config, rank=1, spmd_id="A", static_args={})
     mailbox = WorkerMailbox()
     stub = types.SimpleNamespace(
         spmd_id="A",
         rank=1,
+        config=config,
+        _graph_view=config.require_graph_view(),
         _world_size=config.num_workers,
         _mesh=config.mesh,
         _local_spmd_code=3,
@@ -198,10 +247,11 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
         send_context,
         {},
         0,
+        dependency_decisions=None,
     )
 
-    tuuid = op_manager.get_expected_tuuids("consume")[0]
-    stored = stub._direct_local_input_slots["consume"][0][tuuid].tensor
+    transfer_code = _only_expected_transfer_code(op_manager, "consume")
+    stored = stub._direct_local_input_slots["consume"][0][transfer_code].tensor
     assert isinstance(stored, TransportTensor)
     assert stored.receipt is not None
     assert stored.receipt.world_size == 7
@@ -212,8 +262,7 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
 async def test_send_output_all_local_only_returns_no_background_tasks_with_profiler():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
-    op_manager = OperatorManager(config, rank=1, spmd_id="A")
-    mailbox = WorkerMailbox()
+    op_manager = OperatorManager(config, rank=1, spmd_id="A", static_args={})
     profiler_runtime = ProfilerRuntimeFactory.from_config(
         ProfilerConfig(
             trace_dir="/tmp/fluxway_test_send_output_all_local_only",
@@ -226,13 +275,14 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         spmd_id="A",
         rank=1,
         config=config,
+        _graph_view=config.require_graph_view(),
         _world_size=config.num_workers,
         _mesh=config.mesh,
         _local_spmd_code=3,
         _successor_handlers={},
         _operator_send_context_cache={},
         _profiler_runtime=profiler_runtime,
-        _mailbox=profiler_runtime.worker_mailbox(mailbox),
+        _mailbox=profiler_runtime.create_worker_mailbox(),
         _barriers_declared={},
         _op_manager=op_manager,
         op_manager=op_manager,
@@ -251,8 +301,8 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         "_send_output",
         "_send_step_data_plane_frames_background",
         "_deposit_local_only_outputs",
-        "_non_local_send_plan",
         "_ensure_step_declared",
+        "_send_control_arguments",
     ):
         setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
     _bind_direct_local_fast_path(stub, raw_cls)
@@ -266,10 +316,101 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         "produce",
         result,
         exec_step=0,
-        step_tuuid_cache={},
+        step_transfer_cache={},
     )
 
-    tuuid = op_manager.get_expected_tuuids("consume")[0]
-    stored = stub._direct_local_input_slots["consume"][0][tuuid].tensor
+    transfer_code = _only_expected_transfer_code(op_manager, "consume")
+    stored = stub._direct_local_input_slots["consume"][0][transfer_code].tensor
     assert send_tasks == ()
     assert isinstance(stored, TransportTensor)
+
+
+def test_transport_send_context_is_compiled_once_for_mixed_local_routes():
+    def condition(_result):
+        return True
+
+    routes = (
+        CompiledSuccessorRoute(
+            context_index=0,
+            spmd_id="source",
+            effective_rank=0,
+            tensor_routes=(),
+            dependency_decision_routes=(
+                CompiledDependencyDecisionRoute(11, "local", (0,), 1),
+            ),
+            local_only=True,
+        ),
+        CompiledSuccessorRoute(
+            context_index=1,
+            spmd_id="target",
+            effective_rank=0,
+            tensor_routes=(),
+            dependency_decision_routes=(
+                CompiledDependencyDecisionRoute(22, "remote", (0,), 1),
+            ),
+        ),
+    )
+    plan = CompiledSendPlan(
+        op_name="source",
+        source_spmd_id="source",
+        rank=0,
+        sender_spmd_code=1,
+        sender_world_size=1,
+        successor_routes=routes,
+        output_count=0,
+        transfer_code_to_name={},
+        dependency_conditions=(
+            CompiledDependencyCondition(11, condition),
+            CompiledDependencyCondition(22, condition),
+        ),
+    )
+    local_handlers = {0: object()}
+    remote_handlers = {0: object()}
+
+    transport = _compile_transport_send_context(
+        plan,
+        (local_handlers, remote_handlers),
+    )
+
+    assert transport is not None
+    assert transport.compiled_plan is not plan
+    assert transport.successor_handlers == (remote_handlers,)
+    assert tuple(
+        route.context_index for route in transport.compiled_plan.successor_routes
+    ) == (0,)
+    assert tuple(
+        item.dependency_code for item in transport.compiled_plan.dependency_conditions
+    ) == (22,)
+    assert transport.select_dependency_decisions(
+        {
+            11: DependencyDecision.PROCEED,
+            22: DependencyDecision.SKIP,
+        }
+    ) == {22: DependencyDecision.SKIP}
+
+
+def test_transport_send_context_reuses_all_remote_plan():
+    route = CompiledSuccessorRoute(
+        context_index=0,
+        spmd_id="target",
+        effective_rank=0,
+        tensor_routes=(),
+    )
+    plan = CompiledSendPlan(
+        op_name="source",
+        source_spmd_id="source",
+        rank=0,
+        sender_spmd_code=1,
+        sender_world_size=1,
+        successor_routes=(route,),
+        output_count=0,
+        transfer_code_to_name={},
+    )
+    handlers = ({0: object()},)
+
+    transport = _compile_transport_send_context(plan, handlers)
+
+    assert transport is not None
+    assert transport.compiled_plan is plan
+    assert transport.successor_handlers is handlers
+    assert transport.select_dependency_decisions(None) is None

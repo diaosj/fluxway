@@ -4,9 +4,32 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fluxway.common.types import ControllerEvent
-from fluxway.common.types import ControllerState
+from fluxway.common.types import ControllerState, ExecutionFailure
 from fluxway.common.types.drain import DrainStrategy
+from fluxway.common.decorators import operator, spmd
+from fluxway.control_plane import ExecutionFailedError
 from fluxway.control_plane.controller import ControllerActor
+from fluxway.control_plane.graph.builder import Builder
+from fluxway.resources import ResourceProfile
+
+
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
+class _DrainSPMD:
+    @operator(name="run")
+    def run(self):
+        return None
+
+
+def _drain_graph():
+    builder = Builder()
+    builder.add_node("op1", _DrainSPMD)
+    builder.add_node("op2", _DrainSPMD)
+    builder.add_func_edge("op1", "run", "op2", "run", tensor_map={})
+    return builder.build("drain-integration")
 
 
 class MockDrainStrategy(DrainStrategy):
@@ -38,16 +61,14 @@ def mock_spmd_manager():
 
 @pytest.fixture
 def controller(mock_spmd_manager):
-    # Setup partial graph stub
-    graph_stub = MagicMock()
-    graph_stub.nodes.keys.return_value = ["op1", "op2"]
+    graph = _drain_graph()
 
     ctrl = ControllerActor.__ray_actor_class__(  # type: ignore[attr-defined]
-        graph=graph_stub,
+        graph=graph,
         placement_recipe=MagicMock(),
     )
     ctrl._spmd_manager = mock_spmd_manager
-    ctrl._graph = graph_stub
+    ctrl._graph = graph
 
     # inject mock strategy and checkpointer
     ctrl._drain_strategy = MockDrainStrategy()
@@ -74,8 +95,6 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
     # Driver 2 reports drained, completing the set and triggering checkpoint.
     await controller.report_driver_drained("op2")
 
-    # We call this manually simulating the FSM dispatching it
-    await controller._on_all_drivers_drained()
     await controller._checkpoint_task
 
     controller._checkpointer.save.assert_called_with(2)
@@ -128,7 +147,7 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
     transition_task = asyncio.create_task(
         controller._state_machine.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
     )
-    wait_task = asyncio.create_task(controller.wait_for_completion(timeout=1.0))
+    wait_task = asyncio.create_task(controller.wait_for_completion())
     await asyncio.sleep(0)
 
     assert controller._state_machine.state == ControllerState.COMPLETING
@@ -137,7 +156,7 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
     cleanup_gate.set()
 
     assert await transition_task is True
-    assert await wait_task is True
+    assert await asyncio.wait_for(wait_task, timeout=0.2) is True
     controller._release_stopped_spmd_handles.assert_called_once_with()
 
 
@@ -155,7 +174,12 @@ async def test_shutdown_hook_failure_marks_controller_failed(controller):
     )
 
     assert controller._state_machine.state == ControllerState.FAILED
-    assert await controller.wait_for_completion(timeout=0.1) is False
+    with pytest.raises(ExecutionFailedError) as raised:
+        await controller.wait_for_completion(timeout=0.1)
+    failure = raised.value.failures["controller"]
+    assert failure.phase == "CONTROLLER_CLEANUP"
+    assert failure.exception_type == "RuntimeError"
+    assert failure.message == "metrics drain failed"
 
 
 @pytest.mark.asyncio
@@ -172,7 +196,9 @@ async def test_driver_handle_release_failure_marks_controller_failed(controller)
     )
 
     assert controller._state_machine.state == ControllerState.FAILED
-    assert await controller.wait_for_completion(timeout=0.1) is False
+    with pytest.raises(ExecutionFailedError) as raised:
+        await controller.wait_for_completion(timeout=0.1)
+    assert raised.value.failures["controller"].message == "handle release failed"
 
 
 @pytest.mark.asyncio
@@ -187,6 +213,41 @@ async def test_unexpected_terminal_callback_failure_marks_controller_failed(cont
     )
 
     assert controller._state_machine.state == ControllerState.FAILED
+    failure = controller._state_machine.get_failures()["controller"]
+    assert failure.phase == "CONTROLLER_CLEANUP"
+    assert failure.message == "unexpected terminal failure"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_completion_raises_builtin_timeout(controller):
+    controller._state_machine._state = ControllerState.RUNNING
+
+    with pytest.raises(TimeoutError):
+        await controller.wait_for_completion(timeout=0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ("report_spmd_error", "_on_driver_error"))
+async def test_controller_error_entrypoints_forward_failure(controller, method_name):
+    failure = ExecutionFailure(
+        spmd_id="op1",
+        rank=None,
+        op_name=None,
+        step=None,
+        phase="DRIVER",
+        exception_type="RuntimeError",
+        message="rank lost",
+        traceback=None,
+    )
+    controller._state_machine.trigger_event = AsyncMock()
+
+    await getattr(controller, method_name)("op1", failure)
+
+    controller._state_machine.trigger_event.assert_awaited_once_with(
+        ControllerEvent.DRIVER_ERROR,
+        spmd_id="op1",
+        failure=failure,
+    )
 
 
 @pytest.mark.asyncio
@@ -280,6 +341,47 @@ async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release
 
 
 @pytest.mark.asyncio
+async def test_cleanup_all_spmds_stops_spmds_concurrently(controller):
+    both_started = asyncio.Event()
+    started: set[str] = set()
+    cleanup_order: list[tuple[str, str]] = []
+
+    async def stop_spmd(spmd_id, **kwargs):
+        started.add(spmd_id)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        cleanup_order.append(("stop", spmd_id))
+
+    def unregister_spmd(spmd_id):
+        assert ("stop", spmd_id) in cleanup_order
+        cleanup_order.append(("unregister", spmd_id))
+
+    def release_resources():
+        assert {event for event in cleanup_order if event[0] == "unregister"} == {
+            ("unregister", "op1"),
+            ("unregister", "op2"),
+        }
+        cleanup_order.append(("release", "job"))
+
+    controller._heartbeat_manager = MagicMock()
+    controller._heartbeat_manager.stop_monitoring_async = AsyncMock()
+    controller._heartbeat_manager.unregister_spmd.side_effect = unregister_spmd
+    controller._spmd_manager.stop_spmd = AsyncMock(side_effect=stop_spmd)
+    controller._scheduler = MagicMock()
+    controller._scheduler.pg_manager.has_job_pg = True
+    controller._scheduler.release_resources.side_effect = release_resources
+
+    await controller._cleanup_all_spmds()
+
+    assert started == {"op1", "op2"}
+    assert controller._spmd_manager.stop_spmd.await_count == 2
+    controller._heartbeat_manager.unregister_spmd.assert_any_call("op1")
+    controller._heartbeat_manager.unregister_spmd.assert_any_call("op2")
+    assert cleanup_order[-1] == ("release", "job")
+
+
+@pytest.mark.asyncio
 async def test_cleanup_all_spmds_propagates_failures_after_releasing_resources(
     controller,
 ):
@@ -332,11 +434,21 @@ async def test_driver_error_transitions_through_failing(controller):
     controller.stop_checkpointer = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
 
+    failure = ExecutionFailure(
+        spmd_id="op1",
+        rank=None,
+        op_name=None,
+        step=None,
+        phase="DRIVER",
+        exception_type="RuntimeError",
+        message="rank lost",
+        traceback=None,
+    )
     transition_task = asyncio.create_task(
         controller._state_machine.trigger_event(
             ControllerEvent.DRIVER_ERROR,
             spmd_id="op1",
-            error="rank lost",
+            failure=failure,
         )
     )
     await asyncio.sleep(0)
@@ -347,6 +459,7 @@ async def test_driver_error_transitions_through_failing(controller):
 
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.FAILED
+    assert controller._state_machine.get_failures() == {"op1": failure}
     controller._release_stopped_spmd_handles.assert_called_once_with()
     controller.stop_checkpointer.assert_awaited_once_with()
 

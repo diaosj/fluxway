@@ -19,9 +19,10 @@ class _InheritedOperators(_BaseOperators):
     pass
 
 
-def test_bound_inherited_operator_identity_uses_resolved_metadata():
+def test_bound_inherited_operator_identity_uses_compiled_metadata():
     bound_spmd = bind_spmd(
         _InheritedOperators,
+        resource_profile=fw.ResourceProfile(base={"CPU": 1}),
         mesh_axis_names=("data",),
         mesh_axis_shapes=(1,),
         produce={"output_sharding": {"value": _REP}},
@@ -38,15 +39,14 @@ def test_bound_inherited_operator_identity_uses_resolved_metadata():
         tensor_map={"value": "item"},
     )
 
-    manifest = fw.graph_manifest(builder.build("bound-manifest"))
-    assert all(
-        spmd.class_id == f"{bound_spmd.__module__}.{bound_spmd.__qualname__}"
-        for spmd in manifest.spmds
-    )
+    graph = builder.build("bound-compiled-graph")
+    plan = graph.compiled_graph
+    assert plan is not None
+    assert all(node.spmd_class is bound_spmd for node in graph.nodes.values())
     functions = {
-        operator.op_id: operator.function_id
-        for spmd in manifest.spmds
+        operator.key.op_id: operator.function_id
+        for spmd in plan.spmds
         for operator in spmd.operators
     }
-    assert functions["produce"].endswith("._BaseOperators.produce")
-    assert functions["consume"].endswith("._BaseOperators.consume")
+    assert functions["produce"].endswith("._InheritedOperators.produce")
+    assert functions["consume"].endswith("._InheritedOperators.consume")

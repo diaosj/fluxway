@@ -32,7 +32,7 @@ fenced only by drain/checkpoint/export/stop.
 | Worker scheduler | `SPMDWorker` | choose ready `(op, step)`, enforce pipeline depth, submit `LocalStepPlan` |
 | Local DAG | `LocalStepPlanExecutor` | execute `WAIT -> CALL -> SEND -> BARRIER` dependencies and resource ids |
 | Prepare runtime | `LocalInputPrepareRuntime` | own prepare tokens, background assemble execution, consume/cancel/drain |
-| Call runtime | `WorkerProcessCallRuntime` | run process-affine synchronous user code off the actor event loop |
+| Call runtime | `WorkerProcessCallRuntime` | asynchronously submit ordinary Python callables away from the actor event loop |
 | Delivery runtime | `OutboundDeliveryRuntime` | own `LocalSendToken`, delivery tasks, semaphore, poison, delivery fence |
 | Assembly | `CompiledAssemblePlan` | cache worker-local input topology and static assemble metadata |
 | Transport | `TransportFrameTemplate`, `TransportBatchPlan` | own frame schema/template, routing batch plan, target grouping |
@@ -43,13 +43,37 @@ The data-plane executor must not duplicate sharding/split logic. Remote edges,
 local-only self edges, normal send, and empty propagation use the same compiled
 send plan and transport frame builder path.
 
+## Routing Batch Identity
+
+`select_routing_source()` is the only selector used by sender batching and
+transport planning. It distinguishes source-layout, routing-index,
+origin-index, tensor-value, and receipt routing. A routing batch may reuse one
+sort/count plan only when its source and target layouts, routing-source
+identity, routing kind, and routing entity count are equal. Two tensors that
+eventually reach the same set of ranks still use separate plans when their
+per-entity destination assignments differ.
+
+Receipt tags lower directly to `DestinationAssignment`; receipt routing does
+not own a second sorting or ragged-slicing algorithm. Scalar receipts produce
+an O(1) constant-rank plan. Vector receipts use stable rank grouping and the
+same multi-payload ragged projection as algebraic routing. A tag equal to the
+target rank count is a routing sentinel for a payload slot with no destination;
+it is not an empty tensor and not an execution-error marker.
+
+The receipt rank domain is the original sender domain carried by
+`SymmetryReceipt`, not the mesh size of the operator that most recently passed
+the reference tensor through. A reference received from a two-rank sparse SPMD
+can therefore cross a four-rank dense SPMD and route gradients back to the same
+two sparse ranks. Compilation fixes the expected domain to the gradient target
+mesh; the sender validates the runtime receipt against it before distribution.
+
 ## AsyncPolicy Quickstart
 
 `AsyncPolicy` describes algorithm semantics; runtime backpressure and lifecycle
 remain framework-internal.
 
 ```python
-from fluxway import AsyncPolicy, SchedulePolicy, StatePolicy
+from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy, StatePolicy
 
 
 class SparseEmbeddingSPMD:
@@ -194,15 +218,65 @@ unique/inverse/grad data is never reused across steps.
 ## Frame Build And Batch
 
 `CompiledSendPlan` is built per operator and cached by the worker. It stores
-static successor routes, sharding specs, output tuuid/name metadata, sender
-rank/world, and a transport template cache.
+static successor routes, compiled effective sharding geometry, declared mirror
+references, transfer-code diagnostic names, sender rank/world, dependency
+conditions, and a transport template cache. `GraphCompiler` resolves the full
+referential-sharding closure once; Worker initialization does not build another
+TUUID registry or repeat the graph traversal.
+
+Each tensor route carries a `TransportRoutingMode`. `ALGEBRAIC` uses the
+effective source and target layouts. `RECEIPT` uses the same effective geometry
+but selects the inherited `SymmetryReceipt` as the routing fact. A referential
+`PhysicalLayout` is rejected by transport, so geometry and mirror semantics
+cannot be inferred from the same object.
 
 The transport layer owns:
 
 - `TransportFrameTemplate` for reusable header/table skeletons.
 - `TransportBatchPlan` for batch grouping from frame groups.
-- `build_step_frame_groups()` and `build_empty_step_frame_groups()` as the
-  single frame-building path.
+- `build_step_frame_groups()` for tensor output and routing misses.
+- `build_completed_without_tensor_step_frame_groups()` for a successful step
+  that produced no tensor.
+- `build_dependency_decision_only_frame_groups()` for a step that only
+  propagates dependency decisions.
+
+All three builders reuse `_build_causal_frame_groups()` for ordering completion
+and dependency decisions.
+
+`TransportFrame.entry_i32` is the fixed-width manifest table. Each frame has
+exactly one `FrameFlag` category:
+
+- `TENSOR_TRANSFER`: entries identify transfer codes and payload metadata.
+- `ORDERING_COMPLETION`: header-only entries identify dependency codes.
+- `DEPENDENCY_DECISION`: header-only entries carry
+  `DependencyDecision.PROCEED` or `DependencyDecision.SKIP` for dependency
+  codes.
+
+A condition callable is only one source of a dependency decision. Every source
+rank evaluates it once per dependency and step. The target waits for the
+declared source count and rejects mixed decisions. `SKIP` satisfies that
+dependency without manufacturing a tensor, but the target still waits for its
+other causal dependencies. A skipped operator registers the same asynchronous
+send task as a successful operator and propagates `SKIP` across every downstream
+dependency, including dependencies without tensor transfer. A conditional
+dependency without tensor transfer emits one dependency decision instead of an
+ordering completion; `PROCEED` completes that dependency and `SKIP` marks the
+target step skipped. A condition may return an exact `bool` directly or an
+awaitable that resolves to an exact `bool`. Graph execution uses the async
+evaluator ABI; a graph step with no condition bypasses coroutine creation, and a
+future eager adapter reuses the same plan interface.
+Every tensor-transfer entry has one `TensorEntryKind`:
+
+- `TensorEntryKind.TENSOR` carries a tensor; a zero-element tensor is still a
+  tensor.
+- `TensorEntryKind.ROUTING_MISS` means the sender has a tensor but this target
+  rank receives no shard.
+- `TensorEntryKind.COMPLETED_WITHOUT_TENSOR` means the upstream step completed
+  successfully without producing a tensor.
+- `TensorEntryKind.NOT_APPLICABLE` is reserved for ordering-completion and
+  dependency-decision entries because those entries do not describe tensors.
+
+An operator exception is never represented by a tensor entry.
 
 static-to-static paths patch step and payload refs. Dynamic paths cache only
 stable schema/tuuid/role skeletons; shape/count/routing/origin/inverse/payload
@@ -237,8 +311,14 @@ call the current worker object directly. The transport/data-plane layer decides
 batch contents by successor context and target rank; it does not merge frames
 across different concrete endpoints.
 
-Axon payload iovs may use DLPack-compatible buffers when the adapter validates
-device class and payload shape. Header metadata stays in the host/object lane.
+Every payload segment is a tensor implementing both `__dlpack__()` and
+`__dlpack_device__()`, with `dtype` and `shape` metadata. This is the transport
+payload ABI for Ray, worker-local delivery, and Axon; array interfaces alone are
+not accepted. The validator does not export a DLPack capsule. Axon additionally
+uses `__dlpack_device__()` to require that every payload in one invocation has
+the same CPU or CUDA device class and matches the receiver device class. Empty
+payload tuples remain valid for ordering-only frames. Header metadata always
+stays in the host/object lane.
 
 ## Commit And Fence
 
@@ -251,8 +331,28 @@ finished.
 - `data_plane.delivery_fence`: drain/checkpoint/export/stop waiting on registered
   delivery.
 
-Delivery task failures poison the worker through `OutboundDeliveryRuntime`.
-Drain/checkpoint/export/stop re-raise the failure through the same fence path.
+## Failure Channel
+
+`ExecutionFailure` is the only runtime failure fact. The first failure wins and
+keeps its SPMD, rank, operator, step, phase, exception type, message, and Python
+traceback. User CALL, SEND registration, background delivery, and scheduler
+exceptions all enter the same Worker latch.
+
+The latch stops new step admission, wakes every execution lane, cancels pending
+plan/SEND/background tasks, and calls `receive_worker_failure` on the Driver.
+The Worker heartbeat carries the same object for state synchronization; it does
+not create a second error string. Driver worker-heartbeat timeout and Controller
+driver-heartbeat timeout create the same structured type with their respective
+phases.
+
+The Controller stops all SPMDs concurrently after the first Driver failure.
+`wait_for_completion()` returns `True` after successful cleanup, raises
+`ExecutionFailedError` with the collected failures after failed cleanup, and
+raises the built-in `TimeoutError` if its caller-supplied timeout expires.
+
+An exception is never represented by a tensor entry. Consequently the graph
+success path adds no failure frame, mailbox polling, or per-tensor branch. A
+future eager submission path reuses this control-plane failure ABI.
 
 ## Profiler
 
@@ -275,13 +375,12 @@ Use these spans to verify nonblocking overlap:
 `send_output` and `await_send` correlate by
 `(source_spmd_code, source_rank, op_id, step)`. Batch spans add
 `target_spmd_id`, `target_rank`, and `batch_seq`.
-`user_callable.execute` includes `manifest_id`, `spmd_id`, `op_id`,
+`user_callable.execute` includes `graph_id`, `spmd_id`, `op_id`,
 `function_id`, `step`, `input_signature_id`, `output_signature_id`, and
-`execution_mode`. The static identifiers come directly from the computation graph
-manifest used by Model Explorer; the trace wrapper does not reconstruct them
-from runtime callables. Worker configs carry the same frozen SPMD facts and a
-compact `ManifestOperatorFacts` binding; execution fails if either disagrees
-with the manifest ID before a trace record is written.
+`execution_mode`. The static identifiers come directly from the compiled
+`SPMDGraphView`; the trace wrapper does not reconstruct them from runtime
+callables. Worker configs and the profiler share the same frozen
+`CompiledOperator` object.
 
 For short runs:
 

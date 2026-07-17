@@ -9,12 +9,13 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from numba import njit
 
 from fluxway.common.decorators import spmd, operator, requires_worker_process
-from fluxway.common.types import AsyncPolicy, SchedulePolicy, StatePolicy
+from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy, StatePolicy
 from fluxway.common.tensor_components import (
     dense_path_strides,
     fill_nested_dense_inv_with_pad,
 )
 from fluxway.common.types.tensor import TransportTensor
+from fluxway import ResourceProfile
 from .data_types import DPFeatures
 
 _DENSE_PHASE_ORDER = (
@@ -79,9 +80,34 @@ except ImportError:
     cp = None
 
 
-def _xp():
+def _xp() -> Any:
     """Return CuPy if GPU is available, otherwise NumPy."""
     return cp if _GPU_AVAILABLE else np
+
+
+def _place_gradient_like(gradient: jax.Array, reference: jax.Array) -> jax.Array:
+    if not isinstance(reference, jax.Array):
+        raise TypeError(
+            f"gradient reference must be a jax.Array, got {type(reference).__name__}"
+        )
+    if gradient.shape != reference.shape:
+        raise ValueError(
+            f"gradient shape {gradient.shape} does not match reference {reference.shape}"
+        )
+    if gradient.dtype != reference.dtype:
+        raise TypeError(
+            f"gradient dtype {gradient.dtype} does not match reference {reference.dtype}"
+        )
+    addressable_gradients = tuple(
+        jax.device_put(gradient, shard.device) for shard in reference.addressable_shards
+    )
+    if not addressable_gradients:
+        raise RuntimeError("gradient reference has no addressable shards")
+    return jax.make_array_from_single_device_arrays(
+        shape=reference.shape,
+        sharding=reference.sharding,
+        arrays=addressable_gradients,
+    )
 
 
 def _host_array(x, dtype=None):
@@ -276,7 +302,7 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
 
 
 @spmd(
-    resource={"num_cpus": 1, "memory_gb": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("dp",),
 )
 @requires_worker_process
@@ -726,7 +752,8 @@ class DenseSPMD:
         cursor = 0
         split_leaves = []
         for leaf in param_leaves:
-            split_leaves.append(flat[cursor : cursor + leaf.size].reshape(leaf.shape))
+            local_gradient = flat[cursor : cursor + leaf.size].reshape(leaf.shape)
+            split_leaves.append(_place_gradient_like(local_gradient, leaf))
             cursor += leaf.size
 
         self.grad_accum = jtu.tree_map(

@@ -3,11 +3,17 @@
 from __future__ import annotations
 
 import enum
+import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any
-from collections.abc import Callable
-from pydantic import Field, model_validator
+from typing import Any, Literal
+from collections.abc import Callable, Mapping
+from pydantic import (
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.mesh import DeviceMesh
@@ -16,9 +22,9 @@ from fluxway.common.index_descriptor import (
     ContinuousIndex,
     ExplicitIndex,
     RaggedIndex,
-    FunctionalIndex,
 )
-from fluxway.common.types.configs import FluxwayBaseSchema, ConfigDict
+from fluxway.common.schema import FluxwayBaseSchema
+from fluxway.common.frozen_mapping import FrozenMap
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +85,11 @@ class AlgebraicRouting(Routing):
     routing_dim: int | tuple[int, ...] = 0
     index_descriptor: IndexDescriptor | None = None
 
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def validate_strategy(cls, value: Any) -> PartitionStrategy:
+        return _parse_partition_strategy(value)
+
     @property
     def is_static(self) -> bool:
         return self.strategy.routing_paradigm == RoutingParadigm.STATIC
@@ -97,8 +108,6 @@ class ReferentialRouting(Routing):
     tuuid: int | None = None
     # Map: Target Dimension -> Source Dimension
     dim_map: dict[int, int] = Field(default_factory=lambda: {0: 0})
-    # To be populated during topology resolution phase to avoid late-binding logic in the Hot Path.
-    _resolved_routing: AlgebraicRouting | None = None
 
     @property
     def is_referential(self) -> bool:
@@ -106,8 +115,6 @@ class ReferentialRouting(Routing):
 
     @property
     def routing_dim(self) -> int | tuple[int, ...]:
-        if self._resolved_routing:
-            return self._resolved_routing.routing_dim
         raise RuntimeError(
             f"[Fluxway Referential Error] Unresolved 'mirror/follow' routing at path '{self.path}'.\n"
             f"  Status: Unresolved (TUUID: {self.tuuid})\n"
@@ -116,8 +123,6 @@ class ReferentialRouting(Routing):
 
     @property
     def strategy(self) -> PartitionStrategy:
-        if self._resolved_routing:
-            return self._resolved_routing.strategy
         raise RuntimeError(
             f"[Fluxway Referential Error] Strategy accessed on unresolved path '{self.path}'.\n"
             f"  Fix: This typically means a 'mirror' tensor was used in a Forward path where its source was not yet materialized."
@@ -125,20 +130,26 @@ class ReferentialRouting(Routing):
 
     @property
     def partition(self) -> PartitionSpec:
-        if self._resolved_routing:
-            return self._resolved_routing.partition
         raise RuntimeError(
             f"[Fluxway Referential Error] Partition accessed on unresolved path '{self.path}'."
         )
 
-    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
-        """Resolve the logical path to a physical TUUID."""
-        if self.tuuid is None:
-            object.__setattr__(self, "tuuid", resolver_fn(self.path))
-
-    def resolve_sharding(self, routing: AlgebraicRouting) -> None:
-        """Inject the physical routing strategy once resolved."""
-        object.__setattr__(self, "_resolved_routing", routing)
+    def resolved(
+        self,
+        resolver_fn: Callable[[str], int | None],
+        *,
+        required: bool,
+    ) -> ReferentialRouting:
+        if self.tuuid is not None:
+            return self
+        tuuid = resolver_fn(self.path)
+        if tuuid is None:
+            if required:
+                raise ValueError(
+                    f"referential routing path {self.path!r} does not resolve to a TUUID"
+                )
+            return self
+        return self.model_copy(update={"tuuid": tuuid})
 
     def __hash__(self):
         items = tuple(sorted(self.dim_map.items())) if self.dim_map else ()
@@ -157,7 +168,16 @@ class PartitionSpec(FluxwayBaseSchema):
 
     specs: tuple[str | tuple[str, ...] | None, ...] = Field(default_factory=tuple)
 
-    def __init__(self, *specs: str | tuple[str, ...] | None):
+    def __init__(
+        self,
+        *specs: str | tuple[str, ...] | None,
+        **data: Any,
+    ):
+        if data:
+            if specs:
+                raise TypeError("PartitionSpec accepts positional specs or model data")
+            super().__init__(**data)
+            return
         if len(specs) == 1 and isinstance(specs[0], list | tuple) and not specs[0]:
             super().__init__(specs=())  # type: ignore
         else:
@@ -185,84 +205,6 @@ P = PartitionSpec
 
 
 # ============================================================
-# ShardingConfig — Declarative Config (Bridge from Dict)
-# ============================================================
-
-
-class ShardingConfig(FluxwayBaseSchema):
-    """Bridge model to parse user-provided sharding dictionaries."""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    sharding_type: str = Field(default="static", alias="type")
-    axis: list[str] = Field(default_factory=list)
-    fn: str | None = None
-    routing_dim: int | tuple[int, ...] = 0
-    reference: str | None = None
-
-    def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
-        """Binds the sharding config to a physical mesh, producing a PhysicalLayout."""
-        return self.to_spec().bind(mesh)
-
-    def to_spec(self) -> ShardingSpec:
-        """Alias for to_routing for backward compatibility."""
-        return self.to_routing()
-
-    def to_routing(self) -> ShardingSpec:
-        """Converts declarative config to a ShardingSpec (pure logic)."""
-        ps = PartitionSpec(*self.axis)
-
-        # 1. Handle Explicitly Replicated or Default Static
-        if self.sharding_type == "replicated" or (
-            self.sharding_type == "static" and not self.axis
-        ):
-            return ShardingSpec(
-                routing=AlgebraicRouting(strategy=_CHUNK, partition=PartitionSpec())
-            )
-
-        # 2. Handle Referential Routing (Follow/Mirror)
-        if self.sharding_type == "mirror":
-            if not self.reference:
-                raise ValueError(
-                    "[Fluxway Sharding Config Error] 'mirror' (referential) sharding type REQUIRES a 'reference' path "
-                    "specifying which TUUID to follow (e.g., reference='train_step.state')."
-                )
-            return ShardingSpec.follow(reference_path=self.reference)
-
-        # 3. Handle Algebraic Routing with Strategy Detection
-        if self.sharding_type not in ("static", "dynamic"):
-            raise ValueError(
-                f"[Fluxway Sharding Config Error] Unsupported sharding type: '{self.sharding_type}'. "
-                "Valid types: replicated, static, dynamic, mirror."
-            )
-
-        if self.fn in ("hash_routing", "hash"):
-            # Explicit hash-based routing ALWAYS uses modulo
-            strategy = _INDEXED_MODULO
-        elif self.sharding_type == "dynamic":
-            # Default dynamic (no fn specified) now uses chunking as requested
-            strategy = _INDEXED_CHUNK
-        elif self.fn == "cyclic":
-            strategy = _CYCLIC
-        elif self.fn == "greedy":
-            strategy = _GREEDY
-        elif self.fn in ("chunk", "block", None) or self.sharding_type == "static":
-            # Default to chunk-sharding for static assignments
-            strategy = _CHUNK
-        else:
-            raise ValueError(
-                f"[Fluxway Sharding Config Error] Unsupported partitioning function: fn='{self.fn}' for type='{self.sharding_type}'. "
-                "Valid fns: hash, cyclic, greedy, chunk."
-            )
-
-        return ShardingSpec(
-            routing=AlgebraicRouting(
-                strategy=strategy, partition=ps, routing_dim=self.routing_dim
-            )
-        )
-
-
-# ============================================================
 # PartitionStrategy — Composable Algebraic Mappings
 # ============================================================
 
@@ -276,6 +218,7 @@ class PartitionStrategy(FluxwayBaseSchema):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
+    type: Any
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(
@@ -371,6 +314,7 @@ class PartitionStrategy(FluxwayBaseSchema):
 class ChunkPartition(PartitionStrategy):
     """Chunk partitioning: idx → idx // chunk_size"""
 
+    type: Literal["chunk"] = "chunk"
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
@@ -409,6 +353,7 @@ class ChunkPartition(PartitionStrategy):
 class CyclicPartition(PartitionStrategy):
     """Cyclic partitioning: idx → idx % num_workers"""
 
+    type: Literal["cyclic"] = "cyclic"
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
@@ -436,23 +381,30 @@ class CyclicPartition(PartitionStrategy):
         return (src_rank % gcd) == (dst_rank % gcd)
 
 
-class IndexedChunkPartition(PartitionStrategy):
+class _IndexValuePartition(PartitionStrategy):
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        indices, valid = _values_for_indices_spec(spec, backend)
+        ranks = self(indices, dim_size, num_workers, index_desc=index_desc)
+        return ranks, valid
+
+
+class IndexedChunkPartition(_IndexValuePartition):
     """Dynamic partitioning using continuous chunks based on index values."""
 
+    type: Literal["indexed_chunk"] = "indexed_chunk"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
 
-        if isinstance(index_desc, ExplicitIndex):
-            values = index_desc.indices
-        elif isinstance(index_desc, FunctionalIndex):
-            values = index_desc.hash_fn(indices)
-        elif isinstance(index_desc, RaggedIndex):
-            starts = index_desc.splits[0][:-1]
-            values = backend.take(starts, indices)
-        else:
-            values = indices
+        values = _dynamic_routing_values(indices, index_desc, backend)
 
         if num_workers <= 1:
             return backend.zeros(backend.shape(values), dtype=backend.int32())
@@ -465,55 +417,25 @@ class IndexedChunkPartition(PartitionStrategy):
             ranks,
         )
 
-    def ranks_for_indices_spec(
-        self,
-        spec: IndicesSpec,
-        dim_size: int,
-        num_workers: int,
-        index_desc: IndexDescriptor | None = None,
-    ) -> tuple[Any, Any]:
-        backend = get_backend()
-        indices, valid = _values_for_indices_spec(spec, backend)
-        ranks = self(indices, dim_size, num_workers, index_desc=index_desc)
-        return ranks, valid
 
-
-class IndexedModuloPartition(PartitionStrategy):
+class IndexedModuloPartition(_IndexValuePartition):
     """Dynamic partitioning using modulo hashing based on index values."""
 
+    type: Literal["indexed_modulo"] = "indexed_modulo"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
 
-        if isinstance(index_desc, ExplicitIndex):
-            values = index_desc.indices
-        elif isinstance(index_desc, FunctionalIndex):
-            values = index_desc.hash_fn(indices)
-        elif isinstance(index_desc, RaggedIndex):
-            starts = index_desc.splits[0][:-1]
-            values = backend.take(starts, indices)
-        else:
-            values = indices
+        values = _dynamic_routing_values(indices, index_desc, backend)
 
         return backend.mod(values, num_workers)
-
-    def ranks_for_indices_spec(
-        self,
-        spec: IndicesSpec,
-        dim_size: int,
-        num_workers: int,
-        index_desc: IndexDescriptor | None = None,
-    ) -> tuple[Any, Any]:
-        backend = get_backend()
-        indices, valid = _values_for_indices_spec(spec, backend)
-        ranks = self(indices, dim_size, num_workers, index_desc=index_desc)
-        return ranks, valid
 
 
 class GreedyPartition(PartitionStrategy):
     """Greedy load balancing partitioning."""
 
+    type: Literal["greedy"] = "greedy"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
@@ -537,6 +459,73 @@ class GreedyPartition(PartitionStrategy):
             rank_loads[best] += int(length)
 
         return backend.tensor(assigned, dtype=backend.int32())
+
+
+class FunctionPartition(_IndexValuePartition):
+    type: Literal["function"] = "function"
+    routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
+    target: Callable[..., Any]
+    arguments: Mapping[str, Any] = Field(default_factory=dict)
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def validate_target(cls, value: Any) -> Callable[..., Any]:
+        if not callable(value):
+            raise TypeError("function partition target must be callable")
+        return value
+
+    @field_validator("arguments")
+    @classmethod
+    def validate_arguments(cls, value: Any) -> Mapping[str, Any]:
+        if not isinstance(value, Mapping):
+            raise TypeError("routing arguments must be a mapping")
+        reserved = {"partition_count", "domain_size"}.intersection(value)
+        if reserved:
+            raise ValueError(
+                f"routing arguments use reserved names: {sorted(reserved)}"
+            )
+        for name, argument in value.items():
+            if not isinstance(name, str) or not name:
+                raise TypeError("routing argument names must be non-empty strings")
+            try:
+                hash(argument)
+            except TypeError as error:
+                raise TypeError(
+                    f"routing argument {name!r} must be hashable"
+                ) from error
+        return FrozenMap(value)
+
+    def validate_contract(self) -> None:
+        try:
+            inspect.signature(self.target).bind(
+                object(),
+                partition_count=1,
+                domain_size=1,
+                **self.arguments,
+            )
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "function partition target does not satisfy the routing contract"
+            ) from error
+
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
+        backend = get_backend()
+        values = _dynamic_routing_values(indices, index_desc, backend)
+        return self.target(
+            values,
+            partition_count=num_workers,
+            domain_size=dim_size,
+            **self.arguments,
+        )
+
+
+def _dynamic_routing_values(indices: Any, index_desc: Any, backend: Any) -> Any:
+    if isinstance(index_desc, ExplicitIndex):
+        return index_desc.indices
+    if isinstance(index_desc, RaggedIndex):
+        starts = index_desc.splits[0][:-1]
+        return backend.take(starts, indices)
+    return indices
 
 
 def _values_for_indices_spec(spec: IndicesSpec, backend: Any) -> tuple[Any, Any]:
@@ -645,9 +634,91 @@ _INDEXED_CHUNK = IndexedChunkPartition()
 _INDEXED_MODULO = IndexedModuloPartition()
 _GREEDY = GreedyPartition()
 
-# TODO(He Jia) I'm not sure if we need this implicity default alias, maybe it's a bug.
-# Compatibility Aliases
-IndexedPartition = IndexedChunkPartition
+
+_PARTITION_STRATEGY_TYPES: dict[str, type[PartitionStrategy]] = {
+    "chunk": ChunkPartition,
+    "cyclic": CyclicPartition,
+    "indexed_chunk": IndexedChunkPartition,
+    "indexed_modulo": IndexedModuloPartition,
+    "greedy": GreedyPartition,
+    "function": FunctionPartition,
+}
+
+
+def _parse_partition_strategy(value: Any) -> PartitionStrategy:
+    if isinstance(value, PartitionStrategy):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("partition strategy must be a typed mapping")
+    strategy_type = value.get("type")
+    if not isinstance(strategy_type, str):
+        raise ValueError(f"unsupported partition strategy type {strategy_type!r}")
+    model = _PARTITION_STRATEGY_TYPES.get(strategy_type)
+    if model is None:
+        raise ValueError(f"unsupported partition strategy type {strategy_type!r}")
+    return model.model_validate(value)
+
+
+_CONFIG_STRATEGIES: dict[tuple[str, str], PartitionStrategy] = {
+    ("static", "chunk"): _CHUNK,
+    ("static", "cyclic"): _CYCLIC,
+    ("dynamic", "chunk"): _INDEXED_CHUNK,
+    ("dynamic", "modulo"): _INDEXED_MODULO,
+    ("dynamic", "greedy"): _GREEDY,
+}
+
+
+class ShardingConfig(FluxwayBaseSchema):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    sharding_type: str = Field(default="static", alias="type")
+    axis: list[str] = Field(default_factory=list)
+    strategy: str | FunctionPartition = "chunk"
+    routing_dim: int | tuple[int, ...] = 0
+    reference: str | None = None
+
+    def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
+        return self.to_spec().bind(mesh)
+
+    def to_spec(self) -> ShardingSpec:
+        return self.to_routing()
+
+    def to_routing(self) -> ShardingSpec:
+        partition = PartitionSpec(*self.axis)
+        if self.sharding_type == "replicated":
+            return ShardingSpec(
+                routing=AlgebraicRouting(
+                    strategy=_CHUNK,
+                    partition=PartitionSpec(),
+                )
+            )
+        if self.sharding_type == "mirror":
+            if not self.reference:
+                raise ValueError("mirror routing requires a reference path")
+            return ShardingSpec.follow(reference_path=self.reference)
+        if self.sharding_type not in ("static", "dynamic"):
+            raise ValueError(f"unsupported sharding type {self.sharding_type!r}")
+        if isinstance(self.strategy, FunctionPartition):
+            if self.sharding_type != "dynamic":
+                raise ValueError(
+                    "function partition strategies require dynamic routing"
+                )
+            self.strategy.validate_contract()
+            strategy = self.strategy
+        else:
+            strategy = _CONFIG_STRATEGIES.get((self.sharding_type, self.strategy))
+            if strategy is None:
+                raise ValueError(
+                    f"strategy {self.strategy!r} is invalid for "
+                    f"{self.sharding_type!r} routing"
+                )
+        return ShardingSpec(
+            routing=AlgebraicRouting(
+                strategy=strategy,
+                partition=partition,
+                routing_dim=self.routing_dim,
+            )
+        )
 
 
 # ============================================================
@@ -680,8 +751,6 @@ class ShardingSpec(FluxwayBaseSchema):
     def strategy(self) -> PartitionStrategy:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.strategy
-        if self.routing._resolved_routing:
-            return self.routing._resolved_routing.strategy
 
         raise RuntimeError(
             f"Sharding strategy accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid}). "
@@ -692,8 +761,6 @@ class ShardingSpec(FluxwayBaseSchema):
     def partition(self) -> PartitionSpec:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.partition
-        if self.routing._resolved_routing:
-            return self.routing._resolved_routing.partition
 
         raise RuntimeError(
             f"Partition spec accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
@@ -703,8 +770,6 @@ class ShardingSpec(FluxwayBaseSchema):
     def routing_dim(self) -> int | tuple[int, ...]:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.routing_dim
-        if self.routing._resolved_routing:
-            return self.routing._resolved_routing.routing_dim
 
         raise RuntimeError(
             f"Routing dim accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
@@ -745,15 +810,18 @@ class ShardingSpec(FluxwayBaseSchema):
         """Returns True if the routing is rank-based (Algebraic STATIC)."""
         return self.routing.is_static
 
-    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
-        """Resolve the logical path to a physical TUUID."""
-        if hasattr(self.routing, "resolve"):
-            self.routing.resolve(resolver_fn)  # type: ignore
-
-    def resolve_sharding(self, routing: AlgebraicRouting) -> None:
-        """Inject the physical routing strategy once resolved."""
-        if hasattr(self.routing, "resolve_sharding"):
-            self.routing.resolve_sharding(routing)  # type: ignore
+    def resolved(
+        self,
+        resolver_fn: Callable[[str], int | None],
+        *,
+        required: bool = True,
+    ) -> ShardingSpec:
+        if not isinstance(self.routing, ReferentialRouting):
+            return self
+        routing = self.routing.resolved(resolver_fn, required=required)
+        if routing is self.routing:
+            return self
+        return self.model_copy(update={"routing": routing})
 
     # ---- Factory Methods ----
 

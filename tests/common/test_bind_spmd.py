@@ -4,6 +4,7 @@ import pytest
 
 from fluxway.common.decorators import spmd, operator
 from fluxway.common.bind import bind_spmd, _apply_operator_configs
+from fluxway import ResourceProfile
 
 
 class PlainBusinessClass:
@@ -17,10 +18,45 @@ class PlainBusinessClass:
         pass
 
 
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(2,),
+)
+class DecoratedSPMD:
+    @operator(
+        name="step",
+        input_sharding={"x": {"type": "static", "axis": ["dp"]}},
+    )
+    def step(self, **kwargs):
+        return kwargs
+
+
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(2,),
+)
+class ConfigurableSPMD:
+    @operator(
+        name="fwd",
+        input_sharding={"a": {"type": "static", "axis": ["dp"]}},
+    )
+    def fwd(self, **kwargs):
+        return kwargs
+
+    @operator(name="existing")
+    def existing(self):
+        return None
+
+    def new_method(self, **kwargs):
+        return kwargs
+
+
 def test_bind_spmd_creates_spmd_from_plain_class():
     BoundCls = bind_spmd(
         PlainBusinessClass,
-        resource={"num_cpus": 2, "num_gpus": 1},
+        resource_profile=ResourceProfile(base={"CPU": 2, "GPU": 1}),
         mesh_axis_names=("dp",),
         mesh_axis_shapes=(4,),
         step={
@@ -33,20 +69,55 @@ def test_bind_spmd_creates_spmd_from_plain_class():
     assert BoundCls.__name__ == "PlainBusinessClass"
 
     config = BoundCls.get_spmd_config()
-    assert "step" in config.operator_metas
-    assert "emb" in config.operator_metas["step"].input_sharding
-    assert "grad" in config.operator_metas["step"].output_sharding
+    assert "step" in config.operator_specs
+    assert "emb" in config.operator_specs["step"].input_sharding
+    assert "grad" in config.operator_specs["step"].output_sharding
     assert config.mesh.size == 4
 
-    res = BoundCls.get_resource()
-    assert res.num_gpus == 1
-    assert res.num_cpus == 2
+    profile = BoundCls.get_resource_profile()
+    assert profile.base["GPU"] == 1
+    assert profile.base["CPU"] == 2
+
+
+def test_bind_spmd_preserves_business_class_identity() -> None:
+    left = type(
+        "SharedName",
+        (),
+        {"__module__": "business.left", "step": lambda self: None},
+    )
+    right = type(
+        "SharedName",
+        (),
+        {"__module__": "business.right", "step": lambda self: None},
+    )
+
+    bound_left = bind_spmd(
+        left,
+        resource_profile=ResourceProfile(base={"CPU": 1}),
+        mesh_axis_names=("worker",),
+        mesh_axis_shapes=(1,),
+    )
+    bound_right = bind_spmd(
+        right,
+        resource_profile=ResourceProfile(base={"CPU": 1}),
+        mesh_axis_names=("worker",),
+        mesh_axis_shapes=(1,),
+    )
+
+    assert (bound_left.__module__, bound_left.__qualname__) == (
+        "business.left",
+        "SharedName",
+    )
+    assert (bound_right.__module__, bound_right.__qualname__) == (
+        "business.right",
+        "SharedName",
+    )
 
 
 def test_bind_spmd_multiple_operators():
     BoundCls = bind_spmd(
         PlainBusinessClass,
-        resource={"num_cpus": 1},
+        resource_profile=ResourceProfile(base={"CPU": 1}),
         mesh_axis_names=("dp",),
         mesh_axis_shapes=(2,),
         step={
@@ -58,16 +129,16 @@ def test_bind_spmd_multiple_operators():
     )
 
     config = BoundCls.get_spmd_config()
-    assert "step" in config.operator_metas
-    assert "update" in config.operator_metas
-    assert "x" in config.operator_metas["step"].input_sharding
-    assert "grad" in config.operator_metas["update"].input_sharding
+    assert "step" in config.operator_specs
+    assert "update" in config.operator_specs
+    assert "x" in config.operator_specs["step"].input_sharding
+    assert "grad" in config.operator_specs["update"].input_sharding
 
 
 def test_bind_spmd_original_class_unmodified():
     bind_spmd(
         PlainBusinessClass,
-        resource={"num_cpus": 1},
+        resource_profile=ResourceProfile(base={"CPU": 1}),
         mesh_axis_names=("dp",),
         mesh_axis_shapes=(2,),
         step={"input_sharding": {"x": {"type": "static", "axis": ["dp"]}}},
@@ -77,19 +148,6 @@ def test_bind_spmd_original_class_unmodified():
 
 
 def test_bind_spmd_overrides_existing_decorated_operator():
-    @spmd(
-        resource={"num_cpus": 1},
-        mesh_axis_names=("dp",),
-        mesh_axis_shapes=(2,),
-    )
-    class DecoratedSPMD:
-        @operator(
-            name="step",
-            input_sharding={"x": {"type": "static", "axis": ["dp"]}},
-        )
-        def step(self, **kwargs):
-            return kwargs
-
     Overridden = bind_spmd(
         DecoratedSPMD,
         mesh_axis_names=("dp",),
@@ -104,7 +162,7 @@ def test_bind_spmd_overrides_existing_decorated_operator():
 
     config = Overridden.get_spmd_config()
     assert config.mesh.size == 8
-    meta = config.operator_metas["step"]
+    meta = config.operator_specs["step"]
     assert "x" in meta.input_sharding
     assert "y" in meta.input_sharding
 
@@ -112,7 +170,7 @@ def test_bind_spmd_overrides_existing_decorated_operator():
 def test_bind_spmd_as_source():
     BoundCls = bind_spmd(
         PlainBusinessClass,
-        resource={"num_cpus": 1},
+        resource_profile=ResourceProfile(base={"CPU": 1}),
         mesh_axis_names=("worker",),
         mesh_axis_shapes=(1,),
         is_source=True,
@@ -123,7 +181,7 @@ def test_bind_spmd_as_source():
 
     assert BoundCls.is_fluxway_spmd()
     config = BoundCls.get_spmd_config()
-    meta = config.operator_metas["step"]
+    meta = config.operator_specs["step"]
     assert meta.is_source is True
 
 
@@ -140,20 +198,7 @@ def test_bind_spmd_raises_on_missing_method():
 
 
 def test_apply_operator_configs_override_existing():
-    @spmd(
-        resource={"num_cpus": 1},
-        mesh_axis_names=("dp",),
-        mesh_axis_shapes=(2,),
-    )
-    class TestCls:
-        @operator(
-            name="fwd",
-            input_sharding={"a": {"type": "static", "axis": ["dp"]}},
-        )
-        def fwd(self, **kwargs):
-            pass
-
-    config = copy.deepcopy(TestCls.get_spmd_config())
+    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())
     _apply_operator_configs(
         config,
         {
@@ -164,51 +209,28 @@ def test_apply_operator_configs_override_existing():
                 }
             }
         },
-        TestCls,
+        ConfigurableSPMD,
     )
 
-    meta = config.operator_metas["fwd"]
+    meta = config.operator_specs["fwd"]
     assert "a" in meta.input_sharding
     assert "b" in meta.input_sharding
 
 
 def test_apply_operator_configs_register_new():
-    @spmd(
-        resource={"num_cpus": 1},
-        mesh_axis_names=("dp",),
-        mesh_axis_shapes=(2,),
-    )
-    class TestCls:
-        @operator(name="existing")
-        def existing(self):
-            pass
-
-        def new_method(self, **kwargs):
-            pass
-
-    config = copy.deepcopy(TestCls.get_spmd_config())
+    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())
     _apply_operator_configs(
         config,
         {"new_method": {"input_sharding": {"x": {"type": "static", "axis": ["dp"]}}}},
-        TestCls,
+        ConfigurableSPMD,
     )
 
-    assert "new_method" in config.operator_metas
-    assert "x" in config.operator_metas["new_method"].input_sharding
+    assert "new_method" in config.operator_specs
+    assert "x" in config.operator_specs["new_method"].input_sharding
 
 
 def test_apply_operator_configs_raises_on_missing_method():
-    @spmd(
-        resource={"num_cpus": 1},
-        mesh_axis_names=("dp",),
-        mesh_axis_shapes=(2,),
-    )
-    class TestCls:
-        @operator(name="existing")
-        def existing(self):
-            pass
-
-    config = copy.deepcopy(TestCls.get_spmd_config())
+    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())
     with pytest.raises(ValueError, match="method not found"):
         _apply_operator_configs(
             config,
@@ -217,5 +239,5 @@ def test_apply_operator_configs_raises_on_missing_method():
                     "input_sharding": {"x": {"type": "static", "axis": ["dp"]}}
                 }
             },
-            TestCls,
+            ConfigurableSPMD,
         )

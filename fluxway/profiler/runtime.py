@@ -7,6 +7,7 @@ from fluxway.profiler.clock import ClockCalibration
 from fluxway.profiler.diagnostics import HeartbeatProfilerObserver
 from fluxway.profiler.record import ProfilerSnapshot, TraceArena
 from fluxway.profiler.recorder import TraceRecorder
+from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.profiler.wrappers import (
     TracingDataPlaneBackendExecutor,
     TracingDataPlaneCallable,
@@ -75,10 +76,10 @@ class ProfilerRuntimeFactory:
             return executor
         return TracingUserCallableExecutor(executor, self._recorder)
 
-    def worker_mailbox(self, mailbox: Any) -> Any:
+    def create_worker_mailbox(self) -> WorkerMailbox:
         if self._recorder is None:
-            return mailbox
-        return TracingWorkerMailbox(mailbox, self._recorder)
+            return WorkerMailbox()
+        return TracingWorkerMailbox(self._recorder)
 
     def heartbeat_observer(self) -> HeartbeatProfilerObserver | None:
         if self._recorder is None:

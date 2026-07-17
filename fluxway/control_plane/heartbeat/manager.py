@@ -20,6 +20,7 @@ from fluxway.common.types import (
     DriverHeartbeat,
     DriverStatus,
     DriverState,
+    ExecutionFailure,
     HeartbeatConfig,
 )
 from fluxway.common.utils.logging import get_logger
@@ -29,10 +30,8 @@ logger = get_logger(__name__)
 # Type aliases for callbacks
 SyncCallback = Callable[[], None]
 AsyncCallback = Callable[[], Awaitable[None]]
-SyncErrorCallback = Callable[[str, str], None]
-AsyncErrorCallback = Callable[[str, str], Awaitable[None]]
-SyncRecoverCallback = Callable[[str], None]
-AsyncRecoverCallback = Callable[[str], Awaitable[None]]
+SyncErrorCallback = Callable[[str, ExecutionFailure], None]
+AsyncErrorCallback = Callable[[str, ExecutionFailure], Awaitable[None]]
 
 
 class HeartbeatObserver(Protocol):
@@ -55,7 +54,6 @@ class HeartbeatManager:
         on_all_ready: SyncCallback | AsyncCallback | None = None,
         on_all_workers_running: SyncCallback | AsyncCallback | None = None,
         on_driver_error: SyncErrorCallback | AsyncErrorCallback | None = None,
-        on_driver_recovered: SyncRecoverCallback | AsyncRecoverCallback | None = None,
         observer: HeartbeatObserver | None = None,
     ):
         """
@@ -66,14 +64,12 @@ class HeartbeatManager:
             on_all_ready: Callback when all registered drivers are ready (workers_ready=True)
             on_all_workers_running: Callback when all drivers report workers_running=True
                 (after topology registration completes)
-            on_driver_error: Callback when a driver has error (spmd_id, error_msg) (sync or async)
-            on_driver_recovered: Callback when a driver recovers (spmd_id) (sync or async)
+            on_driver_error: Callback when a driver has error (spmd_id, failure) (sync or async)
         """
         self._config = config or HeartbeatConfig()
         self._on_all_ready = on_all_ready
         self._on_all_workers_running = on_all_workers_running
         self._on_driver_error = on_driver_error
-        self._on_driver_recovered = on_driver_recovered
         self._observer = observer
 
         # Registered SPMD IDs that we expect heartbeats from
@@ -136,6 +132,7 @@ class HeartbeatManager:
             heartbeat: Driver heartbeat data
         """
         spmd_id = heartbeat.spmd_id
+        error_notification: tuple[str, ExecutionFailure] | None = None
 
         async with self._lock:
             if spmd_id not in self._registered_spmds:
@@ -145,22 +142,17 @@ class HeartbeatManager:
             self._heartbeats[spmd_id] = heartbeat
             self._missed_counts[spmd_id] = 0
 
-            # Check if driver recovered from error
-            was_in_error = spmd_id in self._error_drivers
-            if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
-                self._error_drivers.discard(spmd_id)
-                logger.info(f"Driver {spmd_id} recovered from error")
-                # Will call callback outside lock
-
             # Check if driver reported error
-            is_new_error = False
             if heartbeat.status == DriverStatus.ERROR:
+                failure = heartbeat.failure
+                if failure is None:
+                    raise RuntimeError(
+                        "DriverHeartbeat ERROR invariant violated: failure is None."
+                    )
                 if spmd_id not in self._error_drivers:
                     self._error_drivers.add(spmd_id)
-                    is_new_error = True
-                    logger.error(
-                        f"Driver {spmd_id} reported error: {heartbeat.error_message}"
-                    )
+                    error_notification = (spmd_id, failure)
+                    logger.error(f"Driver {spmd_id} reported error: {failure}")
 
             # Check if all drivers are ready (first time) — Phase 1
             should_trigger_ready = False
@@ -180,12 +172,8 @@ class HeartbeatManager:
                     logger.heartbeat("All workers running workers_running=True")
 
         # Call callbacks outside lock to prevent deadlock
-        if was_in_error and heartbeat.status == DriverStatus.HEALTHY:
-            await self._call_recovered_callback(spmd_id)
-
-        if is_new_error:
-            error_msg = heartbeat.error_message or "Unknown error"
-            await self._call_error_callback(spmd_id, error_msg)
+        if error_notification is not None:
+            await self._call_error_callback(*error_notification)
 
         if should_trigger_ready:
             await self._call_ready_callback()
@@ -211,27 +199,15 @@ class HeartbeatManager:
         except Exception as e:
             logger.error(f"Error in on_all_ready callback: {e}")
 
-    async def _call_error_callback(self, spmd_id: str, error: str) -> None:
+    async def _call_error_callback(
+        self, spmd_id: str, failure: ExecutionFailure
+    ) -> None:
         """Call the on_driver_error callback (handles sync and async)."""
         if self._on_driver_error is None:
             return
-        try:
-            result = self._on_driver_error(spmd_id, error)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as e:
-            logger.error(f"Error in on_driver_error callback: {e}")
-
-    async def _call_recovered_callback(self, spmd_id: str) -> None:
-        """Call the on_driver_recovered callback (handles sync and async)."""
-        if self._on_driver_recovered is None:
-            return
-        try:
-            result = self._on_driver_recovered(spmd_id)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception as e:
-            logger.error(f"Error in on_driver_recovered callback: {e}")
+        result = self._on_driver_error(spmd_id, failure)
+        if asyncio.iscoroutine(result):
+            await result
 
     async def _call_workers_running_callback(self) -> None:
         """Call the on_all_workers_running callback (handles sync and async)."""
@@ -450,7 +426,7 @@ class HeartbeatManager:
     async def _check_heartbeat_timeouts(self) -> None:
         """Check for heartbeat timeouts and trigger callbacks."""
         current_time = time.time()
-        timeout_drivers: list[tuple] = []
+        timeout_drivers: list[tuple[str, ExecutionFailure]] = []
 
         async with self._lock:
             for spmd_id in self._registered_spmds:
@@ -503,15 +479,24 @@ class HeartbeatManager:
                 if missed >= self._config.max_missed_heartbeats:
                     if spmd_id not in self._error_drivers:
                         self._error_drivers.add(spmd_id)
-                        error_msg = f"Heartbeat timeout (missed {missed})"
-                        timeout_drivers.append((spmd_id, error_msg))
+                        failure = ExecutionFailure(
+                            spmd_id=spmd_id,
+                            rank=None,
+                            op_name=None,
+                            step=None,
+                            phase="DRIVER_HEARTBEAT",
+                            exception_type="DriverHeartbeatTimeout",
+                            message=f"Heartbeat timeout (missed {missed})",
+                            traceback=None,
+                        )
+                        timeout_drivers.append((spmd_id, failure))
                         logger.error(
                             f"Driver {spmd_id} heartbeat timeout (missed {missed})"
                         )
 
         # Call callbacks outside lock
-        for spmd_id, error_msg in timeout_drivers:
-            await self._call_error_callback(spmd_id, error_msg)
+        for spmd_id, failure in timeout_drivers:
+            await self._call_error_callback(spmd_id, failure)
 
     async def reset(self) -> None:
         """Reset all heartbeat state."""

@@ -1,7 +1,7 @@
 # Computation Graph Visualization
 
-Fluxway exports computation graphs for Google Model Explorer without generating
-or maintaining a custom user interface.
+Fluxway projects a compiled computation graph into Google Model Explorer. It
+does not generate an SVG, DOT graph, or a separate visualization service.
 
 ## Installation
 
@@ -20,46 +20,183 @@ bundle = visualize_graph(graph, "/tmp/training-graph")
 view_graph(bundle)
 ```
 
+`visualize_graph` reads two existing Python objects:
+
+- `Graph` supplies the human-readable SPMD description.
+- `CompiledGraph` supplies frozen SPMD declarations, compiled operators,
+  dependencies, dependency codes, ports, TUUIDs, callable identities, and
+  `AsyncPolicy`.
+
+The function writes exactly one file:
+
+```text
+/tmp/training-graph/model_explorer.json
+```
+
+This JSON file is a Model Explorer export artifact. Fluxway does not use it to
+rebuild operators, dependencies, callables, or worker state. Ray continues to
+transport the native Python compiled graph and its user callables.
+
 `view_graph` starts the Model Explorer server and blocks until it is stopped.
-Export and viewing are separate so a headless training process never opens a
+Export and viewing are separate, so a headless training process never opens a
 browser or starts an HTTP server implicitly.
 
-The bundle contains exactly two files:
-
-- `manifest.json` is Fluxway's immutable computation-graph fact document.
-- `model_explorer.json` is a replaceable Model Explorer projection generated
-  only from the manifest.
-
 An existing output directory raises `FileExistsError`. Passing `overwrite=True`
-replaces it only when both files exactly match a projection regenerated from the
-validated manifest. Replacement restores the previous bundle if the directory
-swap fails.
+requires the existing directory to contain a valid Fluxway Model Explorer
+projection, then replaces the directory atomically. If the directory swap
+fails, the previous projection is restored and the exception is propagated.
 
-## Model Explorer Mapping
+## Two Views
 
-SPMDs are Model Explorer namespaces. Operators are op nodes. Selecting an SPMD
-or operator shows its full identifiers, description, mesh, resources, classified
-inputs and outputs, signature identifiers, and TUUID mappings.
+The exported Model Explorer collection contains two views of the same compiled
+operators and dependencies.
 
-Search Model Explorer attributes using the exact identifiers shown in Perfetto:
+| View | Question it answers |
+|---|---|
+| `Dependencies` | Which operator must precede which other operator, and what data moves between them? |
+| `Potential overlap` | Which operators may become ready together, and which causal relations constrain that overlap? |
 
-- `manifest_id`
+There are not two graph definitions. Both views are projections of the same
+`CompiledGraph` and compiled `AsyncPolicy` schedule. The views deliberately use
+different edge representations because they answer different questions.
+
+SPMDs are Model Explorer namespaces and compiled operators are op nodes.
+Selecting an operator exposes its `graph_id`, SPMD identity, function identity,
+input/output signature IDs, mesh, resource range, dependency rank, and schedule
+policy.
+
+Searchable correlation fields include:
+
+- `graph_id`
+- `graph_generation`
 - `spmd_id`
 - `op_id`
 - `function_id`
 - `input_signature_id`
 - `output_signature_id`
+- `dependency_code`
 
-Model Explorer removes layers that contain one operator by default. Fluxway also
-places the SPMD identity, class, description, mesh, and resources on every
-operator, so those facts remain searchable and copyable. Enable Model Explorer's
-`Keep layers with a single op node child` setting when every SPMD must remain a
-visible layer in the overview.
+Model Explorer may remove a namespace containing only one operator from the
+overview. Fluxway therefore also places SPMD metadata on every operator. Enable
+Model Explorer's `Keep layers with a single op node child` setting when each
+SPMD must remain visible as a layer.
 
-Model Explorer may draw multiple transfers between the same operator pair as one
-edge. Each transfer remains separate in operator input/output metadata and in
-`manifest.json`, including `source output -> target input -> tuuid` and the
-local, conditional, or symmetric properties.
+## Dependency And Transfer
+
+A dependency means that a target operator cannot begin the corresponding step
+until the source operator has satisfied that dependency. A transfer means that
+a tensor also moves along the dependency.
+
+```text
+dependency: source operator -> target operator
+transfers:  zero or more source port -> target port -> TUUID mappings
+```
+
+Zero transfers is valid. It is an ordering-only dependency and is implemented
+by the transport compiler as a header-only frame rather than a tensor payload.
+The visualization creates input/output metadata for that control relation so it
+is visible in the same Model Explorer graph as tensor transfers.
+
+The `Dependencies` view contains exactly one native edge per compiled
+dependency. When one dependency carries multiple tensors, the source and
+target metadata contain a structured `transfers` list with every transfer code,
+logical TUUID, source port, and target port. It has no overlays.
+
+The `Potential overlap` view contains one thin, unlabeled native layout edge
+for each same-step causal operator pair. These edges use Model Explorer's
+default ports and have no tensor metadata. The view aggregates compiled
+dependencies and phase schedule relations by ordered operator pair, then emits
+at most one colored overlay edge for each pair. Local-only, conditional,
+symmetric, multiple-transfer, and phase facts never create parallel overlays.
+Cross-step phase relations are overlay-only because they must not change the
+same-step layout rank.
+
+## Visual Language
+
+Operator box colors describe structural roles in the compiled dependency graph.
+
+| Box | Meaning |
+|---|---|
+| Green | Source: no incoming dependency |
+| Blue | Transform: both incoming and outgoing dependencies |
+| Amber | Sink: no outgoing dependency |
+| Purple | Member of a dependency cycle |
+| Gray | Isolated operator |
+
+The `Dependencies` view has no overlays. Its native Model Explorer edges are
+the complete dependency projection and carry all tensor port metadata.
+
+In `Potential overlap`, faint native edges provide a stable same-step layout
+skeleton. Colored overlays describe causal kinds and can be selected
+independently.
+
+| Color | Meaning |
+|---|---|
+| Blue `#1967D2` | One or more tensors move along the dependency |
+| Amber `#B06000` | Same-step ordering without a tensor payload |
+| Teal `#007B83` | Cross-step phase dependency from `AsyncPolicy` |
+
+Width independently describes execution scope.
+
+| Width | Meaning |
+|---|---|
+| 1 | Worker-local relation |
+| 2 | Same SPMD, but not worker-local |
+| 3 | Cross-SPMD relation |
+
+Width never represents tensor bytes or traffic. Dynamic tensor sizes are not
+known when the static graph is exported. Conditional and symmetric facts are
+appended to the single relation label and remain available in dependency
+metadata.
+
+Model Explorer's edge schema supports color, width, and labels, but has no
+dashed or dotted stroke field. Fluxway therefore uses a thin amber labelled
+line for ordering-only dependencies. It does not emit unsupported JSON fields
+that the viewer would silently ignore.
+
+## Async Scheduling Facts
+
+`AsyncPolicy` is the only source of asynchronous execution facts. Every
+operator node exposes the policy values compiled for that operator, including:
+
+- `async_mode`, `async_depth`, `async_commit`, and `async_max_staleness`
+- `state_access` and `state_resource`
+- `schedule_kind`, `schedule_base_priority`, and `schedule_phase`
+- `schedule_phase_order` and `schedule_phase_dependencies`
+- `schedule_lane`, `schedule_lane_order`, and `schedule_lane_priorities`
+- `schedule_phase_priorities`
+
+A phase-to-lane mapping is represented by each phase operator's
+`schedule_phase` and `schedule_lane`. The ordered phase and lane collections are
+also shown, so the Model Explorer details pane can reconstruct the full policy
+without a second set of constants in the visualization module.
+
+`compile_phase_schedule` is the shared schedule-semantics module. The worker
+uses its precomputed gates on the execution hot path, while visualization uses
+the same compiled relations. Phase ordering is therefore not reimplemented in
+the visualization adapter.
+
+These fields describe scheduling rules, not measured execution. Perfetto traces
+remain the authority for actual queueing, transport, and device timing.
+
+## Potential Overlap
+
+Fluxway computes overlap groups without recursively traversing Python objects:
+
+1. Combine compiled dependencies with same-step phase relations.
+2. Collapse every same-step causal cycle into one component.
+3. Compute the longest dependency rank on the resulting acyclic graph.
+4. Put operators with the same rank into the same outer namespace.
+5. Put schedule lanes inside each rank, following `lane_order` where present.
+6. Keep each SPMD as the innermost namespace.
+
+Every same-step causal relation between different components increases the
+target rank. Cross-step phase relations are visible as teal overlays but do not
+increase same-step rank. Operators in one rank are shown as a group rather than
+being connected pairwise; pairwise overlap lines would grow quadratically.
+Members of one group may become ready concurrently, but the view does not claim
+that they overlap at runtime. Resource contention, conditions, different step
+numbers, and backpressure can still serialize them.
 
 ## Remote Use
 
@@ -78,71 +215,28 @@ view_graph(
 ssh -L 8080:127.0.0.1:8080 user@training-host
 ```
 
-The bundle can also be copied to another machine and opened with:
+The exported file can also be copied to another machine and opened directly:
 
 ```bash
-model-explorer /path/to/training-graph/model_explorer.json
+scp user@training-host:/tmp/training-graph/model_explorer.json \
+  "$HOME/Downloads/training-graph.json"
+model-explorer "$HOME/Downloads/training-graph.json"
 ```
 
-## Copy To A Mac
-
-Copy the complete bundle so `manifest.json` remains beside the replaceable
-Model Explorer projection. Run this on the Mac, replacing the SSH host and
-remote path:
-
-```bash
-mkdir -p "$HOME/Downloads/training-graph"
-rsync -av --progress \
-  user@training-host:/tmp/training-graph/ \
-  "$HOME/Downloads/training-graph/"
-ls -1 "$HOME/Downloads/training-graph"
-```
-
-The final command must show exactly `manifest.json` and
-`model_explorer.json`. For a one-time copy, `scp` is also sufficient:
-
-```bash
-scp -r user@training-host:/tmp/training-graph "$HOME/Downloads/"
-```
-
-Install Model Explorer in an isolated Mac environment and open the copied
-projection on loopback:
-
-```bash
-brew install python@3.12  # only when python3.12 is not already installed
-python3.12 -m venv "$HOME/.venvs/fluxway-model-explorer"
-source "$HOME/.venvs/fluxway-model-explorer/bin/activate"
-python -m pip install ai-edge-model-explorer
-model-explorer \
-  "$HOME/Downloads/training-graph/model_explorer.json" \
-  --host 127.0.0.1 --port 8080
-```
-
-To compare with a trace, copy the `.pftrace` file to the Mac as well:
+To compare the graph with a trace, copy the `.pftrace` file and load it with
+Perfetto:
 
 ```bash
 scp user@training-host:/tmp/recommendation-traces/run.pftrace \
   "$HOME/Downloads/run.pftrace"
-open "https://ui.perfetto.dev"
 ```
 
-Load `run.pftrace` from Perfetto's **Open trace file** action. Search the
-`manifest_id`, `spmd_id`, `op_id`, `function_id`, and signature IDs shown in
-Model Explorer to compare the two views.
+Use `graph_id`, `spmd_id`, `op_id`, and `function_id` to correlate Model Explorer
+nodes with trace events.
 
-## Future Viewers
+## Scale Boundary
 
-`fluxway.graph_manifest(graph)` returns the same frozen
-`ComputationGraphManifest` stored on the built graph. A future viewer consumes
-this document rather than importing Builder, profiler, Model Explorer, or
-runtime internals. Identity and transfer fields must never be reconstructed from
-display names.
-
-Model Explorer is desktop-oriented. It does not parse `.pftrace` files or
-provide automatic navigation to Perfetto. The two tools correlate through
-fields copied from the same manifest facts.
-
-The official UI loaded and searched the 1k-operator proof, but a single SPMD
-containing 10k operators and 9,999 transfers did not finish its initial layout
-within 180 seconds. Bundle generation still succeeds; use the manifest directly
-for automated inspection of graphs at that density.
+The iterative component and dependency-rank algorithms avoid Python recursion
+and support graphs with more than 10,000 operators during export. Browser layout
+is a separate Model Explorer cost: very dense graphs can take substantially
+longer to open even when Fluxway exports them quickly.

@@ -1,15 +1,23 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from typing import Any
 
+from fluxway.common.operator_policy import BarrierConfig
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.profiler.clock import AxonNativeHlcBridge, RayFluxwayHlcBridge
 from fluxway.profiler.record import TraceCarrier
 from fluxway.profiler.recorder import TraceRecorder
 from fluxway.profiler.user_api import activate_user_profiler
 from fluxway.rpc.protocol import AxonDataPlane, DataPlaneCallable, RayActorDataPlane
-from fluxway.transport.manifest import FRAME_EDGE_COUNT, FRAME_PAYLOAD_COUNT, FRAME_STEP
+from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
+from fluxway.transport.manifest import (
+    FRAME_ENTRY_COUNT,
+    FRAME_PAYLOAD_COUNT,
+    FRAME_STEP,
+    TransportFrame,
+)
 
 
 class TracingDataPlaneCallable(DataPlaneCallable):
@@ -106,61 +114,68 @@ class TracingDataPlaneBackendExecutor:
         self._delegate = delegate
         self._recorder = recorder
 
-    async def send_step_frames(self, **kwargs: Any) -> Any:
+    async def send_tensor_frames(self, **kwargs: Any) -> Any:
+        return await self._send(self._delegate.send_tensor_frames, kwargs)
+
+    async def send_completed_without_tensor_frames(self, **kwargs: Any) -> Any:
+        return await self._send(
+            self._delegate.send_completed_without_tensor_frames,
+            kwargs,
+        )
+
+    async def send_dependency_decision_frames(self, **kwargs: Any) -> Any:
+        return await self._send(
+            self._delegate.send_dependency_decision_frames,
+            kwargs,
+        )
+
+    async def _send(self, send: Any, kwargs: dict[str, Any]) -> Any:
         async with self._recorder.data_plane_send_step_frames(
             rank=int(kwargs.get("rank", 0)),
             exec_step=int(kwargs.get("exec_step", 0)),
         ):
             kwargs["profiler_recorder"] = self._recorder
-            return await self._delegate.send_step_frames(**kwargs)
+            return await send(**kwargs)
 
 
-class TracingWorkerMailbox:
-    def __init__(self, delegate: Any, recorder: TraceRecorder) -> None:
-        self._delegate = delegate
+class TracingWorkerMailbox(WorkerMailbox):
+    def __init__(self, recorder: TraceRecorder) -> None:
+        super().__init__()
         self._recorder = recorder
 
-    def set_ready_callback(self, callback: Any) -> None:
+    def set_ready_callback(self, callback: Callable[[str, int], None]) -> None:
         def traced_callback(op_name: str, step: int) -> None:
             self._recorder.mailbox_ready_fire(op_name=op_name, step=step)
             callback(op_name, step)
 
-        self._delegate.set_ready_callback(traced_callback)
+        super().set_ready_callback(traced_callback)
 
     def declare_step(
         self,
         op_name: str,
         step: int,
-        expected_tensors: dict[int, int],
+        expected_transfers: dict[int, int],
         expected_states: list[str],
-        barrier_config: Any = None,
+        barrier_config: BarrierConfig | None = None,
+        expected_orderings: dict[int, int] | None = None,
+        transfer_dependencies: dict[int, int] | None = None,
+        expected_dependency_decisions: dict[int, int] | None = None,
     ) -> None:
         self._recorder.mailbox_declare_step(
             op_name=op_name,
             step=step,
-            tensor_count=len(expected_tensors),
+            transfer_count=len(expected_transfers),
             state_count=len(expected_states),
         )
-        self._delegate.declare_step(
+        super().declare_step(
             op_name,
             step,
-            expected_tensors,
+            expected_transfers,
             expected_states,
             barrier_config,
-        )
-
-    def configure_transport_expected_counts(
-        self, op_name: str, step: int, expected_counts: dict[int, int]
-    ) -> None:
-        self._recorder.mailbox_expected_count_update(
-            op_name=op_name,
-            step=step,
-            tensor_count=len(expected_counts),
-        )
-        self._delegate.configure_transport_expected_counts(
-            op_name,
-            step,
-            expected_counts,
+            expected_orderings,
+            transfer_dependencies,
+            expected_dependency_decisions,
         )
 
     async def deposit_control_arguments(
@@ -171,22 +186,22 @@ class TracingWorkerMailbox:
             step=step,
             field_count=len(names),
         ):
-            await self._delegate.deposit_control_arguments(op_name, step, names, values)
+            await super().deposit_control_arguments(op_name, step, names, values)
 
     async def deposit_transport_frame(
         self,
         op_name: str,
         sender_id: str,
-        frame: Any,
+        frame: TransportFrame,
     ) -> int:
         step = int(frame.frame_i32[FRAME_STEP])
         async with self._recorder.mailbox_deposit_frame(
             op_name=op_name,
             step=step,
-            edge_count=int(frame.frame_i32[FRAME_EDGE_COUNT]),
+            entry_count=int(frame.frame_i32[FRAME_ENTRY_COUNT]),
             payload_count=int(frame.frame_i32[FRAME_PAYLOAD_COUNT]),
         ):
-            return await self._delegate.deposit_transport_frame(
+            return await super().deposit_transport_frame(
                 op_name,
                 sender_id,
                 frame,
@@ -195,96 +210,44 @@ class TracingWorkerMailbox:
     async def deposit_local_tensor(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         sender_id: str,
         rank: int,
         tensor: Any,
     ) -> int:
         if not isinstance(tensor, TransportTensor):
-            raise TypeError(
-                "TracingWorkerMailbox.deposit_local_tensor requires a TransportTensor, "
-                f"got {type(tensor).__name__}."
-            )
-        expected_count = tensor.routing_entity_count
-        async with self._recorder.mailbox_deposit_local_tensor(
-            op_name=op_name,
-            tuuid=tuuid,
-            step=step,
-            data_count=expected_count,
-        ):
-            data_count = await self._delegate.deposit_local_tensor(
+            return await super().deposit_local_tensor(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 sender_id,
                 rank,
                 tensor,
             )
-        if data_count != expected_count:
-            raise ValueError(
-                "TracingWorkerMailbox local tensor data_count mismatch: "
-                f"op={op_name} tuuid={tuuid} step={step} "
-                f"expected={expected_count} actual={data_count}."
+        expected_count = tensor.routing_entity_count
+        async with self._recorder.mailbox_deposit_local_tensor(
+            op_name=op_name,
+            transfer_code=transfer_code,
+            step=step,
+            data_count=expected_count,
+        ):
+            return await super().deposit_local_tensor(
+                op_name,
+                transfer_code,
+                step,
+                sender_id,
+                rank,
+                tensor,
             )
-        return data_count
 
     async def clear_step(self, op_name: str, step: int) -> None:
         async with self._recorder.mailbox_clear_step(op_name=op_name, step=step):
-            await self._delegate.clear_step(op_name, step)
+            await super().clear_step(op_name, step)
 
     async def wait_step_ready(self, op_name: str, step: int) -> None:
         async with self._recorder.mailbox_wait_step_ready(op_name=op_name, step=step):
-            await self._delegate.wait_step_ready(op_name, step)
-
-    def is_step_ready(self, op_name: str, step: int) -> bool:
-        return self._delegate.is_step_ready(op_name, step)
-
-    async def get_all_control_arguments(
-        self, op_name: str, step: int
-    ) -> dict[str, Any]:
-        return await self._delegate.get_all_control_arguments(op_name, step)
-
-    async def get_all_tensor_shard_views(
-        self, op_name: str, step: int
-    ) -> dict[int, Any]:
-        return await self._delegate.get_all_tensor_shard_views(op_name, step)
-
-    async def get_tensor_shard_views(
-        self, op_name: str, tuuid: int, step: int
-    ) -> dict[Any, Any]:
-        return await self._delegate.get_tensor_shard_views(op_name, tuuid, step)
-
-    async def get_tensor_arrivals(
-        self, op_name: str, tuuid: int, step: int
-    ) -> dict[Any, Any]:
-        return await self._delegate.get_tensor_arrivals(op_name, tuuid, step)
-
-    async def get_tensor_shard_views_and_arrivals(
-        self, op_name: str, tuuid: int, step: int
-    ) -> tuple[int, dict[Any, Any], dict[Any, Any]]:
-        return await self._delegate.get_tensor_shard_views_and_arrivals(
-            op_name, tuuid, step
-        )
-
-    async def get_tensor_shard_views_and_arrivals_many(
-        self,
-        op_name: str,
-        tuuids: list[int] | tuple[int, ...],
-        step: int,
-    ) -> list[tuple[int, dict[Any, Any], dict[Any, Any]]]:
-        return await self._delegate.get_tensor_shard_views_and_arrivals_many(
-            op_name, tuuids, step
-        )
-
-    async def snapshot(self) -> dict[str, Any]:
-        return await self._delegate.snapshot()
-
-    async def get_size(self) -> int:
-        return await self._delegate.get_size()
-
-    async def get_capacity(self) -> int:
-        return await self._delegate.get_capacity()
+            await super().wait_step_ready(op_name, step)
 
 
 class TracingLocalStepPlanExecutor:
@@ -319,21 +282,22 @@ class TracingUserCallableExecutor:
         self._recorder = recorder
 
     async def execute(self, spec: Any) -> Any:
-        lane = self._delegate._lane_for(spec)
-        execution_mode = str(getattr(lane, "value", lane))
-        operator_facts = getattr(spec, "operator_facts", None)
-        if operator_facts is None:
-            raise ValueError("traced user callable execution requires operator_facts.")
-        canonical_facts = operator_facts.operator
-        operator_name = getattr(spec, "operator_name", None)
-        if operator_name is not None and operator_name != canonical_facts.op_id:
-            raise ValueError("operator_name does not match graph_manifest.")
-        op_name = canonical_facts.op_id
+        selected = self._delegate.select(spec)
+        execution_mode = selected.lane.value
+        compiled_operator = spec.compiled_operator
+        if compiled_operator is None:
+            raise ValueError(
+                "traced user callable execution requires compiled_operator."
+            )
+        graph_id = spec.graph_id
+        if graph_id is None:
+            raise ValueError("traced user callable execution requires graph_id.")
+        op_name = compiled_operator.key.op_id
         step = self._operator_step(spec)
         rank = self._operator_rank(spec)
         async with self._recorder.user_callable_execute(
-            manifest_id=operator_facts.manifest_id,
-            operator_facts=canonical_facts,
+            graph_id=graph_id,
+            compiled_operator=compiled_operator,
             step=step,
             execution_mode=execution_mode,
         ):
@@ -344,68 +308,13 @@ class TracingUserCallableExecutor:
                 rank=rank,
                 execution_mode=execution_mode,
             ):
-                return await self._execute_selected_mode(spec, execution_mode)
-
-    def actor_owned_operator_names(self) -> set[str | None]:
-        return self._delegate.actor_owned_operator_names()
+                return await self._delegate.execute_selected(selected)
 
     async def drain(self) -> None:
         return await self._delegate.drain()
 
-    async def export_profiler_snapshots(self) -> tuple[Any, ...]:
-        return await self._delegate.export_profiler_snapshots()
-
-    async def trigger_snapshot_begin(self, spmd_dir: str) -> None:
-        async with self._recorder.user_callable_snapshot_hook(
-            hook_name="on_snapshot_begin",
-            operator_count=len(self._delegate._ray_actors),
-        ):
-            return await self._delegate.trigger_snapshot_begin(spmd_dir)
-
-    async def trigger_snapshot_commit(
-        self, spmd_dir: str, operator_states: dict[str, Any]
-    ) -> None:
-        async with self._recorder.user_callable_snapshot_hook(
-            hook_name="on_snapshot_commit",
-            operator_count=len(operator_states),
-        ):
-            return await self._delegate.trigger_snapshot_commit(
-                spmd_dir,
-                operator_states,
-            )
-
-    async def save_state(self, ckpt_dir: str) -> dict[str, Any]:
-        async with self._recorder.user_callable_snapshot_hook(
-            hook_name="save_state",
-            operator_count=len(self._delegate._ray_actors),
-        ):
-            return await self._delegate.save_state(ckpt_dir)
-
-    async def restore_state(self, states: dict[str, Any], ckpt_dir: str) -> None:
-        async with self._recorder.user_callable_snapshot_hook(
-            hook_name="restore_state",
-            operator_count=len(states),
-        ):
-            return await self._delegate.restore_state(states, ckpt_dir)
-
-    async def _execute_selected_mode(self, spec: Any, execution_mode: str) -> Any:
-        if execution_mode == "inline_async":
-            return await spec.fn()
-        if execution_mode == "inline_sync":
-            return self._delegate._execute_sync_sampled(spec)
-        if execution_mode == "worker_process":
-            return await self._delegate._execute_worker_process(spec)
-        if execution_mode == "local_free_thread":
-            return await self._delegate._execute_local_free_thread(spec)
-        if execution_mode == "ray_execution_actor":
-            return await self._delegate._execute_ray_actor(spec)
-        if execution_mode == "native_backend":
-            raise NotImplementedError(
-                "native_backend user callable execution mode is not installed."
-            )
-        raise ValueError(
-            f"unsupported user callable execution mode {execution_mode!r}."
-        )
+    async def shutdown(self) -> None:
+        return await self._delegate.shutdown()
 
     @staticmethod
     def _operator_step(spec: Any) -> int:
@@ -416,7 +325,9 @@ class TracingUserCallableExecutor:
 
     @staticmethod
     def _operator_rank(spec: Any) -> int:
-        rank = getattr(spec, "operator_rank", None)
-        if rank is None:
-            raise ValueError("traced user callable execution requires operator_rank.")
-        return int(rank)
+        scope = getattr(spec, "object_scope", None)
+        if scope is None:
+            raise ValueError(
+                "traced user callable execution requires an SPMDObjectScope."
+            )
+        return int(scope.rank)

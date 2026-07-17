@@ -26,6 +26,7 @@ from fluxway.common.types.sharding import (
     P,
     RangeIndices,
     RoutingDomain,
+    ShardingConfig,
     ShardingSpec,
 )
 from fluxway.common.types.tensor import TransportTensor
@@ -188,6 +189,40 @@ def test_hash_literal_indices_keep_negative_bit_patterns_valid():
     plan = TransportPlanner.compute_plan(src_local_rank=0, domain=domain)
 
     assert plan.send_counts.tolist() == [3]
+
+
+def test_custom_dynamic_function_routes_through_transport_planner():
+    offset = 3
+
+    def offset_modulo(values, *, partition_count, domain_size):
+        del domain_size
+        return (values + offset) % partition_count
+
+    config = ShardingConfig.model_validate(
+        {
+            "type": "dynamic",
+            "axis": ["x"],
+            "strategy": {
+                "type": "function",
+                "target": offset_modulo,
+            },
+        }
+    )
+    layout = config.bind(DeviceMesh(device_shape=(8,), axis_names=("x",)))
+    domain = _domain(
+        layout,
+        axis_sizes=(16,),
+        axis_indices=(
+            LiteralIndices(
+                length=4,
+                values=jnp.asarray([0, 1, 7, 8], dtype=jnp.int32),
+            ),
+        ),
+    )
+
+    plan = TransportPlanner.compute_plan(src_local_rank=0, domain=domain)
+
+    assert plan.send_counts.tolist() == [0, 0, 1, 2, 1, 0, 0, 0]
 
 
 def test_literal_indices_valid_length_masks_only_padding_tail():

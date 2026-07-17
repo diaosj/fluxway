@@ -2,6 +2,8 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE_DIR = REPO_ROOT / "fluxway" / "example" / "recommendation"
 
@@ -17,7 +19,7 @@ def _decorator_has_resource_kw(decorator: ast.AST, decorator_names: set[str]) ->
         return False
     if decorator.func.id not in decorator_names:
         return False
-    return any(keyword.arg == "resource" for keyword in decorator.keywords)
+    return any(keyword.arg == "resource_profile" for keyword in decorator.keywords)
 
 
 def test_recommendation_spmd_classes_declare_resources():
@@ -40,7 +42,7 @@ def test_recommendation_spmd_classes_declare_resources():
             ), f"{path.name}:{cls.name} should declare explicit resource requirements"
 
 
-def test_recommendation_train_uses_fluxway_launch():
+def test_recommendation_train_uses_fluxway_sandbox():
     module = _load_module(EXAMPLE_DIR / "train.py")
     launch_calls = []
 
@@ -48,11 +50,10 @@ def test_recommendation_train_uses_fluxway_launch():
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        # Accept both `launch(...)` and `fluxway.launch(...)` call styles
-        is_bare_launch = isinstance(func, ast.Name) and func.id == "launch"
+        is_bare_launch = isinstance(func, ast.Name) and func.id == "run_in_sandbox"
         is_attr_launch = (
             isinstance(func, ast.Attribute)
-            and func.attr == "launch"
+            and func.attr == "run_in_sandbox"
             and isinstance(func.value, ast.Name)
             and func.value.id == "fluxway"
         )
@@ -60,30 +61,24 @@ def test_recommendation_train_uses_fluxway_launch():
             launch_calls.append(node)
 
     assert launch_calls, (
-        "expected train.py to call fluxway.launch() for zero-config Ray initialization"
+        "expected train.py to call run_in_sandbox() for Ray initialization"
     )
 
 
-def _is_controller_resource_summary_remote_call(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
+def _is_execution_allocation_property(node: ast.AST) -> bool:
+    if not isinstance(node, ast.Attribute):
         return False
-    func = node.func
-    if not isinstance(func, ast.Attribute) or func.attr != "remote":
+    if node.attr != "allocation":
         return False
-    owner = func.value
-    if not isinstance(owner, ast.Attribute):
-        return False
-    if owner.attr != "get_resource_allocation_summary":
-        return False
-    return isinstance(owner.value, ast.Name) and owner.value.id == "controller"
+    return isinstance(node.value, ast.Name) and node.value.id == "execution"
 
 
 def test_recommendation_train_prints_controller_resource_summary():
     module = _load_module(EXAMPLE_DIR / "train.py")
 
-    assert any(
-        _is_controller_resource_summary_remote_call(node) for node in ast.walk(module)
-    ), "train.py should query controller.get_resource_allocation_summary.remote()"
+    assert any(_is_execution_allocation_property(node) for node in ast.walk(module)), (
+        "train.py should query execution.allocation"
+    )
 
 
 def test_sparse_spmd_reserves_embedding_store_capacity():
@@ -183,10 +178,9 @@ def test_recommendation_visualization_export_is_explicit(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
         "fluxway.visualize_graph",
-        lambda graph, directory, *, overwrite: calls.append(
-            (graph, directory, overwrite)
-        )
-        or directory,
+        lambda graph, directory, *, overwrite: (
+            calls.append((graph, directory, overwrite)) or directory
+        ),
     )
     graph = object()
     train._export_graph_visualization(
@@ -207,3 +201,41 @@ def test_recommendation_visualization_export_is_explicit(monkeypatch, tmp_path):
         ),
     )
     assert calls == [(graph, destination, True)]
+
+
+def test_recommendation_dense_runtime_env_matches_gpu_request():
+    from fluxway.example.recommendation.train import _dense_runtime_env
+
+    assert _dense_runtime_env(0)["env_vars"]["JAX_PLATFORMS"] == "cpu"
+    assert _dense_runtime_env(1)["env_vars"]["JAX_PLATFORMS"] == "cuda"
+    with pytest.raises(ValueError, match="num_gpus must be non-negative"):
+        _dense_runtime_env(-1)
+
+
+def test_recommendation_checkpoint_clear_is_idempotent(tmp_path):
+    from fluxway.example.recommendation.train import _clear_checkpoint_dir
+    from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    _clear_checkpoint_dir(checkpoint_dir)
+
+    CheckpointDirectory.open(checkpoint_dir)
+    (checkpoint_dir / "state").write_text("checkpoint")
+    _clear_checkpoint_dir(checkpoint_dir)
+
+    assert not checkpoint_dir.exists()
+
+
+def test_recommendation_checkpoint_clear_rejects_unowned_directory(tmp_path):
+    from fluxway.control_plane.checkpointer.directory import (
+        CheckpointDirectoryOwnershipError,
+    )
+    from fluxway.example.recommendation.train import _clear_checkpoint_dir
+
+    checkpoint_dir = tmp_path / "checkpoint"
+    checkpoint_dir.mkdir()
+
+    with pytest.raises(CheckpointDirectoryOwnershipError, match="not owned"):
+        _clear_checkpoint_dir(checkpoint_dir)
+
+    assert checkpoint_dir.is_dir()

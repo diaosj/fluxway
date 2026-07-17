@@ -10,16 +10,15 @@ from enum import Enum
 from inspect import isawaitable
 from typing import Any, ClassVar
 
-import numpy as np
-
 from fluxway.common.tensor_backend import ensure_cpu_serializable
+from fluxway.common.tensor_protocol import DLPackTensor, dlpack_device
 from fluxway.transport.manifest import TransportFrameHeader
 
 
 @dataclass(frozen=True, slots=True)
 class TransportFrameEnvelope:
     header: TransportFrameHeader
-    payload_segments: tuple[Any, ...]
+    payload_segments: tuple[DLPackTensor, ...]
 
 
 class PayloadDeviceClass(str, Enum):
@@ -55,32 +54,13 @@ def _coerce_axon_completion_mode(value: AxonCompletionMode | str) -> AxonComplet
 
 
 def payload_device_class(payload_iov: Any) -> PayloadDeviceClass:
-    dlpack_device = getattr(payload_iov, "__dlpack_device__", None)
-    if dlpack_device is not None:
-        device_type, _ = dlpack_device()
-        device_type = int(device_type)
-        if device_type == _DLPACK_CPU_DEVICE_TYPE:
-            return PayloadDeviceClass.CPU
-        if device_type == _DLPACK_CUDA_DEVICE_TYPE:
-            return PayloadDeviceClass.CUDA
-        raise TypeError(
-            f"Unsupported DLPack device type {device_type} for Axon payload iov."
-        )
-
-    if hasattr(payload_iov, "__cuda_array_interface__"):
-        return PayloadDeviceClass.CUDA
-    if isinstance(payload_iov, np.ndarray) or hasattr(
-        payload_iov, "__array_interface__"
-    ):
+    device_type, _ = dlpack_device(payload_iov, name="Axon payload iov")
+    if device_type == _DLPACK_CPU_DEVICE_TYPE:
         return PayloadDeviceClass.CPU
-    if hasattr(payload_iov, "__dlpack__"):
-        raise TypeError(
-            "Axon payload iov exposes __dlpack__ but not __dlpack_device__; "
-            "device class cannot be validated."
-        )
+    if device_type == _DLPACK_CUDA_DEVICE_TYPE:
+        return PayloadDeviceClass.CUDA
     raise TypeError(
-        "Axon payload iov must expose __dlpack_device__, __cuda_array_interface__, "
-        f"or __array_interface__, got {type(payload_iov).__name__}."
+        f"Unsupported DLPack device type {device_type} for Axon payload iov."
     )
 
 

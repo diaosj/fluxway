@@ -22,7 +22,7 @@ See: https://docs.ray.io/en/latest/ray-core/actors/async_api.html
 import asyncio
 from functools import partial
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import os
 import socket
 import time
@@ -36,37 +36,50 @@ from fluxway.common.tensor_backend import (
     get_backend,
     force_writable,
     ensure_cpu_serializable,
+    set_hybrid_device,
 )
 from fluxway.common.decorators import (
     operator_context,
     get_current_context,
     get_instance_storage,
-    _resolve_owner_class,
     _inject_context_properties,
     _STATIC_CONTEXT_ATTR_NAMES,
     _validate_worker_process_marker,
 )
 from fluxway.common.execution import compile
+from fluxway.common.compiled_graph import CompiledDependency
 from fluxway.common.types import (
+    ExecutionFailure,
     SPMDConfig,
     WorkerHeartbeat,
     WorkerStatus,
 )
-from fluxway.common.types.configs import OperatorMeta
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.common.types.sharding import (
     ShardingSpec,
     PhysicalLayout,
 )
 from fluxway.common.index_descriptor import ContinuousIndex, IndexDescriptor
+from fluxway.common.operator_initialization import operator_initialization_arguments
+from fluxway.common.operator_policy import SchedulePolicy
+from fluxway.common.schedule_semantics import (
+    CompiledPhaseSchedule,
+    compile_phase_schedule,
+)
 from fluxway.transport.manifest import (
-    EDGE_EXPECTED_COUNT,
-    EDGE_TUUID,
-    EmptyKind,
-    FRAME_EDGE_COUNT,
+    ENTRY_DEPENDENCY_DECISION,
+    ENTRY_EXPECTED_COUNT,
+    ENTRY_ROUTE_CODE,
+    ENTRY_SOURCE_STEP,
+    DependencyDecision,
+    FRAME_ENTRY_COUNT,
+    FRAME_FLAGS,
     FRAME_SENDER_SPMD_CODE,
+    FRAME_SENDER_RANK,
     FRAME_STEP,
+    FrameFlag,
     PayloadRole,
+    TensorEntryKind,
     TransportFrame,
     TransportFrameHeader,
 )
@@ -81,10 +94,13 @@ from fluxway.rpc.protocol import (
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
+    DependencyDecisions,
     SuccessorRouteContext,
     compile_send_plan,
+    evaluate_dependency_decisions,
     ensure_transport_source_step,
-    inherit_mirror_metadata,
+    prepare_route_tensor,
+    skipped_dependency_decisions,
 )
 from fluxway.spmd.worker.data_plane_executor import BatchingDataPlaneExecutor
 from fluxway.spmd.worker.assembly import (
@@ -101,6 +117,7 @@ from fluxway.spmd.worker.local_plan import (
 )
 from fluxway.spmd.worker.user_callable_executor import (
     USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+    SPMDObjectScope,
     UserCallableExecutor,
     UserCallableSpec,
 )
@@ -109,14 +126,16 @@ from fluxway.spmd.worker.runtime import (
     OutboundDeliveryRuntime,
     WorkerProcessCallRuntime,
 )
-from fluxway.spmd.worker.operator_manager import OperatorManager
+from fluxway.spmd.worker.operator_manager.operator_manager import (
+    OperatorManager,
+    ResolvedDependencyRoute,
+)
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
     ExecutionResult,
 )
 from fluxway.profiler import ProfilerRuntimeFactory
 from fluxway.profiler.record import ProfilerSnapshot
-from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.recorder import (
     LOCAL_STEP_AWAIT_SEND,
     LOCAL_STEP_CALL_USER,
@@ -139,7 +158,7 @@ from fluxway.profiler.recorder import (
     WORKER_SNAPSHOT_HOOK,
     WORKER_STALE_TASK,
 )
-from typing import Any, Literal, Optional, get_type_hints, cast
+from typing import Any, Optional, get_type_hints, cast
 
 _WAIT_INPUTS_CALLABLE = "__fluxway_wait_inputs__"
 _CALL_USER_OP_CALLABLE = "__fluxway_call_user_op__"
@@ -158,7 +177,8 @@ def _assemble_detail_span(
     *,
     spec: Any,
     op_name: str,
-    tuuid: int,
+    transfer_code: int,
+    logical_tuuid: int,
     step: int,
     first_count: int,
     second_count: int = 0,
@@ -169,7 +189,8 @@ def _assemble_detail_span(
     return profiler_runtime.recorder.worker_assemble_detail(
         spec=spec,
         op_name=op_name,
-        tuuid=tuuid,
+        transfer_code=transfer_code,
+        logical_tuuid=logical_tuuid,
         step=step,
         first_count=first_count,
         second_count=second_count,
@@ -181,6 +202,27 @@ def _profiler_enabled(worker: Any) -> bool:
     return bool(
         profiler_runtime is not None and getattr(profiler_runtime, "enabled", False)
     )
+
+
+def _route_inspection_snapshot(
+    route: ResolvedDependencyRoute,
+) -> dict[str, Any]:
+    dependency = route.dependency
+    transfer = route.transfer
+    source = dependency.spec.source
+    target = dependency.spec.target
+    return {
+        "dependency_code": dependency.code,
+        "transfer_code": transfer.transfer_code,
+        "logical_tuuid": transfer.logical_tuuid,
+        "source": f"{source.spmd_id}.{source.op_id}.{transfer.spec.source.name}",
+        "target": f"{target.spmd_id}.{target.op_id}.{transfer.spec.target.name}",
+        "peer_spmd_id": route.spmd_id,
+        "peer_world_size": route.world_size,
+        "local_only": dependency.spec.local_only,
+        "source_sharding": str(transfer.source_sharding),
+        "target_sharding": str(transfer.target_sharding),
+    }
 
 
 def _nonzero_1d_indices(backend: Any, mask: Any) -> Any:
@@ -290,25 +332,83 @@ logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class _SuccessorSendContext:
-    spmd_id: str
-    info: Any
+    route_context: SuccessorRouteContext
     handlers: dict[int, Any]
-    effective_rank: int
+
+    @property
+    def spmd_id(self) -> str:
+        return self.route_context.spmd_id
+
+    @property
+    def dependencies(self) -> tuple[CompiledDependency, ...]:
+        return self.route_context.dependencies
 
 
 @dataclass(frozen=True)
 class _OperatorSendContext:
-    successor_ids: tuple[str, ...]
-    output_uuids: tuple[int, ...]
-    output_sharding: dict[int, ShardingSpec]
-    tuuid_to_name: dict[int, str] | None
     compiled_plan: CompiledSendPlan
     successor_contexts: tuple[_SuccessorSendContext, ...]
-    route_contexts: tuple[SuccessorRouteContext, ...]
     successor_handlers: tuple[dict[int, Any], ...]
-    sender_spmd_code: int
-    sender_world_size: int
-    interleave_unit_size: int | None
+    transport: "_TransportSendContext | None"
+
+
+@dataclass(frozen=True)
+class _TransportSendContext:
+    compiled_plan: CompiledSendPlan
+    successor_handlers: tuple[dict[int, Any], ...]
+    condition_codes: tuple[int, ...] | None
+
+    def select_dependency_decisions(
+        self,
+        dependency_decisions: DependencyDecisions,
+    ) -> DependencyDecisions:
+        if self.condition_codes is None:
+            return dependency_decisions
+        if not self.condition_codes:
+            return None
+        if dependency_decisions is None:
+            raise ValueError(
+                f"Operator {self.compiled_plan.op_name!r} requires transport "
+                "dependency decisions."
+            )
+        return {code: dependency_decisions[code] for code in self.condition_codes}
+
+
+def _compile_transport_send_context(
+    compiled_plan: CompiledSendPlan,
+    successor_handlers: tuple[dict[int, Any], ...],
+) -> _TransportSendContext | None:
+    if len(successor_handlers) != len(compiled_plan.successor_routes):
+        raise ValueError(
+            f"Operator {compiled_plan.op_name!r} has "
+            f"{len(compiled_plan.successor_routes)} successor routes but "
+            f"{len(successor_handlers)} handler groups."
+        )
+    context_indices = tuple(
+        index
+        for index, route in enumerate(compiled_plan.successor_routes)
+        if not route.local_only
+    )
+    if not context_indices:
+        return None
+    transport_plan = compiled_plan.project_successors(context_indices)
+    condition_codes = (
+        None
+        if transport_plan is compiled_plan
+        else tuple(
+            condition.dependency_code
+            for condition in transport_plan.dependency_conditions
+        )
+    )
+    return _TransportSendContext(
+        compiled_plan=transport_plan,
+        successor_handlers=(
+            successor_handlers
+            if transport_plan is compiled_plan
+            else tuple(successor_handlers[index] for index in context_indices)
+        ),
+        condition_codes=condition_codes,
+    )
 
 
 @dataclass(frozen=True)
@@ -324,7 +424,7 @@ class LocalSendToken:
 @dataclass(frozen=True)
 class _PreparedOperatorInput:
     value: Any
-    step_tuuid_cache: dict[int, Any]
+    step_transfer_cache: dict[int, Any]
 
 
 @dataclass(frozen=True)
@@ -355,10 +455,11 @@ class SPMDWorker:
     _scheduled_step_count: dict[str, int]
     _pending_future_steps: dict[str, list[int]]
     _pending_phase_order_steps: dict[str, list[int]]
+    _phase_schedule: CompiledPhaseSchedule
     _successor_handlers: dict[str, dict[int, Any]]
     _operator_send_context_cache: dict[str, _OperatorSendContext]
     _heartbeat_interval: float
-    _last_error: str | None
+    _failure: ExecutionFailure | None
     _op_runnable: dict[str, "asyncio.Event"]
     _mailbox: WorkerMailbox
     _drain_cond: "asyncio.Condition"
@@ -376,6 +477,7 @@ class SPMDWorker:
         spmd_id: str = "",
         driver_handle: Any | None = None,
         checkpoint_backend: Any | None = None,
+        tensor_device: str = "cpu",
     ):
         """
         Initialize worker.
@@ -392,11 +494,24 @@ class SPMDWorker:
         # Ray actors run in separate worker processes; ensure they respect
         # FLUXWAY_LOG_LEVEL / FLUXWAY_LOG_FORCE so DEBUG logs are not dropped.
         ensure_logging_configured()
+        set_hybrid_device(tensor_device)
         logger.debug("phase_one_init_begin spmd_id=%s rank=%s", spmd_id, rank)
         self.config = config
         self.rank = rank
         self.spmd_id = spmd_id or ""
+        self._tensor_device = tensor_device
         self._running = False
+        self._graph_view = config.require_graph_view()
+        self._operator_specs = {
+            op_id: config.operator_specs[op_id]
+            for op_id in self._graph_view.operator_ids
+        }
+        self._phase_schedule = compile_phase_schedule(
+            {
+                op_id: spec.runtime_policy.schedule
+                for op_id, spec in self._operator_specs.items()
+            }
+        )
 
         # Pluggable per-worker checkpoint serialization. Defaults to OrbaxBackend.
         self._checkpoint_backend = checkpoint_backend
@@ -405,8 +520,8 @@ class SPMDWorker:
         self._driver_handle: Any | None = driver_handle
 
         # Mesh from config
-        self._mesh = config.mesh
-        self._world_size = config.num_workers
+        self._mesh = self._graph_view.mesh
+        self._world_size = self._graph_view.world_size
         self.local_rank: int | None = None
         self.local_world_size: int | None = None
         self.node_rank: int | None = None
@@ -414,61 +529,47 @@ class SPMDWorker:
         self.rank0_address: str | None = None
 
         self._op_manager: OperatorManager | None = None
+        operator_names = self._graph_view.operator_ids
 
         # Completed step counters {op_name: count} - tracks how many steps were executed
-        self._completed_step_count: dict[str, int] = dict.fromkeys(
-            self.config.operators if self.config is not None else {}, 0
-        )
-        self._scheduled_step_count: dict[str, int] = dict.fromkeys(
-            self.config.operators if self.config is not None else {}, 0
-        )
+        self._completed_step_count: dict[str, int] = dict.fromkeys(operator_names, 0)
+        self._scheduled_step_count: dict[str, int] = dict.fromkeys(operator_names, 0)
 
         # Op-level blocking: asyncio.Event (set=runnable, clear=blocked)
-        self._op_runnable = {
-            op_name: asyncio.Event()
-            for op_name in (self.config.operators if self.config is not None else {})
-        }
+        self._op_runnable = {op_name: asyncio.Event() for op_name in operator_names}
         self._latest_op_runnable_epoch: dict[str, int] = dict.fromkeys(
-            self.config.operators if self.config is not None else {}, -1
+            operator_names, -1
         )
         for event in self._op_runnable.values():
             event.set()  # Initially all ops are runnable
 
         # Pending tasks when blocked (to avoid priority queue reentry loop)
         self._pending_blocked: dict[str, list[int]] = {
-            op_name: []
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: [] for op_name in operator_names
         }
 
         # Pending tasks for future steps (arrived early, waiting for current step to complete)
         # Structure: {op_name: List[step]} - steps waiting to be executed
         self._pending_future_steps: dict[str, list[int]] = {
-            op_name: []
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: [] for op_name in operator_names
         }
         self._pending_async_lag_steps: dict[str, list[int]] = {
-            op_name: []
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: [] for op_name in operator_names
         }
         self._pending_phase_order_steps: dict[str, list[int]] = {
-            op_name: []
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: [] for op_name in operator_names
         }
         self._running_plan_steps: dict[str, set[int]] = {
-            op_name: set()
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: set() for op_name in operator_names
         }
         self._finished_plan_steps: dict[str, dict[int, ExecutionResult]] = {
-            op_name: {}
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: {} for op_name in operator_names
         }
         self._ready_pending_pipeline_steps: dict[str, list[int]] = {
-            op_name: []
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: [] for op_name in operator_names
         }
         self._mailbox_ready_steps: dict[str, set[int]] = {
-            op_name: set()
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: set() for op_name in operator_names
         }
         self._plan_tasks: set[asyncio.Task] = set()
         self._send_tasks: set[asyncio.Task] = set()
@@ -508,22 +609,18 @@ class SPMDWorker:
         self._mailbox_capacity = 100  # Default value
         self._high_watermark = int(self._mailbox_capacity * 0.8)
 
-        # Internal Mailbox (async-safe), wired to auto-enqueue when a step is ready
-        self._mailbox = WorkerMailbox()
-        self._mailbox.set_ready_callback(self._on_step_ready)
-
         # Handler storage (Data Plane - wrapped in DataPlaneCallable)
         # {spmd_id: {rank: DataPlaneCallable}}
         self._predecessor_handlers: dict[str, dict[int, DataPlaneCallable]] = {}
         self._successor_handlers = {}
         self._operator_send_context_cache = {}
+        self._local_step_plan_cache: dict[str, LocalStepPlan] = {}
         self._assemble_plan_cache: dict[tuple[str, int], CompiledAssemblePlan] = {}
         self._direct_local_input_slots: dict[
             str, dict[int, dict[int, _DirectLocalInputSlot]]
         ] = {}
         self._direct_local_ready_steps: dict[str, set[int]] = {
-            op_name: set()
-            for op_name in (self.config.operators if self.config is not None else {})
+            op_name: set() for op_name in operator_names
         }
         self._local_spmd_code: int | None = None
         self._spmd_id_by_code: dict[int, str] = {}
@@ -538,7 +635,7 @@ class SPMDWorker:
         self._in_op_step_queue: set = set()
 
         # State tracking
-        self._last_error: str | None = None
+        self._failure: ExecutionFailure | None = None
 
         # Run loop synchronization
         self._start_event = asyncio.Event()  # Signals when to start execution
@@ -551,7 +648,7 @@ class SPMDWorker:
             profiler_config,
             process_name=profiler_process_name,
         )
-        self._mailbox = self._profiler_runtime.worker_mailbox(self._mailbox)
+        self._mailbox = self._profiler_runtime.create_worker_mailbox()
         self._mailbox.set_ready_callback(self._on_step_ready)
         self._data_plane_executor = self._profiler_runtime.data_plane_backend_executor(
             BatchingDataPlaneExecutor()
@@ -564,8 +661,6 @@ class SPMDWorker:
         user_callable_executor = self._profiler_runtime.user_callable_executor(
             UserCallableExecutor(
                 worker_process_runtime=self._worker_process_call_runtime,
-                profiler_config=profiler_config,
-                profiler_process_name=profiler_process_name,
             )
         )
         self._user_callable_executor = user_callable_executor
@@ -637,7 +732,7 @@ class SPMDWorker:
         config: "SPMDConfig",
         rank: int,
         *,
-        operator_location: Literal["worker", "execution_actor"],
+        static_args: dict[str, Any],
         local_rank: int | None = None,
         local_world_size: int | None = None,
         node_rank: int | None = None,
@@ -656,10 +751,8 @@ class SPMDWorker:
         __init__ signature and forwarded as keyword arguments, so users can
         declare custom init parameters and have them populated from static_args.
         """
-        import inspect as _inspect
-
-        world_size = config.num_workers
-        static_args = config.static_args or {}
+        graph_view = config.require_graph_view()
+        world_size = graph_view.world_size
 
         seen: set = set()
         with operator_context(
@@ -673,36 +766,25 @@ class SPMDWorker:
             rank0_address=rank0_address,
         ):
             storage, lock = get_instance_storage()
-            for op_meta in (config.operator_metas or {}).values():
-                if not op_meta.owner_class_qualname:
+            for op_id in graph_view.operator_ids:
+                try:
+                    op_meta = config.operator_specs[op_id]
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"SPMDConfig {config.spmd_id!r} is missing active operator "
+                        f"{op_id!r}."
+                    ) from exc
+                cls = op_meta.owner
+                if cls is None:
                     continue
-                process_affine = op_meta.requires_worker_process
-                if process_affine != (operator_location == "worker"):
-                    continue
-                cls = _resolve_owner_class(
-                    op_meta.owner_class_module, op_meta.owner_class_qualname
-                )
                 _validate_worker_process_marker(cls)
-                if cls is None or id(cls) in seen:
+                if id(cls) in seen:
                     continue
                 seen.add(id(cls))
                 if id(cls) in storage:
                     continue
 
-                try:
-                    init_sig = _inspect.signature(cls.__init__)
-                    init_params = set(init_sig.parameters.keys()) - {"self"}
-                    has_var_keyword = any(
-                        p.kind == _inspect.Parameter.VAR_KEYWORD
-                        for p in init_sig.parameters.values()
-                    )
-                    init_kwargs = (
-                        dict(static_args)
-                        if has_var_keyword
-                        else {k: v for k, v in static_args.items() if k in init_params}
-                    )
-                except (ValueError, TypeError):
-                    init_kwargs = {}
+                init_kwargs = operator_initialization_arguments(cls, static_args)
 
                 instance = object.__new__(cls)
                 _inject_context_properties(cls)
@@ -771,10 +853,8 @@ class SPMDWorker:
 
     def _worker_process_call_max_workers(self) -> int:
         max_depth = 1
-        for op_meta in (self.config.operator_metas or {}).values():
-            if not bool(getattr(op_meta, "requires_worker_process", False)):
-                continue
-            depth = int(getattr(op_meta, "local_pipeline_depth", 1))
+        for op_meta in self._operator_specs.values():
+            depth = op_meta.runtime_policy.pipeline_depth
             if depth <= 0:
                 raise ValueError(
                     f"local_pipeline_depth must be positive for op={op_meta.name}, "
@@ -785,16 +865,15 @@ class SPMDWorker:
 
     def _input_prepare_max_workers(self) -> int:
         max_depth = 1
-        for op_meta in (self.config.operator_metas or {}).values():
-            policy = getattr(op_meta, "async_policy", None)
-            mode = str(getattr(policy, "mode", "sync"))
+        for op_meta in self._operator_specs.values():
+            mode = op_meta.runtime_policy.mode
             if mode == "sync":
                 continue
             if mode not in ("pipelined", "bounded_stale", "pipeline_parallel"):
                 raise ValueError(
                     f"Unsupported AsyncPolicy mode {mode!r} for op={op_meta.name}."
                 )
-            depth = int(getattr(op_meta, "local_pipeline_depth", 1))
+            depth = op_meta.runtime_policy.pipeline_depth
             if depth <= 0:
                 raise ValueError(
                     f"local_pipeline_depth must be positive for op={op_meta.name}, "
@@ -828,11 +907,12 @@ class SPMDWorker:
             self.node_rank = node_rank
             self.num_nodes = num_nodes
             self.rank0_address = rank0_address
+            static_args = self.config.static_args
 
             self._pre_instantiate_operators(
                 self.config,
                 self.rank,
-                operator_location="worker",
+                static_args=static_args,
                 local_rank=local_rank,
                 local_world_size=local_world_size,
                 node_rank=node_rank,
@@ -848,11 +928,16 @@ class SPMDWorker:
                 self.config,
                 self.rank,
                 self.spmd_id,
+                static_args=static_args,
                 local_rank=local_rank,
                 local_world_size=local_world_size,
                 node_rank=node_rank,
                 num_nodes=num_nodes,
             )
+            self._local_step_plan_cache = {
+                op_name: self._compile_operator_local_plan(op_name)
+                for op_name in self._graph_view.operator_ids
+            }
             logger.debug(
                 "setup_and_start_operator_manager_complete spmd_id=%s rank=%s",
                 self.spmd_id,
@@ -860,9 +945,7 @@ class SPMDWorker:
             )
             self._source_pause_events = {
                 op_name: asyncio.Event()
-                for op_name in (
-                    self.config.operators if self.config is not None else {}
-                )
+                for op_name in self._operator_specs
                 if self.op_manager.is_source_operator(op_name)
             }
             for event in self._source_pause_events.values():
@@ -935,7 +1018,7 @@ class SPMDWorker:
         """
         Register handlers for a predecessor SPMD.
 
-        Note: Topology info is already in config/OperatorMeta.
+        Topology information is already compiled into the SPMDConfig.
         Only handlers need runtime registration.
 
         Args:
@@ -959,7 +1042,7 @@ class SPMDWorker:
         """
         Register handlers for a successor SPMD.
 
-        Note: Topology info is already in config/OperatorMeta.
+        Topology information is already compiled into the SPMDConfig.
         Only handlers need runtime registration.
 
         Args:
@@ -1093,35 +1176,62 @@ class SPMDWorker:
         exc = task.exception()
         if exc is None:
             return
-        self._last_error = f"{type(exc).__name__}: {exc}"
+        self._record_failure(exc, phase="BACKGROUND")
+
+    def _record_failure(
+        self,
+        exception: BaseException,
+        *,
+        phase: str,
+        op_name: str | None = None,
+        step: int | None = None,
+    ) -> ExecutionFailure:
+        if self._failure is not None:
+            return self._failure
+
+        failure = ExecutionFailure.from_exception(
+            spmd_id=self.spmd_id,
+            rank=self.rank,
+            op_name=op_name,
+            step=step,
+            phase=phase,
+            exception=exception,
+        )
+        self._failure = failure
+        self._running = False
+
+        for execution_queue in self._execution_queues.values():
+            execution_queue.put_nowait(_EXECUTION_STOP_ITEM)
+        for tasks in (self._plan_tasks, self._send_tasks, self._background_tasks):
+            for task in tuple(tasks):
+                if not task.done():
+                    task.cancel()
+
+        if self._driver_handle is not None:
+            self._driver_handle.receive_worker_failure.remote(self.rank, failure)
+
         logger.error(
-            "Background task failed spmd_id=%s rank=%s error=%s",
+            "Worker execution failed spmd_id=%s rank=%s op=%s step=%s phase=%s error=%s",
             self.spmd_id,
             self.rank,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
+            op_name,
+            step,
+            phase,
+            exception,
+            exc_info=(type(exception), exception, exception.__traceback__),
         )
+        return failure
 
     async def _drain_outbound_tasks(self) -> None:
-        await self._input_prepare_runtime.drain()
-        await self._local_step_plan_executor.drain()
-        await self._local_step_plan_executor.drain_user_callables()
         while True:
-            plan_tasks = [task for task in self._plan_tasks if not task.done()]
-            if plan_tasks:
-                await asyncio.gather(*plan_tasks)
-                continue
             send_tasks = [task for task in self._send_tasks if not task.done()]
             if send_tasks:
                 await asyncio.gather(*send_tasks)
                 continue
             break
         await self._delivery_runtime.drain("worker_drain_outbound")
-        await self._input_prepare_runtime.drain()
-        await self._local_step_plan_executor.drain()
-        await self._local_step_plan_executor.drain_user_callables()
-        if self._last_error is not None:
-            raise RuntimeError(f"Worker has failed background task: {self._last_error}")
+        if self._failure is not None:
+            raise RuntimeError(f"Worker execution failed: {self._failure}")
 
     async def _trigger_source_operators(self) -> None:
         """
@@ -1169,34 +1279,6 @@ class SPMDWorker:
     def is_op_blocked(self, op_name: str) -> bool:
         """Check if an operator is blocked."""
         return not self._op_runnable[op_name].is_set()
-
-    # =========================================================================
-    # Eager Mode Support
-    # =========================================================================
-
-    async def prepare_eager_op(
-        self,
-        op_name: str,
-        step: int,
-        tuuid_sharding: dict[int, "ShardingSpec"],
-        expected_counts: dict[int, int] | None = None,
-    ) -> None:
-        """
-        Prepare for an Eager operator execution by registering its input TUUIDs.
-        Called by the Driver BEFORE the task is triggered on all workers.
-        """
-        if self._op_manager:
-            self.op_manager.register_eager_inputs(
-                op_name, tuuid_sharding, expected_counts
-            )
-
-        # Ensure the step is declared in the mailbox so it can start receiving data
-        self._ensure_step_declared(op_name, step)
-
-        logger.debug(
-            f"Prepared eager op op={op_name} step={step} input_count={len(tuuid_sharding)} "
-            f"spmd_id={self.spmd_id} rank={self.rank}"
-        )
 
     # =========================================================================
     # Data Reception
@@ -1276,7 +1358,7 @@ class SPMDWorker:
         frame = header.to_frame(payload_iovs)
         sender_spmd_code = int(frame.frame_i32[FRAME_SENDER_SPMD_CODE])
         step = int(frame.frame_i32[FRAME_STEP])
-        edge_count = int(frame.frame_i32[FRAME_EDGE_COUNT])
+        entry_count = int(frame.frame_i32[FRAME_ENTRY_COUNT])
         profiler_recorder = (
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
@@ -1288,49 +1370,41 @@ class SPMDWorker:
                 f"spmd_id={self.spmd_id} rank={self.rank}."
             ) from exc
 
-        watermark = 0
-        op_to_edge_rows: dict[str, list[int]] = {}
-        for row_idx, edge in enumerate(frame.edge_i32):
-            tuuid = int(edge[EDGE_TUUID])
-            for op_name in self.op_manager.get_operators_for_tuuid(tuuid):
-                op_to_edge_rows.setdefault(op_name, []).append(row_idx)
+        frame_flag = FrameFlag(int(frame.frame_i32[FRAME_FLAGS]))
+        if frame_flag is FrameFlag.ORDERING_COMPLETION:
+            return await self._receive_ordering_frame(
+                sender_id=sender_id,
+                frame=frame,
+                step=step,
+            )
+        if frame_flag is FrameFlag.DEPENDENCY_DECISION:
+            return await self._receive_dependency_decision_frame(
+                sender_id=sender_id,
+                frame=frame,
+                step=step,
+            )
 
-        async def deposit_frame_rows() -> int:
+        watermark = 0
+        op_to_entry_indices: dict[str, list[int]] = {}
+        for entry_index, entry in enumerate(frame.entry_i32):
+            transfer_code = int(entry[ENTRY_ROUTE_CODE])
+            op_name = self.op_manager.get_transfer_target_op(transfer_code)
+            op_to_entry_indices.setdefault(op_name, []).append(entry_index)
+
+        async def deposit_frame_entries() -> int:
             deposited_watermark = 0
-            for op_name, rows in op_to_edge_rows.items():
+            for op_name, entry_indices in op_to_entry_indices.items():
                 self._ensure_step_declared(op_name, step)
                 op_frame = TransportFrame(
                     frame_i32=frame.frame_i32.copy(),
-                    edge_i32=frame.edge_i32[rows],
+                    entry_i32=frame.entry_i32[entry_indices],
                     payload_i32=frame.payload_i32,
                     shape_i32=frame.shape_i32,
                     global_shape_i64=frame.global_shape_i64,
                     compact_i64=frame.compact_i64,
                     payload_segments=frame.payload_segments,
                 )
-                op_frame.frame_i32[FRAME_EDGE_COUNT] = len(rows)
-                expected_counts = {}
-                for edge in op_frame.edge_i32:
-                    tuuid = int(edge[EDGE_TUUID])
-                    expected_count = int(edge[EDGE_EXPECTED_COUNT])
-                    if expected_count <= 0:
-                        raise ValueError(
-                            f"[SPMDWorker] Transport frame for op={op_name} "
-                            f"step={step} tuuid={tuuid} "
-                            f"has invalid EDGE_EXPECTED_COUNT={expected_count}."
-                        )
-                    previous = expected_counts.get(tuuid)
-                    if previous is not None and previous != expected_count:
-                        raise ValueError(
-                            f"[SPMDWorker] Transport frame for op={op_name} "
-                            f"step={step} tuuid={tuuid} "
-                            f"contains conflicting EDGE_EXPECTED_COUNT values: "
-                            f"{previous} and {expected_count}."
-                        )
-                    expected_counts[tuuid] = expected_count
-                self._mailbox.configure_transport_expected_counts(
-                    op_name, step, expected_counts
-                )
+                op_frame.frame_i32[FRAME_ENTRY_COUNT] = len(entry_indices)
                 deposited_watermark = await self._mailbox.deposit_transport_frame(
                     op_name,
                     sender_id,
@@ -1340,28 +1414,105 @@ class SPMDWorker:
                     profiler_recorder.worker_deposit_transport_frame(
                         op_name=op_name,
                         step=step,
-                        edge_count=len(rows),
+                        entry_count=len(entry_indices),
                         watermark=deposited_watermark,
                     )
             return deposited_watermark
 
         if profiler_recorder is None:
-            watermark = await deposit_frame_rows()
+            watermark = await deposit_frame_entries()
         else:
             async with profiler_recorder.worker_receive_transport_frame(
                 step=step,
                 sender_spmd_code=sender_spmd_code,
-                edge_count=edge_count,
+                entry_count=entry_count,
                 payload_count=len(payload_iovs),
             ):
                 async with profiler_recorder.data_plane_receiver_deposit(
                     step=step,
                     sender_spmd_code=sender_spmd_code,
-                    edge_count=edge_count,
+                    entry_count=entry_count,
                     payload_count=len(payload_iovs),
                 ):
-                    watermark = await deposit_frame_rows()
+                    watermark = await deposit_frame_entries()
 
+        return watermark
+
+    async def _receive_ordering_frame(
+        self,
+        *,
+        sender_id: str,
+        frame: TransportFrame,
+        step: int,
+    ) -> int:
+        watermark = 0
+        for entry in frame.entry_i32:
+            dependency_code = int(entry[ENTRY_ROUTE_CODE])
+            source_step = int(entry[ENTRY_SOURCE_STEP])
+            if source_step != step:
+                raise ValueError(
+                    f"[SPMDWorker] Ordering dependency code={dependency_code} "
+                    f"source_step={source_step} does not match frame step={step}."
+                )
+            expected_count = int(entry[ENTRY_EXPECTED_COUNT])
+            if expected_count <= 0:
+                raise ValueError(
+                    f"[SPMDWorker] Ordering dependency code={dependency_code} "
+                    f"has invalid expected_count={expected_count}."
+                )
+            target_op = self.op_manager.get_ordering_target_op(dependency_code)
+            self._ensure_step_declared(target_op, step)
+            watermark = await self._mailbox.deposit_ordering(
+                target_op,
+                dependency_code,
+                step,
+                sender_id=sender_id,
+                rank=int(frame.frame_i32[FRAME_SENDER_RANK]),
+                expected_count=expected_count,
+            )
+        return watermark
+
+    async def _receive_dependency_decision_frame(
+        self,
+        *,
+        sender_id: str,
+        frame: TransportFrame,
+        step: int,
+    ) -> int:
+        watermark = 0
+        sender_rank = int(frame.frame_i32[FRAME_SENDER_RANK])
+        for entry in frame.entry_i32:
+            dependency_code = int(entry[ENTRY_ROUTE_CODE])
+            source_step = int(entry[ENTRY_SOURCE_STEP])
+            if source_step != step:
+                raise ValueError(
+                    f"[SPMDWorker] Dependency decision code={dependency_code} "
+                    f"source_step={source_step} does not match frame step={step}."
+                )
+            expected_count = int(entry[ENTRY_EXPECTED_COUNT])
+            canonical_count = self.op_manager.get_dependency_decision_expected_count(
+                dependency_code
+            )
+            if expected_count != canonical_count:
+                raise ValueError(
+                    f"[SPMDWorker] Dependency decision code={dependency_code} "
+                    f"expected_count={expected_count} does not match canonical "
+                    f"source count={canonical_count}."
+                )
+            decision = DependencyDecision(int(entry[ENTRY_DEPENDENCY_DECISION]))
+            target_op = self.op_manager.get_dependency_decision_target_op(
+                dependency_code
+            )
+            self._ensure_step_declared(target_op, step)
+            watermark = await self._mailbox.deposit_dependency_decision(
+                target_op,
+                dependency_code,
+                step,
+                sender_id=sender_id,
+                rank=sender_rank,
+                expected_count=expected_count,
+                decision=decision,
+            )
         return watermark
 
     def _ensure_step_declared(self, op_name: str, step: int) -> None:
@@ -1376,25 +1527,26 @@ class SPMDWorker:
         if self._barriers_declared.get((op_name, step)):
             return  # Already declared
 
-        expected_tensors = (
-            self.op_manager.get_expected_tensor_shards(op_name)
-            if self._op_manager
-            else {}
-        )
-        expected_states = (
-            self.op_manager.get_expected_control_arg_names(op_name)
-            if self._op_manager
-            else []
-        )
-        meta = (
-            self.op_manager.get_operator_metadata(op_name) if self._op_manager else None
-        )
+        expected_transfers = self.op_manager.get_expected_transfer_shards(op_name)
+        expected_states = self.op_manager.get_expected_control_arg_names(op_name)
+        meta = self.op_manager.get_operator_spec(op_name)
         self._mailbox.declare_step(
             op_name,
             step,
-            expected_tensors,
+            expected_transfers,
             expected_states,
-            barrier_config=meta.barrier_config if meta is not None else None,
+            barrier_config=meta.barrier_config,
+            expected_orderings=self.op_manager.get_expected_ordering_counts(op_name),
+            transfer_dependencies=(
+                self.op_manager.get_transfer_dependency_codes(op_name)
+                if expected_transfers
+                else {}
+            ),
+            expected_dependency_decisions=(
+                self.op_manager.get_expected_dependency_decisions(op_name)
+                if expected_transfers
+                else {}
+            ),
         )
         self._barriers_declared[(op_name, step)] = True
 
@@ -1408,12 +1560,13 @@ class SPMDWorker:
         logger.debug(
             f"Step ready op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
+        if not self._running:
+            return
         if not self.op_manager.is_periodic_trigger(op_name):
             if self._scheduler_knows_step(op_name, step):
                 return
             self._mailbox_ready_steps[op_name].add(step)
-            if self._running:
-                self._spawn_background_task(self._schedule_mailbox_ready_steps(op_name))
+            self._spawn_background_task(self._schedule_mailbox_ready_steps(op_name))
             return
         if self._should_start_prepare_on_ready(op_name, step):
             self._spawn_background_task(
@@ -1422,98 +1575,92 @@ class SPMDWorker:
         else:
             self._spawn_background_task(self._enqueue(op_name, step))
 
-    def _direct_local_input_tuuids(self, op_name: str) -> set[int]:
-        expected = self.op_manager.get_expected_tensor_shards(op_name)
-        if not expected:
-            return set()
-        if any(count != 1 for count in expected.values()):
+    def _direct_local_input_transfer_codes(self, op_name: str) -> set[int]:
+        expected = self.op_manager.get_expected_transfer_shards(op_name)
+        if not expected or any(count != 1 for count in expected.values()):
             return set()
         if self.op_manager.get_expected_control_arg_names(op_name):
             return set()
-        predecessor_topology = self.op_manager.get_predecessor_topology(op_name)
-        if not predecessor_topology:
+        if self.op_manager.get_expected_ordering_counts(op_name):
             return set()
-        if any(
-            not bool(getattr(info, "local_only", False))
-            or pre_spmd_id != self.spmd_id
-            or int(getattr(info, "world_size", self._world_size)) != self._world_size
-            for pre_spmd_id, info in predecessor_topology.items()
-        ):
+        if self.op_manager.get_expected_dependency_decisions(op_name):
             return set()
-        direct_tuuids = set()
-        for tuuid in expected:
-            providers = [
-                pre_spmd_id
-                for pre_spmd_id, info in predecessor_topology.items()
-                if tuuid in info.tuuid_sharding
-            ]
-            if providers != [self.spmd_id]:
-                return set()
-            plan = self._compiled_assemble_plan(op_name, tuuid)
+
+        direct_codes: set[int] = set()
+        for transfer_code in expected:
+            route = self.op_manager.get_predecessor_route(op_name, transfer_code)
             if (
-                plan.assembles_to_dynamic
-                or plan.has_dynamic_predecessor
-                or len(plan.providers) != 1
-                or plan.providers[0].spmd_id != self.spmd_id
-                or plan.providers[0].dynamic_to_static
+                not route.local_only
+                or route.spmd_id != self.spmd_id
+                or route.world_size != self._world_size
             ):
                 return set()
-            direct_tuuids.add(tuuid)
-        return direct_tuuids
+            plan = self._compiled_assemble_plan(op_name, transfer_code)
+            if plan.assembles_to_dynamic or plan.has_dynamic_predecessor:
+                return set()
+            direct_codes.add(transfer_code)
+        return direct_codes
 
     def _uses_direct_local_input_fast_path(self, op_name: str) -> bool:
-        return bool(self._direct_local_input_tuuids(op_name))
+        return bool(self._direct_local_input_transfer_codes(op_name))
 
     def _deposit_direct_local_input(
         self,
         *,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         sender_id: str,
         rank: int,
         tensor: TransportTensor,
     ) -> None:
-        direct_tuuids = self._direct_local_input_tuuids(op_name)
-        if tuuid not in direct_tuuids:
+        direct_codes = self._direct_local_input_transfer_codes(op_name)
+        if transfer_code not in direct_codes:
             raise ValueError(
                 "Direct local input fast path received a tensor outside the "
-                f"compiled local-only contract: op={op_name} tuuid={tuuid} "
-                f"expected={sorted(direct_tuuids)}."
+                f"compiled local-only contract: op={op_name} "
+                f"transfer_code={transfer_code} expected={sorted(direct_codes)}."
             )
+        plan = self._compiled_assemble_plan(op_name, transfer_code)
         ensure_transport_source_step(
             op_name=op_name,
-            tensor_name=f"TUUID:{tuuid}",
+            tensor_name=(
+                f"transfer_code={transfer_code},"
+                f"logical_tensor={plan.logical_tensor.name!r},"
+                f"logical_tuuid={plan.logical_tensor.logical_tuuid}"
+            ),
             tensor=tensor,
             exec_step=step,
         )
         step_slots = self._direct_local_input_slots.setdefault(op_name, {}).setdefault(
             step, {}
         )
-        if tuuid in step_slots:
-            existing = step_slots[tuuid]
+        if transfer_code in step_slots:
+            existing = step_slots[transfer_code]
             raise ValueError(
                 "Duplicate direct local tensor deposit: "
-                f"op={op_name} tuuid={tuuid} step={step} "
+                f"op={op_name} transfer_code={transfer_code} "
+                f"logical_tensor={plan.logical_tensor.name!r} "
+                f"logical_tuuid={plan.logical_tensor.logical_tuuid} step={step} "
                 f"existing={existing.sender_id}:{existing.rank} "
                 f"new={sender_id}:{rank}."
             )
-        step_slots[tuuid] = _DirectLocalInputSlot(
+        step_slots[transfer_code] = _DirectLocalInputSlot(
             tensor=tensor,
             source_step=step,
             sender_id=sender_id,
             rank=rank,
         )
-        if direct_tuuids.issubset(step_slots.keys()):
+        if direct_codes.issubset(step_slots.keys()):
             self._direct_local_ready_steps.setdefault(op_name, set()).add(step)
             self._on_step_ready(op_name, step)
 
     def _direct_local_slots_ready(self, op_name: str, step: int) -> bool:
-        direct_tuuids = self._direct_local_input_tuuids(op_name)
-        if not direct_tuuids:
+        direct_codes = self._direct_local_input_transfer_codes(op_name)
+        if not direct_codes:
             return False
         step_slots = self._direct_local_input_slots.get(op_name, {}).get(step, {})
-        return direct_tuuids.issubset(step_slots.keys())
+        return direct_codes.issubset(step_slots.keys())
 
     def _clear_direct_local_step(self, op_name: str, step: int) -> None:
         self._direct_local_input_slots.get(op_name, {}).pop(step, None)
@@ -1553,11 +1700,8 @@ class SPMDWorker:
         await self._put_execution_item(op_name, schedule_key)
 
     def _should_prepare_inputs_on_ready(self, op_name: str) -> bool:
-        if self._op_manager is None:
-            return False
-        meta = self.op_manager.get_operator_metadata(op_name)
-        policy = getattr(meta, "async_policy", None)
-        mode = str(getattr(policy, "mode", "sync"))
+        meta = self.op_manager.get_operator_spec(op_name)
+        mode = meta.runtime_policy.mode
         if mode == "sync":
             return False
         if mode in ("pipelined", "bounded_stale", "pipeline_parallel"):
@@ -1641,19 +1785,14 @@ class SPMDWorker:
 
     def _initialize_execution_lanes(self) -> None:
         self._execution_queues = {_EXECUTION_DEFAULT_LANE: self._execution_queue}
-        for meta in self.config.operator_metas.values():
-            lane = meta.schedule_policy.lane
+        for meta in self._operator_specs.values():
+            lane = meta.runtime_policy.schedule.lane
             if lane is not None:
                 self._execution_queue_for_lane(lane)
 
     def _execution_lane_for_op(self, op_name: str) -> str:
-        meta = self.op_manager._get_operator_metadata(op_name)
-        if not isinstance(meta, OperatorMeta):
-            raise TypeError(
-                f"operator metadata for op={op_name!r} must be OperatorMeta, "
-                f"got {type(meta).__name__}."
-            )
-        lane = meta.schedule_policy.lane
+        meta = self.op_manager._get_operator_spec(op_name)
+        lane = meta.runtime_policy.schedule.lane
         if lane is None:
             return _EXECUTION_DEFAULT_LANE
         return lane
@@ -1682,24 +1821,19 @@ class SPMDWorker:
     def _effective_schedule_key(
         self, op_name: str, step: int
     ) -> tuple[int, int, int, str]:
-        meta = self.op_manager._get_operator_metadata(op_name)
-        if not isinstance(meta, OperatorMeta):
-            raise TypeError(
-                f"operator metadata for op={op_name!r} must be OperatorMeta, "
-                f"got {type(meta).__name__}."
-            )
-        policy = getattr(meta, "schedule_policy", None)
-        base_priority = meta.priority
-        kind = str(getattr(policy, "kind", "fifo"))
+        meta = self.op_manager._get_operator_spec(op_name)
+        policy = meta.runtime_policy.schedule
+        base_priority = meta.runtime_policy.priority
+        kind = policy.kind
         prepare_state = self._prepare_schedule_state(op_name, step)
         if kind == "deadline_boost":
             effective_priority = base_priority
             if self._deadline_boost_active(op_name, step):
-                effective_priority += int(getattr(policy, "boost_priority", 0))
+                effective_priority += policy.boost_priority
             return (-effective_priority, prepare_state, step, op_name)
         if kind in ("phase_order", "phase_graph"):
-            phase_order = tuple(getattr(policy, "phase_ordering", ()))
-            phase = getattr(policy, "phase", None)
+            phase_order = policy.phase_ordering
+            phase = policy.phase
             if phase is None or not phase_order or phase not in phase_order:
                 raise ValueError(
                     f"{kind} schedule for op={op_name} has invalid phase={phase!r} "
@@ -1707,7 +1841,7 @@ class SPMDWorker:
                 )
             phase_index = phase_order.index(phase)
             if self._uses_lane_aware_phase_priority(policy):
-                lane = getattr(policy, "lane", None)
+                lane = policy.lane
                 lane_priority = self._lane_priority(policy, lane)
                 phase_priority = self._phase_priority(policy, phase)
                 return (
@@ -1727,22 +1861,22 @@ class SPMDWorker:
         return (-base_priority, prepare_state, step, op_name)
 
     @staticmethod
-    def _uses_lane_aware_phase_priority(policy: Any) -> bool:
+    def _uses_lane_aware_phase_priority(policy: SchedulePolicy) -> bool:
         return bool(
-            getattr(policy, "lane", None)
-            or getattr(policy, "lane_ordering", ())
-            or getattr(policy, "lane_priorities", {})
-            or getattr(policy, "phase_priorities", {})
+            policy.lane
+            or policy.lane_ordering
+            or policy.lane_priorities
+            or policy.phase_priorities
         )
 
     @staticmethod
-    def _lane_priority(policy: Any, lane: str | None) -> int:
+    def _lane_priority(policy: SchedulePolicy, lane: str | None) -> int:
         if lane is None:
             return 0
-        priorities = dict(getattr(policy, "lane_priorities", {}) or {})
+        priorities = policy.lane_priorities
         if lane in priorities:
             return int(priorities[lane])
-        lane_order = tuple(getattr(policy, "lane_ordering", ()) or ())
+        lane_order = policy.lane_ordering
         if not lane_order:
             return 0
         if lane not in lane_order:
@@ -1750,9 +1884,8 @@ class SPMDWorker:
         return len(lane_order) - lane_order.index(lane) - 1
 
     @staticmethod
-    def _phase_priority(policy: Any, phase: str) -> int:
-        priorities = dict(getattr(policy, "phase_priorities", {}) or {})
-        return int(priorities.get(phase, 0))
+    def _phase_priority(policy: SchedulePolicy, phase: str) -> int:
+        return policy.phase_priorities.get(phase, 0)
 
     def _prepare_schedule_state(self, op_name: str, step: int) -> int:
         runtime = getattr(self, "_input_prepare_runtime", None)
@@ -1773,13 +1906,11 @@ class SPMDWorker:
         return not self._deadline_boost_active(op_name, step)
 
     def _deadline_boost_active(self, op_name: str, step: int) -> bool:
-        meta = self.op_manager._get_operator_metadata(op_name)
-        if not isinstance(meta, OperatorMeta):
+        meta = self.op_manager._get_operator_spec(op_name)
+        policy = meta.runtime_policy.schedule
+        if policy.kind != "deadline_boost":
             return False
-        policy = getattr(meta, "schedule_policy", None)
-        if str(getattr(policy, "kind", "fifo")) != "deadline_boost":
-            return False
-        max_async_lag = getattr(meta, "max_async_lag", None)
+        max_async_lag = meta.runtime_policy.max_async_lag
         if max_async_lag is None:
             raise ValueError(
                 f"deadline_boost schedule for op={op_name} requires max_async_lag."
@@ -1787,7 +1918,7 @@ class SPMDWorker:
         committed = [
             count
             for name, count in self._completed_step_count.items()
-            if name in self.config.operator_metas
+            if name in self._operator_specs
         ]
         slowest_committed = min(
             committed,
@@ -1804,24 +1935,46 @@ class SPMDWorker:
                 f"[SPMDWorker] local_spmd_code is not registered "
                 f"spmd_id={self.spmd_id} rank={self.rank}."
             )
-        successor_ids = tuple(sorted(set(self.op_manager.get_successor_ids(op_name))))
-        output_uuids = tuple(self.op_manager.get_output_tuuids(op_name))
-        output_sharding = self.op_manager.get_output_sharding(op_name)
-        tuuid_to_name = self.op_manager.get_output_tuuid_to_name(op_name)
-        dispatcher = self.op_manager.get_dispatcher(op_name)
-        interleave_unit_size = getattr(dispatcher, "interleave_unit_size", None)
+        source_operator = self.config.require_graph_view().operator(op_name)
+        dependencies = tuple(
+            sorted(
+                (
+                    *self.op_manager.get_outgoing_tensor_dependencies(op_name),
+                    *self.op_manager.get_outgoing_ordering_dependencies(op_name),
+                ),
+                key=lambda dependency: dependency.code,
+            )
+        )
+        grouped_dependencies: dict[tuple[str, bool], list[CompiledDependency]] = {}
+        for dependency in dependencies:
+            key = (
+                dependency.spec.target.spmd_id,
+                dependency.spec.local_only,
+            )
+            grouped_dependencies.setdefault(key, []).append(dependency)
 
+        interleave_unit_size = (
+            source_operator.spec.interleave_unit_size
+            if source_operator.spec.is_interleaved
+            else None
+        )
+        effective_rank = (
+            self.rank
+            if interleave_unit_size is None
+            else self.rank % interleave_unit_size
+        )
         successor_contexts: list[_SuccessorSendContext] = []
-        for spmd_id in successor_ids:
-            succ_info = self.op_manager.get_successor_info(op_name, spmd_id)
-            if succ_info is None:
-                raise ValueError(
-                    f"[SPMDWorker] Missing successor topology for op={op_name} "
-                    f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
-                )
-            if bool(getattr(succ_info, "local_only", False)):
+        for context_index, key in enumerate(sorted(grouped_dependencies)):
+            spmd_id, local_only = key
+            route_context = SuccessorRouteContext(
+                context_index=context_index,
+                dependencies=tuple(grouped_dependencies[key]),
+                effective_rank=effective_rank,
+            )
+            if local_only:
                 handlers = self._local_only_successor_handlers(
-                    op_name, spmd_id, succ_info
+                    op_name,
+                    route_context,
                 )
             else:
                 handlers = self._successor_handlers.get(spmd_id, {})
@@ -1830,86 +1983,65 @@ class SPMDWorker:
                         f"[SPMDWorker] Missing successor handlers for op={op_name} "
                         f"successor={spmd_id} source={self.spmd_id}:{self.rank}."
                     )
-            effective_rank = self.rank
-            if succ_info.is_interleaved:
-                effective_rank = self.rank % succ_info.interleave_unit_size
             successor_contexts.append(
                 _SuccessorSendContext(
-                    spmd_id=spmd_id,
-                    info=succ_info,
+                    route_context=route_context,
                     handlers=handlers,
-                    effective_rank=effective_rank,
                 )
             )
 
-        route_contexts = tuple(
-            SuccessorRouteContext(
-                context_index=index,
-                spmd_id=context.spmd_id,
-                info=context.info,
-                effective_rank=context.effective_rank,
-                local_only=bool(getattr(context.info, "local_only", False)),
-            )
-            for index, context in enumerate(successor_contexts)
-        )
+        route_contexts = tuple(context.route_context for context in successor_contexts)
         compiled_plan = compile_send_plan(
-            op_name=op_name,
+            graph_view=self._graph_view,
+            source_op_id=source_operator.key.op_id,
             rank=self.rank,
-            mesh=self._mesh,
-            output_uuids=output_uuids,
-            output_sharding=output_sharding,
             successor_contexts=route_contexts,
-            tuuid_to_name=tuuid_to_name,
             sender_spmd_code=self._local_spmd_code,
-            sender_world_size=self._world_size,
             interleave_unit_size=interleave_unit_size,
+        )
+        successor_handlers = tuple(
+            successor.handlers for successor in successor_contexts
         )
         context = _OperatorSendContext(
-            successor_ids=successor_ids,
-            output_uuids=output_uuids,
-            output_sharding=output_sharding,
-            tuuid_to_name=tuuid_to_name,
             compiled_plan=compiled_plan,
             successor_contexts=tuple(successor_contexts),
-            route_contexts=route_contexts,
-            successor_handlers=tuple(
-                context.handlers for context in successor_contexts
+            successor_handlers=successor_handlers,
+            transport=_compile_transport_send_context(
+                compiled_plan,
+                successor_handlers,
             ),
-            sender_spmd_code=self._local_spmd_code,
-            sender_world_size=self._world_size,
-            interleave_unit_size=interleave_unit_size,
         )
         self._operator_send_context_cache[op_name] = context
         return context
 
     def _local_only_successor_handlers(
-        self, op_name: str, spmd_id: str, succ_info: Any
+        self,
+        op_name: str,
+        route_context: SuccessorRouteContext,
     ) -> dict[int, Any]:
-        if (
-            spmd_id != self.spmd_id
-            or getattr(succ_info, "spmd_id", None) != self.spmd_id
-        ):
+        if route_context.spmd_id != self.spmd_id:
             raise ValueError(
                 "local_only successors must target the current SPMD, "
                 f"op={op_name} source={self.spmd_id}:{self.rank} "
-                f"successor={spmd_id} info_spmd={getattr(succ_info, 'spmd_id', None)!r}."
+                f"successor={route_context.spmd_id}."
             )
-        if bool(getattr(succ_info, "is_interleaved", False)):
+        source_spec = route_context.dependencies[0].source_operator.spec
+        if source_spec.is_interleaved:
             raise ValueError(
                 f"local_only successors do not support interleaved routing, op={op_name}."
             )
-        if int(getattr(succ_info, "world_size", self._world_size)) != self._world_size:
+        if route_context.target_world_size != self._world_size:
             raise ValueError(
                 "local_only successors require matching world_size, "
                 f"op={op_name} source_world_size={self._world_size} "
-                f"target_world_size={getattr(succ_info, 'world_size', None)}."
+                f"target_world_size={route_context.target_world_size}."
             )
         handler = LocalWorkerDataPlane(
             self,
             sender_spmd_code=self._require_local_spmd_code(),
         )
         return self._profiler_runtime.wrap_data_plane_handlers(
-            spmd_id,
+            route_context.spmd_id,
             {self.rank: handler},
         )
 
@@ -2082,10 +2214,6 @@ class SPMDWorker:
                         continue
 
                 # Execute (for periodic mode, execute any task that comes)
-                if self._last_error is not None:
-                    raise RuntimeError(
-                        f"Worker has failed background task: {self._last_error}"
-                    )
                 if self._should_hold_prepare_pending_token(op_name, step):
                     continue
                 if self._async_lag_limit_reached(op_name, step):
@@ -2113,10 +2241,9 @@ class SPMDWorker:
                     f"Run loop cancelled spmd_id={self.spmd_id} rank={self.rank}"
                 )
                 break
-            except Exception as e:
-                logger.error(
-                    f"Error in execution loop error={e} spmd_id={self.spmd_id} rank={self.rank}"
-                )
+            except Exception as error:
+                self._record_failure(error, phase="SCHEDULER")
+                break
 
     async def stop(self) -> None:
         """Stop the execution loop gracefully."""
@@ -2210,49 +2337,37 @@ class SPMDWorker:
 
         logger.debug(f"Worker stopping spmd_id={self.spmd_id} rank={self.rank}")
 
-    async def _check_all_empty(self, op_name: str, step: int) -> bool:
-        """Check if all received shards for a step are empty packets."""
-        expected_tuuids = self.op_manager.get_expected_tuuids(op_name)
-        if not expected_tuuids:
-            return False
-
-        all_tensor_shards = await self._mailbox.get_all_tensor_shard_views(
-            op_name, step
-        )
-
-        for tuuid in expected_tuuids:
-            if tuuid not in all_tensor_shards:
-                return False
-            shards = all_tensor_shards[tuuid]
-            if not shards:
-                return False
-            for key, tensor_list in shards.items():
-                backend = get_backend()
-                for tensor in tensor_list:
-                    shape = backend.shape(tensor.flat_values)
-                    if shape and shape[0] > 0:
-                        return False
-        return True
-
-    async def _propagate_empty_packets(
+    async def _propagate_completed_without_tensor(
         self,
         op_name: str,
         step: int,
+        dependency_decisions: DependencyDecisions,
     ) -> tuple[asyncio.Task, ...]:
-        """Propagate empty packets to successor SPMDs for skipped/empty steps."""
+        """Propagate protocol-empty tensor arrivals to successor SPMDs."""
         if self._op_manager is None:
-            return ()
+            raise RuntimeError("Cannot propagate empty packets before worker setup.")
 
         send_context = self._operator_send_context(op_name)
         if not send_context.successor_contexts:
             return ()
 
+        await self._deposit_local_only_orderings(
+            send_context.compiled_plan,
+            step,
+            dependency_decisions,
+        )
+        await self._deposit_local_only_dependency_decisions(
+            send_context.compiled_plan,
+            step,
+            dependency_decisions,
+        )
+
         backend = get_backend()
         empty_values = backend.zeros((0,), dtype=backend.int32())
-        tasks = await self._data_plane_executor.send_step_frames(
+        tasks = await self._data_plane_executor.send_completed_without_tensor_frames(
             compiled_plan=send_context.compiled_plan,
             flat_results=[],
-            step_tuuid_cache={},
+            step_transfer_cache={},
             exec_step=step,
             successor_handlers=send_context.successor_handlers,
             source_spmd_id=self.spmd_id,
@@ -2260,13 +2375,52 @@ class SPMDWorker:
             batch_flush_us=self._data_plane_batch_flush_us,
             submit_delivery=self._delivery_submitter(op_name, step),
             delivery_schedule_key=self._effective_schedule_key(op_name, step),
+            dependency_decisions=dependency_decisions,
             empty_values=empty_values,
         )
         return tuple(tasks)
 
+    async def _propagate_skipped_completion(
+        self,
+        op_name: str,
+        step: int,
+        dependency_decisions: DependencyDecisions,
+    ) -> tuple[asyncio.Task, ...]:
+        if self._op_manager is None:
+            raise RuntimeError(
+                "Cannot propagate skipped completion before worker setup."
+            )
+        send_context = self._operator_send_context(op_name)
+        if not send_context.successor_contexts:
+            return ()
+        await self._deposit_local_only_orderings(
+            send_context.compiled_plan,
+            step,
+            dependency_decisions,
+        )
+        await self._deposit_local_only_dependency_decisions(
+            send_context.compiled_plan,
+            step,
+            dependency_decisions,
+        )
+        tasks = await self._data_plane_executor.send_dependency_decision_frames(
+            compiled_plan=send_context.compiled_plan,
+            flat_results=[],
+            step_transfer_cache={},
+            exec_step=step,
+            successor_handlers=send_context.successor_handlers,
+            source_spmd_id=self.spmd_id,
+            batch_max_frames=self._data_plane_batch_max_frames,
+            batch_flush_us=self._data_plane_batch_flush_us,
+            submit_delivery=self._delivery_submitter(op_name, step),
+            delivery_schedule_key=self._effective_schedule_key(op_name, step),
+            dependency_decisions=dependency_decisions,
+        )
+        return tuple(tasks)
+
     def _operator_pipeline_depth(self, op_name: str) -> int:
-        meta = self.op_manager.get_operator_metadata(op_name)
-        depth = int(getattr(meta, "local_pipeline_depth", 1))
+        meta = self.op_manager.get_operator_spec(op_name)
+        depth = meta.runtime_policy.pipeline_depth
         if depth <= 0:
             raise ValueError(
                 f"local_pipeline_depth must be positive for op={op_name}, got {depth}."
@@ -2279,6 +2433,8 @@ class SPMDWorker:
         )
 
     def _start_local_step_plan(self, op_name: str, step: int) -> None:
+        if self._failure is not None or not self._running:
+            return
         self._record_local_plan_scheduled(op_name, step)
         self._running_plan_steps[op_name].add(step)
         task = asyncio.create_task(self._run_local_step_plan(op_name, step))
@@ -2291,25 +2447,20 @@ class SPMDWorker:
                 return
             exc = done_task.exception()
             if exc is not None:
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                logger.error(
-                    "Local step plan failed spmd_id=%s rank=%s op=%s step=%s error=%s",
-                    self.spmd_id,
-                    self.rank,
-                    op_name,
-                    step,
+                self._record_failure(
                     exc,
-                    exc_info=(type(exc), exc, exc.__traceback__),
+                    phase="LOCAL_STEP_PLAN",
+                    op_name=op_name,
+                    step=step,
                 )
                 return
-            self._spawn_background_task(self._start_pending_pipeline_steps(op_name))
+            if self._running:
+                self._spawn_background_task(self._start_pending_pipeline_steps(op_name))
 
         task.add_done_callback(_done)
 
     def _record_local_plan_scheduled(self, op_name: str, step: int) -> None:
-        is_periodic = (
-            self.op_manager.is_periodic_trigger(op_name) if self._op_manager else False
-        )
+        is_periodic = self.op_manager.is_periodic_trigger(op_name)
         if is_periodic:
             return
         scheduled_count = self._scheduled_step_count[op_name]
@@ -2321,9 +2472,11 @@ class SPMDWorker:
         self._scheduled_step_count[op_name] = scheduled_count + 1
 
     async def _start_pending_pipeline_steps(self, op_name: str) -> None:
+        if not self._running:
+            return
         await self._move_future_steps_into_pipeline_queue(op_name)
         pending = self._ready_pending_pipeline_steps[op_name]
-        while pending and self._can_start_local_plan(op_name):
+        while self._running and pending and self._can_start_local_plan(op_name):
             step = pending.pop(0)
             if self._async_lag_limit_reached(op_name, step):
                 pending_lag = self._pending_async_lag_steps[op_name]
@@ -2339,9 +2492,7 @@ class SPMDWorker:
             await self._move_future_steps_into_pipeline_queue(op_name)
 
     async def _move_future_steps_into_pipeline_queue(self, op_name: str) -> None:
-        is_periodic = (
-            self.op_manager.is_periodic_trigger(op_name) if self._op_manager else False
-        )
+        is_periodic = self.op_manager.is_periodic_trigger(op_name)
         if is_periodic:
             return
         pending = self._pending_future_steps[op_name]
@@ -2353,23 +2504,21 @@ class SPMDWorker:
             self._ready_pending_pipeline_steps[op_name].append(step)
 
     def _bounded_async_ops(self) -> tuple[str, ...]:
-        metas = getattr(self.config, "operator_metas", {})
+        metas = self._operator_specs
         result = []
         for name, meta in metas.items():
-            policy = getattr(meta, "async_policy", None)
             if (
-                str(getattr(policy, "mode", "sync")) == "bounded_stale"
-                and getattr(meta, "max_async_lag", None) is not None
+                meta.runtime_policy.mode == "bounded_stale"
+                and meta.runtime_policy.max_async_lag is not None
             ):
                 result.append(name)
         return tuple(sorted(result))
 
     def _async_lag_limit_reached(self, op_name: str, step: int) -> bool:
-        meta = self.op_manager._get_operator_metadata(op_name)
-        policy = getattr(meta, "async_policy", None)
-        if str(getattr(policy, "mode", "sync")) != "bounded_stale":
+        meta = self.op_manager._get_operator_spec(op_name)
+        if meta.runtime_policy.mode != "bounded_stale":
             return False
-        max_async_lag = getattr(meta, "max_async_lag", None)
+        max_async_lag = meta.runtime_policy.max_async_lag
         if max_async_lag is None:
             return False
         peers = self._bounded_async_ops()
@@ -2395,113 +2544,11 @@ class SPMDWorker:
                 else:
                     await self._enqueue(op_name, step)
 
-    def _phase_order_policy(self, op_name: str) -> Any | None:
-        meta = self.op_manager._get_operator_metadata(op_name)
-        if not isinstance(meta, OperatorMeta):
-            return None
-        policy = getattr(meta, "schedule_policy", None)
-        if str(getattr(policy, "kind", "fifo")) not in ("phase_order", "phase_graph"):
-            return None
-        return policy
-
-    def _phase_order_operator_sequence(self, policy: Any) -> tuple[str, ...]:
-        policy_kind = str(getattr(policy, "kind", "fifo"))
-        if policy_kind not in ("phase_order", "phase_graph"):
-            raise ValueError(
-                f"phase schedule requires a phase policy, got {policy_kind!r}."
-            )
-        phase_order = tuple(getattr(policy, "phase_ordering", ()))
-        if not phase_order:
-            raise ValueError(
-                f"{policy_kind} schedule requires a non-empty phase_order."
-            )
-        phase_to_op: dict[str, str] = {}
-        for name, meta in self.config.operator_metas.items():
-            other_policy = getattr(meta, "schedule_policy", None)
-            if str(getattr(other_policy, "kind", "fifo")) != policy_kind:
-                continue
-            if tuple(getattr(other_policy, "phase_ordering", ())) != phase_order:
-                continue
-            phase = getattr(other_policy, "phase", None)
-            if phase is None:
-                raise ValueError(f"phase_order operator {name} has no phase.")
-            existing = phase_to_op.get(phase)
-            if existing is not None and existing != name:
-                raise ValueError(
-                    f"phase_order phase {phase!r} is assigned to multiple operators: "
-                    f"{existing!r} and {name!r}."
-                )
-            phase_to_op[phase] = name
-
-        missing = [phase for phase in phase_order if phase not in phase_to_op]
-        if missing:
-            raise ValueError(
-                f"{policy_kind} schedule missing operators for phases {missing!r}."
-            )
-        return tuple(phase_to_op[phase] for phase in phase_order)
-
     def _phase_order_step_blocked(self, op_name: str, step: int) -> bool:
-        policy = self._phase_order_policy(op_name)
-        if policy is None:
+        gate = self._phase_schedule.gates.get(op_name)
+        if gate is None:
             return False
-        kind = str(getattr(policy, "kind", "fifo"))
-        phase_order = tuple(getattr(policy, "phase_ordering", ()))
-        phase = getattr(policy, "phase", None)
-        if phase is None or phase not in phase_order:
-            raise ValueError(
-                f"{kind} schedule for op={op_name} has invalid phase={phase!r} "
-                f"phase_order={phase_order!r}."
-            )
-        phase_ops = self._phase_order_operator_sequence(policy)
-        if kind == "phase_graph":
-            return self._phase_graph_step_blocked(
-                op_name,
-                step,
-                phase,
-                phase_order,
-                phase_ops,
-                policy,
-            )
-        if kind != "phase_order":
-            raise ValueError(f"Unsupported phase schedule kind {kind!r}.")
-        phase_index = phase_order.index(phase)
-        for prior_op in phase_ops[:phase_index]:
-            if self._completed_step_count.get(prior_op, 0) <= step:
-                return True
-        if phase_index > 0 and step > 0:
-            for prior_cycle_op in phase_ops[phase_index:]:
-                if self._completed_step_count.get(prior_cycle_op, 0) < step:
-                    return True
-        return False
-
-    def _phase_graph_step_blocked(
-        self,
-        op_name: str,
-        step: int,
-        phase: str,
-        phase_order: tuple[str, ...],
-        phase_ops: tuple[str, ...],
-        policy: Any,
-    ) -> bool:
-        del op_name
-        phase_to_op = dict(zip(phase_order, phase_ops, strict=True))
-        dependencies = tuple(getattr(policy, "phase_dependencies", ()))
-        if not dependencies:
-            raise ValueError("phase_graph schedule requires dependencies.")
-        for before_phase, after_phase, step_delta in dependencies:
-            if after_phase != phase:
-                continue
-            required_step = step - int(step_delta)
-            if required_step < 0:
-                continue
-            prior_op = phase_to_op.get(before_phase)
-            if prior_op is None:
-                raise ValueError(
-                    f"phase_graph dependency references missing phase {before_phase!r}."
-                )
-            if self._completed_step_count.get(prior_op, 0) <= required_step:
-                return True
-        return False
+        return gate.is_blocked(self._completed_step_count, step=step)
 
     async def _release_phase_order_steps(self) -> None:
         for op_name, pending in self._pending_phase_order_steps.items():
@@ -2515,11 +2562,11 @@ class SPMDWorker:
                     await self._enqueue(op_name, step)
 
     def _state_resource_id(self, op_name: str) -> int:
-        meta = self.op_manager.get_operator_metadata(op_name)
-        is_stateful = bool(getattr(meta, "owner_class_qualname", ""))
+        meta = self.op_manager.get_operator_spec(op_name)
+        is_stateful = bool(meta.owner_class_qualname)
         if not is_stateful:
             return -1
-        state_access = str(getattr(meta, "state_access", "exclusive"))
+        state_access = meta.runtime_policy.state_access
         if state_access == "thread_safe":
             return -1
         if state_access != "exclusive":
@@ -2527,10 +2574,10 @@ class SPMDWorker:
                 f"state_access for op={op_name} must be 'exclusive' or 'thread_safe', "
                 f"got {state_access!r}."
             )
-        state_resource = getattr(meta, "state_resource", None)
+        state_resource = meta.runtime_policy.state_resource
         owner_key = (
-            f"{getattr(meta, 'owner_class_module', '')}."
-            f"{getattr(meta, 'owner_class_qualname', '')}:"
+            f"{meta.owner_class_module}."
+            f"{meta.owner_class_qualname}:"
             f"{state_resource or '__owner__'}"
         )
         from fluxway.profiler.record import stable_u64
@@ -2544,7 +2591,7 @@ class SPMDWorker:
             (1 << 31) - 1
         )
 
-    def _build_operator_local_plan(self, op_name: str) -> LocalStepPlan:
+    def _compile_operator_local_plan(self, op_name: str) -> LocalStepPlan:
         return LocalStepPlan(
             node_kinds=(
                 int(LocalStepNodeKind.WAIT),
@@ -2570,7 +2617,12 @@ class SPMDWorker:
         )
 
     async def _run_local_step_plan(self, op_name: str, step: int) -> ExecutionResult:
-        plan = self._build_operator_local_plan(op_name)
+        try:
+            plan = self._local_step_plan_cache[op_name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Operator {op_name!r} has no installed local step plan."
+            ) from exc
         registry = self._operator_local_node_registry(op_name, step)
         context = LocalStepContext(op_name=op_name, step=step)
         return await self._local_step_plan_executor.execute(plan, registry, context)
@@ -2600,21 +2652,24 @@ class SPMDWorker:
                 if callable_id == _CALL_USER_OP_CALLABLE:
                     return LocalNodeSpec(
                         callable_id=callable_id,
-                        user_runner=lambda dependency_results: worker_self._local_plan_call_user(
-                            op_name,
-                            step,
-                            dependency_results[0],
+                        user_runner=lambda dependency_results: (
+                            worker_self._local_plan_call_user(
+                                op_name,
+                                step,
+                                dependency_results[0],
+                            )
                         ),
                     )
                 if callable_id == _SEND_OUTPUT_CALLABLE:
                     return LocalNodeSpec(
                         callable_id=callable_id,
-                        fn=lambda prepared_input,
-                        op_result: worker_self._local_plan_send_output(
-                            op_name,
-                            step,
-                            prepared_input,
-                            op_result,
+                        fn=lambda prepared_input, op_result: (
+                            worker_self._local_plan_send_output(
+                                op_name,
+                                step,
+                                prepared_input,
+                                op_result,
+                            )
                         ),
                     )
                 if callable_id == _COMMIT_STEP_CALLABLE:
@@ -2690,14 +2745,16 @@ class SPMDWorker:
         recorder = (
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
-        step_tuuid_cache = self._step_tuuid_cache_from_prepared_input(
+        step_transfer_cache = self._step_transfer_cache_from_prepared_input(
             op_name,
             step,
             prepared_input,
             op_result,
         )
         if recorder is None:
-            return self._register_local_send(op_name, step, op_result, step_tuuid_cache)
+            return self._register_local_send(
+                op_name, step, op_result, step_transfer_cache
+            )
         source_spmd_code = self._require_local_spmd_code()
         async with recorder.local_step_node(
             spec=LOCAL_STEP_SEND_OUTPUT,
@@ -2710,10 +2767,10 @@ class SPMDWorker:
                 op_name,
                 step,
                 op_result,
-                step_tuuid_cache,
+                step_transfer_cache,
             )
 
-    def _step_tuuid_cache_from_prepared_input(
+    def _step_transfer_cache_from_prepared_input(
         self,
         op_name: str,
         step: int,
@@ -2722,11 +2779,15 @@ class SPMDWorker:
     ) -> dict[int, Any]:
         result = self._normalize_local_plan_result(op_name, step, op_result)
         if isinstance(prepared_input, _PreparedOperatorInput):
-            return dict(prepared_input.step_tuuid_cache)
+            return dict(prepared_input.step_transfer_cache)
         if isinstance(prepared_input, ExecutionResult):
             if not self._result_requires_send(result):
                 return {}
-            if result.status is ExecutionStatus.EMPTY_PROPAGATION:
+            if result.status in (
+                ExecutionStatus.SKIPPED,
+                ExecutionStatus.INACTIVE,
+                ExecutionStatus.COMPLETED_WITHOUT_TENSOR,
+            ):
                 return {}
         raise TypeError(
             f"Local SEND for op={op_name} step={step} requires prepared input "
@@ -2738,7 +2799,7 @@ class SPMDWorker:
         op_name: str,
         step: int,
         op_result: Any,
-        step_tuuid_cache: dict[int, Any],
+        step_transfer_cache: dict[int, Any],
     ) -> LocalSendToken:
         result = self._normalize_local_plan_result(op_name, step, op_result)
         send_task = None
@@ -2750,7 +2811,7 @@ class SPMDWorker:
                     op_name,
                     step,
                     result,
-                    step_tuuid_cache,
+                    step_transfer_cache,
                 ),
             )
         return LocalSendToken(
@@ -2771,7 +2832,8 @@ class SPMDWorker:
         if op_result.status in (
             ExecutionStatus.SUCCESS,
             ExecutionStatus.SKIPPED,
-            ExecutionStatus.EMPTY_PROPAGATION,
+            ExecutionStatus.INACTIVE,
+            ExecutionStatus.COMPLETED_WITHOUT_TENSOR,
             ExecutionStatus.STALE_AFTER_RESTORE,
         ):
             return op_result
@@ -2781,9 +2843,10 @@ class SPMDWorker:
         )
 
     def _result_requires_send(self, result: ExecutionResult) -> bool:
-        if result.status is ExecutionStatus.STALE_AFTER_RESTORE:
-            return False
-        if result.status is ExecutionStatus.SKIPPED:
+        if result.status in (
+            ExecutionStatus.INACTIVE,
+            ExecutionStatus.STALE_AFTER_RESTORE,
+        ):
             return False
         return True
 
@@ -2792,13 +2855,13 @@ class SPMDWorker:
         op_name: str,
         step: int,
         result: ExecutionResult,
-        step_tuuid_cache: dict[int, Any],
+        step_transfer_cache: dict[int, Any],
     ) -> ExecutionResult:
         await self._send_output(
             op_name,
             result,
             exec_step=step,
-            step_tuuid_cache=step_tuuid_cache,
+            step_transfer_cache=step_transfer_cache,
         )
         return result
 
@@ -2817,15 +2880,11 @@ class SPMDWorker:
                 return
             exc = done_task.exception()
             if exc is not None:
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                logger.error(
-                    "Local SEND task failed spmd_id=%s rank=%s op=%s step=%s error=%s",
-                    self.spmd_id,
-                    self.rank,
-                    op_name,
-                    step,
+                self._record_failure(
                     exc,
-                    exc_info=(type(exc), exc, exc.__traceback__),
+                    phase="SEND",
+                    op_name=op_name,
+                    step=step,
                 )
 
         task.add_done_callback(_done)
@@ -2912,11 +2971,14 @@ class SPMDWorker:
             self._barriers_declared.pop((op_name, step), None)
             return ExecutionResult(status=ExecutionStatus.STALE_AFTER_RESTORE)
 
+        if self._mailbox.is_step_skipped(op_name, step):
+            return ExecutionResult(status=ExecutionStatus.SKIPPED)
+
         dispatcher = self.op_manager.get_dispatcher(op_name)
         if not dispatcher.should_execute(self.rank, self._world_size, step):
             await self._mailbox.clear_step(op_name, step)
             self._barriers_declared.pop((op_name, step), None)
-            return ExecutionResult(status=ExecutionStatus.SKIPPED)
+            return ExecutionResult(status=ExecutionStatus.INACTIVE)
 
         if self._uses_direct_local_input_fast_path(op_name):
             if not self._direct_local_slots_ready(op_name, step):
@@ -2925,11 +2987,6 @@ class SPMDWorker:
                     f"op={op_name} step={step}."
                 )
             return self._assemble_direct_local_input(op_name, step)
-
-        if self.config.enable_empty_fastpath:
-            all_empty = await self._check_all_empty(op_name, step)
-            if all_empty:
-                return ExecutionResult(status=ExecutionStatus.EMPTY_PROPAGATION)
 
         return await self._assemble_input(op_name, step)
 
@@ -2955,86 +3012,79 @@ class SPMDWorker:
     def _operator_user_callable_spec(
         self, op_name: str, step: int, input_data: Any
     ) -> UserCallableSpec:
-        meta = self.op_manager.get_operator_metadata(op_name)
-        if meta.graph_facts is None:
-            raise ValueError(f"Operator {self.spmd_id}.{op_name} has no graph facts.")
-        spmd_facts = self.config.graph_spmd_facts
-        if spmd_facts is None:
-            raise ValueError(f"Worker {self.spmd_id} has no SPMD graph facts.")
-        if meta.graph_facts.manifest_id != self.config.graph_manifest_id:
-            raise ValueError(
-                f"Operator {self.spmd_id}.{op_name} graph facts do not match "
-                "the worker manifest."
-            )
-        if meta.graph_facts.operator != spmd_facts.operator_facts(op_name):
-            raise ValueError(
-                f"Operator {self.spmd_id}.{op_name} facts do not match its SPMD."
-            )
-        is_stateful = bool(getattr(meta, "owner_class_qualname", ""))
-        owner_classes: tuple[tuple[str, str, type], ...] = ()
-        process_affine = bool(getattr(meta, "requires_worker_process", False))
-        if is_stateful:
-            if not process_affine:
-                owner_cls = _resolve_owner_class(
-                    meta.owner_class_module, meta.owner_class_qualname
-                )
-                owner_classes = (
-                    (
-                        meta.owner_class_module,
-                        meta.owner_class_qualname,
-                        owner_cls,
-                    ),
-                )
-
-        operator_args: tuple[Any, ...] = ()
-        operator_kwargs: dict[str, Any] | None = {}
+        graph_view = self.config.require_graph_view()
+        compiled_operator = graph_view.operator(op_name)
+        meta = compiled_operator.spec
         if isinstance(input_data, dict):
+            operator_args: tuple[Any, ...] = ()
             operator_kwargs = input_data
         else:
             operator_args = (input_data,)
-            operator_kwargs = None
+            operator_kwargs = {}
+        operator_is_coroutine_function = self.op_manager.operator_is_coroutine_function(
+            op_name
+        )
 
-        async def execute_operator_callable() -> Any:
-            if operator_kwargs:
-                return await self.op_manager.execute_async(
-                    op_name, step, **operator_kwargs
-                )
-            if operator_args:
-                return await self.op_manager.execute_async(
-                    op_name, step, *operator_args
-                )
-            return await self.op_manager.execute_async(op_name, step)
+        def execute_regular_operator() -> Any:
+            return self.op_manager.execute(
+                op_name,
+                step,
+                *operator_args,
+                **operator_kwargs,
+            )
+
+        async def execute_coroutine_operator() -> Any:
+            return await self.op_manager.execute_async(
+                op_name,
+                step,
+                *operator_args,
+                **operator_kwargs,
+            )
 
         return UserCallableSpec(
-            callable_id=op_name,
-            fn=execute_operator_callable,
-            is_stateful=is_stateful,
+            callable_id=compiled_operator.key.op_id,
+            fn=(
+                execute_coroutine_operator
+                if operator_is_coroutine_function
+                else execute_regular_operator
+            ),
             resource_id=self._state_resource_id(op_name),
             operator_lane=(
                 _EXECUTION_DEFAULT_LANE
-                if meta.schedule_policy.lane is None
-                else meta.schedule_policy.lane
+                if meta.runtime_policy.schedule.lane is None
+                else meta.runtime_policy.schedule.lane
             ),
-            operator_config=self.config if is_stateful else None,
-            operator_name=op_name,
+            operator_is_coroutine_function=operator_is_coroutine_function,
             operator_step=step,
-            operator_args=operator_args,
-            operator_kwargs=operator_kwargs,
-            operator_rank=self.rank,
-            operator_spmd_id=self.spmd_id if is_stateful else "",
-            local_rank=self.local_rank if is_stateful else None,
-            local_world_size=self.local_world_size if is_stateful else None,
-            node_rank=0 if self.node_rank is None else self.node_rank,
-            num_nodes=1 if self.num_nodes is None else self.num_nodes,
-            rank0_address=self.rank0_address,
-            operator_owner_classes=owner_classes if is_stateful else (),
-            process_affine=process_affine,
-            operator_facts=meta.graph_facts,
+            object_scope=SPMDObjectScope(
+                spmd_id=compiled_operator.key.spmd_id,
+                rank=self.rank,
+            ),
+            graph_id=graph_view.graph_id,
+            compiled_operator=compiled_operator,
         )
+
+    def _operator_input_transfer_codes(
+        self, op_name: str
+    ) -> tuple[Any, dict[str, list[int | None]]]:
+        meta = self.op_manager.get_operator_spec(op_name)
+        input_types = self.op_manager.get_operator_input_types(op_name)
+        input_transfer_codes = self.op_manager.get_input_transfer_codes(op_name)
+        parameter_codes: dict[str, list[int | None]] = {}
+        for parameter_name in input_types:
+            if parameter_name in self.op_manager.get_static_args():
+                continue
+            paths = meta.input_param_map.get(parameter_name, (parameter_name,))
+            codes: list[int | None] = []
+            for path in paths:
+                codes.append(input_transfer_codes.get(f"{op_name}.{path}"))
+            parameter_codes[parameter_name] = codes
+        return meta, parameter_codes
 
     async def _assemble_input(self, op_name: str, step: int) -> Any:
         background_prepare = self._should_prepare_inputs_on_ready(op_name)
         static_args = self.op_manager.get_static_args()
+        input_types = self.op_manager.get_operator_input_types(op_name)
         expected_state_names = self.op_manager.get_expected_control_arg_names(op_name)
         all_states = await self._mailbox.get_all_control_arguments(op_name, step)
         state_args = {
@@ -3043,35 +3093,20 @@ class SPMDWorker:
             if name in all_states
         }
 
-        meta = self.op_manager.get_operator_metadata(op_name)
-        input_types = self.op_manager.get_operator_input_types(op_name)
-        pre_topo = self.op_manager.get_predecessor_topology(op_name)
-
-        all_tuuids = []
-        p_to_tuuids = {}
-        for p_name in input_types:
-            if p_name in static_args:
-                continue
-
-            p_paths = meta.input_param_map.get(p_name, [p_name])
-            p_tuuids = []
-            for path in p_paths:
-                tuuid = None
-                for info in pre_topo.values():
-                    if path in info.tuuid_map:
-                        tuuid = info.tuuid_map[path]
-                        break
-                p_tuuids.append(tuuid)
-
-            p_to_tuuids[p_name] = p_tuuids
-            all_tuuids.extend([u for u in p_tuuids if u is not None])
-
-        unique_tuuids = list(set(all_tuuids))
+        meta, parameter_codes = self._operator_input_transfer_codes(op_name)
+        transfer_codes = list(
+            dict.fromkeys(
+                code
+                for codes in parameter_codes.values()
+                for code in codes
+                if code is not None
+            )
+        )
 
         async def snapshot_tensors() -> list[Any]:
             return await self._mailbox.get_tensor_shard_views_and_arrivals_many(
                 op_name,
-                unique_tuuids,
+                transfer_codes,
                 step,
             )
 
@@ -3086,21 +3121,32 @@ class SPMDWorker:
         all_source_steps = [item[0] for item in tensor_input_list]
         all_shards_list = [item[1] for item in tensor_input_list]
         all_arrivals_list = [item[2] for item in tensor_input_list]
-        tuuid_to_source_step = dict(zip(unique_tuuids, all_source_steps, strict=True))
-        tuuid_to_shards = dict(zip(unique_tuuids, all_shards_list, strict=True))  # type: ignore
-        tuuid_to_arrivals = dict(zip(unique_tuuids, all_arrivals_list, strict=True))  # type: ignore
+        transfer_to_source_step = dict(
+            zip(transfer_codes, all_source_steps, strict=True)
+        )
+        transfer_to_shards = dict(zip(transfer_codes, all_shards_list, strict=True))  # type: ignore
+        transfer_to_arrivals = dict(zip(transfer_codes, all_arrivals_list, strict=True))  # type: ignore
+
+        for transfer_code in transfer_codes:
+            if transfer_to_shards[transfer_code]:
+                continue
+            assemble_plan = self._compiled_assemble_plan(op_name, transfer_code)
+            if assemble_plan.completed_without_tensor(
+                transfer_to_arrivals[transfer_code]
+            ):
+                return ExecutionResult(status=ExecutionStatus.COMPLETED_WITHOUT_TENSOR)
 
         async def assemble_tensors() -> list[Any]:
             assemble_tasks = [
                 self._assemble_tensor_for_prepare_policy(
                     op_name,
-                    u,
+                    transfer_code,
                     step,
-                    tuuid_to_shards[u],
-                    tuuid_to_arrivals[u],
+                    transfer_to_shards[transfer_code],
+                    transfer_to_arrivals[transfer_code],
                     background_prepare=background_prepare,
                 )
-                for u in unique_tuuids
+                for transfer_code in transfer_codes
             ]
             return await asyncio.gather(*assemble_tasks)
 
@@ -3110,24 +3156,33 @@ class SPMDWorker:
             async with profiler_recorder.worker_assemble_input(
                 op_name=op_name,
                 step=step,
-                tuuid_count=len(unique_tuuids),
+                transfer_count=len(transfer_codes),
                 state_count=len(state_args),
             ):
                 assembled_list = await assemble_tensors()
-        for tuuid, assembled in zip(unique_tuuids, assembled_list, strict=True):
+        for transfer_code, assembled in zip(
+            transfer_codes, assembled_list, strict=True
+        ):
             if isinstance(assembled, TransportTensor):
-                assembled.source_step = tuuid_to_source_step[tuuid]
-        tuuid_to_assembled = dict(zip(unique_tuuids, assembled_list, strict=True))  # type: ignore
+                assembled.source_step = transfer_to_source_step[transfer_code]
+        transfer_to_assembled = dict(zip(transfer_codes, assembled_list, strict=True))  # type: ignore
 
         input_kwargs = {}
-        for p_name, p_tuuids in p_to_tuuids.items():
-            if not p_tuuids or p_tuuids[0] is None:
+        for p_name, p_codes in parameter_codes.items():
+            if not p_codes or p_codes[0] is None:
                 continue
+            if any(code is None for code in p_codes):
+                raise ValueError(
+                    f"Operator {op_name!r} input {p_name!r} mixes tensor and "
+                    "non-tensor leaves; declare separate parameters."
+                )
 
-            p_leaves = [tuuid_to_assembled[u] for u in p_tuuids]
+            tensor_codes = [code for code in p_codes if code is not None]
+            p_leaves = [transfer_to_assembled[code] for code in tensor_codes]
             tdef = meta.input_treedefs.get(p_name)
-            if tdef:
-                input_kwargs[p_name] = tree_unflatten(tdef, p_leaves)
+            runtime_treedef = None if tdef is None else tdef.materialize()
+            if runtime_treedef is not None:
+                input_kwargs[p_name] = tree_unflatten(runtime_treedef, p_leaves)
             else:
                 input_kwargs[p_name] = p_leaves[0]
 
@@ -3139,55 +3194,50 @@ class SPMDWorker:
         final_args.update(input_kwargs)
         return _PreparedOperatorInput(
             value=final_args,
-            step_tuuid_cache=dict(tuuid_to_assembled),
+            step_transfer_cache=dict(transfer_to_assembled),
         )
 
     def _assemble_direct_local_input(
         self, op_name: str, step: int
     ) -> _PreparedOperatorInput:
         static_args = self.op_manager.get_static_args()
-        meta = self.op_manager.get_operator_metadata(op_name)
         input_types = self.op_manager.get_operator_input_types(op_name)
-        pre_topo = self.op_manager.get_predecessor_topology(op_name)
-        direct_tuuids = self._direct_local_input_tuuids(op_name)
+        meta, parameter_codes = self._operator_input_transfer_codes(op_name)
+        direct_codes = self._direct_local_input_transfer_codes(op_name)
         step_slots = self._direct_local_input_slots.get(op_name, {}).get(step, {})
-        if not direct_tuuids.issubset(step_slots.keys()):
+        if not direct_codes.issubset(step_slots.keys()):
             raise ValueError(
                 "Direct local input fast path missing tensors: "
-                f"op={op_name} step={step} expected={sorted(direct_tuuids)} "
+                f"op={op_name} step={step} expected={sorted(direct_codes)} "
                 f"available={sorted(step_slots.keys())}."
             )
 
-        p_to_tuuids = {}
-        for p_name in input_types:
-            if p_name in static_args:
-                continue
-            p_paths = meta.input_param_map.get(p_name, [p_name])
-            p_tuuids = []
-            for path in p_paths:
-                tuuid = None
-                for info in pre_topo.values():
-                    if path in info.tuuid_map:
-                        tuuid = info.tuuid_map[path]
-                        break
-                p_tuuids.append(tuuid)
-            p_to_tuuids[p_name] = p_tuuids
-
-        tuuid_to_assembled = {tuuid: slot.tensor for tuuid, slot in step_slots.items()}
+        transfer_to_assembled = {
+            transfer_code: slot.tensor for transfer_code, slot in step_slots.items()
+        }
         input_kwargs = {}
-        for p_name, p_tuuids in p_to_tuuids.items():
-            if not p_tuuids or p_tuuids[0] is None:
+        for p_name, p_codes in parameter_codes.items():
+            if not p_codes or p_codes[0] is None:
                 continue
-            missing = [tuuid for tuuid in p_tuuids if tuuid not in tuuid_to_assembled]
+            if any(code is None for code in p_codes):
+                raise ValueError(
+                    f"Operator {op_name!r} input {p_name!r} mixes tensor and "
+                    "non-tensor leaves; declare separate parameters."
+                )
+            tensor_codes = [code for code in p_codes if code is not None]
+            missing = [
+                code for code in tensor_codes if code not in transfer_to_assembled
+            ]
             if missing:
                 raise ValueError(
                     "Direct local input fast path cannot satisfy operator input: "
                     f"op={op_name} step={step} param={p_name} missing={missing}."
                 )
-            p_leaves = [tuuid_to_assembled[u] for u in p_tuuids]
+            p_leaves = [transfer_to_assembled[code] for code in tensor_codes]
             tdef = meta.input_treedefs.get(p_name)
-            if tdef:
-                input_kwargs[p_name] = tree_unflatten(tdef, p_leaves)
+            runtime_treedef = None if tdef is None else tdef.materialize()
+            if runtime_treedef is not None:
+                input_kwargs[p_name] = tree_unflatten(runtime_treedef, p_leaves)
             else:
                 input_kwargs[p_name] = p_leaves[0]
 
@@ -3198,13 +3248,13 @@ class SPMDWorker:
         final_args.update(input_kwargs)
         return _PreparedOperatorInput(
             value=final_args,
-            step_tuuid_cache=dict(tuuid_to_assembled),
+            step_transfer_cache=dict(transfer_to_assembled),
         )
 
     async def _assemble_tensor_for_prepare_policy(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
@@ -3212,13 +3262,15 @@ class SPMDWorker:
         background_prepare: bool,
     ) -> "TransportTensor":
         if not background_prepare:
-            return await self._assemble_tensor(op_name, tuuid, step, shards, arrivals)
+            return await self._assemble_tensor(
+                op_name, transfer_code, step, shards, arrivals
+            )
         return await self._input_prepare_runtime.run_assemble(
             op_name,
             step,
             lambda: self._assemble_tensor_sync_traced(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 shards,
                 arrivals,
@@ -3435,33 +3487,21 @@ class SPMDWorker:
     def _describe_shard_flow_for_error(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards_dict: dict[Any, list[Any]],
         filtered_shards: list[Any],
         input_layout: "PhysicalLayout | None",
-        predecessor_topology: dict[str, Any],
+        assemble_plan: CompiledAssemblePlan,
     ) -> str:
         backend = get_backend()
-        producer_path = getattr(self.op_manager, "_tuuid_to_op_outputs", {}).get(tuuid)
-        tuuid_name = ".".join(producer_path) if producer_path else f"TUUID:{tuuid}"
-
-        predecessor_lines = []
-        for pre_spmd_id, pre_info in predecessor_topology.items():
-            if tuuid not in pre_info.tuuid_sharding:
-                continue
-            producer_layout = self.op_manager._resolve_producer_spec(
-                tuuid, provider_map=pre_info.tuuid_sharding
-            )
-            rank_keys = [
-                key
-                for key in shards_dict.keys()
-                if isinstance(key, tuple) and len(key) == 2 and key[0] == pre_spmd_id
-            ]
-            predecessor_lines.append(
-                f"{pre_spmd_id}: producer={_describe_layout_for_error(producer_layout)}, "
-                f"mailbox_keys={rank_keys}"
-            )
+        logical_tuuid = assemble_plan.transfer.logical_tuuid
+        source_spmd_id = assemble_plan.source_spmd_id
+        source_keys = [
+            key
+            for key in shards_dict
+            if isinstance(key, tuple) and len(key) == 2 and key[0] == source_spmd_id
+        ]
 
         shard_lines = []
         for i, shard in enumerate(filtered_shards[:16]):
@@ -3493,15 +3533,15 @@ class SPMDWorker:
             )
 
         shard_summary = "; ".join(shard_lines) if shard_lines else "none"
-        predecessor_summary = (
-            "; ".join(predecessor_lines) if predecessor_lines else "none"
-        )
         return (
-            f"name={tuuid_name}, op={op_name}, tuuid={tuuid}, step={step}, "
+            f"op={op_name}, transfer_code={transfer_code}, "
+            f"logical_tuuid={logical_tuuid}, source_spmd={source_spmd_id}, "
+            f"step={step}, "
             f"consumer_rank={self.rank}, consumer={_describe_layout_for_error(input_layout)}, "
             f"mailbox_keys={list(shards_dict.keys())}, "
+            f"source_mailbox_keys={source_keys}, "
+            f"source_layout={_describe_layout_for_error(assemble_plan.source_layout)}, "
             f"filtered_shards={len(filtered_shards)}, "
-            f"predecessors=[{predecessor_summary}], "
             f"filtered_detail=[{shard_summary}]"
         )
 
@@ -3512,7 +3552,7 @@ class SPMDWorker:
     async def _assemble_tensor(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
@@ -3521,7 +3561,9 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
         if profiler_recorder is None:
-            return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
+            return self._assemble_tensor_sync(
+                op_name, transfer_code, step, shards, arrivals
+            )
         shard_count = (
             sum(len(items) for items in shards.values())
             if _profiler_enabled(self)
@@ -3529,17 +3571,22 @@ class SPMDWorker:
         )
         async with profiler_recorder.worker_assemble_tensor(
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=self._compiled_assemble_plan(
+                op_name, transfer_code
+            ).transfer.logical_tuuid,
             step=step,
             sender_count=len(shards),
             shard_count=shard_count,
         ):
-            return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
+            return self._assemble_tensor_sync(
+                op_name, transfer_code, step, shards, arrivals
+            )
 
     def _assemble_tensor_sync_traced(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
@@ -3548,7 +3595,9 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
         if profiler_recorder is None:
-            return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
+            return self._assemble_tensor_sync(
+                op_name, transfer_code, step, shards, arrivals
+            )
         shard_count = (
             sum(len(items) for items in shards.values())
             if _profiler_enabled(self)
@@ -3556,68 +3605,69 @@ class SPMDWorker:
         )
         with profiler_recorder.worker_assemble_tensor_sync(
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=self._compiled_assemble_plan(
+                op_name, transfer_code
+            ).transfer.logical_tuuid,
             step=step,
             sender_count=len(shards),
             shard_count=shard_count,
         ):
-            return self._assemble_tensor_sync(op_name, tuuid, step, shards, arrivals)
+            return self._assemble_tensor_sync(
+                op_name, transfer_code, step, shards, arrivals
+            )
 
     def _assemble_tensor_sync(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
     ) -> "TransportTensor":
-        assemble_plan = self._compiled_assemble_plan(op_name, tuuid)
-        input_layout = assemble_plan.input_layout
-        predecessor_topology = assemble_plan.predecessor_topology
+        assemble_plan = self._compiled_assemble_plan(op_name, transfer_code)
+        input_layout = assemble_plan.target_layout
 
         if assemble_plan.assembles_to_dynamic:
             return self._assemble_to_dynamic_tensor(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 shards,
                 arrivals,
-                predecessor_topology,
                 assemble_plan=assemble_plan,
             )
 
         if assemble_plan.has_dynamic_predecessor:
             return self._assemble_dynamic_to_static_tensor(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 shards,
                 input_layout,
-                predecessor_topology,
                 assemble_plan=assemble_plan,
             )
         return self._assemble_static_to_static_tensor(
             op_name,
-            tuuid,
+            transfer_code,
             step,
             shards,
             input_layout,
-            predecessor_topology,
             assemble_plan=assemble_plan,
         )
 
     def _compiled_assemble_plan(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
     ) -> CompiledAssemblePlan:
-        key = (op_name, tuuid)
+        key = (op_name, transfer_code)
         plan = self._assemble_plan_cache.get(key)
         if plan is None:
             plan = compile_assemble_plan(
                 op_manager=self.op_manager,
                 op_name=op_name,
-                tuuid=tuuid,
+                transfer_code=transfer_code,
             )
             self._assemble_plan_cache[key] = plan
         return plan
@@ -3637,73 +3687,86 @@ class SPMDWorker:
             flatten_shards=self._flatten_shards,
         )
 
-    def _protocol_empty_dynamic_tensor(
+    def _routing_miss_tensor(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         arrivals: dict[Any, dict[str, Any]],
     ) -> "TransportTensor":
+        assemble_plan = self._compiled_assemble_plan(op_name, transfer_code)
+        logical_tensor = assemble_plan.logical_tensor
+        tensor_identity = (
+            f"logical_tensor={logical_tensor.name!r} "
+            f"logical_tuuid={logical_tensor.logical_tuuid}"
+        )
         expected_values = {
             int(meta.get("expected_count", 0)) for meta in arrivals.values()
         }
         if len(expected_values) != 1:
             raise ValueError(
                 f"[Fluxway Protocol Error] Conflicting expected_count metadata "
-                f"for all-empty dynamic tensor op={op_name} tuuid={tuuid} "
+                f"for routing-miss tensor op={op_name} "
+                f"transfer_code={transfer_code} {tensor_identity} "
                 f"step={step}: {sorted(expected_values)}."
             )
         expected = next(iter(expected_values), 0)
         if expected <= 0:
             raise ValueError(
-                f"[Fluxway Protocol Error] Missing expected_count for all-empty "
-                f"dynamic tensor op={op_name} tuuid={tuuid} step={step}."
+                f"[Fluxway Protocol Error] Missing expected_count for routing-miss "
+                f"tensor op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step}."
             )
         if len(arrivals) != expected:
             raise ValueError(
-                f"[Fluxway Protocol Error] Incomplete all-empty dynamic tensor "
-                f"arrival metadata op={op_name} tuuid={tuuid} step={step}: "
+                f"[Fluxway Protocol Error] Incomplete routing-miss tensor "
+                f"arrival metadata op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step}: "
                 f"arrived={len(arrivals)} expected={expected}."
             )
 
-        first_meta = next(iter(arrivals.values()))
+        routing_miss_arrivals = {}
+        for key, meta in arrivals.items():
+            raw_tensor_kind = meta.get("tensor_kind")
+            if raw_tensor_kind is None:
+                raise ValueError(
+                    f"[Fluxway Protocol Error] Tensor arrival lacks tensor_kind "
+                    f"op={op_name} transfer_code={transfer_code} "
+                    f"{tensor_identity} step={step} sender={key}."
+                )
+            tensor_kind = TensorEntryKind(int(raw_tensor_kind))
+            if tensor_kind is TensorEntryKind.ROUTING_MISS:
+                routing_miss_arrivals[key] = meta
+                continue
+            if tensor_kind is TensorEntryKind.COMPLETED_WITHOUT_TENSOR:
+                continue
+            raise ValueError(
+                f"[Fluxway Protocol Error] Tensor kind {tensor_kind.name} has no "
+                f"business shard op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step} sender={key}."
+            )
+        if not routing_miss_arrivals:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Transfer completed without tensor but "
+                f"reached dynamic assembly op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step}."
+            )
+
+        first_meta = next(iter(routing_miss_arrivals.values()))
         first_schema = tuple(first_meta.get("payload_schema") or ())
         if not first_schema:
             raise ValueError(
-                f"[Fluxway Protocol Error] Protocol-empty tensor lacks payload schema "
-                f"op={op_name} tuuid={tuuid} step={step}."
+                f"[Fluxway Protocol Error] Routing-miss tensor lacks payload schema "
+                f"op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step}."
             )
-        first_empty_kind = first_meta.get("empty_kind")
-        if first_empty_kind is None:
-            raise ValueError(
-                f"[Fluxway Protocol Error] Protocol-empty tensor lacks empty_kind "
-                f"op={op_name} tuuid={tuuid} step={step}."
-            )
-        if EmptyKind(int(first_empty_kind)) is not EmptyKind.PROTOCOL_EMPTY:
-            raise ValueError(
-                f"[Fluxway Protocol Error] All-empty dynamic tensor must be composed "
-                f"only of PROTOCOL_EMPTY arrivals op={op_name} tuuid={tuuid} step={step}."
-            )
-
-        for key, meta in arrivals.items():
-            raw_empty_kind = meta.get("empty_kind")
-            if raw_empty_kind is None:
-                raise ValueError(
-                    f"[Fluxway Protocol Error] Protocol-empty tensor lacks empty_kind "
-                    f"op={op_name} tuuid={tuuid} step={step} sender={key}."
-                )
-            empty_kind = EmptyKind(int(raw_empty_kind))
-            if empty_kind is not EmptyKind.PROTOCOL_EMPTY:
-                raise ValueError(
-                    f"[Fluxway Protocol Error] Mixed empty semantics for dynamic tensor "
-                    f"op={op_name} tuuid={tuuid} step={step} sender={key}: "
-                    f"{empty_kind.name}."
-                )
+        for key, meta in routing_miss_arrivals.items():
             schema = tuple(meta.get("payload_schema") or ())
             if schema != first_schema:
                 raise ValueError(
-                    f"[Fluxway Protocol Error] Protocol-empty schema mismatch "
-                    f"op={op_name} tuuid={tuuid} step={step} sender={key}."
+                    f"[Fluxway Protocol Error] Routing-miss schema mismatch "
+                    f"op={op_name} transfer_code={transfer_code} "
+                    f"{tensor_identity} step={step} sender={key}."
                 )
 
         value_schema = [
@@ -3711,8 +3774,10 @@ class SPMDWorker:
         ]
         if len(value_schema) != 1:
             raise ValueError(
-                f"[Fluxway Protocol Error] Protocol-empty tensor requires exactly "
-                f"one VALUES payload schema op={op_name} tuuid={tuuid} step={step}; "
+                f"[Fluxway Protocol Error] Routing-miss tensor requires exactly "
+                f"one VALUES payload schema op={op_name} "
+                f"transfer_code={transfer_code} {tensor_identity} "
+                f"step={step}; "
                 f"got {len(value_schema)}."
             )
         shape = list(value_schema[0]["shape"])
@@ -3723,21 +3788,33 @@ class SPMDWorker:
 
         backend = get_backend()
         values = backend.zeros(tuple(shape), dtype=value_schema[0]["dtype"])
-        global_shape = first_meta.get("global_shape")
+        global_shapes = {
+            None if meta.get("global_shape") is None else tuple(meta["global_shape"])
+            for meta in routing_miss_arrivals.values()
+        }
+        if len(global_shapes) != 1:
+            raise ValueError(
+                f"[Fluxway Protocol Error] Conflicting global_shape metadata for "
+                f"routing-miss tensor op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step}: {global_shapes}."
+            )
+        global_shape = next(iter(global_shapes))
         sender_world_sizes = {
             int(meta.get("sender_world_size", 0)) for meta in arrivals.values()
         }
         if len(sender_world_sizes) != 1:
             raise ValueError(
                 f"[Fluxway Protocol Error] Conflicting sender_world_size metadata "
-                f"for all-empty dynamic tensor op={op_name} tuuid={tuuid} "
+                f"for routing-miss tensor op={op_name} "
+                f"transfer_code={transfer_code} {tensor_identity} "
                 f"step={step}: {sorted(sender_world_sizes)}."
             )
         sender_world_size = next(iter(sender_world_sizes), 0)
         if sender_world_size <= 0:
             raise ValueError(
-                f"[Fluxway Protocol Error] Missing sender_world_size for all-empty "
-                f"dynamic tensor op={op_name} tuuid={tuuid} step={step}."
+                f"[Fluxway Protocol Error] Missing sender_world_size for routing-miss "
+                f"tensor op={op_name} transfer_code={transfer_code} "
+                f"{tensor_identity} step={step}."
             )
         receipt = SymmetryReceipt(
             sender_world_size,
@@ -3748,15 +3825,15 @@ class SPMDWorker:
     def _assemble_static_to_static_tensor(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         input_layout: "PhysicalLayout",
-        predecessor_topology: dict[str, Any],
         *,
         assemble_plan: CompiledAssemblePlan,
     ) -> "TransportTensor":
         """Assemble static-to-static tensor using exact physical shards."""
+        logical_tuuid = assemble_plan.transfer.logical_tuuid
         shard_count = (
             sum(len(items) for items in shards.values())
             if _profiler_enabled(self)
@@ -3766,7 +3843,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_FILTER_SHARDS,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(shards),
             second_count=shard_count,
@@ -3780,16 +3858,17 @@ class SPMDWorker:
         if not shard_list:
             flow_detail = self._describe_shard_flow_for_error(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 shards,
                 shard_list,
                 input_layout,
-                predecessor_topology,
+                assemble_plan,
             )
             raise ValueError(
                 f"[Fluxway Assembly Error] Static-to-static assembly for op "
-                f"'{op_name}' (TUUID {tuuid}, rank {self.rank}, step {step}) "
+                f"'{op_name}' (transfer_code={transfer_code}, "
+                f"logical_tuuid={logical_tuuid}, rank {self.rank}, step {step}) "
                 f"received no routed shards. Flow detail: {flow_detail}"
             )
 
@@ -3801,7 +3880,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_CAT_VALUES,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(flat_values),
         ):
@@ -3810,7 +3890,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_MERGE_METADATA,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(shard_list),
         ):
@@ -3840,12 +3921,15 @@ class SPMDWorker:
     def _assemble_scalar_reduction(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         input_layout: "PhysicalLayout",
     ) -> TransportTensor:
         backend = get_backend()
+        logical_tuuid = self._compiled_assemble_plan(
+            op_name, transfer_code
+        ).transfer.logical_tuuid
 
         all_values = []
         for rank_shards in shards.values():
@@ -3857,7 +3941,8 @@ class SPMDWorker:
 
         if not all_values:
             raise ValueError(
-                f"No scalar shards found for TUUID {tuuid} at step {step} for reduction."
+                f"No scalar shards found for transfer_code={transfer_code}, "
+                f"logical_tuuid={logical_tuuid} at step {step} for reduction."
             )
 
         stacked = backend.stack(all_values)
@@ -3872,16 +3957,16 @@ class SPMDWorker:
     def _assemble_dynamic_to_static_tensor(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         input_layout: "PhysicalLayout",
-        predecessor_topology: dict[str, Any],
         *,
         assemble_plan: CompiledAssemblePlan,
     ) -> "TransportTensor":
         """Assemble dynamic-to-static (Sparse-to-Dense) tensor using origin_indices."""
         backend = get_backend()
+        logical_tuuid = assemble_plan.transfer.logical_tuuid
 
         shard_count = (
             sum(len(items) for items in shards.values())
@@ -3892,7 +3977,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_FILTER_SHARDS,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(shards),
             second_count=shard_count,
@@ -3926,16 +4012,17 @@ class SPMDWorker:
         if not valid_shards:
             flow_detail = self._describe_shard_flow_for_error(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 shards,
                 filtered_shards,
                 input_layout,
-                predecessor_topology,
+                assemble_plan,
             )
             raise ValueError(
                 f"[Fluxway Assembly Error] Dynamic-to-static assembly for op "
-                f"'{op_name}' (TUUID {tuuid}, rank {self.rank}, step {step}) "
+                f"'{op_name}' (transfer_code={transfer_code}, "
+                f"logical_tuuid={logical_tuuid}, rank {self.rank}, step {step}) "
                 "received no non-empty data shards. Dense SPMD inputs must be "
                 "slot-addressed by real payload rows; constructing a zero local "
                 "buffer would hide upstream routing data loss. "
@@ -3945,7 +4032,8 @@ class SPMDWorker:
         if any(getattr(s, "is_ragged", False) for s in valid_shards):
             raise ValueError(
                 f"[Fluxway Assembly Error] Dynamic-to-static assembly for op "
-                f"'{op_name}' (TUUID {tuuid}, rank {self.rank}, step {step}) "
+                f"'{op_name}' (transfer_code={transfer_code}, "
+                f"logical_tuuid={logical_tuuid}, rank {self.rank}, step {step}) "
                 "received ragged payload shards. Fluxway transport keeps dynamic "
                 "ragged streams compact; consumer-specific padding/pooling/masking "
                 "must be implemented in the SPMD operator input adapter."
@@ -3955,7 +4043,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_MERGE_METADATA,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(valid_shards),
         ):
@@ -3969,7 +4058,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_CAT_VALUES,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(valid_shards),
         ):
@@ -3993,7 +4083,8 @@ class SPMDWorker:
             if idx is None:
                 raise ValueError(
                     f"[Fluxway Protocol Error] Dynamic-to-static assembly for "
-                    f"op '{op_name}' (TUUID {tuuid}) received a shard with "
+                    f"op '{op_name}' (transfer_code={transfer_code}, "
+                    f"logical_tuuid={logical_tuuid}) received a shard with "
                     f"neither origin_indices nor routing_indices. The producer "
                     f"must attach per-row global position metadata so each row "
                     f"can be deterministically scattered into the destination "
@@ -4006,7 +4097,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_MERGE_METADATA,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(all_indices_list),
         ):
@@ -4019,7 +4111,8 @@ class SPMDWorker:
             global_shape = input_layout.global_shape
         else:
             raise ValueError(
-                f"[Fluxway Assembly Error] Dynamic-to-Static conversion failed for TUUID {tuuid}. "
+                f"[Fluxway Assembly Error] Dynamic-to-Static conversion failed for "
+                f"transfer_code={transfer_code}, logical_tuuid={logical_tuuid}. "
                 "Global shape information is missing. Inference from raw indices is forbidden. "
                 "Please Ensure the producer TransportTensor has global_shape set."
             )
@@ -4041,7 +4134,8 @@ class SPMDWorker:
             raise ValueError(
                 f"[Fluxway Assembly Error] global_shape[{routing_dim}]={routing_extent} "
                 f"is not divisible by shard_count={num_shards} "
-                f"in op '{op_name}' (TUUID {tuuid}). "
+                f"in op '{op_name}' (transfer_code={transfer_code}, "
+                f"logical_tuuid={logical_tuuid}). "
                 f"This causes partition boundary misalignment between producers and consumers. "
                 f"Ensure the upstream batch_size is divisible by the DP world_size."
             )
@@ -4056,7 +4150,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_SCATTER,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=logical_len_early,
             second_count=buffer_capacity,
@@ -4073,7 +4168,8 @@ class SPMDWorker:
             if n_unique_slots > buffer_capacity:
                 raise ValueError(
                     f"[Fluxway Assembly Error] Dynamic-to-static buffer overflow in op '{op_name}' "
-                    f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
+                    f"(transfer_code={transfer_code}, logical_tuuid={logical_tuuid}, "
+                    f"rank {self.rank}, step {step}). "
                     f"Received {logical_len_early} data elements mapping to {n_unique_slots} unique "
                     f"buffer positions, but buffer capacity is {buffer_capacity} "
                     f"(global_shape={global_shape}, local_shape={local_shape}). "
@@ -4085,7 +4181,8 @@ class SPMDWorker:
             if logical_len_early > 0 and n_unique_slots < logical_len_early:
                 logger.warning(
                     f"[Fluxway Assembly Warning] origin_indices collision detected in op '{op_name}' "
-                    f"(TUUID {tuuid}, rank {self.rank}, step {step}). "
+                    f"(transfer_code={transfer_code}, logical_tuuid={logical_tuuid}, "
+                    f"rank {self.rank}, step {step}). "
                     f"{logical_len_early} data elements map to only {n_unique_slots} unique buffer positions. "
                     f"{logical_len_early - n_unique_slots} elements will be silently overwritten by index_update. "
                     f"This usually indicates the producer uses row-level origin_indices for multi-column features, "
@@ -4131,11 +4228,10 @@ class SPMDWorker:
     def _assemble_to_dynamic_tensor(
         self,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
         step: int,
         shards: dict[Any, list[Any]],
         arrivals: dict[Any, dict[str, Any]],
-        predecessor_topology: dict[str, Any],
         *,
         assemble_plan: CompiledAssemblePlan,
     ) -> "TransportTensor":
@@ -4144,13 +4240,15 @@ class SPMDWorker:
         Handles both static_to_dynamic and dynamic_to_dynamic scenarios.
         """
         backend = get_backend()
+        logical_tuuid = assemble_plan.transfer.logical_tuuid
 
         shard_count = sum(len(items) for items in shards.values())
         with _assemble_detail_span(
             self,
             spec=WORKER_ASSEMBLE_FILTER_SHARDS,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(shards),
             second_count=shard_count,
@@ -4163,21 +4261,22 @@ class SPMDWorker:
         if not filtered_shards:
             filtered_arrivals = assemble_plan.collect_arrivals(arrivals)
             if filtered_arrivals:
-                return self._protocol_empty_dynamic_tensor(
-                    op_name, tuuid, step, filtered_arrivals
+                return self._routing_miss_tensor(
+                    op_name, transfer_code, step, filtered_arrivals
                 )
             flow_detail = self._describe_shard_flow_for_error(
                 op_name,
-                tuuid,
+                transfer_code,
                 step,
                 shards,
                 filtered_shards,
                 None,
-                predecessor_topology,
+                assemble_plan,
             )
             raise ValueError(
                 f"[Fluxway Assembly Error] Dynamic assembly for op '{op_name}' "
-                f"(TUUID {tuuid}, rank {self.rank}, step {step}) received no "
+                f"(transfer_code={transfer_code}, logical_tuuid={logical_tuuid}, "
+                f"rank {self.rank}, step {step}) received no "
                 "arrived shards. Dynamic inputs require an explicit empty or "
                 "non-empty packet from every expected sender; synthesizing an "
                 f"empty TransportTensor would hide a transport/barrier bug. "
@@ -4189,7 +4288,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_CAT_VALUES,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(all_values_list),
         ):
@@ -4198,7 +4298,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_MERGE_METADATA,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(filtered_shards),
         ):
@@ -4218,7 +4319,8 @@ class SPMDWorker:
                 if idx is None:
                     raise ValueError(
                         f"[Fluxway Protocol Error] Dynamic assembly for op "
-                        f"'{op_name}' (TUUID {tuuid}) received an inconsistent "
+                        f"'{op_name}' (transfer_code={transfer_code}, "
+                        f"logical_tuuid={logical_tuuid}) received an inconsistent "
                         f"set of shards: some carry routing_indices and some "
                         f"do not.  routing_indices encode per-row *global* "
                         f"positions; producers must agree on whether to emit "
@@ -4231,7 +4333,8 @@ class SPMDWorker:
                 self,
                 spec=WORKER_ASSEMBLE_MERGE_METADATA,
                 op_name=op_name,
-                tuuid=tuuid,
+                transfer_code=transfer_code,
+                logical_tuuid=logical_tuuid,
                 step=step,
                 first_count=len(indices_list),
             ):
@@ -4244,7 +4347,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_MERGE_METADATA,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(filtered_shards),
         ):
@@ -4259,7 +4363,8 @@ class SPMDWorker:
             self,
             spec=WORKER_ASSEMBLE_MERGE_METADATA,
             op_name=op_name,
-            tuuid=tuuid,
+            transfer_code=transfer_code,
+            logical_tuuid=logical_tuuid,
             step=step,
             first_count=len(filtered_shards),
         ):
@@ -4332,7 +4437,8 @@ class SPMDWorker:
                     self,
                     spec=WORKER_ASSEMBLE_SORT,
                     op_name=op_name,
-                    tuuid=tuuid,
+                    transfer_code=transfer_code,
+                    logical_tuuid=logical_tuuid,
                     step=step,
                     first_count=actual_len,
                     second_count=cap,
@@ -4507,23 +4613,48 @@ class SPMDWorker:
         result: ExecutionResult,
         *,
         exec_step: int,
-        step_tuuid_cache: dict[int, Any],
+        step_transfer_cache: dict[int, Any],
     ) -> tuple[asyncio.Task, ...]:
         """Send output to successor SPMDs using TransportTensor."""
-        if result.status in (
-            ExecutionStatus.SKIPPED,
-            ExecutionStatus.EMPTY_PROPAGATION,
-        ) or (result.status is ExecutionStatus.SUCCESS and result.data is None):
-            # If the result is None (e.g., end of stream or no data Produced),
-            # we must propagate empty packets to all successors to prevent deadlocks.
-            return await self._propagate_empty_packets(op_name, exec_step)
-
+        if result.status is ExecutionStatus.INACTIVE:
+            return ()
         send_context = self._operator_send_context(op_name)
+        if not send_context.successor_contexts:
+            return ()
+        if result.status is ExecutionStatus.SKIPPED:
+            dependency_decisions = skipped_dependency_decisions(
+                send_context.compiled_plan
+            )
+            return await self._propagate_skipped_completion(
+                op_name,
+                exec_step,
+                dependency_decisions,
+            )
+        if send_context.compiled_plan.dependency_conditions:
+            dependency_decisions = await evaluate_dependency_decisions(
+                send_context.compiled_plan,
+                result,
+            )
+        else:
+            dependency_decisions = None
+        if result.status is ExecutionStatus.COMPLETED_WITHOUT_TENSOR or (
+            result.status is ExecutionStatus.SUCCESS and result.data is None
+        ):
+            return await self._propagate_completed_without_tensor(
+                op_name,
+                exec_step,
+                dependency_decisions,
+            )
+
         # Flatten the result using guided tree_flatten
-        meta = self.op_manager.get_operator_metadata(op_name)
+        meta = self.op_manager.get_operator_spec(op_name)
         flat_results, treedef = tree_flatten(
             result.data,
-            treedef_template=meta.output_treedef if meta is not None else None,
+            treedef_template=(
+                None
+                if meta.output_treedef is None
+                else meta.output_treedef.materialize()
+            ),
         )
 
         profiler_recorder = (
@@ -4548,8 +4679,9 @@ class SPMDWorker:
             tasks = await self._send_step_data_plane_frames_background(
                 flat_results,
                 send_context,
-                step_tuuid_cache,
+                step_transfer_cache,
                 exec_step,
+                dependency_decisions,
             )
             return tuple(tasks)
 
@@ -4565,77 +4697,97 @@ class SPMDWorker:
             ):
                 send_tasks = await send_successor_frames()
 
-        for context in send_context.successor_contexts:
-            spmd_id = context.spmd_id
-            succ_info = context.info
-            # --- Send control_argument via control plane ---
-            if state_data:
-                # Check condition
-                if succ_info.condition_fn is not None:
-                    if not succ_info.condition_fn(result):
-                        continue
-
-                # Collect all state names and values for this target
-                names_to_send = []
-                values_to_send = []
-                # Leader of the active group/SPMD sends to avoid duplicates
-                is_leader = self.rank % succ_info.interleave_unit_size == 0
-
-                for state_name, state_value in state_data.items():
-                    # Control states are mapped by name (str), not TUUID (int).
-                    # TODO(He Jia): Currently we assume names match across the edge unless a state-specific map is added.
-                    target_state_name = state_name
-                    if is_leader:
-                        names_to_send.append(target_state_name)
-                        # Materialize device tensors to host numpy at the
-                        # control-plane (Ray pickle) boundary so the
-                        # backend-free driver can deserialize safely.
-                        values_to_send.append(ensure_cpu_serializable(state_value))
-
-                if names_to_send:
-                    logger.debug(
-                        f"Sending control_arguments names={names_to_send} "
-                        f"step={exec_step} target_spmd_id={spmd_id} "
-                        f"spmd_id={self.spmd_id} rank={self.rank}"
-                    )
-                    if self._driver_handle is not None:
-                        try:
-                            self._driver_handle.routing_control_argument_to_controller.remote(
-                                spmd_id,
-                                op_name,
-                                names_to_send,
-                                exec_step,
-                                values_to_send,
-                            )
-                        except Exception as e:
-                            logger.error(
-                                f"Failed to send control_arguments via driver error={e} "
-                                f"target_spmd_id={spmd_id} spmd_id={self.spmd_id} rank={self.rank}"
-                            )
+        self._send_control_arguments(
+            send_context=send_context,
+            state_data=state_data,
+            exec_step=exec_step,
+            dependency_decisions=dependency_decisions,
+        )
         return send_tasks
+
+    def _send_control_arguments(
+        self,
+        *,
+        send_context: _OperatorSendContext,
+        state_data: dict[str, Any],
+        exec_step: int,
+        dependency_decisions: DependencyDecisions,
+    ) -> None:
+        if not state_data:
+            return
+        names = list(state_data)
+        values = [ensure_cpu_serializable(state_data[name]) for name in names]
+        seen_codes: set[int] = set()
+        for context in send_context.successor_contexts:
+            for dependency in context.dependencies:
+                if dependency.code in seen_codes:
+                    raise ValueError(
+                        f"Duplicate control dependency code {dependency.code}."
+                    )
+                seen_codes.add(dependency.code)
+                source_spec = dependency.source_operator.spec
+                leader_group_size = (
+                    source_spec.interleave_unit_size
+                    if source_spec.is_interleaved
+                    else dependency.source_world_size
+                )
+                if leader_group_size <= 0:
+                    raise ValueError(
+                        f"Dependency code {dependency.code} has invalid control "
+                        f"leader group size {leader_group_size}."
+                    )
+                if self.rank % leader_group_size != 0:
+                    continue
+                if dependency.spec.condition is not None:
+                    if (
+                        dependency_decisions is None
+                        or dependency.code not in dependency_decisions
+                    ):
+                        raise ValueError(
+                            f"Missing condition decision for dependency code "
+                            f"{dependency.code}."
+                        )
+                    decision = dependency_decisions[dependency.code]
+                    if decision is DependencyDecision.SKIP:
+                        continue
+                if self._driver_handle is None:
+                    raise RuntimeError(
+                        f"Cannot send control values for dependency code "
+                        f"{dependency.code} without a driver handle."
+                    )
+                target = dependency.spec.target
+                self._driver_handle.routing_control_argument_to_controller.remote(
+                    target.spmd_id,
+                    target.op_id,
+                    names,
+                    exec_step,
+                    values,
+                )
 
     async def _send_step_data_plane_frames_background(
         self,
         flat_results: list[Any],
         send_context: _OperatorSendContext,
-        step_tuuid_cache: dict[int, Any],
+        step_transfer_cache: dict[int, Any],
         exec_step: int,
+        dependency_decisions: DependencyDecisions,
     ) -> list[asyncio.Task[Any]]:
         await self._deposit_local_only_outputs(
             flat_results,
             send_context,
-            step_tuuid_cache,
+            step_transfer_cache,
             exec_step,
+            dependency_decisions,
         )
-        compiled_plan, successor_handlers = self._non_local_send_plan(send_context)
-        if compiled_plan is None:
+        transport = send_context.transport
+        if transport is None:
             return []
-        return await self._data_plane_executor.send_step_frames(
-            compiled_plan=compiled_plan,
+        return await self._data_plane_executor.send_tensor_frames(
+            compiled_plan=transport.compiled_plan,
             flat_results=flat_results,
-            step_tuuid_cache=step_tuuid_cache,
+            step_transfer_cache=step_transfer_cache,
             exec_step=exec_step,
-            successor_handlers=successor_handlers,
+            successor_handlers=transport.successor_handlers,
             source_spmd_id=self.spmd_id,
             batch_max_frames=self._data_plane_batch_max_frames,
             batch_flush_us=self._data_plane_batch_flush_us,
@@ -4645,6 +4797,9 @@ class SPMDWorker:
             delivery_schedule_key=self._effective_schedule_key(
                 send_context.compiled_plan.op_name, exec_step
             ),
+            dependency_decisions=transport.select_dependency_decisions(
+                dependency_decisions
+            ),
         )
 
     def _delivery_submitter(self, op_name: str, step: int):
@@ -4653,35 +4808,25 @@ class SPMDWorker:
             schedule_key=self._effective_schedule_key(op_name, step),
         )
 
-    def _non_local_send_plan(
-        self, send_context: _OperatorSendContext
-    ) -> tuple[CompiledSendPlan | None, tuple[dict[int, Any], ...]]:
-        routes = []
-        handlers = []
-        for route, route_handlers in zip(
-            send_context.compiled_plan.successor_routes,
-            send_context.successor_handlers,
-            strict=True,
-        ):
-            if route.local_only:
-                continue
-            routes.append(replace(route, context_index=len(routes)))
-            handlers.append(route_handlers)
-        if not routes:
-            return None, ()
-        return (
-            replace(send_context.compiled_plan, successor_routes=tuple(routes)),
-            tuple(handlers),
-        )
-
     async def _deposit_local_only_outputs(
         self,
         flat_results: list[Any],
         send_context: _OperatorSendContext,
-        step_tuuid_cache: dict[int, Any],
+        step_transfer_cache: dict[int, Any],
         exec_step: int,
+        dependency_decisions: DependencyDecisions,
     ) -> None:
         wrapped_results: dict[int, TransportTensor] = {}
+        await self._deposit_local_only_orderings(
+            send_context.compiled_plan,
+            exec_step,
+            dependency_decisions,
+        )
+        await self._deposit_local_only_dependency_decisions(
+            send_context.compiled_plan,
+            exec_step,
+            dependency_decisions,
+        )
         for route in send_context.compiled_plan.successor_routes:
             if not route.local_only:
                 continue
@@ -4691,69 +4836,112 @@ class SPMDWorker:
                     f"source={self.spmd_id}:{self.rank} target={route.spmd_id}."
                 )
             for tensor_route in route.tensor_routes:
+                if (
+                    dependency_decisions is not None
+                    and dependency_decisions.get(tensor_route.dependency_code)
+                    is DependencyDecision.SKIP
+                ):
+                    continue
                 if tensor_route.output_index >= len(flat_results):
-                    continue
-                raw_leaf = flat_results[tensor_route.output_index]
-                if raw_leaf is None:
-                    continue
-                leaf_tensor = wrapped_results.get(tensor_route.output_index)
-                if leaf_tensor is None:
-                    if isinstance(raw_leaf, TransportTensor):
-                        leaf_tensor = raw_leaf
-                    else:
-                        leaf_tensor = TransportTensor.from_tensor(raw_leaf)
-                    ensure_transport_source_step(
-                        op_name=send_context.compiled_plan.op_name,
-                        tensor_name=tensor_route.tensor_name,
-                        tensor=leaf_tensor,
-                        exec_step=exec_step,
-                    )
-                    wrapped_results[tensor_route.output_index] = leaf_tensor
-                else:
-                    ensure_transport_source_step(
-                        op_name=send_context.compiled_plan.op_name,
-                        tensor_name=tensor_route.tensor_name,
-                        tensor=leaf_tensor,
-                        exec_step=exec_step,
-                    )
-                leaf_tensor = inherit_mirror_metadata(
-                    op_name=send_context.compiled_plan.op_name,
-                    tuuid=tensor_route.tuuid,
-                    leaf_tensor=leaf_tensor,
-                    source_spec=tensor_route.source_spec,
-                    tuuid_to_name=send_context.tuuid_to_name,
-                    step_tuuid_cache=step_tuuid_cache,
-                    exec_step=exec_step,
-                    spmd_id=self.spmd_id,
-                    rank=self.rank,
-                )
-                target_ops = self.op_manager.get_operators_for_tuuid(tensor_route.tuuid)
-                if not target_ops:
                     raise ValueError(
-                        "local_only route has no local consumer for tuuid="
-                        f"{tensor_route.tuuid} op={send_context.compiled_plan.op_name} "
-                        f"source={self.spmd_id}:{self.rank}."
+                        f"Operator {send_context.compiled_plan.op_name!r} produced "
+                        f"{len(flat_results)} flat outputs, but transfer code "
+                        f"{tensor_route.transfer_code} requires output index "
+                        f"{tensor_route.output_index}."
                     )
-                for target_op in target_ops:
-                    if self._uses_direct_local_input_fast_path(target_op):
-                        self._deposit_direct_local_input(
-                            op_name=target_op,
-                            tuuid=tensor_route.tuuid,
-                            step=exec_step,
-                            sender_id=self.spmd_id,
-                            rank=self.rank,
-                            tensor=leaf_tensor,
-                        )
-                    else:
-                        self._ensure_step_declared(target_op, exec_step)
-                        await self._mailbox.deposit_local_tensor(
-                            target_op,
-                            tensor_route.tuuid,
-                            exec_step,
-                            self.spmd_id,
-                            self.rank,
-                            leaf_tensor,
-                        )
+                raw_leaf = flat_results[tensor_route.output_index]
+                leaf_tensor = prepare_route_tensor(
+                    compiled_plan=send_context.compiled_plan,
+                    route=tensor_route,
+                    raw_leaf=raw_leaf,
+                    step_transfer_cache=step_transfer_cache,
+                    exec_step=exec_step,
+                    wrapped_results=wrapped_results,
+                )
+                target_op = tensor_route.target_op
+                if self._uses_direct_local_input_fast_path(target_op):
+                    self._deposit_direct_local_input(
+                        op_name=target_op,
+                        transfer_code=tensor_route.transfer_code,
+                        step=exec_step,
+                        sender_id=self.spmd_id,
+                        rank=self.rank,
+                        tensor=leaf_tensor,
+                    )
+                else:
+                    self._ensure_step_declared(target_op, exec_step)
+                    await self._mailbox.deposit_local_tensor(
+                        target_op,
+                        tensor_route.transfer_code,
+                        exec_step,
+                        self.spmd_id,
+                        self.rank,
+                        leaf_tensor,
+                    )
+
+    async def _deposit_local_only_dependency_decisions(
+        self,
+        compiled_plan: CompiledSendPlan,
+        step: int,
+        dependency_decisions: DependencyDecisions,
+    ) -> None:
+        if not dependency_decisions:
+            return
+        for route in compiled_plan.successor_routes:
+            if not route.local_only:
+                continue
+            for dependency_decision_route in route.dependency_decision_routes:
+                decision = dependency_decisions.get(
+                    dependency_decision_route.dependency_code
+                )
+                if decision is None:
+                    continue
+                if dependency_decision_route.target_ranks != (self.rank,):
+                    raise ValueError(
+                        "local_only dependency decision "
+                        f"code={dependency_decision_route.dependency_code} must target rank "
+                        f"{self.rank}, got {dependency_decision_route.target_ranks}."
+                    )
+                self._ensure_step_declared(dependency_decision_route.target_op, step)
+                await self._mailbox.deposit_dependency_decision(
+                    dependency_decision_route.target_op,
+                    dependency_decision_route.dependency_code,
+                    step,
+                    sender_id=self.spmd_id,
+                    rank=self.rank,
+                    expected_count=dependency_decision_route.expected_count,
+                    decision=decision,
+                )
+
+    async def _deposit_local_only_orderings(
+        self,
+        compiled_plan: CompiledSendPlan,
+        step: int,
+        dependency_decisions: DependencyDecisions,
+    ) -> None:
+        for route in compiled_plan.successor_routes:
+            if not route.local_only:
+                continue
+            for ordering in route.ordering_routes:
+                if (
+                    dependency_decisions is not None
+                    and ordering.dependency_code in dependency_decisions
+                ):
+                    continue
+                if ordering.target_ranks != (self.rank,):
+                    raise ValueError(
+                        f"local_only ordering dependency code={ordering.dependency_code} "
+                        f"must target rank {self.rank}, got {ordering.target_ranks}."
+                    )
+                self._ensure_step_declared(ordering.target_op, step)
+                await self._mailbox.deposit_ordering(
+                    ordering.target_op,
+                    ordering.dependency_code,
+                    step,
+                    sender_id=self.spmd_id,
+                    rank=self.rank,
+                    expected_count=ordering.expected_count,
+                )
 
     def _reconstruct_data_type_from_dict(self, cls: type, data: dict[str, Any]) -> Any:
         """Reconstruct a @data_type or dataclass from a nested dictionary of fields."""
@@ -4929,7 +5117,8 @@ class SPMDWorker:
             return
 
         # Determine status
-        if self._last_error:
+        failure = self._failure
+        if failure is not None:
             status = WorkerStatus.ERROR
         elif any(not event.is_set() for event in self._op_runnable.values()):
             status = WorkerStatus.BLOCKED
@@ -4942,7 +5131,7 @@ class SPMDWorker:
             rank=self.rank,
             timestamp=time.time(),
             status=status,
-            error_message=self._last_error,
+            failure=failure,
         )
 
         try:
@@ -4956,29 +5145,42 @@ class SPMDWorker:
                 f"Failed to send heartbeat error={e} spmd_id={self.spmd_id} rank={self.rank}"
             )
 
-    def _actor_owned_operator_names(self) -> set[str | None]:
-        executor = self._local_step_plan_executor.user_callable_executor
-        return executor.actor_owned_operator_names()
+    def _operator_instance(self, op_name: str) -> Any | None:
+        op_meta = self._operator_specs.get(op_name)
+        if op_meta is None:
+            raise RuntimeError(
+                f"Operator {op_name} not found in config "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
+            )
+        cls = op_meta.owner
+        if cls is None:
+            return None
+        storage, lock = get_instance_storage()
+        with lock:
+            instance = storage.get(id(cls))
+        if instance is None:
+            raise RuntimeError(
+                f"Operator {op_name} instance is not initialized "
+                f"spmd_id={self.spmd_id} rank={self.rank}"
+            )
+        return instance
+
+    def _operator_instances(self) -> dict[str, Any]:
+        if self._op_manager is None:
+            return {}
+        instances: dict[str, Any] = {}
+        seen: set[int] = set()
+        for op_name in self._operator_specs:
+            instance = self._operator_instance(op_name)
+            if instance is None or id(instance) in seen:
+                continue
+            seen.add(id(instance))
+            instances[op_name] = instance
+        return instances
 
     async def _shutdown_local_operator_instances(self) -> None:
-        actor_owned_ops = self._actor_owned_operator_names()
-        storage, lock = get_instance_storage()
-        instances: dict[int, Any] = {}
-        for op_name, op_meta in (self.config.operator_metas or {}).items():
-            if op_name in actor_owned_ops or not op_meta.owner_class_qualname:
-                continue
-            cls = _resolve_owner_class(
-                op_meta.owner_class_module,
-                op_meta.owner_class_qualname,
-            )
-            if cls is None:
-                continue
-            with lock:
-                instance = storage.get(id(cls))
-            if instance is not None:
-                instances.setdefault(id(instance), instance)
         shutdown_errors: list[Exception] = []
-        for instance in instances.values():
+        for instance in self._operator_instances().values():
             hook = getattr(instance, "on_shutdown", None)
             if not callable(hook):
                 continue
@@ -5010,32 +5212,10 @@ class SPMDWorker:
             )
         await self._drain_outbound_tasks()
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
-        await self._local_step_plan_executor.user_callable_executor.trigger_snapshot_begin(
-            spmd_dir
-        )
-        if self._op_manager:
-            actor_owned_ops = self._actor_owned_operator_names()
-            seen_cls_ids: set = set()
-            storage, lock = get_instance_storage()
-            for op_name, op_meta in (self.config.operator_metas or {}).items():
-                if op_name in actor_owned_ops:
-                    continue
-                if not op_meta.owner_class_qualname:
-                    continue
-                cls = _resolve_owner_class(
-                    op_meta.owner_class_module, op_meta.owner_class_qualname
-                )
-                if cls is None or id(cls) in seen_cls_ids:
-                    continue
-                seen_cls_ids.add(id(cls))
-                with lock:
-                    instance = storage.get(id(cls))
-                if instance is None:
-                    continue
-                if hasattr(instance, "on_snapshot_begin") and callable(
-                    instance.on_snapshot_begin
-                ):
-                    instance.on_snapshot_begin(spmd_dir)
+        for instance in self._operator_instances().values():
+            hook = getattr(instance, "on_snapshot_begin", None)
+            if callable(hook):
+                hook(spmd_dir)
 
     async def trigger_snapshot_commit(
         self, ckpt_dir: str, step: int, gathered_states: dict[str, dict[int, dict]]
@@ -5052,37 +5232,10 @@ class SPMDWorker:
             )
         await self._drain_outbound_tasks()
         spmd_dir = str(Path(ckpt_dir) / str(step) / self.spmd_id)
-        await self._local_step_plan_executor.user_callable_executor.trigger_snapshot_commit(
-            spmd_dir,
-            {
-                op_name: gathered_states.get(op_name, {})
-                for op_name in (self.config.operator_metas or {})
-            },
-        )
-        if self._op_manager:
-            actor_owned_ops = self._actor_owned_operator_names()
-            seen_cls_ids: set = set()
-            storage, lock = get_instance_storage()
-            for op_name, op_meta in (self.config.operator_metas or {}).items():
-                if op_name in actor_owned_ops:
-                    continue
-                if not op_meta.owner_class_qualname:
-                    continue
-                cls = _resolve_owner_class(
-                    op_meta.owner_class_module, op_meta.owner_class_qualname
-                )
-                if cls is None or id(cls) in seen_cls_ids:
-                    continue
-                seen_cls_ids.add(id(cls))
-                with lock:
-                    instance = storage.get(id(cls))
-                if instance is None:
-                    continue
-                if hasattr(instance, "on_snapshot_commit") and callable(
-                    instance.on_snapshot_commit
-                ):
-                    op_states = gathered_states.get(op_name, {})
-                    instance.on_snapshot_commit(spmd_dir, op_states)
+        for op_name, instance in self._operator_instances().items():
+            hook = getattr(instance, "on_snapshot_commit", None)
+            if callable(hook):
+                hook(spmd_dir, gathered_states.get(op_name, {}))
 
     async def save_state_to_disk(
         self, ckpt_dir: str, step: int
@@ -5243,89 +5396,24 @@ class SPMDWorker:
             self._spawn_background_task(self._enqueue(op_name, count))
 
     async def _collect_operator_save_state(self, ckpt_dir: str) -> dict[str, Any]:
-        states = self._call_operator_save_state(ckpt_dir)
-        actor_states = (
-            await self._local_step_plan_executor.user_callable_executor.save_state(
-                ckpt_dir
-            )
-        )
-        states.update(actor_states)
-        return states
+        return self._call_operator_save_state(ckpt_dir)
 
     async def _restore_operator_state(
         self, operator_states: dict[str, Any], ckpt_dir: str
     ) -> None:
-        local_states = self._filter_local_operator_states(operator_states)
-        if local_states:
-            self._call_operator_restore_state(local_states, ckpt_dir)
-        await self._local_step_plan_executor.user_callable_executor.restore_state(
-            operator_states, ckpt_dir
-        )
-
-    def _filter_local_operator_states(
-        self, operator_states: dict[str, Any]
-    ) -> dict[str, Any]:
-        actor_owned_ops = self._actor_owned_operator_names()
-        storage, lock = get_instance_storage()
-        local_states: dict[str, Any] = {}
-        for op_name, op_state in operator_states.items():
-            if op_name in actor_owned_ops:
-                continue
-            op_meta = (self.config.operator_metas or {}).get(op_name)
-            if op_meta is None:
-                raise RuntimeError(
-                    f"Operator {op_name} not found in config during restore "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
-            if not op_meta.owner_class_qualname:
-                continue
-            cls = _resolve_owner_class(
-                op_meta.owner_class_module, op_meta.owner_class_qualname
-            )
-            if cls is None:
-                raise RuntimeError(
-                    f"Operator '{op_name}' failed to resolve class "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
-            with lock:
-                instance = storage.get(id(cls))
-            if instance is not None:
-                local_states[op_name] = op_state
-        return local_states
+        self._call_operator_restore_state(operator_states, ckpt_dir)
 
     def _call_operator_save_state(self, ckpt_dir: str) -> dict[str, Any]:
         """Call save_state() on each operator instance and collect results."""
-        actor_owned_ops = self._actor_owned_operator_names()
-        seen_cls_ids: set = set()
         states: dict[str, Any] = {}
-        for op_name, op_meta in (self.config.operator_metas or {}).items():
-            if op_name in actor_owned_ops:
-                continue
-            if not op_meta.owner_class_qualname:
-                continue
-            cls = _resolve_owner_class(
-                op_meta.owner_class_module, op_meta.owner_class_qualname
-            )
-            if cls is None or id(cls) in seen_cls_ids:
-                continue
-            seen_cls_ids.add(id(cls))
+        for op_name in self._operator_instances():
             state = self._call_single_operator_save_state(op_name, ckpt_dir)
             if state is not None:
                 states[op_name] = state
         return states
 
     def _call_single_operator_save_state(self, op_name: str, ckpt_dir: str) -> Any:
-        op_meta = (self.config.operator_metas or {}).get(op_name)
-        if op_meta is None or not op_meta.owner_class_qualname:
-            return None
-        cls = _resolve_owner_class(
-            op_meta.owner_class_module, op_meta.owner_class_qualname
-        )
-        if cls is None:
-            return None
-        storage, lock = get_instance_storage()
-        with lock:
-            instance = storage.get(id(cls))
+        instance = self._operator_instance(op_name)
         if instance is None:
             return None
         if not (hasattr(instance, "save_state") and callable(instance.save_state)):
@@ -5335,25 +5423,8 @@ class SPMDWorker:
         return instance.save_state()
 
     def _call_operator_restore_target_state(self) -> dict[str, Any]:
-        actor_owned_ops = self._actor_owned_operator_names()
-        seen_cls_ids: set = set()
         states: dict[str, Any] = {}
-        storage, lock = get_instance_storage()
-        for op_name, op_meta in (self.config.operator_metas or {}).items():
-            if op_name in actor_owned_ops:
-                continue
-            if not op_meta.owner_class_qualname:
-                continue
-            cls = _resolve_owner_class(
-                op_meta.owner_class_module, op_meta.owner_class_qualname
-            )
-            if cls is None or id(cls) in seen_cls_ids:
-                continue
-            seen_cls_ids.add(id(cls))
-            with lock:
-                instance = storage.get(id(cls))
-            if instance is None:
-                continue
+        for op_name, instance in self._operator_instances().items():
             target_fn = getattr(instance, "restore_target_state", None)
             if callable(target_fn):
                 states[op_name] = target_fn()
@@ -5375,26 +5446,10 @@ class SPMDWorker:
     def _call_single_operator_restore_state(
         self, op_name: str, op_state: Any, ckpt_dir: str
     ) -> None:
-        storage, lock = get_instance_storage()
-        op_meta = (self.config.operator_metas or {}).get(op_name)
-        if op_meta is None:
-            raise RuntimeError(
-                f"Operator {op_name} not found in config during restore "
-                f"spmd_id={self.spmd_id} rank={self.rank}"
-            )
-        cls = _resolve_owner_class(
-            op_meta.owner_class_module, op_meta.owner_class_qualname
-        )
-        if cls is None:
-            raise RuntimeError(
-                f"Operator '{op_name}' failed to resolve class "
-                f"spmd_id={self.spmd_id} rank={self.rank}"
-            )
-        with lock:
-            instance = storage.get(id(cls))
+        instance = self._operator_instance(op_name)
         if instance is None:
             raise RuntimeError(
-                f"Operator {op_name} instance not found in _instance_storage during restore "
+                f"Operator {op_name} has no stateful owner during restore "
                 f"spmd_id={self.spmd_id} rank={self.rank}"
             )
         if hasattr(instance, "restore_state") and callable(instance.restore_state):
@@ -5404,64 +5459,47 @@ class SPMDWorker:
                 instance.restore_state(op_state)
 
     async def inspect_operator_state(self) -> dict[str, Any]:
-        seen_cls_ids: set[int] = set()
         snapshots: dict[str, Any] = {}
-        storage, lock = get_instance_storage()
-        for op_name, op_meta in (self.config.operator_metas or {}).items():
-            if not op_meta.owner_class_qualname:
-                continue
-            cls = _resolve_owner_class(
-                op_meta.owner_class_module, op_meta.owner_class_qualname
-            )
-            if cls is None or id(cls) in seen_cls_ids:
-                continue
-            seen_cls_ids.add(id(cls))
-            with lock:
-                instance = storage.get(id(cls))
-            if instance is None:
-                continue
+        for op_name, instance in self._operator_instances().items():
             snapshot_fn = getattr(instance, "audit_state_snapshot", None)
             if callable(snapshot_fn):
                 snapshots[op_name] = snapshot_fn()
         operator_inputs: dict[str, Any] = {}
-        tuuid_consumers: dict[str, list[str]] = {}
+        transfer_targets: dict[str, str] = {}
         if self._op_manager is not None:
-            for op_name in sorted(self.config.operator_metas or {}):
+            for op_name in sorted(self._operator_specs):
                 input_sharding = self.op_manager.get_input_sharding(op_name)
-                expected_tuuids = self.op_manager.get_expected_tuuids(op_name)
-                predecessor_topology = self.op_manager.get_predecessor_topology(op_name)
-                successor_topology = self.op_manager.get_successor_topology(op_name)
+                input_transfer_codes = self.op_manager.get_input_transfer_codes(op_name)
+                expected_transfer_codes = self.op_manager.get_expected_transfer_codes(
+                    op_name
+                )
+                predecessor_routes = self.op_manager.get_predecessor_routes(op_name)
+                successor_routes = self.op_manager.get_successor_routes(op_name)
                 operator_inputs[op_name] = {
-                    "input_sharding_tuuids": sorted(u for u in input_sharding),
-                    "expected_tuuids": sorted(u for u in expected_tuuids),
-                    "output_tuuids": sorted(
-                        u for u in self.op_manager.get_output_tuuids(op_name)
+                    "input_transfer_codes": dict(sorted(input_transfer_codes.items())),
+                    "input_sharding_transfer_codes": sorted(input_sharding),
+                    "expected_transfer_codes": expected_transfer_codes,
+                    "expected_transfer_shards": self.op_manager.get_expected_transfer_shards(
+                        op_name
                     ),
-                    "predecessors": {
-                        spmd_id: {
-                            "world_size": info.world_size,
-                            "tuuid_map": dict(sorted(info.tuuid_map.items())),
-                            "tuuid_sharding": sorted(
-                                tuuid for tuuid in info.tuuid_sharding
-                            ),
-                        }
-                        for spmd_id, info in sorted(predecessor_topology.items())
-                    },
-                    "successors": {
-                        spmd_id: {
-                            "world_size": info.world_size,
-                            "tuuid_map": dict(sorted(info.tuuid_map.items())),
-                            "tuuid_sharding": sorted(
-                                tuuid for tuuid in info.tuuid_sharding
-                            ),
-                        }
-                        for spmd_id, info in sorted(successor_topology.items())
-                    },
+                    "output_logical_tuuids": self.op_manager.get_output_tuuids(op_name),
+                    "predecessors": [
+                        _route_inspection_snapshot(route)
+                        for route in sorted(
+                            predecessor_routes,
+                            key=lambda item: item.transfer_code,
+                        )
+                    ],
+                    "successors": [
+                        _route_inspection_snapshot(route)
+                        for route in sorted(
+                            successor_routes,
+                            key=lambda item: item.transfer_code,
+                        )
+                    ],
                 }
-                for tuuid in input_sharding:
-                    tuuid_consumers[str(tuuid)] = (
-                        self.op_manager.get_operators_for_tuuid(tuuid)
-                    )
+                for route in predecessor_routes:
+                    transfer_targets[str(route.transfer_code)] = route.target_op
         return {
             "spmd_id": self.spmd_id,
             "rank": self.rank,
@@ -5541,17 +5579,13 @@ class SPMDWorker:
                 "input_prepare_pending_count": self._input_prepare_runtime.pending_count(),
                 "mailbox": await self._mailbox.snapshot(),
                 "operator_inputs": operator_inputs,
-                "tuuid_consumers": tuuid_consumers,
+                "transfer_targets": transfer_targets,
             },
         }
 
     async def export_profiler_snapshot(self) -> ProfilerSnapshot | None:
         await self._drain_outbound_tasks()
-        actor_snapshots = await self._user_callable_executor.export_profiler_snapshots()
-        return merge_profiler_snapshots(
-            (self._profiler_runtime.snapshot(), *actor_snapshots),
-            process_name=f"worker/{self.spmd_id}/rank:{self.rank}",
-        )
+        return self._profiler_runtime.snapshot()
 
     # =========================================================================
     # Utility
@@ -5584,8 +5618,10 @@ class SPMDWorker:
                 f"Drain target set to {target_count} spmd_id={self.spmd_id} rank={self.rank}"
             )
         await self._input_prepare_runtime.cancel_matching(
-            lambda op_name, step: step >= target_count
-            and step not in self._running_plan_steps.get(op_name, set())
+            lambda op_name, step: (
+                step >= target_count
+                and step not in self._running_plan_steps.get(op_name, set())
+            )
         )
 
     async def clear_drain_target_count(self) -> None:

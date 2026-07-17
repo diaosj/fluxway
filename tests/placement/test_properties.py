@@ -52,7 +52,7 @@ from fluxway.placement import (
     max_min,
 )
 
-from .test_planner import graph_node
+from .test_planner import graph_node, placement_graph, placement_inventory
 
 
 class LeftSPMD: ...
@@ -74,12 +74,22 @@ class FragmentationSPMD: ...
 
 
 def test_constraint_algebra_matches_exhaustive_assignment_oracle() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "left": graph_node("left", LeftSPMD, 1),
             "right": graph_node("right", RightSPMD, 1),
-            "node-zero": graph_node("node-zero", NodeZeroAnchor, 1),
-            "node-one": graph_node("node-one", NodeOneAnchor, 1),
+            "node-zero": graph_node(
+                "node-zero",
+                NodeZeroAnchor,
+                1,
+                ResourceProfile(base={"anchor:zero": 1}),
+            ),
+            "node-one": graph_node(
+                "node-one",
+                NodeOneAnchor,
+                1,
+                ResourceProfile(base={"anchor:one": 1}),
+            ),
         }
     )
     left = union(instance("left"), ranks(workers(LeftSPMD), [0]))
@@ -155,12 +165,6 @@ def test_constraint_algebra_matches_exhaustive_assignment_oracle() -> None:
             recipe = PlacementRecipe(
                 recipe_id=(f"constraint-oracle-{case_index}-{left_node}-{right_node}"),
                 version="1.0.0",
-                profiles={
-                    LeftSPMD: ResourceProfile(base={"CPU": 1}),
-                    RightSPMD: ResourceProfile(base={"CPU": 1}),
-                    NodeZeroAnchor: ResourceProfile(base={"anchor:zero": 1}),
-                    NodeOneAnchor: ResourceProfile(base={"anchor:one": 1}),
-                },
                 constraints=(
                     equal(left_nodes, anchor_nodes[left_node]),
                     equal(right_nodes, anchor_nodes[right_node]),
@@ -169,7 +173,9 @@ def test_constraint_algebra_matches_exhaustive_assignment_oracle() -> None:
                 objective=lexicographic(minimize(cardinality(support(all_workers())))),
             )
             try:
-                PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+                PlacementPlanner(solve_timeout_s=10).resolve(
+                    placement_inventory(graph), recipe, snapshot
+                )
             except PlacementInfeasibleError:
                 solver_value = False
             else:
@@ -178,12 +184,22 @@ def test_constraint_algebra_matches_exhaustive_assignment_oracle() -> None:
 
 
 def test_affinity_objectives_include_positive_equal_relations() -> None:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "left": graph_node("left", LeftSPMD, 1),
             "right": graph_node("right", RightSPMD, 1),
-            "node-zero": graph_node("node-zero", NodeZeroAnchor, 1),
-            "node-one": graph_node("node-one", NodeOneAnchor, 1),
+            "node-zero": graph_node(
+                "node-zero",
+                NodeZeroAnchor,
+                1,
+                ResourceProfile(base={"anchor:zero": 1}),
+            ),
+            "node-one": graph_node(
+                "node-one",
+                NodeOneAnchor,
+                1,
+                ResourceProfile(base={"anchor:one": 1}),
+            ),
         }
     )
     left_nodes = support(workers(LeftSPMD))
@@ -209,12 +225,6 @@ def test_affinity_objectives_include_positive_equal_relations() -> None:
         recipe = PlacementRecipe(
             recipe_id=f"affinity-oracle-{left_node}-{right_node}",
             version="1.0.0",
-            profiles={
-                LeftSPMD: ResourceProfile(base={"CPU": 1}),
-                RightSPMD: ResourceProfile(base={"CPU": 1}),
-                NodeZeroAnchor: ResourceProfile(base={"anchor:zero": 1}),
-                NodeOneAnchor: ResourceProfile(base={"anchor:one": 1}),
-            },
             constraints=(
                 equal(left_nodes, anchors[left_node]),
                 equal(right_nodes, anchors[right_node]),
@@ -225,7 +235,9 @@ def test_affinity_objectives_include_positive_equal_relations() -> None:
             ),
         )
 
-        plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        plan = PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
         assert plan.objective_results[0].optimum_value == 2
         assert plan.objective_results[1].optimum_value == 2
@@ -242,11 +254,19 @@ def test_affinity_objectives_include_positive_equal_relations() -> None:
 def test_fragmentation_matches_finite_multidimensional_packing_oracle(
     capacity: dict[str, int], expected_fragmentation: Decimal
 ) -> None:
-    graph = Graph(nodes={"fragment": graph_node("fragment", FragmentationSPMD, 1)})
+    graph = placement_graph(
+        nodes={
+            "fragment": graph_node(
+                "fragment",
+                FragmentationSPMD,
+                1,
+                ResourceProfile(base={"CPU": 2, "GPU": 1}),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id=f"fragmentation-oracle-{capacity['CPU']}-{capacity['GPU']}",
         version="1.0.0",
-        profiles={FragmentationSPMD: ResourceProfile(base={"CPU": 2, "GPU": 1})},
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -254,7 +274,9 @@ def test_fragmentation_matches_finite_multidimensional_packing_oracle(
         (ClusterNode(node_id="node", resources=capacity),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert sum(plan.resource_fragmentation["node"].values()) == (expected_fragmentation)
 
@@ -266,13 +288,19 @@ def test_fragmentation_matches_finite_multidimensional_packing_oracle(
 def test_assignment_is_total_and_preserves_resources(
     worker_count: int, node_count: int
 ) -> None:
-    graph = Graph(
-        nodes={"property": graph_node("property", PropertySPMD, worker_count)}
+    graph = placement_graph(
+        nodes={
+            "property": graph_node(
+                "property",
+                PropertySPMD,
+                worker_count,
+                ResourceProfile(base={"CPU": Decimal("0.5")}),
+            )
+        }
     )
     recipe = PlacementRecipe(
         recipe_id=f"resource-property-{worker_count}-{node_count}",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": Decimal("0.5")})},
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -283,7 +311,9 @@ def test_assignment_is_total_and_preserves_resources(
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert {
         (assignment.spmd_id, assignment.rank) for assignment in plan.assignments
@@ -314,13 +344,12 @@ def test_solver_call_count_does_not_scale_with_homogeneous_workers(
     monkeypatch,
 ) -> None:
     worker_count = 64
-    graph = Graph(
+    graph = placement_graph(
         nodes={"property": graph_node("property", PropertySPMD, worker_count)}
     )
     recipe = PlacementRecipe(
         recipe_id="solver-call-bound",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=AFFINITY_FIRST_V1,
     )
@@ -337,7 +366,9 @@ def test_solver_call_count_does_not_scale_with_homogeneous_workers(
 
     monkeypatch.setattr(cp_model.CpSolver, "solve", counted_solve)
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert len(plan.assignments) == worker_count
     assert solve_count <= 8
@@ -346,11 +377,10 @@ def test_solver_call_count_does_not_scale_with_homogeneous_workers(
 def test_lexicographic_program_uses_one_decreasing_solve_budget(
     monkeypatch,
 ) -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
     recipe = PlacementRecipe(
         recipe_id="single-deadline",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -373,7 +403,9 @@ def test_lexicographic_program_uses_one_decreasing_solve_budget(
     monkeypatch.setattr("fluxway.placement.planner.time.monotonic", monotonic)
     monkeypatch.setattr(cp_model.CpSolver, "solve", timed_solve)
 
-    PlacementPlanner(solve_timeout_s=0.5).resolve(graph, recipe, snapshot)
+    PlacementPlanner(solve_timeout_s=0.5).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert budgets == pytest.approx([0.5, 0.4])
 
@@ -381,11 +413,10 @@ def test_lexicographic_program_uses_one_decreasing_solve_budget(
 def test_lexicographic_program_stops_when_shared_deadline_expires(
     monkeypatch,
 ) -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
     recipe = PlacementRecipe(
         recipe_id="expired-deadline",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=lexicographic(
             minimize(cardinality(support(all_workers()))),
@@ -412,17 +443,18 @@ def test_lexicographic_program_stops_when_shared_deadline_expires(
     monkeypatch.setattr(cp_model.CpSolver, "solve", timed_solve)
 
     with pytest.raises(PlacementSolveTimeoutError, match="deadline"):
-        PlacementPlanner(solve_timeout_s=0.5).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=0.5).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
     assert solve_count == 2
 
 
 def test_feasible_incumbent_without_optimality_is_a_timeout(monkeypatch) -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
     recipe = PlacementRecipe(
         recipe_id="feasible-incumbent",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -442,11 +474,13 @@ def test_feasible_incumbent_without_optimality_is_a_timeout(monkeypatch) -> None
     monkeypatch.setattr(cp_model.CpSolver, "solve", feasible_after_base)
 
     with pytest.raises(PlacementSolveTimeoutError, match="timed out"):
-        PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
 
 def _majorization_complexity_case() -> tuple[Graph, PlacementRecipe, ClusterSnapshot]:
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             "left": graph_node("left", LeftSPMD, 1),
             "right": graph_node("right", RightSPMD, 1),
@@ -456,10 +490,6 @@ def _majorization_complexity_case() -> tuple[Graph, PlacementRecipe, ClusterSnap
     recipe = PlacementRecipe(
         recipe_id="complexity-admission",
         version="1.0.0",
-        profiles={
-            LeftSPMD: ResourceProfile(base={"CPU": 1}),
-            RightSPMD: ResourceProfile(base={"CPU": 1}),
-        },
         constraints=(relation,),
         objective=lexicographic(
             maximize_majorization(target_occupancy(affinity_constraints()))
@@ -503,7 +533,7 @@ def test_complexity_is_rejected_before_model_construction(
     monkeypatch.setattr(planner, "_compile", model_construction_must_not_start)
 
     with pytest.raises(PlacementContractError, match=message):
-        planner.resolve(graph, recipe, snapshot)
+        planner.resolve(placement_inventory(graph), recipe, snapshot)
 
 
 def test_batcher_comparator_count_matches_power_of_two_boundaries() -> None:
@@ -519,7 +549,7 @@ def test_model_size_is_rejected_before_assignment_matrix_construction(
 ) -> None:
     instance_count = 20
     node_count = 20
-    graph = Graph(
+    graph = placement_graph(
         nodes={
             f"instance-{index}": graph_node(f"instance-{index}", PropertySPMD, 1)
             for index in range(instance_count)
@@ -528,7 +558,6 @@ def test_model_size_is_rejected_before_assignment_matrix_construction(
     recipe = PlacementRecipe(
         recipe_id="model-variable-admission",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -546,15 +575,23 @@ def test_model_size_is_rejected_before_assignment_matrix_construction(
     monkeypatch.setattr(planner, "_compile", model_construction_must_not_start)
 
     with pytest.raises(PlacementContractError, match="model variables"):
-        planner.resolve(graph, recipe, snapshot)
+        planner.resolve(placement_inventory(graph), recipe, snapshot)
 
 
 def test_fractional_resource_scalar_uses_physical_quantity() -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(
+        nodes={
+            "property": graph_node(
+                "property",
+                PropertySPMD,
+                1,
+                ResourceProfile(base={"CPU": Decimal("0.1")}),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="fractional-resource-scalar",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": Decimal("0.1")})},
         constraints=(equal(resource_usage(all_workers(), "CPU"), 1),),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -563,15 +600,25 @@ def test_fractional_resource_scalar_uses_physical_quantity() -> None:
     )
 
     with pytest.raises(PlacementInfeasibleError):
-        PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
 
 def test_scalar_comparison_rejects_incompatible_resource_dimensions() -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(
+        nodes={
+            "property": graph_node(
+                "property",
+                PropertySPMD,
+                1,
+                ResourceProfile(base={"CPU": 1, "GPU": 1}),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="incompatible-resource-dimensions",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1, "GPU": 1})},
         constraints=(
             equal(
                 resource_usage(all_workers(), "CPU"),
@@ -585,15 +632,16 @@ def test_scalar_comparison_rejects_incompatible_resource_dimensions() -> None:
     )
 
     with pytest.raises(PlacementContractError, match="incompatible dimensions"):
-        PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
 
 
 def test_max_min_accepts_occupancy_vector() -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 2)})
+    graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 2)})
     recipe = PlacementRecipe(
         recipe_id="max-min-occupancy",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=lexicographic(max_min(occupancy(all_workers()))),
     )
@@ -604,22 +652,30 @@ def test_max_min_accepts_occupancy_vector() -> None:
         )
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.objective_results[0].optimum_value == (1, 1)
 
 
 def test_majorization_accepts_weighted_dominant_share_vector() -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(
+        nodes={
+            "property": graph_node(
+                "property",
+                PropertySPMD,
+                1,
+                ResourceProfile(
+                    base={"CPU": 1},
+                    scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
+                ),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="majorize-weighted-share",
         version="1.0.0",
-        profiles={
-            PropertySPMD: ResourceProfile(
-                base={"CPU": 1},
-                scale=ResourceScale(step={"CPU": 1}, max_steps=2, weight=1),
-            )
-        },
         constraints=(),
         objective=lexicographic(
             maximize_majorization(weighted_dominant_share(all_workers()))
@@ -629,7 +685,9 @@ def test_majorization_accepts_weighted_dominant_share_vector() -> None:
         (ClusterNode(node_id="node", resources={"CPU": 3}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.allocated_quanta["property"] == 2
 
@@ -637,11 +695,19 @@ def test_majorization_accepts_weighted_dominant_share_vector() -> None:
 def test_resource_integerization_supports_pib_scale_memory() -> None:
     pib = 1 << 50
     tib = 1 << 40
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(
+        nodes={
+            "property": graph_node(
+                "property",
+                PropertySPMD,
+                1,
+                ResourceProfile(base={"memory": tib}),
+            )
+        }
+    )
     recipe = PlacementRecipe(
         recipe_id="pib-memory",
         version="1.0.0",
-        profiles={PropertySPMD: ResourceProfile(base={"memory": tib})},
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -649,27 +715,35 @@ def test_resource_integerization_supports_pib_scale_memory() -> None:
         (ClusterNode(node_id="node", resources={"memory": pib}),)
     )
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     assert plan.assignments[0].resources["memory"] == Decimal(tib)
 
 
 def test_drf_coefficients_reject_int64_overflow() -> None:
-    graph = Graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
+    graph = placement_graph(
+        nodes={
+            "property": graph_node(
+                "property",
+                PropertySPMD,
+                1,
+                ResourceProfile(
+                    base={"CPU": 1},
+                    scale=ResourceScale(
+                        step={"CPU": 1},
+                        max_steps=100,
+                        weight=Decimal("1e-19"),
+                    ),
+                ),
+            )
+        }
+    )
     selected = workers(PropertySPMD)
     recipe = PlacementRecipe(
         recipe_id="drf-overflow",
         version="1.0.0",
-        profiles={
-            PropertySPMD: ResourceProfile(
-                base={"CPU": 1},
-                scale=ResourceScale(
-                    step={"CPU": 1},
-                    max_steps=100,
-                    weight=Decimal("1e-19"),
-                ),
-            )
-        },
         constraints=(),
         objective=lexicographic(max_min(weighted_dominant_share(selected))),
     )
@@ -678,4 +752,6 @@ def test_drf_coefficients_reject_int64_overflow() -> None:
     )
 
     with pytest.raises(PlacementContractError, match="int64"):
-        PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )

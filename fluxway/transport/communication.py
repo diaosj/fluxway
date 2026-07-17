@@ -12,7 +12,7 @@ import asyncio
 import numpy as np
 
 from fluxway.common.tensor_backend import get_backend
-from fluxway.transport.planner import TransportPlanner
+from fluxway.transport.planner import DestinationAssignment, TransportPlanner
 from fluxway.common.types.sharding import (
     PhysicalLayout,
     RoutingAxis,
@@ -25,7 +25,7 @@ from fluxway.common.types.sharding import (
     LiteralIndices,
     RangeIndices,
 )
-from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.common.execution import compile
 from fluxway.common.index_descriptor import ContinuousIndex, IndexDescriptor
 from fluxway.common.ragged import encode_ragged_level_count, ragged_level_count
@@ -33,18 +33,16 @@ from fluxway.common.tensor_components import (
     index_descriptor_length,
     index_source_to_indices_spec,
     routing_entity_count,
-    select_destination_content_index_source,
-    select_source_geometry_index_source,
 )
 from fluxway.transport.manifest import (
     COMPACT_PARAM_COUNT,
-    EDGE_EMPTY_KIND,
-    EDGE_EXPECTED_COUNT,
-    EDGE_TUUID,
+    ENTRY_EXPECTED_COUNT,
+    ENTRY_ROUTE_CODE,
+    ENTRY_TENSOR_KIND,
     PAYLOAD_VALID_COUNT,
-    EmptyKind,
     PayloadRole,
     SenderEmissionMode,
+    TensorEntryKind,
     TransportFrameBuilder,
     TransportFrameHeader,
     TransportFrameTemplate,
@@ -52,6 +50,13 @@ from fluxway.transport.manifest import (
     dtype_code,
 )
 from fluxway.transport.kernels import FrameTableCapacity
+from fluxway.transport.routing import (
+    RoutingSourceKind,
+    SelectedRoutingSource,
+    TransportRoutingMode,
+    receipt_destination_assignment,
+    select_routing_source,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +99,10 @@ class TransportPayloadPlan:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class TransportFrameEdgePlan:
-    tuuid: int
+class TransportFrameEntryPlan:
+    transfer_code: int
     meta_state: int
-    empty_kind: EmptyKind
+    tensor_kind: TensorEntryKind
     expected_count: int
     source_step: int
     compact_params: tuple[int, ...] | None
@@ -111,7 +116,7 @@ class TransportFrameTemplateKey:
     sender_spmd_code: int
     sender_rank: int
     sender_world_size: int
-    edges: tuple[tuple[Any, ...], ...]
+    entries: tuple[tuple[Any, ...], ...]
 
 
 TransportFrameTemplateCache = dict[TransportFrameTemplateKey, TransportFrameTemplate]
@@ -201,7 +206,7 @@ class SrcSideView:
             layout is replicated (i.e. some other src rank holds the
             same data and is the canonical sender). When ``False`` the
             distributor must still participate in the SPMD round but only
-            transmits empty packets.
+            transmits routing-miss entries.
         expected_senders_per_dst: For each dst rank ``d`` (indexed by
             ``dst_world_size``), the number of src ranks that will send
             *non-empty* payload to ``d``. ``None`` indicates the routing
@@ -685,15 +690,15 @@ class BaseDataDistributor:
     """
 
     @staticmethod
-    def _format_tuuids(tuuid, tuuid_to_name):
-        def _fmt(u):
-            if tuuid_to_name and u in tuuid_to_name:
-                return f"{u} ({tuuid_to_name[u]})"
-            return str(u)
+    def _format_transfer_codes(transfer_codes, transfer_code_to_name):
+        def _format(transfer_code):
+            if transfer_code_to_name and transfer_code in transfer_code_to_name:
+                return f"{transfer_code} ({transfer_code_to_name[transfer_code]})"
+            return str(transfer_code)
 
-        if isinstance(tuuid, list | tuple):
-            return "[" + ", ".join(_fmt(u) for u in tuuid) + "]"
-        return _fmt(tuuid)
+        if isinstance(transfer_codes, list | tuple):
+            return "[" + ", ".join(_format(code) for code in transfer_codes) + "]"
+        return _format(transfer_codes)
 
     def __init__(self, local_rank: int):
         self.local_rank = local_rank
@@ -736,22 +741,68 @@ class BaseDataDistributor:
 
         Callers should pass the result directly to ``ArrivalBarrier``'s
         ``wait_for_n_slices`` so the receiver does not need to encode
-        any private agreement with the distributor about empty packets.
+        any private agreement with the distributor about routing-miss arrivals.
         """
         manifest = self._current_plan_manifest
         if manifest is None:
             return src_world_size
         return manifest.expected_count_for(dst_rank)
 
-    def plan_protocol_empty(
+    def plan_routing_miss(
         self,
         *,
         target_rank: int,
         expected_count: int,
-        tuuid: int,
+        transfer_code: int,
         payload: Any,
         source_step: int,
     ) -> None:
+        self._plan_absent_tensor_entry(
+            target_rank=target_rank,
+            expected_count=expected_count,
+            transfer_code=transfer_code,
+            payload=payload,
+            source_step=source_step,
+            tensor_kind=TensorEntryKind.ROUTING_MISS,
+        )
+
+    def plan_completed_without_tensor(
+        self,
+        *,
+        target_rank: int,
+        expected_count: int,
+        transfer_code: int,
+        payload: Any,
+        source_step: int,
+    ) -> None:
+        self._plan_absent_tensor_entry(
+            target_rank=target_rank,
+            expected_count=expected_count,
+            transfer_code=transfer_code,
+            payload=payload,
+            source_step=source_step,
+            tensor_kind=TensorEntryKind.COMPLETED_WITHOUT_TENSOR,
+        )
+
+    def _plan_absent_tensor_entry(
+        self,
+        *,
+        target_rank: int,
+        expected_count: int,
+        transfer_code: int,
+        payload: Any,
+        source_step: int,
+        tensor_kind: TensorEntryKind,
+    ) -> None:
+        if tensor_kind not in (
+            TensorEntryKind.ROUTING_MISS,
+            TensorEntryKind.COMPLETED_WITHOUT_TENSOR,
+        ):
+            raise ValueError(
+                "Absent tensor entries require ROUTING_MISS or "
+                "COMPLETED_WITHOUT_TENSOR, "
+                f"got {tensor_kind!r}."
+            )
         if target_rank < 0:
             raise ValueError(f"target_rank must be non-negative, got {target_rank}.")
         if expected_count <= 0:
@@ -770,229 +821,122 @@ class BaseDataDistributor:
         existing = expected[target_rank]
         if existing not in (0, expected_count):
             raise ValueError(
-                f"Conflicting protocol-empty expected_count for target_rank={target_rank}: "
+                f"Conflicting absent-entry expected_count for target_rank={target_rank}: "
                 f"existing={existing} new={expected_count}."
             )
         expected[target_rank] = expected_count
         self._current_plan_manifest = TransportPlanManifest(
             expected_senders_per_dst=tuple(expected),
             sender_has_data_per_dst=tuple(sender_has_data),
-            emission_mode=SenderEmissionMode.ALL_SENDERS_WITH_PROTOCOL_EMPTY,
+            emission_mode=SenderEmissionMode.ALL_EXPECTED_SENDERS,
         )
         self._dest_agg[target_rank].append(
             (
-                tuuid,
+                transfer_code,
                 [payload],
                 [0],
                 [None],
                 [0],
                 [None],
-                [int(EmptyKind.PROTOCOL_EMPTY)],
+                [int(tensor_kind)],
                 [source_step],
             )
         )
-
-    def _plan_mirror_group(
-        self,
-        receipt,
-        payloads,
-        has_meta_tensor_state_list,
-        compact_desc_info,
-        global_shapes_list,
-        source_steps_list,
-    ):
-        """Internal logic for Mirror Backflow (using physical receipts)."""
-        backend = get_backend()
-        mirror_target_world_size = receipt.world_size
-        sender_rank_tags = receipt.sender_rank_tags
-
-        # Scalar fast-path: all data goes to one destination.
-        # Handle before entering the JIT-compiled _stitch_with_prime to avoid
-        # ConcretizationTypeError (int() on traced JAX values).
-        is_scalar = isinstance(sender_rank_tags, int | np.integer) or (
-            hasattr(sender_rank_tags, "shape")
-            and np.asarray(sender_rank_tags).ndim == 0
-        )
-        if is_scalar:
-            target_rank = int(sender_rank_tags)
-            flat_leaves, treedef = backend.tree_flatten(payloads)
-            per_tensor_counts = (
-                [backend.shape(t)[0] for t in flat_leaves] if flat_leaves else []
-            )
-
-            for i in range(mirror_target_world_size):
-                if i == target_rank and flat_leaves:
-                    rank_flat_tensors = flat_leaves
-                    rank_flat_counts = per_tensor_counts
-                else:
-                    rank_flat_tensors = (
-                        [t[:0] for t in flat_leaves] if flat_leaves else []
-                    )
-                    rank_flat_counts = [0] * len(flat_leaves) if flat_leaves else []
-
-                slice_params = []
-                for meta_state, desc_obj in zip(
-                    has_meta_tensor_state_list, compact_desc_info, strict=True
-                ):
-                    if meta_state & 4:
-                        offset = 0
-                        count = 1 if i == target_rank else 0
-                        slice_params.append(
-                            desc_obj.slice(offset, offset + count).to_compact_params()
-                        )
-                    else:
-                        slice_params.append(None)
-
-                yield (
-                    [i],
-                    rank_flat_tensors,
-                    rank_flat_counts,
-                    None,
-                    global_shapes_list,
-                    has_meta_tensor_state_list,
-                    slice_params,
-                    [int(EmptyKind.DATA_EMPTY_ALLOWED)]
-                    * len(has_meta_tensor_state_list),
-                    source_steps_list,
-                )
-            return
-
-        grouped_layout = _grouped_numpy_rank_layout(
-            sender_rank_tags,
-            mirror_target_world_size,
-        )
-        if grouped_layout is None:
-            sender_rank_tags = backend.as_tensor(sender_rank_tags)
-            stitched_tensors, tensors_size, tensor_offsets = _stitch_with_prime(
-                sender_rank_tags, payloads, mirror_target_world_size
-            )
-        else:
-            counts, offsets = grouped_layout
-            stitched_tensors = payloads
-            tensors_size = backend.as_tensor(counts)
-            tensor_offsets = backend.as_tensor(offsets)
-
-        counts_np = backend.to_numpy(tensors_size)
-        offsets_np = backend.to_numpy(tensor_offsets)
-
-        for i in range(mirror_target_world_size):
-            count = int(counts_np[i])
-            rank_flat_tensors = _get_rank_data_from_tree(
-                i, stitched_tensors, counts_np, offsets_np
-            )
-
-            if count > 0:
-                rank_flat_tensors = [t[:count] for t in rank_flat_tensors]
-            rank_flat_counts = [count] * len(rank_flat_tensors)
-
-            slice_params = []
-            for meta_state, desc_obj in zip(  # type: ignore
-                has_meta_tensor_state_list, compact_desc_info, strict=True
-            ):
-                if meta_state & 4:
-                    offset = int(offsets_np[i])
-                    slice_params.append(
-                        desc_obj.slice(offset, offset + count).to_compact_params()
-                    )
-                else:
-                    slice_params.append(None)
-
-            yield (
-                [i],
-                rank_flat_tensors,
-                rank_flat_counts,
-                None,
-                global_shapes_list,
-                has_meta_tensor_state_list,
-                slice_params,
-                [
-                    int(
-                        EmptyKind.DATA_EMPTY_ALLOWED
-                        if count > 0
-                        else EmptyKind.PROTOCOL_EMPTY
-                    )
-                ]
-                * len(has_meta_tensor_state_list),
-                source_steps_list,
-            )
 
     def _plan_single_tensor_group(
         self,
         local_data: TransportTensor | list[TransportTensor],
         source: PhysicalLayout | None,
         target: PhysicalLayout | None,
+        *,
+        routing_source: SelectedRoutingSource,
         capacity: int | list[int] | None = None,
-        tuuid: int | list[int] | None = None,
-        tuuid_to_name: dict[int, str] | None = None,
+        transfer_codes: int | list[int] | None = None,
+        transfer_code_to_name: dict[int, str] | None = None,
     ):
         """Generates plans and padded sequences for a single distribution group.
 
         A group is defined as one or more tensors that SHARE the same routing indices
         (e.g. follow-sharding or explicitly aligned tensors).
         """
-        if tuuid is None:
+        if transfer_codes is None:
             raise ValueError(
-                "[Fluxway Distributor Error] tuuid is required for TransportFrame planning. "
-                "The frame ABI no longer supports implicit tensor identity."
+                "[Fluxway Distributor Error] transfer_codes is required for "
+                "TransportFrame planning."
+            )
+        if not isinstance(routing_source, SelectedRoutingSource):
+            raise TypeError("routing_source must be a SelectedRoutingSource.")
+        if source is not None and source.is_referential:
+            raise ValueError(
+                "Transport source must use compiled non-referential geometry."
+            )
+        if target is not None and target.is_referential:
+            raise ValueError(
+                "Transport target must use compiled non-referential geometry."
             )
 
-        # Pack all tensors and lengths
-        # local_data can be a TransportTensor or List[TransportTensor]
         tensors_to_pack = (
             [local_data] if isinstance(local_data, TransportTensor) else local_data
         )
+        if not tensors_to_pack:
+            raise ValueError("Transport planning requires at least one tensor.")
+        if target is None:
+            raise ValueError("Transport planning requires a target PhysicalLayout.")
         source_steps_list = []
         for tt_idx, tt in enumerate(tensors_to_pack):
             if tt.source_step is None:
                 raise ValueError(
                     "[Fluxway Distributor Error] TransportTensor.source_step is "
-                    f"required before frame planning for tuuid(s)="
-                    f"{self._format_tuuids(tuuid, tuuid_to_name)} tt_idx={tt_idx}."
+                    f"required before frame planning for transfer code(s)="
+                    f"{self._format_transfer_codes(transfer_codes, transfer_code_to_name)} "
+                    f"tt_idx={tt_idx}."
                 )
             source_steps_list.append(tt.source_step)
 
-        # Primary tensor drives routing
         primary = tensors_to_pack[0]
-
-        # Logical shape for routing (respecting Ragged/Padded boundaries)
         local_shape = primary.logical_shape
-
-        # Padding-free global logical shape used by the routing strategy.
-        # This is the *single source of truth* for ``ChunkPartition`` /
-        # ``HashPartition`` ``dim_size`` arguments and MUST NOT be inflated by
-        # any capacity bucketing applied to in-flight tensors below.
-        # Mixing the two semantics produces silent routing corruption (e.g.
-        # ``[3,4,8,9]`` against ``dim_size=16`` yields ``[1,1,2,3]`` instead
-        # of ``[1,2,4,4]``).  When ``primary.global_shape`` is unavailable we
-        # fall back to ``local_shape`` -- valid only for scalar / fully
-        # replicated / single-rank cases (see Static->Static guard below).
         primary_logical_shape = (
             primary.global_shape if primary.global_shape is not None else local_shape
         )
-
-        # Signal-driven Routing Detection (Referential vs Algebraic)
-        is_referential = (source and source.is_referential) or (
-            target and target.is_referential
-        )
-        is_mirror = is_referential
-        source_is_content_addressable = bool(source and source.is_content_addressable)
-        target_is_content_addressable = bool(target and target.is_content_addressable)
-        # Pack Tensors and Metadata (Required for all paths)
-        # All payloads/indices entering the eager pipeline below are
-        # normalized to the active backend's native domain via
-        # ``backend.adopt(x)`` here, so HybridBackend (which dispatches
-        # on isinstance(np|cp)) never has to inspect or convert foreign
-        # array types again.  This is the *single* chokepoint -- once
-        # payloads cross this boundary, every downstream backend.* call
-        # operates on a uniform domain.
         backend = get_backend()
+        actual_req = primary.routing_entity_count
+        if routing_source.entity_count != actual_req:
+            raise ValueError(
+                "Selected routing source entity count does not match the primary "
+                f"tensor: routing_source={routing_source.entity_count} "
+                f"tensor={actual_req}."
+            )
+        uses_receipt_routing = routing_source.kind is RoutingSourceKind.RECEIPT
+        target_is_content_addressable = target.is_content_addressable
+        receipt: SymmetryReceipt | None = None
+        if uses_receipt_routing:
+            receipt = routing_source.value
+            if not isinstance(receipt, SymmetryReceipt):
+                raise TypeError(
+                    "Receipt routing requires a SymmetryReceipt routing source."
+                )
+            if receipt.world_size != target.mesh.size:
+                raise ValueError(
+                    "Receipt rank domain does not match the target mesh: "
+                    f"receipt={receipt.world_size} target={target.mesh.size}."
+                )
+            receipt.validate_entity_count(actual_req)
+
         payloads = []
+        payload_routing_axes: list[tuple[int, ...]] = []
         has_meta_tensor_state_list = []
         nested_length_list: list[tuple | None] = []
         compact_desc_info: list[IndexDescriptor | None] = []
 
         for tt_idx, tt in enumerate(tensors_to_pack):
+            tensor_entity_count = tt.routing_entity_count
+            if tensor_entity_count != actual_req:
+                raise ValueError(
+                    "Tensors in one routing batch must have the same entity count: "
+                    f"primary={actual_req} tensor[{tt_idx}]={tensor_entity_count}."
+                )
             payloads.append(backend.adopt(tt.flat_values))
+            payload_routing_axes.append(tt.routing_axes)
             meta_tensor_state = 0
 
             if tt.is_ragged:
@@ -1005,15 +949,18 @@ class BaseDataDistributor:
                     adopted_splits = backend.adopt(splits)
                     level_lengths.append(adopted_splits[1:] - adopted_splits[:-1])
                 nested_length_list.append(tuple(level_lengths))
-                if is_mirror:
-                    for lengths in level_lengths:
-                        payloads.append(lengths)
-                        nested_length_list.append(None)
             else:
                 nested_length_list.append(None)
 
             if tt.origin_indices is not None:
-                if isinstance(tt.origin_indices, ContinuousIndex):
+                preserve_compact_origin = isinstance(
+                    tt.origin_indices, ContinuousIndex
+                ) and not (
+                    uses_receipt_routing
+                    and receipt is not None
+                    and not receipt.is_scalar()
+                )
+                if preserve_compact_origin:
                     meta_tensor_state |= 4
                     compact_desc_info.append(tt.origin_indices)
                 else:
@@ -1023,7 +970,8 @@ class BaseDataDistributor:
                     if idx_len is not None and idx_len != routing_len:
                         raise RuntimeError(
                             "[Fluxway TransportTensor Error] origin_indices "
-                            f"length mismatch for tuuid(s)={self._format_tuuids(tuuid, tuuid_to_name)} "
+                            "length mismatch for transfer code(s)="
+                            f"{self._format_transfer_codes(transfer_codes, transfer_code_to_name)} "
                             f"(tt_idx={tt_idx}): "
                             f"flat_values.shape={tuple(getattr(tt.flat_values, 'shape', ()))}, "
                             f"nested_levels={len(tt.nested_splits)}, "
@@ -1036,6 +984,7 @@ class BaseDataDistributor:
                         )
                     idx = tt.origin_indices.materialize()
                     payloads.append(backend.adopt(idx))
+                    payload_routing_axes.append((0,))
                     nested_length_list.append(None)
                     compact_desc_info.append(None)
             else:
@@ -1043,61 +992,27 @@ class BaseDataDistributor:
 
             has_meta_tensor_state_list.append(meta_tensor_state)
 
-        # Explicit Mirror Early-Exit
-        # Hard interception: when the source/target declares mirror routing
-        # (``is_referential``) we MUST have a SymmetryReceipt on the primary
-        # tensor. Previously, a missing receipt silently fell through to the
-        # algebraic branch below, which then misused ``origin_indices`` as a
-        # routing source and surfaced as an opaque ``numpy.take`` IndexError.
-        # We now fail fast with an actionable message.
-        if is_referential:
-            if primary.receipt is None:
-                raise RuntimeError(
-                    "[Fluxway Mirror Error] target/source declares mirror "
-                    f"routing but primary.receipt is None for tuuid(s)="
-                    f"{self._format_tuuids(tuuid, tuuid_to_name)}. "
-                    "This means the mirror reference upstream did not "
-                    "propagate a SymmetryReceipt onto this TransportTensor. "
-                    "Common causes: (1) the producing OP rebuilt "
-                    "TransportTensor without forwarding the upstream "
-                    "receipt; (2) the ``reference=`` path of the mirror "
-                    "output_sharding does not exist or is wrong; (3) the "
-                    "producing OP used algebraic (non-mirror) routing whose "
-                    "output cannot be mirrored. Fix the producer (forward "
-                    "the upstream TransportTensor unchanged), correct the "
-                    "reference= path, or change the target sharding to "
-                    "dynamic/static."
-                )
-            global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
-            yield from self._plan_mirror_group(
-                primary.receipt,
-                payloads=payloads,
-                has_meta_tensor_state_list=has_meta_tensor_state_list,
-                compact_desc_info=compact_desc_info,
-                global_shapes_list=global_shapes_list,
-                source_steps_list=source_steps_list,
-            )
-            return
-
-        if not source and primary.routing_indices is None:
+        if (
+            not uses_receipt_routing
+            and routing_source.kind is RoutingSourceKind.SOURCE_LAYOUT
+            and source is None
+        ):
             raise ValueError(
-                f"[Fluxway Distributor Error] No sharding source available for TUUID(s): {self._format_tuuids(tuuid, tuuid_to_name)}.\n"
-                f"  Problem: The algebraic path requires either a valid 'source' layout or explicit 'routing_indices'.\n"
-                f"  Fix: Ensure the TransportTensor is initialized with a source PhysicalLayout."
+                "Source-layout routing requires a source PhysicalLayout for "
+                f"transfer code(s) {self._format_transfer_codes(transfer_codes, transfer_code_to_name)}."
             )
 
-        src_geometry_indices, src_geometry_name = select_source_geometry_index_source(
-            routing_indices=primary.routing_indices,
-            origin_indices=primary.origin_indices,
-            source_is_content_addressable=source_is_content_addressable,
-            target_is_content_addressable=target_is_content_addressable,
-        )
-        if target_is_content_addressable and not is_referential:
-            dst_content_routing_values = select_destination_content_index_source(
-                routing_indices=primary.routing_indices,
-                flat_values=primary.flat_values,
-            )
+        if uses_receipt_routing:
+            src_geometry_indices = None
+            src_geometry_name = routing_source.kind.value
+            dst_content_routing_values = None
+        elif target_is_content_addressable:
+            src_geometry_indices = None
+            src_geometry_name = routing_source.kind.value
+            dst_content_routing_values = routing_source.value
         else:
+            src_geometry_indices = routing_source.value
+            src_geometry_name = routing_source.kind.value
             dst_content_routing_values = None
 
         # For dst layout, prefer explicit global_shape, then tensor's global_shape, then primary_logical_shape.
@@ -1105,10 +1020,6 @@ class BaseDataDistributor:
             primary.global_shape
             if primary.global_shape is not None
             else primary_logical_shape
-        )
-        actual_req = local_shape[0] if local_shape else 1
-        assert actual_req is not None, (
-            "actual_req (primary_local_shape[0]) must be statically known"
         )
         if (
             actual_req == 0
@@ -1119,7 +1030,8 @@ class BaseDataDistributor:
         ):
             raise ValueError(
                 f"[Fluxway Static Sharding Error] Static tensor has zero "
-                f"routing rows for TUUID: {self._format_tuuids(tuuid, tuuid_to_name)}. "
+                "routing rows for transfer code(s): "
+                f"{self._format_transfer_codes(transfer_codes, transfer_code_to_name)}. "
                 f"local_shape={local_shape}, global_shape={dst_shape}, "
                 f"target_partitions={target.partitions}. "
                 "Static outputs must be non-empty; use an explicit control tensor "
@@ -1127,7 +1039,7 @@ class BaseDataDistributor:
             )
 
         if (
-            not is_referential
+            not uses_receipt_routing
             and target
             and source
             and not target.is_content_addressable
@@ -1145,12 +1057,13 @@ class BaseDataDistributor:
             ):
                 raise ValueError(
                     f"[Distributor] Static-to-Static routing requires a valid 'global_shape' to determine shard boundaries. "
-                    f"TUUID: {self._format_tuuids(tuuid, tuuid_to_name)}. "
+                    "transfer code(s): "
+                    f"{self._format_transfer_codes(transfer_codes, transfer_code_to_name)}. "
                     f"Please ensure the source TransportTensor has 'global_shape' set explicitly."
                 )
 
         if (
-            not is_referential
+            not uses_receipt_routing
             and target
             and source
             and not target.is_content_addressable
@@ -1173,7 +1086,8 @@ class BaseDataDistributor:
                         f"\n[Fluxway Static Sharding Error] Data dimension {d} has size {global_dim}, "
                         f"but the target mesh needs {sub_mesh_size} elements (axes={axis_names}) "
                         f"to give every worker at least one element.\n"
-                        f"  TUUID: {self._format_tuuids(tuuid, tuuid_to_name)}\n"
+                        "  transfer code(s): "
+                        f"{self._format_transfer_codes(transfer_codes, transfer_code_to_name)}\n"
                         f"  global_shape={dst_shape}, target mesh axes={axis_names}, "
                         f"sub_mesh_size={sub_mesh_size}\n"
                         f"  Fix: Increase the data size along dimension {d} to >= {sub_mesh_size}, "
@@ -1224,9 +1138,13 @@ class BaseDataDistributor:
         global_shapes_list = [tt.global_shape for tt in tensors_to_pack]
 
         is_src_replicated = source is not None and not source.partitions
-        if primary.shape == () or is_src_replicated:
-            target_world_size = target.mesh.size if target and target.mesh else 1
-            src_world_size = source.mesh.size if source and source.mesh else 1
+        if not uses_receipt_routing and (primary.shape == () or is_src_replicated):
+            if source is None:
+                raise ValueError(
+                    "Replicated transport requires a source PhysicalLayout."
+                )
+            target_world_size = target.mesh.size
+            src_world_size = source.mesh.size
 
             # Replicated dispatch: responsible_src = floor(j * N / M)
             # Each target j receives exactly one copy from a designated source.
@@ -1266,15 +1184,15 @@ class BaseDataDistributor:
                 global_shapes_list,
                 has_meta_tensor_state_list,
                 [None] * len(has_meta_tensor_state_list),
-                [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
+                [int(TensorEntryKind.TENSOR)] * len(has_meta_tensor_state_list),
                 source_steps_list,
             )
             return
 
-        identity_target_rank = _static_identity_target_rank(
-            source,
-            target,
-            self.local_rank,
+        identity_target_rank = (
+            None
+            if uses_receipt_routing
+            else _static_identity_target_rank(source, target, self.local_rank)
         )
         if identity_target_rank is not None and target is not None:
             target_world_size = target.mesh.size
@@ -1301,18 +1219,7 @@ class BaseDataDistributor:
                 global_shapes_list,
                 has_meta_tensor_state_list,
                 direct_compact_params,
-                [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(has_meta_tensor_state_list),
-                source_steps_list,
-            )
-            return
-
-        if is_mirror and primary.receipt is not None:
-            yield from self._plan_mirror_group(
-                primary.receipt,
-                payloads,
-                has_meta_tensor_state_list,
-                compact_desc_info,
-                global_shapes_list,
+                [int(TensorEntryKind.TENSOR)] * len(has_meta_tensor_state_list),
                 source_steps_list,
             )
             return
@@ -1407,96 +1314,103 @@ class BaseDataDistributor:
         # corrupt the routing dim_size on the planner side.
 
         payloads_tuple = tuple(padded_payloads)
-        # Each payload's binding axes (which axes of flat_values are bound to
-        # the routing domain). Default (0,) — used for nearly all
-        # DP/MP/EP/SP/CP/TP layouts. The fast-path `take(axis=0)` is taken
-        # whenever the binding is exactly (0,).
-        primary_routing_axes = primary.routing_axes
-        payload_routing_axes = tuple(primary_routing_axes for _ in padded_payloads)
+        payload_routing_axes_tuple = tuple(payload_routing_axes)
         static_shapes_tuple = tuple(static_shapes)
-
-        # ---------- build RoutingDomain (the only thing the planner sees) ----------
-        # The domain is built from the *target* layout. Per-axis sizes are the
-        # routing-domain extents (== padding-free shape under eager backends;
-        # capacity-padded extents under static-shape backends).
-        #
-        # Patch K: transport now owns full src-side reasoning via SrcSideView.
-        # ``derive_src_side_view`` is the *only* legitimate constructor; it
-        # encapsulates per-dim LOCAL IndicesSpec derivation (F), owner gating
-        # on src-replicated mesh axes (G), and static expected_senders_per_dst
-        # (J). Distribution layer consumes ``src_view.is_sender_active`` and
-        # ``src_view.expected_senders_per_dst`` in K-4/K-5.
-        if target is None:
-            raise ValueError(
-                f"[Fluxway Distributor Error] Cannot build routing domain for TUUID(s): "
-                f"{self._format_tuuids(tuuid, tuuid_to_name)}. Target must be a valid PhysicalLayout."
+        invalid_destination_count = None
+        src_view: SrcSideView | None = None
+        if uses_receipt_routing:
+            if receipt is None:
+                raise RuntimeError("Receipt routing lost its validated receipt.")
+            assignment = receipt_destination_assignment(
+                receipt,
+                entity_count=actual_req,
+                capacity=capacity,
+            )
+            (
+                flat_buffers_lists,
+                counts_per_payload,
+                offsets_per_payload,
+                send_counts,
+                send_offsets,
+                dest_devices,
+                replication_factor,
+                sort_indices,
+                invalid_destination_count,
+            ) = _destination_assignment_and_pack(
+                payloads_tuple,
+                tuple(padded_nested_length_list),
+                assignment,
+                payload_routing_axes_tuple,
+                static_shapes_tuple,
+            )
+        else:
+            src_view = derive_src_side_view(
+                src_spec=source,
+                src_local_rank=self.local_rank,
+                target=target,
+                dst_global_shape=tuple(s for s in dst_shape if s is not None)
+                if dst_shape is not None
+                else tuple(s for s in local_shape if s is not None),
+            )
+            self._current_src_view = src_view
+            domain = _build_routing_domain(
+                target=target,
+                src_view=src_view,
+                primary_local_shape=local_shape,
+                src_geometry_indices=src_geometry_indices,
+                dst_content_routing_values=dst_content_routing_values,
+                bk_static=bk_static,
+                capacity=capacity,
+                actual_req=actual_req,
+                dst_global_shape=tuple(s for s in dst_shape if s is not None)
+                if dst_shape is not None
+                else None,
             )
 
-        src_view = derive_src_side_view(
-            src_spec=source,
-            src_local_rank=self.local_rank,
-            target=target,
-            dst_global_shape=tuple(s for s in dst_shape if s is not None)
-            if dst_shape is not None
-            else tuple(s for s in local_shape if s is not None),
-        )
-        # K-5: persist for upper layers (e.g. ArrivalBarrier N derivation).
-        self._current_src_view = src_view
+            def _split_axis(ax: RoutingAxis) -> tuple[RoutingAxis, Any]:
+                spec = ax.indices
+                if isinstance(spec, LiteralIndices):
+                    static_spec = dataclasses.replace(spec, values=None)
+                    return dataclasses.replace(ax, indices=static_spec), spec.values
+                return ax, None
 
-        assert capacity is not None, "capacity must be resolved to an integer"
+            split_pairs = [_split_axis(ax) for ax in domain.axes]
+            domain_static = dataclasses.replace(
+                domain,
+                axes=tuple(p[0] for p in split_pairs),
+            )
+            indices_dyn = tuple(p[1] for p in split_pairs)
+            (
+                flat_buffers_lists,
+                counts_per_payload,
+                offsets_per_payload,
+                send_counts,
+                send_offsets,
+                dest_devices,
+                replication_factor,
+                sort_indices,
+            ) = _jit_plan_and_pack(
+                payloads_tuple,
+                tuple(padded_nested_length_list),
+                self.local_rank,
+                domain_static,
+                indices_dyn,
+                payload_routing_axes_tuple,
+                static_shapes_tuple,
+            )
 
-        domain = _build_routing_domain(
-            target=target,
-            src_view=src_view,
-            primary_local_shape=local_shape,
-            src_geometry_indices=src_geometry_indices,
-            dst_content_routing_values=dst_content_routing_values,
-            bk_static=bk_static,
-            capacity=capacity,
-            actual_req=actual_req,
-            dst_global_shape=tuple(s for s in dst_shape if s is not None)
-            if dst_shape is not None
-            else None,
-        )
-
-        # Split into (static, dynamic) legs so that under jax.jit the static
-        # part is hashable and feeds static_argnums while the LiteralIndices
-        # values flow as the dynamic leg.  RangeIndices / IdentityIndices
-        # are fully hashable and remain inside ``domain_static`` untouched.
-        def _split_axis(ax: RoutingAxis) -> tuple[RoutingAxis, Any]:
-            spec = ax.indices
-            if isinstance(spec, LiteralIndices):
-                # Drop the runtime tensor from the static spec; tensor
-                # flows via indices_dyn[i].
-                static_spec = dataclasses.replace(spec, values=None)
-                return dataclasses.replace(ax, indices=static_spec), spec.values
-            return ax, None
-
-        split_pairs = [_split_axis(ax) for ax in domain.axes]
-        domain_static = dataclasses.replace(
-            domain,
-            axes=tuple(p[0] for p in split_pairs),
-        )
-        indices_dyn = tuple(p[1] for p in split_pairs)
-
-        (
-            flat_buffers_lists,
-            counts_per_payload,
-            offsets_per_payload,
-            send_counts,
-            send_offsets,
-            dest_devices,
-            replication_factor,
-            sort_indices,
-        ) = _jit_plan_and_pack(
-            payloads_tuple,
-            tuple(padded_nested_length_list),
-            self.local_rank,
-            domain_static,
-            indices_dyn,
-            payload_routing_axes,
-            static_shapes_tuple,
-        )
+        if invalid_destination_count is not None:
+            invalid_count = int(backend.to_numpy(invalid_destination_count))
+            if invalid_count:
+                target_size = (
+                    target.mesh.size
+                    if target is not None and getattr(target, "mesh", None) is not None
+                    else -1
+                )
+                raise ValueError(
+                    "Destination assignment contains invalid rank entries: "
+                    f"count={invalid_count} target_rank_count={target_size}."
+                )
 
         if (
             sort_indices is not None
@@ -1612,45 +1526,43 @@ class BaseDataDistributor:
 
         is_replicated = replication_factor > 1
 
-        # Patch K-4: src_view drives SPMD-safe empty-packet emission.
-        # ``expected_senders_per_dst`` enables the static optimization of
-        # skipping a dst whose ``expected[d] == 0`` entirely (no sender
-        # contributes — safe to short-circuit). When ``None`` the routing
-        # graph contains a data-driven dim (Hash/Indexed) and we *cannot*
-        # prove any dst is unreached, so we fall back to always-full SPMD
-        # and emit empty packets to keep alltoall_v symmetric across
-        # senders.
-        # ``is_sender_active`` is False on src ranks that share data with
-        # the canonical (coord==0) replica on at least one src-replicated
-        # mesh axis; they MUST still participate in the SPMD round but
-        # transmit zero-count payloads to avoid double-counting.
-        expected_per_dst = src_view.expected_senders_per_dst
-        is_sender_active = src_view.is_sender_active
-        if expected_per_dst is None:
-            if source is None or source.mesh is None:
-                raise ValueError(
-                    "[Fluxway Distributor Error] Dynamic transport manifest requires "
-                    "a source PhysicalLayout with mesh to determine sender world size."
-                )
+        if source is None:
+            raise ValueError(
+                "Transport manifest requires a source PhysicalLayout to determine "
+                "the sender rank domain."
+            )
+        if uses_receipt_routing:
             source_world_size = source.mesh.size
             manifest = TransportPlanManifest(
                 expected_senders_per_dst=(source_world_size,) * len(counts_host),
                 sender_has_data_per_dst=tuple(bool(count) for count in counts_host),
-                emission_mode=SenderEmissionMode.ALL_SENDERS_WITH_PROTOCOL_EMPTY,
+                emission_mode=SenderEmissionMode.ALL_EXPECTED_SENDERS,
             )
         else:
-            manifest = TransportPlanManifest(
-                expected_senders_per_dst=expected_per_dst,
-                sender_has_data_per_dst=tuple(
-                    (is_sender_active and int(count) > 0) for count in counts_host
-                ),
-                emission_mode=SenderEmissionMode.STATIC_PRODUCERS_ONLY,
-            )
+            if src_view is None:
+                raise RuntimeError("Algebraic routing lost its source-side view.")
+            expected_per_dst = src_view.expected_senders_per_dst
+            is_sender_active = src_view.is_sender_active
+            if expected_per_dst is None:
+                source_world_size = source.mesh.size
+                manifest = TransportPlanManifest(
+                    expected_senders_per_dst=(source_world_size,) * len(counts_host),
+                    sender_has_data_per_dst=tuple(bool(count) for count in counts_host),
+                    emission_mode=SenderEmissionMode.ALL_EXPECTED_SENDERS,
+                )
+            else:
+                manifest = TransportPlanManifest(
+                    expected_senders_per_dst=expected_per_dst,
+                    sender_has_data_per_dst=tuple(
+                        (is_sender_active and int(count) > 0) for count in counts_host
+                    ),
+                    emission_mode=SenderEmissionMode.STATIC_PRODUCERS_ONLY,
+                )
         self._current_plan_manifest = manifest
         expected_counts = manifest.expected_senders_per_dst
         sender_has_data = manifest.sender_has_data_per_dst
         emit_all_senders = (
-            manifest.emission_mode is SenderEmissionMode.ALL_SENDERS_WITH_PROTOCOL_EMPTY
+            manifest.emission_mode is SenderEmissionMode.ALL_EXPECTED_SENDERS
         )
 
         if is_replicated:
@@ -1666,12 +1578,12 @@ class BaseDataDistributor:
                 targets = sorted_dest_host[device_id].flatten().tolist()
                 if sender_has_data[device_id]:
                     p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
-                    empty_kind_list = [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(
+                    tensor_kind_list = [int(TensorEntryKind.TENSOR)] * len(
                         has_meta_tensor_state_list
                     )
                 else:
                     p_flat, c_flat = _get_empty_flat_payloads()
-                    empty_kind_list = [int(EmptyKind.PROTOCOL_EMPTY)] * len(
+                    tensor_kind_list = [int(TensorEntryKind.ROUTING_MISS)] * len(
                         has_meta_tensor_state_list
                     )
 
@@ -1683,7 +1595,7 @@ class BaseDataDistributor:
                     global_shapes_list,
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
-                    empty_kind_list,
+                    tensor_kind_list,
                     source_steps_list,
                 )
         else:
@@ -1697,12 +1609,12 @@ class BaseDataDistributor:
                 targets = [device_id]
                 if sender_has_data[device_id]:
                     p_flat, c_flat = _get_flat_payloads_for_rank(device_id)
-                    empty_kind_list = [int(EmptyKind.DATA_EMPTY_ALLOWED)] * len(
+                    tensor_kind_list = [int(TensorEntryKind.TENSOR)] * len(
                         has_meta_tensor_state_list
                     )
                 else:
                     p_flat, c_flat = _get_empty_flat_payloads()
-                    empty_kind_list = [int(EmptyKind.PROTOCOL_EMPTY)] * len(
+                    tensor_kind_list = [int(TensorEntryKind.ROUTING_MISS)] * len(
                         has_meta_tensor_state_list
                     )
 
@@ -1714,7 +1626,7 @@ class BaseDataDistributor:
                     global_shapes_list,
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
-                    empty_kind_list,
+                    tensor_kind_list,
                     source_steps_list,
                 )
 
@@ -1723,24 +1635,23 @@ class BaseDataDistributor:
         local_data: TransportTensor | list[TransportTensor],
         source: PhysicalLayout | None = None,
         target: PhysicalLayout | None = None,
+        *,
+        routing_source: SelectedRoutingSource,
         capacity: int | list[int] | None = None,
-        tuuid: int | list[int] | None = None,
-        tuuid_to_name: dict[int, str] | None = None,
+        transfer_codes: int | list[int] | None = None,
+        transfer_code_to_name: dict[int, str] | None = None,
     ) -> None:
         """Computes sharding plan and buffers data for all destinations."""
-        if tuuid is None:
+        if transfer_codes is None:
             raise ValueError(
-                "[Fluxway Distributor Error] tuuid is required for TransportFrame planning. "
-                "The frame ABI no longer supports implicit tensor identity."
+                "[Fluxway Distributor Error] transfer_codes is required for "
+                "TransportFrame planning."
             )
 
-        # PLAN ISOLATION:
-        # We MUST NOT reuse plans across separate calls to plan_and_shard.
-        # Each call represents a distinct group of tensors that might have
-        # different routing requirements (e.g., different values/indices).
         self._meta_sort_indices = None
         self._current_source_spec = source
         self._current_target_spec = target
+        self._current_src_view = None
         self._current_plan_manifest = None
 
         for (
@@ -1751,17 +1662,23 @@ class BaseDataDistributor:
             global_shapes_list,
             has_meta_tensor_state_list,
             slice_compact_desc_params,
-            empty_kind_list,
+            tensor_kind_list,
             source_steps_list,
         ) in self._plan_single_tensor_group(
-            local_data, source, target, capacity, tuuid, tuuid_to_name
+            local_data,
+            source,
+            target,
+            routing_source=routing_source,
+            capacity=capacity,
+            transfer_codes=transfer_codes,
+            transfer_code_to_name=transfer_code_to_name,
         ):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "[Distributor Plan] [Rank %s] targets=%s tensors=%s counts=%s "
                     "sort_idx=%s global_shapes_list=%s "
                     "has_meta_tensor_state_list=%s slice_compact_desc_params=%s "
-                    "empty_kind_list=%s",
+                    "tensor_kind_list=%s",
                     self.local_rank,
                     targets,
                     tensors,
@@ -1770,22 +1687,21 @@ class BaseDataDistributor:
                     global_shapes_list,
                     has_meta_tensor_state_list,
                     slice_compact_desc_params,
-                    empty_kind_list,
+                    tensor_kind_list,
                     source_steps_list,
                 )
             if self._meta_sort_indices is None:
                 self._meta_sort_indices = sort_idx
             for target_id in targets:
-                # Store tuuid along with data for correct reconstruction in send_fn
                 self._dest_agg[target_id].append(
                     (
-                        tuuid,
+                        transfer_codes,
                         tensors,
                         counts,
                         global_shapes_list,
                         has_meta_tensor_state_list,
                         slice_compact_desc_params,
-                        empty_kind_list,
+                        tensor_kind_list,
                         source_steps_list,
                     )
                 )
@@ -1815,29 +1731,29 @@ class AsyncDataDistributor(BaseDataDistributor):
                 template_cache=template_cache,
             )
             if logger.isEnabledFor(logging.DEBUG):
-                edge_summary = []
-                for row in frame.edge_i32:
-                    payload_begin = int(row[3])
-                    payload_count = int(row[4])
+                entry_summary = []
+                for entry in frame.entry_i32:
+                    payload_begin = int(entry[3])
+                    payload_count = int(entry[4])
                     valid_count = 0
                     if payload_count > 0:
                         valid_count = int(
                             frame.payload_i32[payload_begin][PAYLOAD_VALID_COUNT]
                         )
-                    edge_summary.append(
+                    entry_summary.append(
                         (
-                            int(row[EDGE_TUUID]),
+                            int(entry[ENTRY_ROUTE_CODE]),
                             valid_count,
-                            EmptyKind(int(row[EDGE_EMPTY_KIND])).name,
-                            int(row[EDGE_EXPECTED_COUNT]),
+                            TensorEntryKind(int(entry[ENTRY_TENSOR_KIND])).name,
+                            int(entry[ENTRY_EXPECTED_COUNT]),
                         )
                     )
                 logger.debug(
-                    "[TransportFrame] sender_rank=%d target_rank=%d step=%d edges=%s",
+                    "[TransportFrame] sender_rank=%d target_rank=%d step=%d entries=%s",
                     sender_rank,
                     target_id,
                     step,
-                    edge_summary,
+                    entry_summary,
                 )
             frame_args.append(
                 (
@@ -1855,16 +1771,50 @@ class AsyncDataDistributor(BaseDataDistributor):
         target: PhysicalLayout | None = None,
         send_fn: Callable | None = None,
         capacity: int | list[int] | None = None,
-        tuuid: int | list[int] | None = None,
-        tuuid_to_name: dict[int, str] | None = None,
+        transfer_codes: int | list[int] | None = None,
+        transfer_code_to_name: dict[int, str] | None = None,
         step: int = 0,
         sender_spmd_code: int = 0,
         sender_rank: int | None = None,
         sender_world_size: int = 1,
+        routing_mode: TransportRoutingMode = TransportRoutingMode.ALGEBRAIC,
     ) -> tuple[list[Any], Any]:
         if local_data is not None:
+            tensors = (
+                [local_data] if isinstance(local_data, TransportTensor) else local_data
+            )
+            if not tensors:
+                raise ValueError("Transport distribution requires at least one tensor.")
+            expected_receipt_world_size = (
+                target.mesh.size if target is not None else None
+            )
+            routing_sources = [
+                select_routing_source(
+                    tensor=tensor,
+                    source=source,
+                    target=target,
+                    mode=routing_mode,
+                    expected_receipt_world_size=expected_receipt_world_size,
+                )
+                for tensor in tensors
+            ]
+            routing_source = routing_sources[0]
+            if any(
+                candidate.batch_key != routing_source.batch_key
+                for candidate in routing_sources[1:]
+            ):
+                raise ValueError(
+                    "One transport distribution call cannot combine tensors with "
+                    "different destination assignments."
+                )
             self.plan_and_shard(
-                local_data, source, target, capacity, tuuid, tuuid_to_name
+                tensors,
+                source,
+                target,
+                routing_source=routing_source,
+                capacity=capacity,
+                transfer_codes=transfer_codes,
+                transfer_code_to_name=transfer_code_to_name,
             )
 
         if send_fn is None:
@@ -1936,24 +1886,23 @@ class AsyncDataDistributor(BaseDataDistributor):
             capacity=_frame_table_capacity_for_groups(groups),
         )
         expected_count = self.expected_n_for_dst(target_id, sender_world_size)
-        for edge_plan in _iter_transport_frame_edge_plans(
+        for entry_plan in _iter_transport_frame_entry_plans(
             groups,
             expected_count=expected_count,
             target_id=target_id,
         ):
-            edge = builder.add_edge(
-                tuuid=edge_plan.tuuid,
-                meta_state=edge_plan.meta_state,
-                empty_kind=edge_plan.empty_kind,
-                min_rows=0,
-                expected_count=edge_plan.expected_count,
-                source_step=edge_plan.source_step,
-                compact_params=edge_plan.compact_params,
-                global_shape=edge_plan.global_shape,
+            entry_index = builder.add_tensor_transfer_entry(
+                transfer_code=entry_plan.transfer_code,
+                meta_state=entry_plan.meta_state,
+                tensor_kind=entry_plan.tensor_kind,
+                expected_count=entry_plan.expected_count,
+                source_step=entry_plan.source_step,
+                compact_params=entry_plan.compact_params,
+                global_shape=entry_plan.global_shape,
             )
-            for payload in edge_plan.payloads:
+            for payload in entry_plan.payloads:
                 builder.add_payload(
-                    edge,
+                    entry_index,
                     payload.role,
                     payload.segment,
                     payload.valid_count,
@@ -1972,8 +1921,8 @@ class AsyncDataDistributor(BaseDataDistributor):
         template_cache: TransportFrameTemplateCache,
     ):
         expected_count = self.expected_n_for_dst(target_id, sender_world_size)
-        edge_plans = tuple(
-            _iter_transport_frame_edge_plans(
+        entry_plans = tuple(
+            _iter_transport_frame_entry_plans(
                 groups,
                 expected_count=expected_count,
                 target_id=target_id,
@@ -1984,7 +1933,7 @@ class AsyncDataDistributor(BaseDataDistributor):
             sender_spmd_code=sender_spmd_code,
             sender_rank=sender_rank,
             sender_world_size=sender_world_size,
-            edge_plans=edge_plans,
+            entry_plans=entry_plans,
         )
         template = template_cache.get(key)
         if template is None:
@@ -2001,73 +1950,75 @@ class AsyncDataDistributor(BaseDataDistributor):
         return template.instantiate(
             step=step,
             payload_segments=tuple(
-                payload.segment for edge in edge_plans for payload in edge.payloads
+                payload.segment for entry in entry_plans for payload in entry.payloads
             ),
             payload_valid_counts=tuple(
-                payload.valid_count for edge in edge_plans for payload in edge.payloads
+                payload.valid_count
+                for entry in entry_plans
+                for payload in entry.payloads
             ),
-            global_shapes=tuple(edge.global_shape for edge in edge_plans),
-            source_steps=tuple(edge.source_step for edge in edge_plans),
+            global_shapes=tuple(entry.global_shape for entry in entry_plans),
+            source_steps=tuple(entry.source_step for entry in entry_plans),
         )
 
 
-def _iter_transport_frame_edge_plans(
+def _iter_transport_frame_entry_plans(
     groups: list[tuple],
     *,
     expected_count: int,
     target_id: int,
-) -> tuple[TransportFrameEdgePlan, ...]:
-    edges: list[TransportFrameEdgePlan] = []
+) -> tuple[TransportFrameEntryPlan, ...]:
+    entries: list[TransportFrameEntryPlan] = []
     for group_index, (
-        tuuids,
+        transfer_codes,
         tensors,
         counts,
         global_shapes,
         meta_states,
         compact_params,
-        empty_kinds,
+        tensor_kinds,
         source_steps,
     ) in enumerate(groups):
-        if isinstance(tuuids, list | tuple):
-            tuuid_seq = tuple(int(u) for u in tuuids)
+        if isinstance(transfer_codes, list | tuple):
+            transfer_code_seq = tuple(int(code) for code in transfer_codes)
         else:
-            tuuid_seq = (int(tuuids),)
-        if len(empty_kinds) != len(tuuid_seq):
+            transfer_code_seq = (int(transfer_codes),)
+        if len(tensor_kinds) != len(transfer_code_seq):
             raise ValueError(
-                f"empty_kinds length {len(empty_kinds)} does not match "
-                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+                f"tensor_kinds length {len(tensor_kinds)} does not match "
+                f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
-        if len(meta_states) != len(tuuid_seq):
+        if len(meta_states) != len(transfer_code_seq):
             raise ValueError(
                 f"meta_states length {len(meta_states)} does not match "
-                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+                f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
-        if len(global_shapes) != len(tuuid_seq):
+        if len(global_shapes) != len(transfer_code_seq):
             raise ValueError(
                 f"global_shapes length {len(global_shapes)} does not match "
-                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+                f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
-        if len(source_steps) != len(tuuid_seq):
+        if len(source_steps) != len(transfer_code_seq):
             raise ValueError(
                 f"source_steps length {len(source_steps)} does not match "
-                f"tuuid count {len(tuuid_seq)} for target_id={target_id}."
+                f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
         cursor = 0
-        for edge_idx, tuuid in enumerate(tuuid_seq):
-            meta_state = int(meta_states[edge_idx])
+        for entry_index, transfer_code in enumerate(transfer_code_seq):
+            meta_state = int(meta_states[entry_index])
             component_count = 1 + ragged_level_count(meta_state)
             if meta_state & 2:
                 component_count += 1
             if cursor + component_count > len(tensors):
                 raise ValueError(
-                    f"group_index={group_index} edge_index={edge_idx} requires "
+                    f"group_index={group_index} entry_index={entry_index} requires "
                     f"{component_count} payload components from cursor={cursor}, "
                     f"but tensors length is {len(tensors)}."
                 )
-            edge_counts = counts[cursor : cursor + component_count]
+            payload_counts = counts[cursor : cursor + component_count]
             compact = (
-                compact_params[edge_idx]
-                if compact_params is not None and edge_idx < len(compact_params)
+                compact_params[entry_index]
+                if compact_params is not None and entry_index < len(compact_params)
                 else None
             )
             if compact is not None:
@@ -2076,7 +2027,7 @@ def _iter_transport_frame_edge_plans(
                 TransportPayloadPlan(
                     role=PayloadRole.VALUES,
                     segment=tensors[cursor],
-                    valid_count=int(edge_counts[0]),
+                    valid_count=int(payload_counts[0]),
                 )
             ]
             cursor += 1
@@ -2098,14 +2049,14 @@ def _iter_transport_frame_edge_plans(
                     )
                 )
                 cursor += 1
-            shape = global_shapes[edge_idx]
-            edges.append(
-                TransportFrameEdgePlan(
-                    tuuid=tuuid,
+            shape = global_shapes[entry_index]
+            entries.append(
+                TransportFrameEntryPlan(
+                    transfer_code=transfer_code,
                     meta_state=meta_state,
-                    empty_kind=EmptyKind(int(empty_kinds[edge_idx])),
+                    tensor_kind=TensorEntryKind(int(tensor_kinds[entry_index])),
                     expected_count=expected_count,
-                    source_step=int(source_steps[edge_idx]),
+                    source_step=int(source_steps[entry_index]),
                     compact_params=compact,
                     global_shape=tuple(int(value) for value in shape)
                     if shape is not None
@@ -2118,7 +2069,7 @@ def _iter_transport_frame_edge_plans(
                 f"group_index={group_index} consumed {cursor} payload components, "
                 f"but tensors length is {len(tensors)}."
             )
-    return tuple(edges)
+    return tuple(entries)
 
 
 def _transport_frame_template_key(
@@ -2127,21 +2078,21 @@ def _transport_frame_template_key(
     sender_spmd_code: int,
     sender_rank: int,
     sender_world_size: int,
-    edge_plans: tuple[TransportFrameEdgePlan, ...],
+    entry_plans: tuple[TransportFrameEntryPlan, ...],
 ) -> TransportFrameTemplateKey:
     return TransportFrameTemplateKey(
         target_rank=target_rank,
         sender_spmd_code=sender_spmd_code,
         sender_rank=sender_rank,
         sender_world_size=sender_world_size,
-        edges=tuple(
+        entries=tuple(
             (
-                edge.tuuid,
-                edge.meta_state,
-                int(edge.empty_kind),
-                edge.expected_count,
-                edge.compact_params,
-                0 if edge.global_shape is None else len(edge.global_shape),
+                entry.transfer_code,
+                entry.meta_state,
+                int(entry.tensor_kind),
+                entry.expected_count,
+                entry.compact_params,
+                0 if entry.global_shape is None else len(entry.global_shape),
                 tuple(
                     (
                         int(payload.role),
@@ -2150,10 +2101,10 @@ def _transport_frame_template_key(
                             tuple(int(x) for x in getattr(payload.segment, "shape", ()))
                         ),
                     )
-                    for payload in edge.payloads
+                    for payload in entry.payloads
                 ),
             )
-            for edge in edge_plans
+            for entry in entry_plans
         ),
     )
 
@@ -2265,56 +2216,56 @@ def _static_identity_payload_group(
 
 
 def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
-    edge_count = 0
+    entry_count = 0
     payload_count = 0
     shape_count = 0
     global_shape_count = 0
     compact_count = 0
 
     for group_index, (
-        tuuids,
+        transfer_codes,
         tensors,
         _counts,
         global_shapes,
         meta_states,
         compact_params,
-        empty_kinds,
+        tensor_kinds,
         _source_steps,
     ) in enumerate(groups):
-        if isinstance(tuuids, list | tuple):
-            tuuid_seq = tuple(tuuids)
+        if isinstance(transfer_codes, list | tuple):
+            transfer_code_seq = tuple(transfer_codes)
         else:
-            tuuid_seq = (tuuids,)
-        if len(empty_kinds) != len(tuuid_seq):
+            transfer_code_seq = (transfer_codes,)
+        if len(tensor_kinds) != len(transfer_code_seq):
             raise ValueError(
-                f"empty_kinds length {len(empty_kinds)} does not match "
-                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+                f"tensor_kinds length {len(tensor_kinds)} does not match "
+                f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
-        if len(meta_states) != len(tuuid_seq):
+        if len(meta_states) != len(transfer_code_seq):
             raise ValueError(
                 f"meta_states length {len(meta_states)} does not match "
-                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+                f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
-        if len(global_shapes) != len(tuuid_seq):
+        if len(global_shapes) != len(transfer_code_seq):
             raise ValueError(
                 f"global_shapes length {len(global_shapes)} does not match "
-                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+                f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
-        if len(_source_steps) != len(tuuid_seq):
+        if len(_source_steps) != len(transfer_code_seq):
             raise ValueError(
                 f"source_steps length {len(_source_steps)} does not match "
-                f"tuuid count {len(tuuid_seq)} for group_index={group_index}."
+                f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
 
         cursor = 0
-        edge_count += len(tuuid_seq)
-        for edge_idx, meta_state in enumerate(meta_states):
+        entry_count += len(transfer_code_seq)
+        for entry_index, meta_state in enumerate(meta_states):
             component_count = 1 + ragged_level_count(int(meta_state))
             if int(meta_state) & 2:
                 component_count += 1
             if cursor + component_count > len(tensors):
                 raise ValueError(
-                    f"group_index={group_index} edge_index={edge_idx} requires "
+                    f"group_index={group_index} entry_index={entry_index} requires "
                     f"{component_count} payload components from cursor={cursor}, "
                     f"but tensors length is {len(tensors)}."
                 )
@@ -2323,13 +2274,13 @@ def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
                 shape_count += len(tuple(int(x) for x in getattr(tensor, "shape", ())))
             cursor += component_count
 
-            global_shape = global_shapes[edge_idx]
+            global_shape = global_shapes[entry_index]
             if global_shape is not None:
                 global_shape_count += len(global_shape)
             if (
                 compact_params is not None
-                and edge_idx < len(compact_params)
-                and compact_params[edge_idx] is not None
+                and entry_index < len(compact_params)
+                and compact_params[entry_index] is not None
             ):
                 compact_count += COMPACT_PARAM_COUNT
 
@@ -2340,7 +2291,7 @@ def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
             )
 
     return FrameTableCapacity(
-        edge_count=edge_count,
+        entry_count=entry_count,
         payload_count=payload_count,
         shape_count=shape_count,
         global_shape_count=global_shape_count,
@@ -2374,26 +2325,6 @@ def _jit_write_at_offset(src, dst, count, offset):
     trimmed = backend.dynamic_slice(src, start, sizes)
     dst_start = (offset,) + (0,) * (ndim - 1)
     return backend.dynamic_slice_update(dst, trimmed, dst_start)
-
-
-def _get_rank_data_from_tree(rank_id, stitched_tensors_tree, counts, offsets):
-    """
-    rank_id: target rank id
-    stitched_tensors_tree: Pytree sorted by rank
-    counts: counts of each rank
-    offsets: offsets of each rank
-    """
-    backend = get_backend()
-
-    start = offsets[rank_id]
-    size = counts[rank_id]
-
-    def slice_leaf(array):
-        # assume all slaves are in the 0-th dimension (Batch dimension)
-        return backend.dynamic_slice_in_dim(array, start=start, size=size, axis=0)
-
-    # 3. 使用 tree_map 一次性处理 List 中的所有 Tensor
-    return backend.tree_map(slice_leaf, stitched_tensors_tree)
 
 
 @compile(static_argnums=(2,))
@@ -2636,81 +2567,6 @@ class TransportReceiver:
         return dict(self._written_counts)
 
 
-@compile(static_argnums=(2,))
-def _stitch_with_prime(prime_rank_tags, slave_tensors, world_size):
-    """
-    prime_rank_tags: (N,) or scalar - origin rang tags decide where to go
-    slave_tensors: pytree (list/dict), with (N, ...extra_dims) tensors
-    world_size: scalar
-    """
-    backend = get_backend()
-
-    # Fast path: If prime_rank_tags is a scalar, everyone goes to one destination
-    if (
-        isinstance(prime_rank_tags, int | np.integer)
-        or len(backend.shape(prime_rank_tags)) == 0
-    ):
-        target_rank = int(prime_rank_tags)
-        counts = backend.zeros((world_size,), dtype=backend.int32(), device="cpu")
-
-        if target_rank >= 0 and target_rank < world_size:
-            first_tensor = backend.tree_flatten(slave_tensors)[0][0]
-            rows = backend.shape(first_tensor)[0]
-            counts = backend.index_update(counts, (target_rank,), rows)
-
-        offsets = backend.zeros((world_size,), dtype=backend.int32(), device="cpu")
-        return slave_tensors, counts, offsets
-
-    # Sentinel Protocol:
-    # Valid tags: 0 <= tag < world_size
-    # Invalid tags (Padding): tag == world_size
-    # We use minlength=world_size + 1 to naturally collect garbage in the last bin.
-
-    sort_idx = backend.argsort(prime_rank_tags)
-
-    counts_with_garbage = backend.bincount(prime_rank_tags, minlength=world_size + 1)
-    counts = counts_with_garbage[:world_size]
-
-    offsets_with_garbage = backend.cumsum(counts_with_garbage) - counts_with_garbage
-    offsets = offsets_with_garbage[:world_size]
-
-    def reorder_fn(x):
-        return x[sort_idx]
-
-    stitched_tensors = backend.tree_map(reorder_fn, slave_tensors)
-    return stitched_tensors, counts, offsets
-
-
-def _grouped_numpy_rank_layout(
-    rank_tags: Any,
-    world_size: int,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    if not isinstance(rank_tags, np.ndarray):
-        return None
-    if rank_tags.ndim != 1:
-        raise ValueError(
-            f"mirror sender rank tags must be 1D, got shape={rank_tags.shape}."
-        )
-    if rank_tags.size:
-        minimum = int(rank_tags[0])
-        maximum = int(rank_tags[-1])
-        if minimum < 0 or maximum > world_size:
-            raise ValueError(
-                "mirror sender rank tags must be target ranks or the padding "
-                f"sentinel {world_size}, got min={minimum} max={maximum}."
-            )
-        if np.any(rank_tags[1:] < rank_tags[:-1]):
-            return None
-    boundaries = np.searchsorted(
-        rank_tags,
-        np.arange(world_size + 1, dtype=rank_tags.dtype),
-        side="left",
-    )
-    counts = np.diff(boundaries).astype(np.int32, copy=False)
-    offsets = boundaries[:-1].astype(np.int32, copy=False)
-    return counts, offsets
-
-
 def _build_routing_domain(
     target: PhysicalLayout,
     src_view: SrcSideView,
@@ -2907,7 +2763,7 @@ def _ragged_project_rows_to_flat(
     deeper ragged topologies by repeatedly expanding sorted parent ids into
     child ids until the last level describes flat value segments.
     """
-    zero = backend.zeros((1,), dtype=backend.int32(), device="cpu")
+    zero = backend.zeros((1,), dtype=backend.int32())
     parent_ids = row_sort_indices
     reordered_levels = []
 
@@ -2920,13 +2776,11 @@ def _ragged_project_rows_to_flat(
         child_offsets = backend.cat([zero, backend.cumsum(reordered_lengths)], dim=0)
         child_count = backend.shape(reordered_lengths)[0]
         child_parent_ids = backend.repeat_interleave(
-            backend.arange(0, child_count, dtype=backend.int32(), device="cpu"),
+            backend.arange(0, child_count, dtype=backend.int32()),
             reordered_lengths,
             total_repeat_length=total_children,
         )
-        child_iota = backend.arange(
-            0, total_children, dtype=backend.int32(), device="cpu"
-        )
+        child_iota = backend.arange(0, total_children, dtype=backend.int32())
         child_starts = backend.take(child_offsets, child_parent_ids)
         child_inner_offsets = child_iota - child_starts
         parent_starts = backend.take(starts, child_parent_ids)
@@ -2935,72 +2789,51 @@ def _ragged_project_rows_to_flat(
     return parent_ids, tuple(reordered_levels)
 
 
-@compile(static_argnums=(2, 3, 5, 6))
-def _jit_plan_and_pack(
+def _pack_payloads_by_plan(
+    *,
+    backend: Any,
     payloads_tuple: tuple[Any, ...],
     nested_length_list: tuple[Any | None, ...],
-    src_local_rank: int,
-    domain_static: RoutingDomain,
-    indices_dyn: tuple[Any, ...],
     payload_routing_axes: tuple[tuple[int, ...], ...],
     static_shapes: tuple[int, ...],
+    sort_indices: Any | None,
+    send_counts: Any,
 ):
-    """JIT-friendly kernel: compute the transport plan and reorder payloads.
-
-    The kernel takes the routing description as a (static, dynamic) split:
-    ``domain_static`` carries every hashable, type-only field of the
-    ``RoutingDomain`` (and is therefore safe as a ``jax.jit`` static arg);
-    ``indices_dyn`` carries the per-axis runtime index tensors. They are
-    re-merged before invoking ``TransportPlanner.compute_plan``.
-
-    Returns O(N) flat reordered arrays together with per-device
-    ``(offsets, counts)`` vectors.  The caller slices each device's window
-    directly from the flat buffer, avoiding the O(W*N) vmap-padded
-    intermediate that the previous implementation produced.
-    """
-    backend = get_backend()
-
-    # Re-merge static + dynamic legs of the routing domain.  Only
-    # `LiteralIndices` axes carry a runtime tensor; the spec for those is
-    # rebuilt with `values=indices_dyn[i]`.  RangeIndices / IdentityIndices
-    # axes are pass-through (their dyn entry is None).
-    def _merge_axis(ax: RoutingAxis, dyn: Any) -> RoutingAxis:
-        spec = ax.indices
-        if isinstance(spec, LiteralIndices) and dyn is not None:
-            new_spec = dataclasses.replace(spec, values=dyn)
-            return dataclasses.replace(ax, indices=new_spec)
-        return ax
-
-    merged_axes = tuple(
-        _merge_axis(ax, dyn)
-        for ax, dyn in zip(domain_static.axes, indices_dyn, strict=True)
-    )
-    domain = dataclasses.replace(domain_static, axes=merged_axes)
-
-    plan = TransportPlanner.compute_plan(src_local_rank, domain)
-    sort_indices = plan.sort_indices
-    dest_devices = plan.dest_devices
-    send_counts = plan.send_counts
-    replica_size = plan.replication_factor
+    has_ragged_payload = any(levels is not None for levels in nested_length_list)
+    if sort_indices is not None:
+        sort_indices = backend.adopt(sort_indices)
 
     cs = backend.cumsum(send_counts, dim=0)
-    zero = backend.zeros((1,), dtype=backend.int32(), device="cpu")
+    zero = send_counts[:1] * 0
     send_offsets = backend.cat([zero, cs[:-1]], dim=0)
+    packing_send_counts = (
+        backend.adopt(send_counts) if has_ragged_payload else send_counts
+    )
+    packing_send_offsets = (
+        backend.adopt(send_offsets) if has_ragged_payload else send_offsets
+    )
+    packing_zero = packing_send_counts[:1] * 0
 
     # Reorder data per payload — O(N) flat reorder, no vmap padding.
-    flat_buffers_lists = []
+    flat_buffers_lists: list[tuple[Any, tuple[Any, ...] | None]] = []
     counts_per_payload = []
     offsets_per_payload = []
 
     for i in range(len(payloads_tuple)):
         data = payloads_tuple[i]
-        level_lengths = nested_length_list[i]
+        raw_level_lengths = nested_length_list[i]
+        level_lengths = (
+            None
+            if raw_level_lengths is None
+            else tuple(backend.adopt(lengths) for lengths in raw_level_lengths)
+        )
         is_ragged = level_lengths is not None
         axes = payload_routing_axes[i]
 
         if not is_ragged:
-            # Dense path: one gather places all rows in send order.
-            if axes == (0,):
+            if sort_indices is None:
+                reordered_data = data
+            elif axes == (0,):
                 reordered_data = backend.take(data, sort_indices)
             else:
                 reordered_data = _apply_with_binding(data, sort_indices, axes)
@@ -3009,27 +2842,31 @@ def _jit_plan_and_pack(
             offsets_per_payload.append(send_offsets)
 
         else:
-            # Ragged path: routing binds to outer rows, then projects row
-            # order through every nested split level before gathering values.
-            level_caps = tuple(
-                int(backend.shape(level_lengths[j + 1])[0])
-                if j + 1 < len(level_lengths)
-                else static_shapes[i + 1]
-                for j in range(len(level_lengths))
-            )
-            flat_indices, reordered_levels = _ragged_project_rows_to_flat(
-                backend, level_lengths, sort_indices, level_caps
-            )
-            reordered_data = backend.take(data, flat_indices)
+            if sort_indices is None:
+                reordered_data = data
+                reordered_levels = level_lengths
+            else:
+                level_caps = tuple(
+                    int(backend.shape(level_lengths[j + 1])[0])
+                    if j + 1 < len(level_lengths)
+                    else static_shapes[i + 1]
+                    for j in range(len(level_lengths))
+                )
+                flat_indices, reordered_levels = _ragged_project_rows_to_flat(
+                    backend, level_lengths, sort_indices, level_caps
+                )
+                reordered_data = backend.take(data, flat_indices)
 
             level_counts = []
             level_offsets = []
-            parent_offsets = send_offsets
-            parent_counts = send_counts
+            parent_offsets = packing_send_offsets
+            parent_counts = packing_send_counts
             for reordered_lengths in reordered_levels:
                 level_counts.append(parent_counts)
                 level_offsets.append(parent_offsets)
-                level_cs = backend.cat([zero, backend.cumsum(reordered_lengths)], dim=0)
+                level_cs = backend.cat(
+                    [packing_zero, backend.cumsum(reordered_lengths)], dim=0
+                )
                 child_offsets = backend.take(level_cs, parent_offsets)
                 child_counts = backend.take(
                     level_cs, parent_offsets + parent_counts
@@ -3053,9 +2890,165 @@ def _jit_plan_and_pack(
         flat_buffers_lists,
         counts_per_payload,
         offsets_per_payload,
-        send_counts,
         send_offsets,
-        dest_devices,
-        replica_size,
-        sort_indices,
+    )
+
+
+@compile(static_argnums=(2, 3, 5, 6))
+def _jit_plan_and_pack(
+    payloads_tuple: tuple[Any, ...],
+    nested_length_list: tuple[Any | None, ...],
+    src_local_rank: int,
+    domain_static: RoutingDomain,
+    indices_dyn: tuple[Any, ...],
+    payload_routing_axes: tuple[tuple[int, ...], ...],
+    static_shapes: tuple[int, ...],
+):
+    backend = get_backend()
+
+    def _merge_axis(ax: RoutingAxis, dyn: Any) -> RoutingAxis:
+        spec = ax.indices
+        if isinstance(spec, LiteralIndices) and dyn is not None:
+            new_spec = dataclasses.replace(spec, values=dyn)
+            return dataclasses.replace(ax, indices=new_spec)
+        return ax
+
+    merged_axes = tuple(
+        _merge_axis(ax, dyn)
+        for ax, dyn in zip(domain_static.axes, indices_dyn, strict=True)
+    )
+    domain = dataclasses.replace(domain_static, axes=merged_axes)
+    plan = TransportPlanner.compute_plan(src_local_rank, domain)
+    (
+        flat_buffers_lists,
+        counts_per_payload,
+        offsets_per_payload,
+        send_offsets,
+    ) = _pack_payloads_by_plan(
+        backend=backend,
+        payloads_tuple=payloads_tuple,
+        nested_length_list=nested_length_list,
+        payload_routing_axes=payload_routing_axes,
+        static_shapes=static_shapes,
+        sort_indices=plan.sort_indices,
+        send_counts=plan.send_counts,
+    )
+    return (
+        flat_buffers_lists,
+        counts_per_payload,
+        offsets_per_payload,
+        plan.send_counts,
+        send_offsets,
+        plan.dest_devices,
+        plan.replication_factor,
+        plan.sort_indices,
+    )
+
+
+@compile(static_argnums=(3, 4, 5, 6))
+def _jit_destination_assignment_and_pack(
+    payloads_tuple: tuple[Any, ...],
+    nested_length_list: tuple[Any | None, ...],
+    destination_ranks: Any,
+    entity_count: int,
+    target_rank_count: int,
+    payload_routing_axes: tuple[tuple[int, ...], ...],
+    static_shapes: tuple[int, ...],
+):
+    backend = get_backend()
+    plan = TransportPlanner.compute_destination_assignment(
+        DestinationAssignment(
+            ranks=destination_ranks,
+            entity_count=entity_count,
+            target_rank_count=target_rank_count,
+        )
+    )
+    (
+        flat_buffers_lists,
+        counts_per_payload,
+        offsets_per_payload,
+        send_offsets,
+    ) = _pack_payloads_by_plan(
+        backend=backend,
+        payloads_tuple=payloads_tuple,
+        nested_length_list=nested_length_list,
+        payload_routing_axes=payload_routing_axes,
+        static_shapes=static_shapes,
+        sort_indices=plan.sort_indices,
+        send_counts=plan.send_counts,
+    )
+    return (
+        flat_buffers_lists,
+        counts_per_payload,
+        offsets_per_payload,
+        plan.send_counts,
+        send_offsets,
+        plan.dest_devices,
+        plan.replication_factor,
+        plan.sort_indices,
+        plan.invalid_destination_count,
+    )
+
+
+@compile(static_argnums=(4, 5))
+def _jit_pack_destination_plan(
+    payloads_tuple: tuple[Any, ...],
+    nested_length_list: tuple[Any | None, ...],
+    sort_indices: Any | None,
+    send_counts: Any,
+    payload_routing_axes: tuple[tuple[int, ...], ...],
+    static_shapes: tuple[int, ...],
+):
+    return _pack_payloads_by_plan(
+        backend=get_backend(),
+        payloads_tuple=payloads_tuple,
+        nested_length_list=nested_length_list,
+        payload_routing_axes=payload_routing_axes,
+        static_shapes=static_shapes,
+        sort_indices=sort_indices,
+        send_counts=send_counts,
+    )
+
+
+def _destination_assignment_and_pack(
+    payloads_tuple: tuple[Any, ...],
+    nested_length_list: tuple[Any | None, ...],
+    assignment: DestinationAssignment,
+    payload_routing_axes: tuple[tuple[int, ...], ...],
+    static_shapes: tuple[int, ...],
+):
+    if isinstance(assignment.ranks, int | np.integer | np.ndarray):
+        plan = TransportPlanner.compute_destination_assignment(assignment)
+        (
+            flat_buffers_lists,
+            counts_per_payload,
+            offsets_per_payload,
+            send_offsets,
+        ) = _jit_pack_destination_plan(
+            payloads_tuple,
+            nested_length_list,
+            plan.sort_indices,
+            plan.send_counts,
+            payload_routing_axes,
+            static_shapes,
+        )
+        return (
+            flat_buffers_lists,
+            counts_per_payload,
+            offsets_per_payload,
+            plan.send_counts,
+            send_offsets,
+            plan.dest_devices,
+            plan.replication_factor,
+            plan.sort_indices,
+            plan.invalid_destination_count,
+        )
+    return _jit_destination_assignment_and_pack(
+        payloads_tuple,
+        nested_length_list,
+        assignment.ranks,
+        assignment.entity_count,
+        assignment.target_rank_count,
+        payload_routing_axes,
+        static_shapes,
     )

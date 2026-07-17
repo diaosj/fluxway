@@ -1,6 +1,9 @@
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.configs import OperatorMeta, SPMDConfig
+from fluxway.common.types.configs import SPMDConfig
+from fluxway import OperatorSpec
+from fluxway.common.compiled_graph import compile_graph
 from fluxway.spmd.driver.driver import SPMDDriver
+from tests.compiled_graph_fixtures import compiled_spmd_spec
 import pytest
 
 
@@ -11,11 +14,23 @@ def _driver_cls():
 
 def _make_driver():
     mesh = DeviceMesh(axis_names=("dp",), device_shape=(4,))
+    operator = OperatorSpec(name="compute")
+    compiled_graph = compile_graph(
+        name="driver-local-rank-test",
+        spmds=(
+            compiled_spmd_spec(
+                spmd_id="spmd-a",
+                mesh=mesh,
+                operators={"compute": operator},
+            ),
+        ),
+        dependencies=(),
+    ).spmd("spmd-a")
     config = SPMDConfig(
+        spmd_id="spmd-a",
+        graph_view=compiled_graph,
         mesh=mesh,
-        operators={},
-        operator_metas={"compute": OperatorMeta(name="compute")},
-        active_operator_names=("compute",),
+        operator_specs={"compute": operator},
     )
     driver_cls = _driver_cls()
     return driver_cls(

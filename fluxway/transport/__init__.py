@@ -11,7 +11,7 @@ from fluxway.common.types.sharding import (
     PartitionStrategy,
     ChunkPartition,
     CyclicPartition,
-    IndexedPartition,
+    FunctionPartition,
     GreedyPartition,
     # RoutingDomain abstraction (L2 contract)
     RoutingDomain,
@@ -25,6 +25,7 @@ from fluxway.common.types.sharding import (
 )
 from .planner import TransportPlanner, TransportPlan
 from .communication import AsyncDataDistributor
+from .routing import TransportRoutingMode
 
 __all__ = [
     "TransportTensor",
@@ -33,7 +34,7 @@ __all__ = [
     "PartitionStrategy",
     "ChunkPartition",
     "CyclicPartition",
-    "IndexedPartition",
+    "FunctionPartition",
     "GreedyPartition",
     # RoutingDomain abstraction
     "RoutingDomain",
@@ -47,6 +48,7 @@ __all__ = [
     "TransportPlanner",
     "TransportPlan",
     "AsyncDataDistributor",
+    "TransportRoutingMode",
 ]
 
 ensure_logging_configured()

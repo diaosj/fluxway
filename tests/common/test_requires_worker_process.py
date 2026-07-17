@@ -12,8 +12,9 @@ from fluxway.common.decorators import (
     requires_worker_process,
     spmd,
 )
-from fluxway.common.types import OperatorMeta, SPMDConfig
+from fluxway import OperatorSpec
 from fluxway.spmd.worker.worker import SPMDWorker
+from tests.compiled_graph_fixtures import single_spmd_config
 
 
 def test_requires_worker_process_marks_class_for_worker_process_lane():
@@ -34,7 +35,7 @@ def test_requires_worker_process_lowers_to_operator_meta():
 
     config = Trainer.get_spmd_config()  # type: ignore
 
-    assert config.operator_metas["step"].requires_worker_process is True
+    assert config.operator_specs["step"].requires_worker_process is True
 
 
 def test_missing_worker_process_marker_fails_for_jax_distributed_initialize(tmp_path):
@@ -66,7 +67,7 @@ def test_missing_worker_process_marker_fails_for_jax_distributed_initialize(tmp_
         _validate_worker_process_marker(module.Trainer)
 
 
-def test_operator_preinstantiation_respects_process_location(monkeypatch):
+def test_operator_preinstantiation_creates_each_owner_once_in_worker():
     created = []
 
     @requires_worker_process
@@ -74,31 +75,31 @@ def test_operator_preinstantiation_respects_process_location(monkeypatch):
         def __init__(self) -> None:
             created.append("worker")
 
-    class ExecutionActorOperator:
-        def __init__(self) -> None:
-            created.append("execution_actor")
+        def update(self) -> None:
+            return None
 
-    classes = {
-        "WorkerOperator": WorkerOperator,
-        "ExecutionActorOperator": ExecutionActorOperator,
-    }
-    monkeypatch.setattr(
-        "fluxway.spmd.worker.worker._resolve_owner_class",
-        lambda _, qualname: classes[qualname],
-    )
-    config = SPMDConfig(
+    class StandardOperator:
+        def __init__(self) -> None:
+            created.append("standard")
+
+    config = single_spmd_config(
+        name="operator-preinstantiation",
+        spmd_id="test",
         mesh=DeviceMesh(axis_names=("data",), device_shape=(1,)),
-        operator_metas={
-            "worker": OperatorMeta(
+        operators={
+            "worker": OperatorSpec(
                 name="worker",
-                owner_class_module="test",
-                owner_class_qualname="WorkerOperator",
+                owner=WorkerOperator,
                 requires_worker_process=True,
             ),
-            "execution_actor": OperatorMeta(
-                name="execution_actor",
-                owner_class_module="test",
-                owner_class_qualname="ExecutionActorOperator",
+            "worker_update": OperatorSpec(
+                name="worker_update",
+                owner=WorkerOperator,
+                requires_worker_process=True,
+            ),
+            "standard": OperatorSpec(
+                name="standard",
+                owner=StandardOperator,
                 requires_worker_process=False,
             ),
         },
@@ -108,14 +109,6 @@ def test_operator_preinstantiation_respects_process_location(monkeypatch):
     worker_type._pre_instantiate_operators(
         config,
         rank=0,
-        operator_location="worker",
+        static_args={},
     )
-    assert created == ["worker"]
-
-    created.clear()
-    worker_type._pre_instantiate_operators(
-        config,
-        rank=0,
-        operator_location="execution_actor",
-    )
-    assert created == ["execution_actor"]
+    assert sorted(created) == ["standard", "worker"]

@@ -29,14 +29,14 @@ class _EnvRestorer:
                 os.environ[k] = v
 
 
-def launch(
+def run_in_sandbox(
     entry_fn: Callable[..., Awaitable[Any]],
     *args: Any,
     ray_init_kwargs: dict[str, Any] | None = None,
     runtime_env: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> Any:
-    """Fluxway Standard Launcher — a pure execution sandbox.
+    """Run an async entry function inside a zero-GPU Ray sandbox.
 
     Runs ``entry_fn`` inside an isolated Ray Task with **zero GPUs** so that
     the main / Jupyter process never triggers eager GPU memory allocation when

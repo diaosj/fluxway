@@ -40,6 +40,17 @@ class SymmetryReceipt:
             world_size: Total number of ranks in the source mesh.
             sender_rank_tags: Tensor or int containing target worker ranks.
         """
+        if type(world_size) is not int or world_size <= 0:
+            raise ValueError(
+                f"SymmetryReceipt.world_size must be a positive int, got {world_size!r}."
+            )
+        if isinstance(sender_rank_tags, int | np.integer) and not (
+            0 <= int(sender_rank_tags) < world_size
+        ):
+            raise ValueError(
+                "SymmetryReceipt scalar rank is outside its rank domain: "
+                f"rank={int(sender_rank_tags)} world_size={world_size}."
+            )
         self._world_size = world_size
         self._sender_rank_tags = sender_rank_tags
 
@@ -52,7 +63,23 @@ class SymmetryReceipt:
         return self._sender_rank_tags
 
     def is_scalar(self) -> bool:
-        return isinstance(self._sender_rank_tags, int | np.integer)
+        if isinstance(self._sender_rank_tags, int | np.integer):
+            return True
+        return getattr(self._sender_rank_tags, "shape", None) == ()
+
+    def validate_entity_count(self, count: int) -> None:
+        if self.is_scalar():
+            return
+        shape = get_backend().shape(self._sender_rank_tags)
+        if len(shape) != 1:
+            raise ValueError(
+                f"SymmetryReceipt rank tags must be 1D, got shape={shape}."
+            )
+        if shape[0] != count:
+            raise ValueError(
+                f"SymmetryReceipt receipt length {shape[0]} does not match "
+                f"tensor routing entity count {count}."
+            )
 
     def __getitem__(self, key: Any) -> "SymmetryReceipt":
         """Slice or gather symmetry metadata."""
@@ -67,6 +94,7 @@ class SymmetryReceipt:
             return backend.full(
                 (length,), int(self._sender_rank_tags), dtype=backend.int32()
             )
+        self.validate_entity_count(length)
         return self._sender_rank_tags
 
     @classmethod
@@ -76,6 +104,10 @@ class SymmetryReceipt:
         """Concatenate multiple receipts into one."""
         if not receipts:
             return None
+        if len(receipts) != len(lengths):
+            raise ValueError(
+                f"Receipt count {len(receipts)} does not match length count {len(lengths)}."
+            )
 
         # Filter out None values and check for consistency
         valid_receipts = [r for r in receipts if r is not None]
@@ -87,7 +119,14 @@ class SymmetryReceipt:
                 f"Inconsistent provenance: Expected {len(receipts)} receipts, "
                 f"but found {len(valid_receipts)}. All shards must carry receipts."
             )
+        rank_domains = {receipt.world_size for receipt in valid_receipts}
+        if len(rank_domains) != 1:
+            raise ValueError(
+                f"Cannot concatenate receipts from different rank domains: "
+                f"{sorted(rank_domains)}."
+            )
         if len(valid_receipts) == 1:
+            valid_receipts[0].validate_entity_count(lengths[0])
             return valid_receipts[0]
 
         world_size = valid_receipts[0].world_size
@@ -182,6 +221,8 @@ class TransportTensor:
             self._lineage,
             backend,
         )
+        if receipt is not None:
+            receipt.validate_entity_count(data_len)
 
     @classmethod
     def from_tensor(
@@ -473,8 +514,28 @@ class TransportTensor:
 
     @receipt.setter
     def receipt(self, value: SymmetryReceipt | None):
+        if value is not None:
+            value.validate_entity_count(self.routing_entity_count)
         self._lineage.receipt = value
         self._receipt = value
+
+    def with_lineage(
+        self,
+        *,
+        origin_indices: Any | None,
+        receipt: SymmetryReceipt,
+        global_shape: tuple[int, ...] | None,
+    ) -> "TransportTensor":
+        return TransportTensor(
+            self.flat_values,
+            nested_splits=self.nested_splits,
+            routing_indices=self.routing_indices,
+            global_shape=global_shape,
+            origin_indices=origin_indices,
+            receipt=receipt,
+            routing_axes=self.routing_axes,
+            source_step=self.source_step,
+        )
 
     @property
     def source_step(self) -> int | None:

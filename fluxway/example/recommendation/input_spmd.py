@@ -8,13 +8,14 @@ import fluxway as fw
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.index_descriptor import ExplicitIndex
-from fluxway.common.types import AsyncPolicy, StatePolicy
+from fluxway.common.operator_policy import AsyncPolicy, StatePolicy
 from fluxway.common.tensor_components import (
     dense_path_strides,
     nested_global_positions_kernel,
     nested_path_position_maps,
 )
 from fluxway.common.types.tensor import TransportTensor
+from fluxway import ResourceProfile
 from .data_types import UserBatch, InputNodeOutput, DPFeatures
 
 
@@ -47,17 +48,6 @@ def _unique_global_flat_positions(
         out,
     )
     return out
-
-
-def hash_routing(tensor, mesh):
-    val = tensor.flat_values if isinstance(tensor, TransportTensor) else tensor
-    assert val is not None, "[InputSPMD.hash_routing] tensor.flat_values is None"
-    assert mesh.size > 0, (
-        f"[InputSPMD.hash_routing] mesh.size must be positive, got {mesh.size}"
-    )
-    if len(val.shape) > 1:
-        val = val[:, 0]
-    return np.mod(val, mesh.size)
 
 
 async def _sparse_unique(
@@ -205,7 +195,7 @@ async def _sparse_unique(
 
 
 @spmd(
-    resource={"num_cpus": 1, "memory_gb": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("dp",),
 )
 @requires_worker_process
@@ -236,12 +226,12 @@ class InputSPMD:
             "unique_user_ids": {
                 "type": "dynamic",
                 "axis": ["dp"],
-                "fn": "hash_routing",
+                "strategy": "modulo",
             },
             "unique_item_ids": {
                 "type": "dynamic",
                 "axis": ["dp"],
-                "fn": "hash_routing",
+                "strategy": "modulo",
             },
             "user_inv": {"type": "static", "axis": ["dp"]},
             "item_inv": {"type": "static", "axis": ["dp"]},

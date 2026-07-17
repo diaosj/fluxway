@@ -6,7 +6,7 @@ These tests verify:
 2. max_inflight_steps: Limits step difference between connected SPMDs in the graph.
 """
 
-from types import SimpleNamespace
+from collections.abc import Mapping
 from unittest.mock import MagicMock
 
 import pytest
@@ -23,12 +23,14 @@ from fluxway.spmd.driver.credit import (
     credit_topology_for_driver,
 )
 from fluxway.control_plane.async_manager.manager import AsyncStepManager
+from fluxway.common.compiled_graph import (
+    DependencySpec,
+    OperatorKey,
+)
+from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import (
     Graph,
     Node,
-    Edge,
-    SPMDConfig,
-    OperatorMeta,
     AsyncStepConfig,
     DriverHeartbeat,
     DriverState,
@@ -37,6 +39,62 @@ from fluxway.common.types.configs import (
     WorkerHeartbeat,
     WorkerStatus,
 )
+from fluxway import OperatorSpec
+from fluxway.common.operator_policy import AsyncPolicy
+from tests.compiled_graph_fixtures import (
+    compile_test_graph,
+    single_spmd_config,
+    spmd_config_from_graph,
+)
+
+
+def _dependency_edge(
+    source_node: str,
+    source_op: str,
+    target_node: str,
+    target_op: str,
+    *,
+    local_only: bool = False,
+) -> DependencySpec:
+    return DependencySpec(
+        source=OperatorKey(spmd_id=source_node, op_id=source_op),
+        target=OperatorKey(spmd_id=target_node, op_id=target_op),
+        local_only=local_only,
+    )
+
+
+def _planned_graph(
+    *,
+    name: str,
+    operators_by_spmd: Mapping[str, Mapping[str, OperatorSpec]],
+    edges: tuple[DependencySpec, ...] = (),
+) -> Graph:
+    mesh = DeviceMesh(axis_names=("worker",), device_shape=(1,))
+    compiled_graph = compile_test_graph(
+        name=name,
+        spmds={
+            spmd_id: (mesh, operators)
+            for spmd_id, operators in operators_by_spmd.items()
+        },
+        dependencies=edges,
+    )
+    return Graph(
+        name=name,
+        nodes={
+            spmd_id: Node(
+                spmd_class=object,
+                name=spmd_id,
+                resource_profile=compiled_graph.spmd(spmd_id).resource_profile,
+                spmd_config=spmd_config_from_graph(
+                    compiled_graph,
+                    spmd_id,
+                ),
+            )
+            for spmd_id in operators_by_spmd
+        },
+        compiled_graph=compiled_graph,
+    )
+
 
 # =============================================================================
 # 1. Intra-SPMD: SPMDSynchronizer Tests
@@ -55,8 +113,8 @@ def test_worker_sync_skew_limit():
         sync_policy=MaxSkewSyncPolicy(max_diff),
     )
 
-    blocked_workers = set()
-    unblocked_workers = set()
+    blocked_workers: set[int] = set()
+    unblocked_workers: set[int] = set()
 
     versions = []
 
@@ -144,7 +202,7 @@ def test_worker_sync_op_runnable_epochs_are_monotonic_per_worker_op():
     sync.report_worker_op_completed(0, "train", 2)
     sync.report_worker_op_completed(1, "train", 2)
 
-    epochs_by_worker = {}
+    epochs_by_worker: dict[tuple[int, str], list[int]] = {}
     for _kind, rank, op_name, epoch in events:
         epochs_by_worker.setdefault((rank, op_name), []).append(epoch)
     for epochs in epochs_by_worker.values():
@@ -160,25 +218,19 @@ def test_worker_sync_op_runnable_epochs_are_monotonic_per_worker_op():
 def test_driver_credit_edge_limit():
     op_a = "produce"
     op_b = "consume"
-    meta_a = OperatorMeta(name=op_a)
-    node_a = Node(
-        name="A",
-        spmd_config=SPMDConfig(
-            operator_metas={op_a: meta_a}, active_operator_names=(op_a,)
-        ),
-    )
-    meta_b = OperatorMeta(name=op_b, max_inflight_steps=2)
-    node_b = Node(
-        name="B",
-        spmd_config=SPMDConfig(
-            operator_metas={op_b: meta_b}, active_operator_names=(op_b,)
-        ),
+    meta_a = OperatorSpec(name=op_a)
+    meta_b = OperatorSpec(name=op_b, async_policy=AsyncPolicy.pipelined(depth=3))
+    edge = _dependency_edge("A", op_a, "B", op_b)
+    graph = _planned_graph(
+        name="driver-credit-edge-limit",
+        operators_by_spmd={"A": {op_a: meta_a}, "B": {op_b: meta_b}},
+        edges=(edge,),
     )
 
-    edge = Edge(source_node="A", target_node="B", source_op=op_a, target_op=op_b)
-    graph = Graph(nodes={"A": node_a, "B": node_b}, edges=[edge])
-
-    credit_edges = build_credit_edges(graph, AsyncStepConfig())
+    credit_edges = build_credit_edges(
+        graph.require_compiled_graph(),
+        AsyncStepConfig(),
+    )
     upstream_edges, downstream_edges = credit_topology_for_driver("A", credit_edges)
     assert downstream_edges == ()
     state = UpstreamCreditState(upstream_edges, epoch=0)
@@ -194,78 +246,57 @@ def test_driver_credit_edge_limit():
 def test_driver_credit_ignores_local_only_edges_for_flow_control():
     op_a = "prepare"
     op_b = "train"
-    meta_a = OperatorMeta(name=op_a)
-    meta_b = OperatorMeta(name=op_b, max_inflight_steps=0)
-    node = Node(
-        name="Dense",
-        spmd_config=SPMDConfig(
-            operator_metas={op_a: meta_a, op_b: meta_b},
-            active_operator_names=(op_a, op_b),
-        ),
-    )
-    edge = Edge(
-        source_node="Dense",
-        target_node="Dense",
-        source_op=op_a,
-        target_op=op_b,
+    meta_a = OperatorSpec(name=op_a)
+    meta_b = OperatorSpec(name=op_b)
+    edge = _dependency_edge(
+        "Dense",
+        op_a,
+        "Dense",
+        op_b,
         local_only=True,
     )
-    graph = Graph(nodes={"Dense": node}, edges=[edge])
-    assert build_credit_edges(graph, AsyncStepConfig()) == ()
+    graph = _planned_graph(
+        name="driver-credit-local-only",
+        operators_by_spmd={"Dense": {op_a: meta_a, op_b: meta_b}},
+        edges=(edge,),
+    )
+    assert build_credit_edges(graph.require_compiled_graph(), AsyncStepConfig()) == ()
 
 
 def test_driver_credit_uses_min_per_source_op_and_keeps_other_ops_independent():
-    node_a = Node(
-        name="A",
-        spmd_config=SPMDConfig(
-            operator_metas={
-                "forward": OperatorMeta(name="forward"),
-                "metrics": OperatorMeta(name="metrics"),
+    graph = _planned_graph(
+        name="driver-credit-source-op-minimum",
+        operators_by_spmd={
+            "A": {
+                "forward": OperatorSpec(name="forward"),
+                "metrics": OperatorSpec(name="metrics"),
             },
-            active_operator_names=("forward", "metrics"),
-        ),
-    )
-    node_b = Node(
-        name="B",
-        spmd_config=SPMDConfig(
-            operator_metas={"train": OperatorMeta(name="train", max_inflight_steps=3)},
-            active_operator_names=("train",),
-        ),
-    )
-    node_c = Node(
-        name="C",
-        spmd_config=SPMDConfig(
-            operator_metas={"train": OperatorMeta(name="train", max_inflight_steps=1)},
-            active_operator_names=("train",),
-        ),
-    )
-    node_d = Node(
-        name="D",
-        spmd_config=SPMDConfig(
-            operator_metas={
-                "consume": OperatorMeta(name="consume", max_inflight_steps=9)
+            "B": {
+                "train": OperatorSpec(
+                    name="train", async_policy=AsyncPolicy.pipelined(depth=4)
+                )
             },
-            active_operator_names=("consume",),
+            "C": {
+                "train": OperatorSpec(
+                    name="train", async_policy=AsyncPolicy.pipelined(depth=2)
+                )
+            },
+            "D": {
+                "consume": OperatorSpec(
+                    name="consume", async_policy=AsyncPolicy.pipelined(depth=10)
+                )
+            },
+        },
+        edges=(
+            _dependency_edge("A", "forward", "B", "train"),
+            _dependency_edge("A", "forward", "C", "train"),
+            _dependency_edge("A", "metrics", "D", "consume"),
         ),
     )
-    graph = Graph(
-        nodes={"A": node_a, "B": node_b, "C": node_c, "D": node_d},
-        edges=[
-            Edge(
-                source_node="A", target_node="B", source_op="forward", target_op="train"
-            ),
-            Edge(
-                source_node="A", target_node="C", source_op="forward", target_op="train"
-            ),
-            Edge(
-                source_node="A",
-                target_node="D",
-                source_op="metrics",
-                target_op="consume",
-            ),
-        ],
+    credit_edges = build_credit_edges(
+        graph.require_compiled_graph(),
+        AsyncStepConfig(),
     )
-    credit_edges = build_credit_edges(graph, AsyncStepConfig())
     upstream_edges, _downstream_edges = credit_topology_for_driver("A", credit_edges)
     state = UpstreamCreditState(upstream_edges, epoch=0)
 
@@ -320,33 +351,17 @@ def test_heartbeat_contract_excludes_progress_and_backpressure_fields():
 
 
 def test_flow_control_manager_produces_controller_authoritative_windows():
-    graph = Graph(
-        nodes={
-            "A": Node(
-                name="A",
-                spmd_config=SPMDConfig(
-                    operator_metas={"produce": OperatorMeta(name="produce")},
-                    active_operator_names=("produce",),
-                ),
-            ),
-            "B": Node(
-                name="B",
-                spmd_config=SPMDConfig(
-                    operator_metas={
-                        "consume": OperatorMeta(name="consume", max_inflight_steps=2)
-                    },
-                    active_operator_names=("consume",),
-                ),
-            ),
+    graph = _planned_graph(
+        name="flow-control-authoritative-windows",
+        operators_by_spmd={
+            "A": {"produce": OperatorSpec(name="produce")},
+            "B": {
+                "consume": OperatorSpec(
+                    name="consume", async_policy=AsyncPolicy.pipelined(depth=3)
+                )
+            },
         },
-        edges=[
-            Edge(
-                source_node="A",
-                target_node="B",
-                source_op="produce",
-                target_op="consume",
-            )
-        ],
+        edges=(_dependency_edge("A", "produce", "B", "consume"),),
     )
     manager = FlowControlManager(graph, AsyncStepConfig())
 
@@ -370,17 +385,21 @@ def test_flow_control_manager_produces_controller_authoritative_windows():
 
 
 def _make_driver(spmd_id: str, controller_handle=None):
+    mesh = DeviceMesh(axis_names=("worker",), device_shape=(1,))
+    operators = {
+        "produce": OperatorSpec(name="produce"),
+        "consume": OperatorSpec(name="consume"),
+    }
+    config = single_spmd_config(
+        name="async-mechanisms-driver-test",
+        spmd_id=spmd_id,
+        mesh=mesh,
+        operators=operators,
+    )
     # pyrefly: ignore [missing-attribute]
     return SPMDDriver.__ray_actor_class__(
         spmd_id=spmd_id,
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=1),
-            operator_metas={
-                "produce": OperatorMeta(name="produce"),
-                "consume": OperatorMeta(name="consume"),
-            },
-            active_operator_names=("produce", "consume"),
-        ),
+        config=config,
         placement_group=object(),
         worker_bundle_indices=[1],
         controller_handle=controller_handle,
@@ -477,21 +496,13 @@ def test_async_manager_reports_all_completed_at_max_steps():
     """Completion should only trip once every tracked op reaches max_steps."""
     op_a = "produce"
     op_b = "consume"
-    node_a = Node(
-        name="A",
-        spmd_config=SPMDConfig(
-            operator_metas={op_a: OperatorMeta(name=op_a)},
-            active_operator_names=(op_a,),
-        ),
+    graph = _planned_graph(
+        name="async-manager-test",
+        operators_by_spmd={
+            "A": {op_a: OperatorSpec(name=op_a)},
+            "B": {op_b: OperatorSpec(name=op_b)},
+        },
     )
-    node_b = Node(
-        name="B",
-        spmd_config=SPMDConfig(
-            operator_metas={op_b: OperatorMeta(name=op_b)},
-            active_operator_names=(op_b,),
-        ),
-    )
-    graph = Graph(nodes={"A": node_a, "B": node_b})
     manager = AsyncStepManager(graph=graph, config=AsyncStepConfig(max_steps=3))
 
     assert manager.is_all_completed() is False

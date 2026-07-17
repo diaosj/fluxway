@@ -1,10 +1,13 @@
 """Execution utilities for controlling JIT behavior."""
 
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 from collections.abc import Callable
 import functools
 
 from fluxway.common.tensor_backend import get_backend
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def shield(func: Callable | None = None, *, result_shape: Any = None):
@@ -72,7 +75,9 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
     return wrapper
 
 
-def compile(func: Callable | None = None, **kwargs):
+def compile[**P, R](
+    func: Callable[P, R] | None = None, **kwargs
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """
     Unified compilation decorator (JAX JIT / PyTorch Compile).
 
@@ -84,12 +89,12 @@ def compile(func: Callable | None = None, **kwargs):
               (Defaults to mode="reduce-overhead" if not specified)
     """
     if func is None:
-        return functools.partial(compile, **kwargs)
+        return functools.partial(compile, **kwargs)  # type: ignore[return-value]
 
     cache = {}
 
     @functools.wraps(func)
-    def wrapper(*args, **kwargs_call):
+    def wrapper(*args: P.args, **kwargs_call: P.kwargs) -> R:
         backend = get_backend()
         backend_name = backend.name()
         if backend_name not in cache:

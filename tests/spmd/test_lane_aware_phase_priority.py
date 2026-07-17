@@ -1,4 +1,5 @@
-from fluxway.common.types.configs import OperatorMeta, SchedulePolicy
+from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy
+from fluxway import OperatorSpec
 from fluxway.spmd.worker.worker import SPMDWorker
 
 
@@ -18,7 +19,7 @@ class DummyManager:
     def __init__(self, metas):
         self._metas = metas
 
-    def _get_operator_metadata(self, op_name):
+    def _get_operator_spec(self, op_name):
         return self._metas[op_name]
 
 
@@ -42,7 +43,10 @@ def policy_for(phase, **kwargs):
 
 
 def meta_for(phase, policy):
-    return OperatorMeta(name=phase, schedule_policy=policy)
+    return OperatorSpec(
+        name=phase,
+        async_policy=AsyncPolicy.pipelined(depth=2, schedule=policy),
+    )
 
 
 def test_default_phase_graph_keeps_step_major_priority():

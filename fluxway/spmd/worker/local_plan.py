@@ -1,4 +1,4 @@
-"""Per-worker flat execution plan runtime."""
+"""Per-worker local step DAG runtime."""
 
 from __future__ import annotations
 
@@ -162,25 +162,20 @@ class MappingCallableRegistry:
         fn: Callable[..., Any],
         resource_id: int,
     ) -> Callable[[tuple[Any, ...]], UserCallableSpec]:
+        operator_is_coroutine_function = inspect.iscoroutinefunction(fn)
+
         def user_callable_factory(
             dependency_results: tuple[Any, ...],
         ) -> UserCallableSpec:
-            if inspect.iscoroutinefunction(fn):
-
-                async def call_with_dependencies() -> Any:
-                    return await fn(*dependency_results)
-
-            else:
-
-                def call_with_dependencies() -> Any:
-                    return fn(*dependency_results)
+            def call_with_dependencies() -> Any:
+                return fn(*dependency_results)
 
             return UserCallableSpec(
                 callable_id=callable_id,
                 fn=call_with_dependencies,
-                is_stateful=False,
                 resource_id=resource_id,
                 operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+                operator_is_coroutine_function=operator_is_coroutine_function,
             )
 
         return user_callable_factory
@@ -189,6 +184,7 @@ class MappingCallableRegistry:
 class LocalStepPlanExecutor:
     def __init__(self, user_callable_executor: UserCallableExecutor) -> None:
         self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._active_executions: set[asyncio.Task[Any]] = set()
         self._user_callable_executor = user_callable_executor
         self._resource_locks: dict[int, asyncio.Lock] = {}
 
@@ -200,39 +196,59 @@ class LocalStepPlanExecutor:
     ) -> Any:
         plan.validate()
         node_count = len(plan.node_kinds)
-        done_events = tuple(asyncio.Event() for _ in range(node_count))
         node_results: list[Any] = [None] * node_count
+        execution_task = asyncio.current_task()
+        if execution_task is None:
+            raise RuntimeError("LocalStepPlanExecutor requires an asyncio task.")
+        self._active_executions.add(execution_task)
+        try:
+            if self._is_linear_chain(plan):
+                for node_index in range(node_count):
+                    await self._execute_ready_node(
+                        plan,
+                        registry,
+                        step_context,
+                        node_results,
+                        node_index,
+                    )
+                return node_results[plan.result_node]
+            return await self._execute_dag(
+                plan,
+                registry,
+                step_context,
+                node_results,
+            )
+        finally:
+            self._active_executions.discard(execution_task)
+
+    @staticmethod
+    def _is_linear_chain(plan: LocalStepPlan) -> bool:
+        return all(
+            plan.dependencies_for(index) == (() if index == 0 else (index - 1,))
+            for index in range(len(plan.node_kinds))
+        )
+
+    async def _execute_dag(
+        self,
+        plan: LocalStepPlan,
+        registry: LocalCallableRegistry,
+        step_context: LocalStepContext,
+        node_results: list[Any],
+    ) -> Any:
+        node_count = len(plan.node_kinds)
+        done_events = tuple(asyncio.Event() for _ in range(node_count))
 
         async def run_node(node_index: int) -> None:
             dependency_indexes = plan.dependencies_for(node_index)
             for dependency in dependency_indexes:
                 await done_events[dependency].wait()
-            raw_kind = plan.node_kinds[node_index]
-            kind = LocalStepNodeKind(raw_kind)
-            resource_id = plan.resource_ids[node_index]
-            lock = self._lock_for(resource_id)
-            spec = registry.spec_for(
-                kind,
-                plan.callable_ids[node_index],
-                resource_id,
+            await self._execute_ready_node(
+                plan,
+                registry,
                 step_context,
+                node_results,
+                node_index,
             )
-            dependency_results = tuple(
-                node_results[index] for index in dependency_indexes
-            )
-            if lock is None:
-                node_results[node_index] = await self._execute_node(
-                    kind,
-                    spec,
-                    dependency_results,
-                )
-            else:
-                async with lock:
-                    node_results[node_index] = await self._execute_node(
-                        kind,
-                        spec,
-                        dependency_results,
-                    )
             done_events[node_index].set()
 
         tasks = [asyncio.create_task(run_node(index)) for index in range(node_count)]
@@ -248,6 +264,39 @@ class LocalStepPlanExecutor:
             for task in tasks:
                 self._active_tasks.discard(task)
         return node_results[plan.result_node]
+
+    async def _execute_ready_node(
+        self,
+        plan: LocalStepPlan,
+        registry: LocalCallableRegistry,
+        step_context: LocalStepContext,
+        node_results: list[Any],
+        node_index: int,
+    ) -> None:
+        dependency_indexes = plan.dependencies_for(node_index)
+        kind = LocalStepNodeKind(plan.node_kinds[node_index])
+        resource_id = plan.resource_ids[node_index]
+        spec = registry.spec_for(
+            kind,
+            plan.callable_ids[node_index],
+            resource_id,
+            step_context,
+        )
+        dependency_results = tuple(node_results[index] for index in dependency_indexes)
+        lock = self._lock_for(resource_id)
+        if lock is None:
+            node_results[node_index] = await self._execute_node(
+                kind,
+                spec,
+                dependency_results,
+            )
+            return
+        async with lock:
+            node_results[node_index] = await self._execute_node(
+                kind,
+                spec,
+                dependency_results,
+            )
 
     def _lock_for(self, resource_id: int) -> asyncio.Lock | None:
         if resource_id < 0:
@@ -296,7 +345,12 @@ class LocalStepPlanExecutor:
 
     async def drain(self) -> None:
         while True:
-            tasks = [task for task in self._active_tasks if not task.done()]
+            current = asyncio.current_task()
+            tasks = [
+                task
+                for task in (*self._active_tasks, *self._active_executions)
+                if task is not current and not task.done()
+            ]
             if not tasks:
                 return
             await asyncio.gather(*tasks)

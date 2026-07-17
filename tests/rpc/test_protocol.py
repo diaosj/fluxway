@@ -12,48 +12,40 @@ from fluxway.rpc.protocol import (
     validate_payload_iov_device_class,
 )
 from fluxway.transport.manifest import (
-    EDGE_WIDTH,
-    FRAME_WIDTH,
-    PAYLOAD_WIDTH,
+    FrameFlag,
+    PayloadRole,
+    TensorEntryKind,
+    TransportFrameBuilder,
     TransportFrameHeader,
 )
 
 
-def _make_header() -> TransportFrameHeader:
-    frame_i32 = np.arange(FRAME_WIDTH, dtype=np.int32)
-    frame_i32[0] = 1
-    frame_i32[5] = 1
-    frame_i32[6] = 2
-    edge_i32 = np.zeros((1, EDGE_WIDTH), dtype=np.int32)
-    edge_i32[0, 2] = 0
-    edge_i32[0, 4] = 2
-    edge_i32[0, 6] = 1
-    payload_i32 = np.zeros((2, PAYLOAD_WIDTH), dtype=np.int32)
-    payload_i32[:, 0] = 0
-    payload_i32[0, 1] = 4
-    payload_i32[1, 1] = 6
-    payload_i32[0, 2] = 1
-    payload_i32[1, 2] = 1
-    payload_i32[0, 3] = 0
-    payload_i32[1, 3] = 0
-    payload_i32[0, 4] = 1
-    payload_i32[1, 4] = 1
-    payload_i32[0, 6] = 0
-    payload_i32[1, 6] = 1
-    shape_i32 = np.array([2], dtype=np.int32)
-    global_shape_i64 = np.array([2**35], dtype=np.int64)
-    compact_i64 = np.array([2**33, 1, 4, 1], dtype=np.int64)
-    return TransportFrameHeader(
-        frame_i32=frame_i32,
-        edge_i32=edge_i32,
-        payload_i32=payload_i32,
-        shape_i32=shape_i32,
-        global_shape_i64=global_shape_i64,
-        compact_i64=compact_i64,
+def _make_header(payload_segments: tuple[np.ndarray, ...]) -> TransportFrameHeader:
+    builder = TransportFrameBuilder(
+        step=0,
+        sender_spmd_code=0,
+        sender_rank=0,
+        sender_world_size=1,
+        flags=FrameFlag.TENSOR_TRANSFER,
     )
+    entry_index = builder.add_tensor_transfer_entry(
+        transfer_code=0,
+        meta_state=0,
+        tensor_kind=TensorEntryKind.TENSOR,
+        expected_count=1,
+        source_step=0,
+    )
+    for payload in payload_segments:
+        builder.add_payload(
+            entry_index,
+            PayloadRole.VALUES,
+            payload,
+            valid_count=int(payload.shape[0]),
+        )
+    return builder.build().header
 
 
-class _FakeCudaPayload:
+class _CudaArrayInterfaceOnlyPayload:
     dtype = np.dtype(np.float32)
     __cuda_array_interface__ = {
         "shape": (1,),
@@ -65,6 +57,7 @@ class _FakeCudaPayload:
 
 class _DLPackOnlyPayload:
     dtype = np.dtype(np.float32)
+    shape = (1,)
 
     def __dlpack__(self, stream=None):
         return object()
@@ -73,6 +66,11 @@ class _DLPackOnlyPayload:
 class _DLPackCpuPayload(_DLPackOnlyPayload):
     def __dlpack_device__(self):
         return (1, 0)
+
+
+class _DLPackCudaPayload(_DLPackOnlyPayload):
+    def __dlpack_device__(self):
+        return (2, 0)
 
 
 def test_registry():
@@ -154,13 +152,14 @@ async def test_ray_actor_data_plane_sends_header_and_payload_buffers():
     adapter = RayActorDataPlane(handle, sender_spmd_code=7)
     ids = np.array([2**40], dtype=np.uint64)
     emb = np.arange(4, dtype=np.float32)
-    header = _make_header()
+    payload_segments = (ids, emb)
+    header = _make_header(payload_segments)
 
     await adapter.receive_transport_frames(
         (
             TransportFrameEnvelope(
                 header=header,
-                payload_segments=(ids, emb),
+                payload_segments=payload_segments,
             ),
         )
     )
@@ -183,19 +182,53 @@ async def test_ray_actor_data_plane_sends_header_and_payload_buffers():
 
 def test_payload_device_class_detects_cpu_cuda_and_dlpack_cpu():
     assert payload_device_class(np.zeros(1, dtype=np.float32)) is PayloadDeviceClass.CPU
-    assert payload_device_class(_FakeCudaPayload()) is PayloadDeviceClass.CUDA
+    assert payload_device_class(_DLPackCudaPayload()) is PayloadDeviceClass.CUDA
     assert payload_device_class(_DLPackCpuPayload()) is PayloadDeviceClass.CPU
 
 
 def test_payload_device_class_rejects_unverifiable_dlpack_payload():
-    with pytest.raises(TypeError, match="__dlpack_device__"):
-        payload_device_class(_DLPackOnlyPayload())
+    for payload in (_DLPackOnlyPayload(), _CudaArrayInterfaceOnlyPayload()):
+        with pytest.raises(TypeError, match="__dlpack_device__"):
+            payload_device_class(payload)
+
+
+def test_payload_device_class_rejects_non_tensor_dlpack_object():
+    class DLPackObjectWithoutTensorMetadata:
+        def __dlpack__(self, stream=None):
+            return object()
+
+        def __dlpack_device__(self):
+            return (1, 0)
+
+    with pytest.raises(TypeError, match="dtype and shape"):
+        payload_device_class(DLPackObjectWithoutTensorMetadata())
+
+
+def test_payload_device_class_does_not_export_dlpack_capsule():
+    class InstrumentedDLPackTensor:
+        dtype = np.dtype(np.float32)
+        shape = (1,)
+
+        def __init__(self):
+            self.device_queries = 0
+
+        def __dlpack__(self, stream=None):
+            raise AssertionError("classification must not export a DLPack capsule")
+
+        def __dlpack_device__(self):
+            self.device_queries += 1
+            return (1, 0)
+
+    payload = InstrumentedDLPackTensor()
+
+    assert payload_device_class(payload) is PayloadDeviceClass.CPU
+    assert payload.device_queries == 1
 
 
 def test_validate_payload_iov_device_class_rejects_mixed_payloads():
     with pytest.raises(ValueError, match="must share one device class"):
         validate_payload_iov_device_class(
-            (np.zeros(1, dtype=np.float32), _FakeCudaPayload())
+            (np.zeros(1, dtype=np.float32), _DLPackCudaPayload())
         )
 
 
@@ -224,12 +257,13 @@ async def test_axon_data_plane_validates_and_invokes_flat_payload_iovs():
 
     handle = MockHandle()
     adapter = AxonDataPlane(handle, sender_spmd_code=11)
-    header = _make_header()
     ids = np.array([2**40], dtype=np.uint64)
     emb = np.arange(4, dtype=np.float32)
+    payload_segments = (ids, emb)
+    header = _make_header(payload_segments)
 
     result = await adapter.receive_transport_frames(
-        (TransportFrameEnvelope(header=header, payload_segments=(ids, emb)),)
+        (TransportFrameEnvelope(header=header, payload_segments=payload_segments),)
     )
 
     assert result is True
@@ -258,16 +292,17 @@ async def test_axon_data_plane_rejects_payload_before_invoking_handle():
 
     handle = MockHandle()
     adapter = AxonDataPlane(handle, sender_spmd_code=0)
+    payload_segments = (
+        np.zeros(1, dtype=np.float32),
+        np.ones(1, dtype=np.float32),
+    )
 
     with pytest.raises(ValueError, match="source=cpu destination=cuda"):
         await adapter.receive_transport_frames(
             (
                 TransportFrameEnvelope(
-                    header=_make_header(),
-                    payload_segments=(
-                        np.zeros(1, dtype=np.float32),
-                        np.ones(1, dtype=np.float32),
-                    ),
+                    header=_make_header(payload_segments),
+                    payload_segments=payload_segments,
                 ),
             )
         )

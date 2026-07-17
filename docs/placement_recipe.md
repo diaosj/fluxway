@@ -1,47 +1,195 @@
 # Placement Recipe
 
-本文是 placement 的用户入口，说明如何选择或编写 `PlacementRecipe`，以及如何读取运行结果。AST、objective 和求解器的形式语义见 [Placement Mathematics](placement_mathematics.md)；模块所有权见 [Architecture](ARCHITECTURE.md#placement)。
+Placement Recipe 只告诉 Fluxway 两件事：哪些调度结果必须成立，以及多个合法结果中先优化什么。每个 worker 需要多少资源由对应 SPMD 的 `ResourceProfile` 声明，不在 Recipe 中重复保存。
 
-## 使用 Recipe
+可以把 Recipe 想成一张经过专家审核的“调度说明书”。普通算法工程师选择说明书，不需要自己设计求解算法。
+
+如果只使用专家准备好的 Recipe，阅读“直接使用现成 Recipe”和“怎么看运行结果”即可。其余章节供需要编写 Recipe 的用户阅读。
+
+## 开始前先认识几个词
+
+SPMD 是一组运行同一段程序的 worker。每个 worker 有 rank，可以把 rank 理解为组内编号 0、1、2……
+
+node 是一台 Ray 机器。Recipe 不写机器 IP，而是写 worker 与机器之间必须满足的关系，让 Fluxway 根据当前集群求解。
+
+profile 是一个 worker 的资源需求。例如 `{"CPU": 2, "GPU": 1}` 表示每个 worker 需要 2 个 CPU 和 1 张 GPU。
+
+Graph 是作业中所有 SPMD 及其连接关系的清单。亲和性表示“两组 worker 希望使用有关联的机器”，不是数据流量大小。
+
+constraint 是必须满足的规则。objective 是多个合法方案之间的比较顺序。Fluxway 不会为了改善 objective 而违反 constraint。
+
+## 直接使用现成 Recipe
+
+普通算法工程师把 Graph 和已发布的 Recipe 一起交给 Controller。两者在同一次 Ray actor 创建中传输，不需要先转换成 JSON 或其他中间格式：
 
 <!-- test:placement-controller-entry -->
 ```python
 from inspect import signature
 
-from fluxway import create_controller
+from fluxway import start
 
 
-async def create_training_controller(graph):
-    return await create_controller(
-        graph,
-        placement_recipe=standard_training,
-    )
+async def start_training(graph, recipe):
+    return await start(graph, placement_recipe=recipe)
 
 
-assert "placement_recipe" in signature(create_controller).parameters
+assert "graph" in signature(start).parameters
+assert "placement_recipe" in signature(start).parameters
 ```
 
-运行时会校验 Graph 中的 SPMD class、world size、rank 和 Ray 资源。配置不可行、求解超时、Ray 资源快照变化或实际节点与解不一致都会抛出异常，不会改用另一种调度策略。
+Fluxway 会检查 Graph、worker 数量、资源和亲和规则。没有合法方案时直接抛出异常，不会偷偷改用另一种调度策略。
 
-## 完整示例
+因此普通使用者只需要确认两件事：Recipe 名称和版本是否正确，运行日志中的最终状态是否为 `READY`。
 
-<!-- test:placement-recipe -->
+## 第一个小 Recipe
+
+下面只有两个 SPMD。先只看它们的机器关系；资源在创建这两个 SPMD 时分别声明。
+
+<!-- test:placement-first-recipe -->
 ```python
-from decimal import Decimal
-
 from fluxway import (
-    AFFINITY_FIRST_V1,
     PlacementRecipe,
-    ResourceProfile,
-    ResourceScale,
-    cardinality,
-    disjoint,
     equal,
-    rank,
-    subseteq,
+    lexicographic,
+    max_min,
+    occupancy,
     support,
     workers,
 )
+
+
+class GpuTraining: ...
+class CpuPreprocess: ...
+
+
+gpu = workers(GpuTraining)
+cpu = workers(CpuPreprocess)
+
+first_recipe = PlacementRecipe(
+    recipe_id="first-recipe",
+    version="1.0.0",
+    constraints=(
+        equal(support(cpu), support(gpu)),
+    ),
+    objective=lexicographic(
+        max_min(occupancy(cpu)),
+    ),
+)
+
+assert first_recipe.constraints[0].kind == "equal"
+```
+
+`equal(support(cpu), support(gpu))` 表示两组 worker 必须使用完全相同的机器。
+
+`max_min(occupancy(cpu))` 表示在这些机器之间尽量均匀分布 CPU worker。constraint 决定什么方案合法，objective 决定合法方案中更喜欢哪一个。
+
+Recipe 中的两个主要字段可以这样读：
+
+| 字段 | 问题 | 本例答案 |
+|---|---|---|
+| `constraints` | 哪些规则绝不能违反？ | 两组 worker 使用相同机器 |
+| `objective` | 多个合法方案中选哪个？ | CPU worker 尽量均匀分布 |
+
+## 怎样选择 worker
+
+`workers(S)` 选择 Graph 中类型为 `S` 的全部实例。这里的类型就是 Python class。若同一个 Reader class 在 Graph 中出现多次，它们都会被选择。
+
+`instance("name")` 只选择 Graph 中叫这个名字的一个实例。`rank(A, 0)` 从 A 中选择每个实例的 0 号 worker。
+
+<!-- test:placement-selectors -->
+```python
+from fluxway import instance, rank
+
+
+all_gpu_workers = workers(GpuTraining)
+one_gpu_instance = instance("Dense")
+all_gpu_rank_zero = rank(all_gpu_workers, 0)
+
+assert all_gpu_workers.kind == "workers"
+assert one_gpu_instance.spmd_id == "Dense"
+assert all_gpu_rank_zero.kind == "rank"
+```
+
+`union(A, B, ...)` 可以把多个 worker 选择器合并。重复选择到的 worker 只保留一次。
+
+## support 为什么会出现
+
+worker set 是 worker 名单，node set 是机器名单。亲和性比较的是机器，所以要用 `support` 把 worker 名单转换成实际使用的机器名单。
+
+假设 A 的 worker 分布是 `{机器 0: 2, 机器 1: 1}`：
+
+```text
+occupancy(A) = {机器 0: 2, 机器 1: 1}
+support(A) = {机器 0, 机器 1}
+```
+
+support 不保留每台机器上的 worker 数。因此“使用相同机器”和“按相同数量分布”是两件不同的事。
+
+在底层数学语言中，`support` 不能省略，因为 worker 名单和机器名单是两种不同的值。现成 Recipe 已经写好了这一层，普通使用者不需要重复填写。
+
+更完整的解释见 [Placement Mathematics: support 的准确含义](placement_mathematics.md#support-的准确含义)。
+
+## 常用亲和规则
+
+<!-- test:placement-constraints -->
+```python
+from fluxway import cardinality, disjoint, subseteq
+
+
+same_machines = equal(support(cpu), support(gpu))
+cpu_only_on_gpu_machines = subseteq(support(cpu), support(gpu))
+separate_machines = disjoint(support(cpu), support(gpu))
+exactly_two_machines = equal(cardinality(support(cpu)), 2)
+
+assert same_machines.kind == "equal"
+assert cpu_only_on_gpu_machines.kind == "subseteq"
+assert separate_machines.kind == "disjoint"
+assert exactly_two_machines.kind == "equal"
+```
+
+`equal(support(A), support(B))`：A 和 B 使用完全相同的机器。
+
+`subseteq(support(A), support(B))`：A 使用的机器必须都承载 B，但 B 可以额外使用其他机器。
+
+`disjoint(support(A), support(B))`：A 和 B 不能共用机器。
+
+`equal(cardinality(support(A)), 2)`：A 必须使用恰好两台机器。
+
+例如 A 使用 `{机器 0}`，B 使用 `{机器 0, 机器 1}`。A 是 B 的子集，但两者并不相等。
+
+如果业务代码同时要求“A 的机器都在 B 中”和“A、B 的机器数量相同”，可以直接写 `equal(support(A), support(B))`。集群机器总是有限的，所以两种写法含义完全相同。
+
+## 均分还是集中
+
+同一个亲和 constraint 可以搭配不同 objective。
+
+<!-- test:placement-balance-and-pack -->
+```python
+from fluxway import maximize_majorization
+
+
+balanced = lexicographic(max_min(occupancy(cpu)))
+concentrated = lexicographic(maximize_majorization(occupancy(cpu)))
+
+assert balanced.objectives[0].kind == "max_min"
+assert concentrated.objectives[0].kind == "maximize_majorization"
+```
+
+`max_min(occupancy(A))` 会先照顾 worker 最少的机器，倾向均分。
+
+`maximize_majorization(occupancy(A))` 会先增加 worker 最多的机器，倾向集中。
+
+例如 4 个 worker 放到两台机器：均分更喜欢 `[2, 2]`，集中更喜欢 `[4, 0]`。方括号里的两个数字分别是两台机器上的 worker 数。
+
+`AFFINITY_FIRST_V1` 是集中优先的通用目标。它还会依次处理弹性资源公平分配、共同覆盖机器数、同机 worker 配对数和无法继续使用的零碎资源。
+
+## 完整六 SPMD 示例
+
+下面对应两台 8 卡 GPU 机器和若干 CPU 机器的训练场景。
+
+<!-- test:placement-recipe -->
+```python
+from fluxway import AFFINITY_FIRST_V1, ResourceScale
 
 
 class SPMD0: ...
@@ -62,28 +210,6 @@ S5 = workers(SPMD5)
 standard_training = PlacementRecipe(
     recipe_id="standard-training",
     version="1.0.0",
-    profiles={
-        SPMD0: ResourceProfile(base={"GPU": 1, "CPU": 1}),
-        SPMD1: ResourceProfile(base={"GPU": 1, "CPU": 1}),
-        SPMD2: ResourceProfile(
-            base={"CPU": 1},
-            scale=ResourceScale(
-                step={"CPU": 1},
-                max_steps=100,
-                weight=1,
-            ),
-        ),
-        SPMD3: ResourceProfile(
-            base={"CPU": 1},
-            scale=ResourceScale(
-                step={"CPU": 1},
-                max_steps=2,
-                weight=1,
-            ),
-        ),
-        SPMD4: ResourceProfile(base={"CPU": 1}),
-        SPMD5: ResourceProfile(base={"CPU": 1}),
-    },
     constraints=(
         subseteq(support(S3), support(S0)),
         subseteq(support(S4), support(S1)),
@@ -93,86 +219,79 @@ standard_training = PlacementRecipe(
     objective=AFFINITY_FIRST_V1,
 )
 
-assert standard_training.recipe_id == "standard-training"
 assert len(standard_training.constraints) == 4
-assert len(standard_training.digest) == 64
+assert S0.spmd.spmd_class is SPMD0
 ```
 
-## 选择 SPMD
+每个 `ResourceProfile` 在创建对应 Graph SPMD 实例时传入。Recipe 不再保存第二份资源映射。
 
-`workers(S)` 选择 Graph 中 class 为 `S` 的全部实例，class 级约束因此会作用于每个实例。`instance("spmd_id")` 只选择一个命名实例；`rank(A, i)` 再从集合 `A` 中选择指定 rank。选择器的集合定义见 [Placement Mathematics](placement_mathematics.md#基本对象)。
+SPMD0 和 SPMD1 是 GPU SPMD。SPMD3、SPMD4 和 SPMD5 通过 support 规则使用相应 GPU SPMD 已经占用的机器。
 
-<!-- test:placement-selectors -->
-```python
-from fluxway import instance
+SPMD2 没有亲和规则。标准 objective 会先完成亲和 SPMD 的弹性分配，再把剩余 CPU 分给 SPMD2。
 
+两台 GPU 机器分别有 8 张卡时，一个集中结果是：
 
-all_spmd5_workers = workers(SPMD5)
-all_spmd5_rank_zero = rank(all_spmd5_workers, 0)
-one_shared_instance = instance("shared-a")
-
-assert all_spmd5_workers == S5
-assert all_spmd5_rank_zero.kind == "rank"
-assert one_shared_instance.spmd_id == "shared-a"
+```text
+GPU 机器 A: SPMD1 × 8
+GPU 机器 B: SPMD1 × 4 + SPMD0 × 4
 ```
 
-## 亲和与均分
+因此 SPMD3 只能去机器 B。SPMD4 有一个 worker 时更喜欢机器 A；有两个 worker 时会优先让 A、B 各有一个。SPMD5 的 rank 0 跟随 SPMD0，rank 1 跟随 SPMD1。
 
-<!-- test:placement-constraints -->
-```python
-independent = disjoint(support(S2), support(S0))
-four_nodes = equal(cardinality(support(S2)), 4)
-same_node = equal(support(rank(S0, 0)), support(rank(S1, 0)))
+## 资源怎么写
 
-assert independent.kind == "disjoint"
-assert four_nodes.kind == "equal"
-assert same_node.kind == "equal"
-```
+`ResourceProfile` 是一个 SPMD 实例中每个 worker 的资源声明，也是调度器、Ray actor 和运行报告共用的唯一资源事实。资源名直接使用 Ray resource key，普通 Ray 集群不需要平台 catalog。
 
-- `subseteq(support(A), support(B))`：`A` 只能使用已经承载 `B` 的节点。
-- `disjoint(support(A), support(B))`：`A` 与 `B` 不能使用相同节点。
-- `equal(cardinality(support(A)), k)`：`A` 必须占用恰好 `k` 个节点。
-- `equal(support(rank(A, i)), support(rank(B, j)))`：两个指定 rank 必须同机。
-
-`support(A)` 是 `A` 在求解结果中实际占用的节点集合，不是候选节点列表。hard constraint 只规定合法位置；worker 在合法节点间如何分布由 objective 决定。下面的 Recipe 让 `S3` 使用与 `S0` 相同的节点，并优先最大化最小 occupancy，从而均分 `S3` workers：
-
-<!-- test:placement-balanced-affinity -->
-```python
-from fluxway import lexicographic, max_min, occupancy
-
-
-balanced_affinity = PlacementRecipe(
-    recipe_id="balanced-affinity",
-    version="1.0.0",
-    profiles={
-        SPMD0: ResourceProfile(base={"GPU": 1, "CPU": 1}),
-        SPMD3: ResourceProfile(base={"CPU": 1}),
-    },
-    constraints=(
-        subseteq(support(S3), support(S0)),
-        equal(cardinality(support(S3)), cardinality(support(S0))),
-    ),
-    objective=lexicographic(max_min(occupancy(S3))),
-)
-
-assert balanced_affinity.objective.objectives[0].kind == "max_min"
-```
-
-`AFFINITY_FIRST_V1` 还会依次优化节点数、target occupancy 集中度、coverage、co-location mass 和 fragmentation，适合集中优先的通用 Recipe；它不表示均分。完整顺序见 [Placement Mathematics](placement_mathematics.md#字典序-objective)。
-
-## 资源
-
-资源名直接使用 Ray resource key。普通 Ray 集群无需平台 catalog：
+Builder 在 `build()` 时把 SPMD class、mesh 和 `ResourceProfile` 一起冻结为 `CompiledSPMDDeclaration`，并放入 `CompiledGraph`。placement、worker graph view 和运行报告引用同一个 declaration；build 后再改原始 Graph node，不会改变已经编译的资源或亲和身份。
 
 <!-- test:placement-resource-vector -->
 ```python
+from decimal import Decimal
+from fluxway import ResourceProfile
+
+
 ordinary = ResourceProfile(
-    base={"CPU": 2, "GPU": 1, "memory": 4 * 1024**3}
+    base={
+        "CPU": 2,
+        "GPU": 1,
+        "memory": 4 * 1024**3,
+        "object_store_memory": 1024**3,
+        "gpu_memory:H100": 40 * 1024**3,
+    }
 )
 assert ordinary.base["GPU"] == 1
+assert ordinary.minimum == ordinary.base
 ```
 
-区分多种 accelerator 时使用 Ray 已暴露的 custom resource：
+`CPU`、`GPU`、`memory` 和 `object_store_memory` 是 Fluxway 直接映射的 Ray actor 资源。显存没有通用的 Ray 原生 key；这里的 `gpu_memory:H100` 是 custom resource，只有在 `ray start --resources` 已经暴露同名资源时才能使用。网卡、TPU、其他 accelerator 或拓扑能力也用 Ray 已暴露的任意 custom resource 名表示。
+
+`base` 是每个 worker 必须获得的资源，也就是 `minimum`。固定资源没有 `scale`，所以 `maximum` 与 `minimum` 相同。
+
+`ResourceScale.step` 是每次额外分配给每个 worker 的资源。`max_steps` 是最多增加多少次，`weight` 越大，公平分配时优先级越高。
+
+每个资源的上限都按同一个公式计算：`maximum = base + step × max_steps`。没有写在 `step` 中的资源不会随 scale 增加。一个 step 中可以同时写 CPU、GPU、内存、显存和 custom resource，它们会按这个固定比例一起增长。
+
+<!-- test:placement-resource-scale -->
+```python
+from fluxway import ResourceScale
+
+
+elastic = ResourceProfile(
+    base={"CPU": 1, "memory": 2 * 1024**3},
+    scale=ResourceScale(
+        step={"CPU": Decimal("0.5"), "memory": 1024**3},
+        max_steps=2,
+    ),
+)
+assert elastic.minimum["CPU"] == 1
+assert elastic.maximum["CPU"] == 2
+assert elastic.maximum["memory"] == 4 * 1024**3
+assert elastic.scale is not None and elastic.scale.weight == 1
+```
+
+这个例子表示每个 worker 至少使用 1 CPU 和 2 GiB 内存，最多增加两次；上限是 2 CPU 和 4 GiB 内存。`weight` 默认是 1，专家才需要修改它。资源数量接受 `int` 或精确的 `Decimal`，不接受不精确的 Python `float`。
+
+有多种 accelerator 时，使用 Ray 已经暴露的 custom resource：
 
 <!-- test:placement-custom-accelerator -->
 ```python
@@ -182,34 +301,47 @@ h100 = ResourceProfile(
 assert h100.base["accelerator_type:H100"] == Decimal("0.001")
 ```
 
-如果 Ray 只暴露 `GPU`，Fluxway 无法推导它是 H100、L4 或其他型号。请求不可观察的维度会失败。
+如果 Ray 只暴露 `GPU`，Fluxway 无法知道它是 H100、L4 还是其他型号。Recipe 不能约束系统看不见的信息。
 
-`ResourceScale` 只增加每个 worker 的资源，不改变 DeviceMesh world size。`step` 是不可分割的分配单位，`weight` 是同一分配阶段的 weighted dominant-share 权重。没有 `scale` 的 SPMD 不进入 DRF 向量，但仍然参与基础资源与拓扑约束。
+精确调度还要求该作业独占 SPMD profiles 请求的资源。普通 Ray API 只给出全局空闲量，不提供每台机器的空闲明细。
 
-精确 Recipe 调度要求它请求的 resource 在求解期间由该作业独占。普通 `ray start` 集群可以直接使用，不需要平台 label 或 catalog；但若同一资源已经被其他 Ray task/actor 占用，Fluxway 会因缺少逐节点空闲账本而抛出 `PlacementContractError`，不会猜测占用位置或等待后改用另一种放置。
+如果已有其他任务占用同类资源，Fluxway 会抛出 `PlacementContractError`，不会猜测资源在哪台机器，也不会退回贪心调度。
 
-## 分配状态
+## 怎么看运行结果
 
-Controller 依次记录：
+日志按下面顺序出现：
 
 ```text
-placement.recipe.selected
-placement.capacity.snapshot
-placement.program.normalized
-placement.program.complexity
-placement.constraint.validated
-placement.objective.started
-placement.objective.completed
-placement.solution.resolved
-placement.pg.waiting
-placement.pg.ready
-placement.worker.attested
-placement.summary
+placement.recipe.selected       选中了哪个 Recipe
+placement.capacity.snapshot     看见了多少机器和资源
+placement.problem.created       已从 SPMD 定义和 Recipe 建立求解问题
+placement.program.complexity    预计模型规模
+placement.constraint.validated  规则已经编译
+placement.objective.started     开始一层优化
+placement.objective.completed   该层得到精确最优值
+placement.solution.resolved     得到 worker 到机器的方案
+placement.pg.waiting            等待 Ray 预留资源
+placement.pg.ready              Ray 已预留资源
+placement.worker.attested       worker 已报告真实机器
+placement.summary               唯一的最终摘要
 ```
 
-`Controller.get_resource_allocation_summary()` 返回当前 `AllocationReport`。`PLANNED` 表示精确解已经产生，`PG_READY` 表示 Ray 已原子预留 composite bundles，`READY` 表示全部 worker 的实际 node ID 已通过 attestation。报告包含 normalized Recipe AST、每条 constraint 的 AST 与真值、objective 最优值及 `value_scale`、每个 worker 的节点和资源、occupancy、support、elastic quanta、PG ID、fragmentation 及未使用资源。对 fragmentation，`resource_fragmentation_score / resource_fragmentation_scale` 是跨 resource 的无量纲 allocation-quantum 数，`resource_fragmentation` 字段仍保存各 resource 的实际 Decimal 数量。
+`AllocationReport.status` 常见值如下：
 
-`PlacementRuntimeConfig` 在构造 CP-SAT 模型前执行复杂度准入，默认最多允许 1024 个 objective 分量、32768 个 Batcher sorting comparator、2048 次字典序 solve、500000 个模型变量和 1000000 条模型约束。五个上限都可显式调高，但不能关闭；超过任一上限会记录 `placement.program.complexity` 并抛出 `PlacementContractError`。变量/约束估算覆盖 assignment matrix、同构节点 symmetry、elastic products、fragmentation、AST lowering、coverage/mass、WDRF 和 sorting network。
+| 状态 | 含义 |
+|---|---|
+| `PLANNED` | 已求出方案，还没有完成 Ray 资源预留 |
+| `PG_READY` | PlacementGroup 已原子预留成功 |
+| `READY` | 所有 worker 的真实机器与方案一致 |
+| `FAILED` | 任一步骤失败，报告中有 error |
+
+报告还保存每个 worker 的机器、每个 SPMD 的 occupancy/support、每条 constraint 的真假和每层 objective 的最优值。
+
+## 模型过大时（专家内容）
+
+Fluxway 在创建求解模型前估算规模。默认上限是 1024 个 objective 分量、32768 个排序 comparator、2048 次 solve、500000 个变量和 1000000 条约束。
+
+普通用户可以跳过本节，不需要调整这些数。专家确认机器内存和求解时间足够后，可以显式提高：
 
 <!-- test:placement-complexity-limits -->
 ```python
@@ -223,17 +355,21 @@ runtime = PlacementRuntimeConfig(
     max_model_variables=750000,
     max_model_constraints=1500000,
 )
-assert runtime.max_objective_components == 2048
+assert runtime.max_model_variables == 750000
 ```
 
-## 错误
+这些上限不能关闭。超过上限会抛出 `PlacementContractError`，而不是先创建巨大模型再耗尽内存。
 
-- `PlacementContractError`：Recipe、Graph、资源精度、复杂度准入或 Ray snapshot 契约不一致。
-- `PlacementInfeasibleError`：不存在满足全部硬约束和资源容量的解。
-- `PlacementSolveTimeoutError`：CP-SAT 未在时限内证明最优或不可行。
-- `PlacementMaterializationError`：Ray 不能表达或物化求解结果。
-- `PlacementGroupTimeoutError`：Ray 无法在时限内原子预留所有 composite bundles。
-- `PlacementAttestationError`：worker 实际 node ID 与求解结果不同。
+## 出错时看哪里
 
-这些异常不会触发 PACK/SPREAD 切换、约束放松、重新解释资源名或贪心放置。
-worker 或 driver 错误也不会局部重启一个 rank 或 SPMD；在没有 checkpointed whole-job gang reconstruction 协议前，Controller 会直接进入失败清理。
+| 异常 | 含义 | 首先检查 |
+|---|---|---|
+| `PlacementContractError` | 输入含义不一致或规模超限 | Graph、资源名、数字精度、复杂度日志 |
+| `PlacementInfeasibleError` | 没有任何方案能满足全部规则 | support 关系、节点数、资源总量 |
+| `PlacementSolveTimeoutError` | 没能在时限内证明最优 | 模型规模和 timeout |
+| `PlacementGroupTimeoutError` | Ray 没能及时预留全部资源 | 集群空闲资源 |
+| `PlacementAttestationError` | worker 实际机器与方案不同 | Ray 节点和 PlacementGroup |
+
+Fluxway 不会自动放松 constraint，不会切换 PACK/SPREAD，也不会只重启 collective SPMD 的一个 rank。
+
+如果业务需要故障恢复，必须由未来的 checkpointed whole-job gang reconstruction 协议重建完整通信组、拓扑和状态。

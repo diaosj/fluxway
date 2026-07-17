@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import inspect
 from pathlib import Path
 from typing import cast
 
@@ -10,12 +11,11 @@ import numpy as np
 import pytest
 
 import fluxway as fw
-from fluxway.common.types import (
-    ComputationGraphManifest,
-    OperatorArguments,
-    OperatorFacts,
-    SPMDFacts,
+from fluxway.common.compiled_graph import (
+    compile_graph,
 )
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_spec import OperatorSpec
 from fluxway.profiler import (
     CausalClockViolation,
     MissingAxonNativeHlc,
@@ -30,6 +30,7 @@ from fluxway.profiler.hierarchy import (
     TRACE_ROOT_TRACK_NAME,
     TraceTrackHierarchy,
 )
+from fluxway.profiler.graph_symbols import GraphTraceSymbols
 from fluxway.profiler.perfetto_writer import PerfettoTraceWriter
 from fluxway.profiler.record import (
     PAYLOAD_START_COLUMN,
@@ -42,123 +43,173 @@ from fluxway.profiler.record import (
 )
 from fluxway.profiler.recorder import (
     LOCAL_STEP_WAIT_INPUTS,
+    MAILBOX_DECLARE_STEP,
+    MAILBOX_DEPOSIT_LOCAL_TENSOR,
     WORKER_RUN_LOOP,
     TraceRecorder,
 )
 from fluxway.profiler.user_api import activate_user_profiler
-from fluxway.profiler.wrappers import TracingLocalStepPlanExecutor
+from fluxway.profiler.wrappers import (
+    TracingLocalStepPlanExecutor,
+    TracingWorkerMailbox,
+)
 from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.filtering import filter_steady_state_records
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
+from tests.compiled_graph_fixtures import compiled_spmd_spec
+from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.local_plan import LocalStepContext, LocalStepPlan
 from fluxway.spmd.worker.runtime import WorkerProcessCallRuntime
 from fluxway.spmd.worker.user_callable_executor import (
     USER_CALLABLE_DEFAULT_OPERATOR_LANE,
+    SPMDObjectScope,
     UserCallableExecutor,
     UserCallableSpec,
 )
-from fluxway.transport.manifest import TransportFrameHeader
+from fluxway.transport.manifest import DependencyDecision, TransportFrameHeader
 
 
-_TRACE_INPUTS = OperatorArguments(data=("ids", "weights"), control=("lr",))
-_TRACE_OUTPUTS = OperatorArguments(data=("embeddings",))
-_TRACE_OPERATOR_FACTS = OperatorFacts(
-    spmd_id="embedding",
-    op_id="lookup",
-    function_id="tests.Embedding.lookup",
-    inputs=_TRACE_INPUTS,
-    outputs=_TRACE_OUTPUTS,
-    input_signature_id=_TRACE_INPUTS.signature_id,
-    output_signature_id=_TRACE_OUTPUTS.signature_id,
+_TRACE_OPERATOR_SPEC = OperatorSpec(
+    name="lookup",
+    method_name="tests.Embedding.lookup",
+    input_arguments={"data": ("ids", "weights"), "control": ("lr",)},
+    output_arguments={"data": ("embeddings",)},
 )
-_TRACE_MANIFEST = ComputationGraphManifest.create(
-    graph_name="profiler-test",
+_TRACE_PLAN = compile_graph(
+    name="profiler-test",
     spmds=(
-        SPMDFacts(
+        compiled_spmd_spec(
             spmd_id="embedding",
-            class_id="tests.Embedding",
-            description="",
-            mesh=(("data", 1),),
-            resource=None,
-            priority=None,
-            placement_strategy=None,
-            operators=(_TRACE_OPERATOR_FACTS,),
+            mesh=DeviceMesh(("data",), (1,)),
+            operators={"lookup": _TRACE_OPERATOR_SPEC},
         ),
     ),
-    transfers=(),
+    dependencies=(),
 )
-_TRACE_RUNTIME_FACTS = _TRACE_MANIFEST.runtime_operator_facts("embedding", "lookup")
+_TRACE_COMPILED_OPERATOR = _TRACE_PLAN.spmd("embedding").operator("lookup")
+_TRACE_GRAPH_SYMBOLS = GraphTraceSymbols.from_compiled_graph(_TRACE_PLAN)
 
 
-def test_disabled_factory_returns_original_objects():
+def test_disabled_factory_returns_canonical_objects():
     factory = ProfilerRuntimeFactory.from_config(
         None, process_name="worker/spmd/rank:0"
     )
     executor = object()
-    mailbox = object()
     handlers = {0: object()}
+    mailbox = factory.create_worker_mailbox()
 
     assert factory.enabled is False
     assert factory.data_plane_backend_executor(executor) is executor
     assert factory.local_step_plan_executor(executor) is executor
     assert factory.user_callable_executor(executor) is executor
-    assert factory.worker_mailbox(mailbox) is mailbox
+    assert type(mailbox) is WorkerMailbox
     assert factory.wrap_data_plane_handlers("remote", handlers) is handlers
 
 
-def test_enabled_factory_wraps_without_replacing_delegate_behavior(tmp_path):
+def test_enabled_factory_creates_tracing_mailbox(tmp_path):
     config = ProfilerConfig(trace_dir=str(tmp_path), run_id="run")
     factory = ProfilerRuntimeFactory.from_config(
         config, process_name="worker/spmd/rank:0"
     )
     executor = object()
-    mailbox = object()
     handlers = {0: _RayLikeDataPlane()}
+    mailbox = factory.create_worker_mailbox()
 
     assert factory.enabled is True
     assert factory.data_plane_backend_executor(executor) is not executor
-    assert factory.worker_mailbox(mailbox) is not mailbox
+    assert type(mailbox) is TracingWorkerMailbox
+    assert isinstance(mailbox, WorkerMailbox)
+    assert not hasattr(mailbox, "_delegate")
     wrapped_handlers = factory.wrap_data_plane_handlers("remote", handlers)
     assert wrapped_handlers is not handlers
     assert wrapped_handlers[0] is not handlers[0]
 
 
-def test_tracing_mailbox_declare_step_forwards_exact_barrier_metadata(tmp_path):
-    config = ProfilerConfig(trace_dir=str(tmp_path), run_id="run")
-    factory = ProfilerRuntimeFactory.from_config(
-        config, process_name="worker/spmd/rank:0"
-    )
-    mailbox = _MailboxLike()
-    wrapped = factory.worker_mailbox(mailbox)
-
-    wrapped.declare_step("op", 3, {11: 1}, ["state"])
-
-    assert mailbox.declared == {
-        "op_name": "op",
-        "step": 3,
-        "expected_tensors": {11: 1},
-        "expected_states": ["state"],
-        "barrier_config": None,
+def test_tracing_mailbox_inherits_uninstrumented_worker_mailbox_contract():
+    traced_methods = {
+        "clear_step",
+        "declare_step",
+        "deposit_control_arguments",
+        "deposit_local_tensor",
+        "deposit_transport_frame",
+        "set_ready_callback",
+        "wait_step_ready",
     }
+    base_public = {
+        name
+        for name, member in inspect.getmembers(WorkerMailbox, inspect.isfunction)
+        if not name.startswith("_")
+    }
+    tracing_public = {
+        name
+        for name, member in inspect.getmembers(TracingWorkerMailbox, inspect.isfunction)
+        if not name.startswith("_")
+    }
+    tracing_own_public = {
+        name
+        for name, member in TracingWorkerMailbox.__dict__.items()
+        if inspect.isfunction(member) and not name.startswith("_")
+    }
+
+    assert tracing_public == base_public
+    assert tracing_own_public == traced_methods
+    assert all(
+        getattr(TracingWorkerMailbox, name) is getattr(WorkerMailbox, name)
+        for name in base_public - traced_methods
+    )
 
 
 @pytest.mark.asyncio
-async def test_tracing_mailbox_forwards_multi_tensor_snapshot(tmp_path):
+async def test_tracing_mailbox_preserves_dependency_decision_barrier(tmp_path):
     config = ProfilerConfig(trace_dir=str(tmp_path), run_id="run")
     factory = ProfilerRuntimeFactory.from_config(
         config, process_name="worker/spmd/rank:0"
     )
-    mailbox = _MailboxLike()
-    wrapped = factory.worker_mailbox(mailbox)
+    mailbox = factory.create_worker_mailbox()
+    ready: list[tuple[str, int]] = []
+    mailbox.set_ready_callback(lambda op_name, step: ready.append((op_name, step)))
 
-    result = await wrapped.get_tensor_shard_views_and_arrivals_many("op", [11, 13], 3)
+    mailbox.declare_step(
+        "op",
+        3,
+        {11: 1},
+        [],
+        transfer_dependencies={11: 7},
+        expected_dependency_decisions={7: 1},
+    )
+    await mailbox.deposit_dependency_decision(
+        "op",
+        7,
+        3,
+        sender_id="Input",
+        rank=0,
+        expected_count=1,
+        decision=DependencyDecision.SKIP,
+    )
 
-    assert result == [(3, {11: "shards"}, {11: "arrivals"})]
-    assert mailbox.snapshot_many == {
-        "op_name": "op",
-        "tuuids": [11, 13],
-        "step": 3,
+    assert ready == [("op", 3)]
+    assert mailbox.is_step_ready("op", 3)
+    assert mailbox.is_step_skipped("op", 3)
+    snapshot = factory.recorder.snapshot()
+    recorded_names = {
+        snapshot["metadata"].name_for(int(row[4])) for row in snapshot["records"]
     }
+    assert {"mailbox.declare_step", "mailbox.ready_fire"} <= recorded_names
+
+
+def test_mailbox_trace_schema_uses_transfer_identity():
+    assert MAILBOX_DECLARE_STEP.payload_fields == (
+        "op_id",
+        "step",
+        "transfer_count",
+        "state_count",
+    )
+    assert MAILBOX_DEPOSIT_LOCAL_TENSOR.payload_fields == (
+        "op_id",
+        "transfer_code",
+        "step",
+        "data_count",
+    )
 
 
 def test_heartbeat_diagnostics_are_opt_in(tmp_path):
@@ -182,7 +233,7 @@ def test_heartbeat_diagnostics_are_opt_in(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_user_callable_execute_records_manifest_operator_facts(tmp_path):
+async def test_user_callable_execute_records_compiled_operator_identity(tmp_path):
     runtime = WorkerProcessCallRuntime(max_workers=1)
     executor = UserCallableExecutor(worker_process_runtime=runtime)
     factory = ProfilerRuntimeFactory.from_config(
@@ -198,13 +249,13 @@ async def test_user_callable_execute_records_manifest_operator_facts(tmp_path):
         UserCallableSpec(
             callable_id="lookup",
             fn=fn,
-            is_stateful=False,
             resource_id=1,
             operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
-            operator_name="lookup",
+            operator_is_coroutine_function=True,
             operator_step=9,
-            operator_rank=0,
-            operator_facts=_TRACE_RUNTIME_FACTS,
+            object_scope=SPMDObjectScope(spmd_id="trace", rank=0),
+            graph_id=_TRACE_PLAN.graph_id,
+            compiled_operator=_TRACE_COMPILED_OPERATOR,
         )
     )
     await runtime.drain()
@@ -224,24 +275,25 @@ async def test_user_callable_execute_records_manifest_operator_facts(tmp_path):
     values = dict(zip(fields, payload, strict=True))
 
     assert len(fields) == 8
-    assert metadata.name_for(int(values["manifest_id"])) == _TRACE_MANIFEST.manifest_id
+    assert metadata.name_for(int(values["graph_id"])) == _TRACE_PLAN.graph_id
     assert metadata.name_for(int(values["spmd_id"])) == "embedding"
     assert metadata.name_for(int(values["function_id"])) == "tests.Embedding.lookup"
     assert metadata.name_for(int(values["op_id"])) == "lookup"
     assert int(values["step"]) == 9
     assert (
         metadata.name_for(int(values["input_signature_id"]))
-        == _TRACE_INPUTS.signature_id
+        == _TRACE_COMPILED_OPERATOR.input_signature_id
     )
     assert (
         metadata.name_for(int(values["output_signature_id"]))
-        == _TRACE_OUTPUTS.signature_id
+        == _TRACE_COMPILED_OPERATOR.output_signature_id
     )
-    assert metadata.name_for(int(values["execution_mode"])) == "inline_async"
+    assert metadata.name_for(int(values["execution_mode"])) == "coroutine_async"
+    assert "operator_facts" not in UserCallableSpec.__dataclass_fields__
 
 
 @pytest.mark.asyncio
-async def test_user_callable_execute_rejects_operator_name_mismatch(tmp_path):
+async def test_user_callable_execute_requires_compiled_graph_identity(tmp_path):
     runtime = WorkerProcessCallRuntime(max_workers=1)
     executor = UserCallableExecutor(worker_process_runtime=runtime)
     factory = ProfilerRuntimeFactory.from_config(
@@ -253,20 +305,32 @@ async def test_user_callable_execute_rejects_operator_name_mismatch(tmp_path):
     async def fn() -> int:
         return 11
 
-    with pytest.raises(ValueError, match="operator_name does not match"):
+    with pytest.raises(ValueError, match="compiled_operator"):
         await wrapped.execute(
             UserCallableSpec(
                 callable_id="lookup",
                 fn=fn,
-                is_stateful=False,
                 resource_id=1,
                 operator_lane=USER_CALLABLE_DEFAULT_OPERATOR_LANE,
-                operator_name="other",
+                operator_is_coroutine_function=True,
                 operator_step=9,
-                operator_rank=0,
-                operator_facts=_TRACE_RUNTIME_FACTS,
+                object_scope=SPMDObjectScope(spmd_id="trace", rank=0),
             )
         )
+    runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_user_callable_wrapper_preserves_shutdown_contract(tmp_path):
+    runtime = WorkerProcessCallRuntime(max_workers=1)
+    executor = UserCallableExecutor(worker_process_runtime=runtime)
+    factory = ProfilerRuntimeFactory.from_config(
+        ProfilerConfig(trace_dir=str(tmp_path), run_id="run"),
+        process_name="worker/spmd/rank:0",
+    )
+
+    wrapped = factory.user_callable_executor(executor)
+    await wrapped.shutdown()
     runtime.close()
 
 
@@ -392,7 +456,7 @@ def test_user_profiler_scope_event_record_readable_payload():
         op_name="lookup",
         step=3,
         rank=2,
-        execution_mode="inline_sync",
+        execution_mode="worker_process",
     ):
         assert fw.profiler.enabled() is True
         with fw.profiler.scope("embedding_lookup", table="item", id_count=17):
@@ -412,7 +476,7 @@ def test_user_profiler_scope_event_record_readable_payload():
     assert metadata.name_for(int(values["op_id"])) == "lookup"
     assert int(values["step"]) == 3
     assert int(values["rank"]) == 2
-    assert metadata.name_for(int(values["execution_mode"])) == "inline_sync"
+    assert metadata.name_for(int(values["execution_mode"])) == "worker_process"
     assert metadata.name_for(int(values["attrs_id"])) == (
         '{"id_count":17,"table":"item"}'
     )
@@ -429,7 +493,7 @@ def test_user_profiler_enabled_rejects_invalid_inputs():
         op_name="lookup",
         step=0,
         rank=0,
-        execution_mode="inline_sync",
+        execution_mode="worker_process",
     ):
         with pytest.raises(ValueError, match="non-empty"):
             fw.profiler.event("")
@@ -452,7 +516,7 @@ def test_user_profiler_skip_initial_steps_applies_to_custom_records():
             op_name="lookup",
             step=step,
             rank=0,
-            execution_mode="inline_sync",
+            execution_mode="worker_process",
         ):
             fw.profiler.event("cache_hit", step_value=step)
 
@@ -584,7 +648,7 @@ async def test_tracing_data_plane_callable_delegates_and_records(tmp_path):
     wrapped = factory.wrap_data_plane_handlers("remote", {3: delegate})[3]
     header = TransportFrameHeader(
         frame_i32=np.array([1, 4, 0, 0, 1, 0, 0, 0], dtype=np.int32),
-        edge_i32=np.zeros((0, 11), dtype=np.int32),
+        entry_i32=np.zeros((0, 11), dtype=np.int32),
         payload_i32=np.zeros((0, 8), dtype=np.int32),
         shape_i32=np.zeros((0,), dtype=np.int32),
         global_shape_i64=np.zeros((0,), dtype=np.int64),
@@ -693,6 +757,7 @@ def test_perfetto_writer_dependency_contract(tmp_path):
         recorder.arena.snapshot(),
         path,
         metadata=recorder.metadata,
+        graph_symbols=_TRACE_GRAPH_SYMBOLS,
     )
     assert path.exists()
     assert path.stat().st_size > 0
@@ -708,7 +773,7 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
     recorder = TraceRecorder(
         TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
         run_id="run",
-        process_name="worker/spmd/rank:0",
+        process_name="worker/embedding/rank:0",
     )
 
     class Delegate:
@@ -722,10 +787,10 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
         LocalStepContext(op_name="lookup", step=4),
     )
     async with recorder.user_callable_execute(
-        manifest_id=_TRACE_MANIFEST.manifest_id,
-        operator_facts=_TRACE_OPERATOR_FACTS,
+        graph_id=_TRACE_PLAN.graph_id,
+        compiled_operator=_TRACE_COMPILED_OPERATOR,
         step=4,
-        execution_mode="inline_async",
+        execution_mode="coroutine_async",
     ):
         pass
 
@@ -734,6 +799,7 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
         recorder.arena.snapshot(),
         path,
         metadata=recorder.metadata,
+        graph_symbols=_TRACE_GRAPH_SYMBOLS,
     )
 
     trace = proto.Trace()
@@ -750,14 +816,20 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
                 annotations[annotation.name] = int(annotation.int_value)
         break
 
-    assert annotations["manifest_id"] == _TRACE_MANIFEST.manifest_id
+    assert annotations["graph_id"] == _TRACE_PLAN.graph_id
+    assert annotations["graph_generation"] == str(_TRACE_GRAPH_SYMBOLS.generation)
     assert annotations["spmd_id"] == "embedding"
     assert annotations["function_id"] == "tests.Embedding.lookup"
     assert annotations["op_id"] == "lookup"
     assert annotations["step"] == 4
-    assert annotations["input_signature_id"] == _TRACE_INPUTS.signature_id
-    assert annotations["output_signature_id"] == _TRACE_OUTPUTS.signature_id
-    assert annotations["execution_mode"] == "inline_async"
+    assert (
+        annotations["input_signature_id"] == _TRACE_COMPILED_OPERATOR.input_signature_id
+    )
+    assert (
+        annotations["output_signature_id"]
+        == _TRACE_COMPILED_OPERATOR.output_signature_id
+    )
+    assert annotations["execution_mode"] == "coroutine_async"
 
     local_step_annotations = {}
     for packet in trace.packet:
@@ -771,11 +843,13 @@ async def test_perfetto_writer_decodes_interned_debug_annotations(tmp_path):
                 local_step_annotations[annotation.name] = int(annotation.int_value)
         break
 
-    assert local_step_annotations == {
-        "op_id": "lookup",
-        "step": 4,
-        "node_count": 1,
-    }
+    assert local_step_annotations["op_id"] == "lookup"
+    assert local_step_annotations["step"] == 4
+    assert local_step_annotations["node_count"] == 1
+    assert local_step_annotations["operator.function"] == "tests.Embedding.lookup"
+    assert local_step_annotations["operator.input.data_ports"] == "ids, weights"
+    assert local_step_annotations["operator.input.control_ports"] == "lr"
+    assert local_step_annotations["operator.output.data_ports"] == "embeddings"
 
 
 @pytest.mark.asyncio
@@ -790,15 +864,15 @@ async def test_perfetto_writer_assigns_overlapping_slices_to_lanes(
     recorder = TraceRecorder(
         TraceArena(buffer_bytes=8 * RECORD_WIDTH * np.dtype(np.int64).itemsize),
         run_id="run",
-        process_name="worker/spmd/rank:3",
+        process_name="worker/embedding/rank:3",
     )
     timestamps = iter((100, 200, 300, 400))
     monkeypatch.setattr(
         "fluxway.profiler.recorder.time.perf_counter_ns",
         lambda: next(timestamps),
     )
-    first = recorder.local_step_plan_execute(op_name="train", step=7, node_count=1)
-    second = recorder.local_step_plan_execute(op_name="train", step=8, node_count=1)
+    first = recorder.local_step_plan_execute(op_name="lookup", step=7, node_count=1)
+    second = recorder.local_step_plan_execute(op_name="lookup", step=8, node_count=1)
     await first.__aenter__()
     await second.__aenter__()
     await first.__aexit__(None, None, None)
@@ -806,7 +880,10 @@ async def test_perfetto_writer_assigns_overlapping_slices_to_lanes(
 
     path = Path(tmp_path) / "overlapping.pftrace"
     PerfettoTraceWriter().write(
-        recorder.arena.snapshot(), path, metadata=recorder.metadata
+        recorder.arena.snapshot(),
+        path,
+        metadata=recorder.metadata,
+        graph_symbols=_TRACE_GRAPH_SYMBOLS,
     )
     trace = proto.Trace()
     trace.ParseFromString(path.read_bytes())
@@ -856,14 +933,14 @@ def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
     recorder = TraceRecorder(
         TraceArena(buffer_bytes=8 * 16 * np.dtype(np.int64).itemsize),
         run_id="run",
-        process_name="worker/spmd/rank:0",
+        process_name="worker/embedding/rank:0",
     )
     with activate_user_profiler(
         recorder=recorder,
         op_name="lookup",
         step=4,
         rank=1,
-        execution_mode="inline_sync",
+        execution_mode="worker_process",
     ):
         with fw.profiler.scope(
             "embedding_lookup",
@@ -880,6 +957,7 @@ def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
         recorder.arena.snapshot(),
         path,
         metadata=recorder.metadata,
+        graph_symbols=_TRACE_GRAPH_SYMBOLS,
     )
 
     trace = proto.Trace()
@@ -903,7 +981,7 @@ def test_perfetto_writer_expands_user_profiler_attrs(tmp_path):
     assert annotations["op_id"] == "lookup"
     assert annotations["step"] == 4
     assert annotations["rank"] == 1
-    assert annotations["execution_mode"] == "inline_sync"
+    assert annotations["execution_mode"] == "worker_process"
     assert annotations["table"] == "item"
     assert annotations["id_count"] == 19
     assert annotations["hit"] is True
@@ -974,33 +1052,3 @@ class _RayLikeDataPlane(DataPlaneCallable):
     async def receive_control(self, op_name, step, names, values):
         self.control_calls += 1
         return True
-
-
-class _MailboxLike:
-    def __init__(self) -> None:
-        self.declared = None
-        self.snapshot_many = None
-
-    def declare_step(
-        self,
-        op_name,
-        step,
-        expected_tensors,
-        expected_states,
-        barrier_config=None,
-    ):
-        self.declared = {
-            "op_name": op_name,
-            "step": step,
-            "expected_tensors": expected_tensors,
-            "expected_states": expected_states,
-            "barrier_config": barrier_config,
-        }
-
-    async def get_tensor_shard_views_and_arrivals_many(self, op_name, tuuids, step):
-        self.snapshot_many = {
-            "op_name": op_name,
-            "tuuids": tuuids,
-            "step": step,
-        }
-        return [(step, {11: "shards"}, {11: "arrivals"})]

@@ -1,11 +1,36 @@
 import threading
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fluxway.common.types import SPMDConfig, OperatorMeta
+from fluxway import OperatorSpec
+from fluxway.common.compiled_graph import compile_graph
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types import SPMDConfig
 from fluxway.spmd.driver.driver import SPMDDriver
+from tests.compiled_graph_fixtures import compiled_spmd_spec
+
+
+def _config(spmd_id: str, operator_id: str, world_size: int) -> SPMDConfig:
+    mesh = DeviceMesh(axis_names=("worker",), device_shape=(world_size,))
+    operator = OperatorSpec(name=operator_id)
+    compiled_graph = compile_graph(
+        name="driver-shutdown-test",
+        spmds=(
+            compiled_spmd_spec(
+                spmd_id=spmd_id,
+                mesh=mesh,
+                operators={operator_id: operator},
+            ),
+        ),
+        dependencies=(),
+    ).spmd(spmd_id)
+    return SPMDConfig(
+        spmd_id=spmd_id,
+        graph_view=compiled_graph,
+        mesh=mesh,
+        operator_specs={operator_id: operator},
+    )
 
 
 @pytest.mark.asyncio
@@ -13,11 +38,7 @@ async def test_driver_stop_waits_for_worker_shutdown():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=2),
-            operator_metas={"compute": OperatorMeta(name="compute")},
-            active_operator_names=("compute",),
-        ),
+        config=_config("dense", "compute", 2),
         placement_group=object(),
         worker_bundle_indices=[1, 2],
         controller_handle=None,
@@ -52,11 +73,7 @@ async def test_driver_stop_propagates_worker_shutdown_failure_after_detach():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="metrics",
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=1),
-            operator_metas={"step": OperatorMeta(name="step")},
-            active_operator_names=("step",),
-        ),
+        config=_config("metrics", "step", 1),
         placement_group=object(),
         worker_bundle_indices=[0],
         controller_handle=None,
@@ -84,11 +101,7 @@ async def test_driver_stop_reports_submission_and_detach_failures():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="metrics",
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=2),
-            operator_metas={"step": OperatorMeta(name="step")},
-            active_operator_names=("step",),
-        ),
+        config=_config("metrics", "step", 2),
         placement_group=object(),
         worker_bundle_indices=[0, 1],
         controller_handle=None,
@@ -125,11 +138,7 @@ async def test_driver_stop_shuts_down_workers_when_heartbeat_stop_fails():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="metrics",
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=1),
-            operator_metas={"step": OperatorMeta(name="step")},
-            active_operator_names=("step",),
-        ),
+        config=_config("metrics", "step", 1),
         placement_group=object(),
         worker_bundle_indices=[0],
         controller_handle=None,
@@ -160,11 +169,7 @@ async def test_stop_heartbeat_joins_background_thread():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=1),
-            operator_metas={"compute": OperatorMeta(name="compute")},
-            active_operator_names=("compute",),
-        ),
+        config=_config("dense", "compute", 1),
         placement_group=object(),
         worker_bundle_indices=[1],
         controller_handle=None,
@@ -192,11 +197,7 @@ def test_driver_ignores_worker_callbacks_while_stopping():
     # pyrefly: ignore [missing-attribute]
     driver = SPMDDriver.__ray_actor_class__(
         spmd_id="dense",
-        config=SPMDConfig(
-            mesh=SimpleNamespace(size=1),
-            operator_metas={"compute": OperatorMeta(name="compute")},
-            active_operator_names=("compute",),
-        ),
+        config=_config("dense", "compute", 1),
         placement_group=object(),
         worker_bundle_indices=[1],
         controller_handle=MagicMock(),

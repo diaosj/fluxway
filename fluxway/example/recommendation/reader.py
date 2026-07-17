@@ -5,9 +5,10 @@ from typing import Any
 
 from fluxway.common.decorators import spmd_source, operator, requires_worker_process
 from fluxway.common.index_descriptor import ContinuousIndex
-from fluxway.common.types import AsyncPolicy
+from fluxway.common.operator_policy import AsyncPolicy
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.reader import GrainReader
+from fluxway import ResourceProfile
 from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
 
 
@@ -33,7 +34,7 @@ def _row_partitioned_int_tensor(
 
 @requires_worker_process
 @spmd_source(
-    resource={"num_cpus": 1, "memory_gb": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("worker",),
     interleaved=True,
     interleave_unit_size=1,

@@ -11,7 +11,7 @@ Responsibilities:
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,7 @@ class SPMDSynchronizer:
                 self.num_workers,
             )
 
-    def register_expected_ops(self, ops: list[str]) -> None:
+    def register_expected_ops(self, ops: Iterable[str]) -> None:
         """Register statically known operators to properly anchor drain ceilings.
         Can be called additively to prepare for Eager Mode dynamic scheduling.
         """

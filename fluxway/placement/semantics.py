@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 from collections import defaultdict
 from collections.abc import Mapping
 from decimal import Decimal
 from functools import singledispatchmethod
 from typing import TYPE_CHECKING, cast
 
-from fluxway.common.types import Graph
+from .inventory import PlacementInventory
 
 from .mathematics import (
     AffinityCoverageExpr,
@@ -55,20 +54,16 @@ if TYPE_CHECKING:
 class _ExpressionResolver:
     def __init__(
         self,
-        graph: Graph,
+        inventory: PlacementInventory,
         workers: tuple[_Worker, ...],
         constraints: tuple[Constraint, ...],
     ):
         self._workers = workers
         self._constraints = constraints
-        self.spmd_ids = tuple(sorted(graph.nodes))
-        self._class_to_spmd: defaultdict[tuple[str | None, str | None], list[str]] = (
-            defaultdict(list)
-        )
-        for spmd_id, node in graph.nodes.items():
-            self._class_to_spmd[
-                (node.spmd_class_module, node.spmd_class_qualname)
-            ].append(spmd_id)
+        self.spmd_ids = inventory.spmd_ids
+        self._class_to_spmd: defaultdict[type, list[str]] = defaultdict(list)
+        for declaration in inventory.declarations:
+            self._class_to_spmd[declaration.spmd_class].append(declaration.spmd_id)
 
     @singledispatchmethod
     def worker_indices(self, expression: WorkerSetExpr) -> tuple[int, ...]:
@@ -78,9 +73,11 @@ class _ExpressionResolver:
 
     @worker_indices.register
     def _(self, expression: WorkersExpr) -> tuple[int, ...]:
-        key = (expression.spmd.module, expression.spmd.qualname)
+        key = expression.spmd.spmd_class
         if key not in self._class_to_spmd:
-            raise PlacementContractError(f"SPMD class {key} is not in the Graph")
+            raise PlacementContractError(
+                f"SPMD class {key.__module__}.{key.__qualname__} is not in the registry"
+            )
         spmd_ids = self._class_to_spmd[key]
         return tuple(
             worker.index for worker in self._workers if worker.spmd_id in spmd_ids
@@ -191,11 +188,9 @@ class _ExpressionResolver:
 
     def affinity_target_worker_sets(self) -> tuple[WorkerSetExpr, ...]:
         targets = {
-            json.dumps(
-                cast(SupportExpr, relation.right).workers.model_dump(mode="json"),
-                sort_keys=True,
-                separators=(",", ":"),
-            ): cast(SupportExpr, relation.right).workers
+            repr(cast(SupportExpr, relation.right).workers): cast(
+                SupportExpr, relation.right
+            ).workers
             for relation in self.support_affinity_constraints()
         }
         return tuple(targets[key] for key in sorted(targets))
@@ -214,11 +209,7 @@ class _ExpressionResolver:
 
 class _PositiveAffinityAnalyzer:
     def _key(self, constraint: Constraint) -> str:
-        return json.dumps(
-            constraint.model_dump(mode="json"),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        return repr(constraint)
 
     @singledispatchmethod
     def guaranteed(

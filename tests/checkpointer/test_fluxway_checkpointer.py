@@ -15,6 +15,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from fluxway.control_plane.checkpointer.checkpoint import FluxwayCheckpointer
+from fluxway.control_plane.checkpointer.directory import (
+    CHECKPOINT_ROOT_MARKER,
+    CheckpointDirectoryOwnershipError,
+)
 
 # Module-level dynamic dataclass for pickle compatibility
 DynamicBatch = make_dataclass("DynamicBatch", [("x", int), ("y", float)])
@@ -38,6 +42,30 @@ def checkpointer(tmp_path):
         interval_steps=1,
         max_to_keep=10,
     )
+
+
+def test_checkpointer_claims_new_checkpoint_root(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+
+    FluxwayCheckpointer(
+        controller=MagicMock(),
+        ckpt_dir=str(checkpoint_root),
+        interval_steps=1,
+    )
+
+    assert (checkpoint_root / CHECKPOINT_ROOT_MARKER).is_file()
+
+
+def test_checkpointer_rejects_existing_unowned_directory(tmp_path):
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+
+    with pytest.raises(CheckpointDirectoryOwnershipError, match="not owned"):
+        FluxwayCheckpointer(
+            controller=MagicMock(),
+            ckpt_dir=str(checkpoint_root),
+            interval_steps=1,
+        )
 
 
 class TestManifestPersistence:
@@ -175,6 +203,12 @@ class TestCheckpointLifecycle:
     def test_load_missing_step_raises(self, checkpointer):
         with pytest.raises(FileNotFoundError, match="manifest not found"):
             checkpointer._load(step=999)
+
+    @pytest.mark.asyncio
+    async def test_restore_latest_returns_none_when_checkpoint_root_is_empty(
+        self, checkpointer
+    ):
+        assert await checkpointer.restore("latest") is None
 
     def test_evict_old_checkpoints(self, checkpointer, tmp_path):
         checkpointer._max_to_keep = 2

@@ -16,7 +16,6 @@ Test scenarios
 
 from __future__ import annotations
 
-import typing
 import unittest
 from types import SimpleNamespace
 
@@ -26,15 +25,26 @@ import numpy as np
 from fluxway.common.tensor_backend import get_backend, use_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.index_descriptor import ExplicitIndex
+from fluxway.common.compiled_graph import (
+    CompiledLogicalTensor,
+    CompiledTensorTransfer,
+    OperatorKey,
+    OperatorPort,
+    TensorTransfer,
+)
 from fluxway.common.types.sharding import AlgebraicRouting, ChunkPartition
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
-from fluxway.transport.manifest import EDGE_SOURCE_STEP
+from fluxway.transport.manifest import (
+    ENTRY_GLOBAL_SHAPE_BEGIN,
+    ENTRY_GLOBAL_SHAPE_COUNT,
+    ENTRY_SOURCE_STEP,
+)
 from fluxway.spmd.worker.worker import (
     SPMDWorker as RaySPMDWorker,
     _nonzero_1d_indices,
 )
-from fluxway.spmd.worker.assembly import AssembleProviderPlan, CompiledAssemblePlan
+from fluxway.spmd.worker.assembly import CompiledAssemblePlan
 
 SPMDWorker = getattr(RaySPMDWorker, "__ray_actor_class__", RaySPMDWorker)  # type: ignore
 # ─── Helper: build a minimal TransportTensor ─────────────────────────────────
@@ -70,189 +80,24 @@ def make_receipt(sender_ranks, remote_indices, world_size=4) -> SymmetryReceipt:
     return SymmetryReceipt(world_size, jnp.array(sender_ranks, dtype=jnp.int32))
 
 
-# ─── Minimal stand-in for the Worker's assembly helpers ──────────────────────
-# We instantiate a light mock object that provides only what is needed for the
-# helper methods so we can test them without spinning up Ray actors.
-
-
-class _AssemblyMixin:
-    """Mixin that contains only the assembly helpers from Worker."""
-
-    rank: int
-
-    def _get_values(self, t: TransportTensor):
-        return t.flat_values
-
-    def _get_routing_indices(self, t: TransportTensor):
-        if isinstance(t, TransportTensor):
-            return t.routing_indices_materialized
-        return None
-
-    def _normalize_and_cat_shards(self, tensors, dim=0):
-        backend = get_backend()
-        if not tensors:
-            return backend.zeros((0,), dtype=backend.float32())
-        if len(tensors) == 1:
-            return tensors[0]
-        # Promote dtype to the first non-empty tensor's dtype
-        proto = next((t for t in tensors if backend.shape(t)[0] > 0), tensors[0])
-        proto_dtype = backend.dtype(proto)
-        proto_shape = list(backend.shape(proto))
-        normalized = []
-        for t in tensors:
-            s = list(backend.shape(t))
-            if s[0] == 0 and len(s) < len(proto_shape):
-                new_shape = [0] + proto_shape[1:]
-                normalized.append(backend.zeros(tuple(new_shape), dtype=proto_dtype))
-            else:
-                normalized.append(t)
-        return backend.cat(normalized, dim=dim)
-
-    # ── Copy the four helpers verbatim from worker.py ────────────────────────
-
-    def _merge_index_descriptors(self, shard_list):
-        from fluxway.common.index_descriptor import IndexDescriptor
-
-        descriptors = [
-            s.index_descriptor for s in shard_list if s.index_descriptor is not None
-        ]
-        if len(descriptors) == len(shard_list) and shard_list:
-            return IndexDescriptor.concatenate(descriptors)
-        return None
-
-    def _merge_origin_indices(self, shards):
-        backend = get_backend()
-        if not any(
-            hasattr(s, "origin_indices") and s.origin_indices is not None
-            for s in shards
-        ):
-            return None
-        origin_list = []
-        for s in shards:
-            idx = (
-                s.origin_indices_materialized
-                if hasattr(s, "origin_indices_materialized")
-                else None
-            )
-            if idx is None:
-                idx = self._get_routing_indices(s)
-            if idx is None:
-                num = backend.shape(self._get_values(s))[0]
-                idx = backend.arange(0, num, dtype=backend.int32())
-            origin_list.append(idx)
-        return self._normalize_and_cat_shards(origin_list, dim=0)
-
-    def _maybe_merge_receipts(self, shards, has_mirror: bool):
-        if not has_mirror:
-            return None
-        receipts = [s.receipt for s in shards]
-        if all(r is not None for r in receipts):
-            backend = get_backend()
-            lengths = [int(backend.shape(s.flat_values)[0]) for s in shards]
-            return SymmetryReceipt.concatenate(receipts, lengths)
-        return None
-
-    def _assemble_dynamic_to_static_core(
-        self, valid_shards: list[TransportTensor], input_spec, has_mirror: bool
+def _assembly_worker(rank: int):
+    worker = SPMDWorker.__new__(SPMDWorker)
+    worker.rank = rank
+    worker._profiler_runtime = SimpleNamespace(enabled=False)
+    worker._op_manager = SimpleNamespace()
+    for name in (
+        "_flatten_shards",
+        "_filter_shards_by_routing",
+        "_get_values",
+        "_get_routing_indices",
+        "_normalize_and_cat_shards",
+        "_maybe_merge_receipts",
+        "_routing_entity_count",
+        "_merge_index_descriptors",
+        "_describe_shard_flow_for_error",
     ):
-        """Extracted core of _assemble_dynamic_to_static_tensor for testing."""
-        backend = get_backend()
-        all_receipt = self._maybe_merge_receipts(valid_shards, has_mirror)
-
-        routing_dim = getattr(input_spec, "routing_dim", 0)
-        if isinstance(routing_dim, list | tuple):
-            routing_dim = routing_dim[0]
-
-        all_values = backend.cat(
-            [self._get_values(s) for s in valid_shards], dim=routing_dim
-        )
-
-        all_indices_list = []
-        for s in valid_shards:
-            idx = (
-                s.origin_indices_materialized
-                if hasattr(s, "origin_indices_materialized")
-                else None
-            )
-            if idx is None:
-                idx = self._get_routing_indices(s)
-            if idx is None:
-                num = backend.shape(self._get_values(s))[0]
-                idx = backend.arange(0, num, dtype=backend.int32())
-            all_indices_list.append(idx)
-        all_indices = backend.cat(all_indices_list, dim=0)
-
-        max_idx = int(backend.item(backend.max(all_indices)))
-        inferred_dim_size = max_idx + 1
-
-        # Prefer the global_shape carried by the received shards when available.
-        # Receivers only see a subset of indices, so local max_idx < global dim.
-        shard_global_shape = next(
-            (s.global_shape for s in valid_shards if s.global_shape is not None), None
-        )
-        if shard_global_shape and len(shard_global_shape) > routing_dim:
-            inferred_dim_size = shard_global_shape[routing_dim]
-
-        val_shape = list(backend.shape(all_values))
-        global_shape_list = val_shape[:]
-        global_shape_list[routing_dim] = inferred_dim_size
-        global_shape = tuple(global_shape_list)
-
-        local_shape = input_spec.get_shard_shape(self.rank, data_shape=global_shape)
-        slice_start, slice_end = input_spec.get_shard_bounds(
-            self.rank, routing_dim, data_shape=global_shape
-        )
-
-        mask = (all_indices >= slice_start) & (all_indices < slice_end)
-        local_indices = all_indices[mask] - slice_start
-
-        if routing_dim == 0:
-            local_values = all_values[mask]
-        else:
-            indices_to_take = backend.nonzero(mask).flatten()
-            idx_tuple = [slice(None)] * len(val_shape)
-            idx_tuple[routing_dim] = indices_to_take
-            local_values = all_values[tuple(idx_tuple)]
-
-        assembled_data = backend.zeros(local_shape, dtype=all_values.dtype)
-        indices_tuple = [slice(None)] * len(local_shape)
-        indices_tuple[routing_dim] = local_indices
-        assembled_data = backend.index_update(
-            assembled_data, tuple(indices_tuple), local_values
-        )
-
-        assembled_receipt = None
-        if all_receipt is not None:
-            final_ranks = backend.full(
-                (local_shape[routing_dim],), -1, dtype=backend.int32()
-            )
-            local_ranks = all_receipt.sender_rank_tags[mask]
-            final_ranks = backend.index_update(final_ranks, local_indices, local_ranks)
-            assembled_receipt = SymmetryReceipt(all_receipt.world_size, final_ranks)
-
-        return TransportTensor(
-            assembled_data,
-            global_shape=global_shape,
-            receipt=assembled_receipt,
-            source_step=0,
-        )
-
-
-class _MockWorker(_AssemblyMixin):
-    def __init__(self, rank: int):
-        self.rank = rank
-
-
-class _DirectWorker:
-    rank: int = 0
-    spmd_id: str = ""
-    _filter_shards_by_routing: typing.Any = None
-    _flatten_shards: typing.Any = None
-    _get_values: typing.Any = None
-    _get_routing_indices: typing.Any = None
-    _normalize_and_cat_shards: typing.Any = None
-    _maybe_merge_receipts: typing.Any = None
-    _assemble_dynamic_to_static_tensor: typing.Any = None
+        setattr(worker, name, getattr(SPMDWorker, name).__get__(worker, SPMDWorker))
+    return worker
 
 
 # =============================================================================
@@ -263,18 +108,65 @@ class _DirectWorker:
 def _dynamic_to_static_assemble_plan(
     *,
     op_name: str,
-    tuuid: int,
+    transfer_code: int,
+    logical_tuuid: int,
     input_layout,
     predecessor_spmd_id: str,
 ) -> CompiledAssemblePlan:
-    topology = {predecessor_spmd_id: SimpleNamespace(tuuid_sharding={tuuid: object()})}
+    sharding = input_layout.spec
+    transfer = CompiledTensorTransfer(
+        spec=TensorTransfer(OperatorPort("output"), OperatorPort("input")),
+        transfer_code=transfer_code,
+        dependency_code=1,
+        logical_tuuid=logical_tuuid,
+        source_sharding=sharding,
+        target_sharding=sharding,
+    )
     return CompiledAssemblePlan(
         op_name=op_name,
-        tuuid=tuuid,
-        input_layout=input_layout,
-        predecessor_topology=topology,
-        providers=(AssembleProviderPlan(predecessor_spmd_id, True),),
-        has_dynamic_predecessor=True,
+        dependency=SimpleNamespace(code=1),
+        transfer=transfer,
+        logical_tensor=CompiledLogicalTensor(
+            logical_tuuid=logical_tuuid,
+            producer=OperatorKey(predecessor_spmd_id, "produce"),
+            producer_port="output",
+            producer_sharding=sharding,
+            effective_sharding=sharding,
+        ),
+        source_spmd_id=predecessor_spmd_id,
+        source_layout=SimpleNamespace(is_content_addressable=True),
+        target_layout=input_layout,
+    )
+
+
+def _assemble_dynamic_to_static(worker, plan, input_layout, shards):
+    max_index = max(
+        int(np.asarray(shard.origin_indices_materialized).max())
+        for shard in shards
+        if shard.origin_indices_materialized is not None
+    )
+    shard_map = {}
+    for rank, shard in enumerate(shards):
+        if shard.global_shape is None:
+            value_shape = tuple(int(x) for x in shard.flat_values.shape[1:])
+            shard = TransportTensor(
+                shard.flat_values,
+                nested_splits=shard.nested_splits,
+                routing_indices=shard.routing_indices,
+                origin_indices=shard.origin_indices,
+                global_shape=(max_index + 1, *value_shape),
+                receipt=shard.receipt,
+                source_step=shard.source_step,
+            )
+        shard_map[(plan.source_spmd_id, rank)] = [shard]
+    return SPMDWorker._assemble_dynamic_to_static_tensor(
+        worker,
+        plan.op_name,
+        plan.transfer_code,
+        0,
+        shard_map,
+        input_layout,
+        assemble_plan=plan,
     )
 
 
@@ -282,15 +174,15 @@ class TestSymmetryReceiptHelpers(unittest.TestCase):
     """Unit tests for _maybe_merge_receipts."""
 
     def setUp(self):
-        self.w = _MockWorker(rank=0)
+        self.w = _assembly_worker(rank=0)
 
     def test_no_mirror_returns_none(self):
         shards = [
             make_tt([[1.0, 2.0]], receipt=make_receipt([0], [0])),
             make_tt([[3.0, 4.0]], receipt=make_receipt([1], [1])),
         ]
-        result = self.w._maybe_merge_receipts(shards, has_mirror=False)
-        self.assertIsNone(result)
+        result = self.w._maybe_merge_receipts(shards)
+        self.assertIsNotNone(result)
 
     def test_mirror_merges_receipts(self):
         r0 = make_receipt([0, 0], [10, 11])
@@ -299,7 +191,7 @@ class TestSymmetryReceiptHelpers(unittest.TestCase):
             make_tt([[1.0], [2.0]], receipt=r0),
             make_tt([[3.0], [4.0]], receipt=r1),
         ]
-        result = self.w._maybe_merge_receipts(shards, has_mirror=True)
+        result = self.w._maybe_merge_receipts(shards)
         self.assertIsNotNone(result)
         assert result is not None
         np.testing.assert_array_equal(result.sender_rank_tags, [0, 0, 1, 1])
@@ -310,40 +202,8 @@ class TestSymmetryReceiptHelpers(unittest.TestCase):
             make_tt([[1.0]], receipt=make_receipt([0], [0])),
             make_tt([[2.0]], receipt=None),
         ]
-        result = self.w._maybe_merge_receipts(shards, has_mirror=True)
+        result = self.w._maybe_merge_receipts(shards)
         self.assertIsNone(result)
-
-
-class TestMergeOriginIndices(unittest.TestCase):
-    """Unit tests for _merge_origin_indices."""
-
-    def setUp(self):
-        self.w = _MockWorker(rank=0)
-
-    def test_returns_none_when_no_origin(self):
-        shards = [make_tt([1.0, 2.0]), make_tt([3.0])]
-        result = self.w._merge_origin_indices(shards)
-        self.assertIsNone(result)
-
-    def test_merges_present_origin_indices(self):
-        shards = [
-            make_tt([1.0, 2.0], origin_indices=[2, 0]),
-            make_tt([3.0], origin_indices=[1]),
-        ]
-        result = self.w._merge_origin_indices(shards)
-        self.assertIsNotNone(result)
-        np.testing.assert_array_equal(result, [2, 0, 1])
-
-    def test_falls_back_to_arange_for_missing_shard(self):
-        """A shard without origin_indices falls back to arange(len)."""
-        shards = [
-            make_tt([1.0, 2.0], origin_indices=[5, 6]),
-            make_tt([3.0, 4.0]),  # no origin_indices
-        ]
-        result = self.w._merge_origin_indices(shards)
-        self.assertIsNotNone(result)
-        # First shard: [5,6], second shard fallback: [0,1]
-        np.testing.assert_array_equal(result, [5, 6, 0, 1])
 
 
 class TestDynamicToStaticAssembly(unittest.TestCase):
@@ -372,13 +232,20 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         spec = ShardingSpec(
             routing=AlgebraicRouting(strategy=strategy, partition=PartitionSpec("dp"))
         ).bind(mesh)
-        w = _MockWorker(rank=rank)
+        w = _assembly_worker(rank=rank)
         valid = [s for s in shards if get_backend().shape(w._get_values(s))[0] > 0]
         if not valid:
             raise ValueError(
                 "Dynamic-to-static assembly requires at least one non-empty shard."
             )
-        return w._assemble_dynamic_to_static_core(valid, spec, has_mirror)
+        plan = _dynamic_to_static_assemble_plan(
+            op_name="step",
+            transfer_code=7,
+            logical_tuuid=7,
+            input_layout=spec,
+            predecessor_spmd_id="Sparse",
+        )
+        return _assemble_dynamic_to_static(w, plan, spec, valid)
 
     def test_basic_reassembly_no_mirror(self):
         """
@@ -413,32 +280,7 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             )
         ).bind(mesh)
 
-        worker: typing.Any = _DirectWorker()
-        worker.rank = 1
-        worker.spmd_id = "Dense"
-        worker.op_manager = None
-        worker._flatten_shards = SPMDWorker._flatten_shards.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
-        worker._filter_shards_by_routing = SPMDWorker._filter_shards_by_routing.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
-        worker._get_values = SPMDWorker._get_values.__get__(worker, _DirectWorker)  # type: ignore
-        worker._get_routing_indices = SPMDWorker._get_routing_indices.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
-        worker._normalize_and_cat_shards = SPMDWorker._normalize_and_cat_shards.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
-        worker._maybe_merge_receipts = SPMDWorker._maybe_merge_receipts.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
-        worker._routing_entity_count = SPMDWorker._routing_entity_count.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
-        assemble = SPMDWorker._assemble_dynamic_to_static_tensor.__get__(  # type: ignore
-            worker, _DirectWorker
-        )
+        worker = _assembly_worker(rank=1)
 
         shard = TransportTensor(
             np.array([[8, 8], [10, 10], [13, 13]], dtype=np.float32),
@@ -450,18 +292,13 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
 
         assemble_plan = _dynamic_to_static_assemble_plan(
             op_name="step",
-            tuuid=7,
+            transfer_code=7,
+            logical_tuuid=7,
             input_layout=input_layout,
             predecessor_spmd_id="Sparse",
         )
-        result = assemble(
-            "step",
-            7,
-            0,
-            {("Sparse", 0): [shard]},
-            input_layout,
-            assemble_plan.predecessor_topology,
-            assemble_plan=assemble_plan,
+        result = _assemble_dynamic_to_static(
+            worker, assemble_plan, input_layout, [shard]
         )
         data = np.asarray(result.flat_values)
 
@@ -504,9 +341,9 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
     def test_unequal_shard_sizes(self):
         """
         Simulates real embedding lookup where shards are unevenly distributed.
-        Global: 11 items across 4 SPMD_A workers → SPMD_B (dp=4).
+        Global: 12 items across 4 SPMD_A workers → SPMD_B (dp=4).
         """
-        # 4 workers send: 4, 3, 2, 2 items with correct global origin_indices
+        # 4 workers send: 4, 3, 3, 2 items with correct global origin_indices
         shard0 = make_tt(
             [[float(i)] for i in range(4)], origin_indices=list(range(0, 4))
         )
@@ -514,10 +351,10 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             [[float(i)] for i in range(4, 7)], origin_indices=list(range(4, 7))
         )
         shard2 = make_tt(
-            [[float(i)] for i in range(7, 9)], origin_indices=list(range(7, 9))
+            [[float(i)] for i in range(7, 10)], origin_indices=list(range(7, 10))
         )
         shard3 = make_tt(
-            [[float(i)] for i in range(9, 11)], origin_indices=list(range(9, 11))
+            [[float(i)] for i in range(10, 12)], origin_indices=list(range(10, 12))
         )
         all_shards = [shard0, shard1, shard2, shard3]
 
@@ -526,8 +363,8 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
             result = self._run_rank(rank, all_shards, world_size=4, has_mirror=False)
             n = int(np.array(result.flat_values).shape[0])
             total += n
-        # All 11 items should be distributed without loss
-        self.assertEqual(total, 11)
+        # All 12 items should be distributed without loss
+        self.assertEqual(total, 12)
 
     def test_mirror_receipt_roundtrip(self):
         """
@@ -598,184 +435,6 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         # It's assumed the receiver knows how to scatter or the tags are enough?
         # In current Fluxway, SymmetryReceipt ONLY carries sender_rank_tags.
         pass
-
-
-class TestOperatorManagerPhase2MeshCorrectness(unittest.TestCase):
-    def _build_operator_manager(
-        self,
-        sender_mesh: DeviceMesh,
-        receiver_mesh: DeviceMesh,
-        sender_op: str = "lookup",
-        receiver_spmd: str = "DenseLayers",
-        output_tensor_name: str = "sparse_features",
-        output_sharding_type: str = "dynamic",
-        output_axis: str = "shard",
-    ):
-        from fluxway.common.types.configs import (
-            SPMDConfig,
-            SPMDTopology,
-            SPMDTopologyInfo,
-            OperatorMeta,
-            EdgeShardingInfo,
-        )
-        from fluxway.spmd.worker.operator_manager.operator_manager import (
-            OperatorManager,
-        )
-
-        # Minimal sentinel operator function
-        def _lookup_fn():
-            pass
-
-        # Build OperatorMeta with output_post_sharding declaring the edge
-        tensor_tuuid = 123
-        edge = EdgeShardingInfo(
-            tuuid_sharding={
-                tensor_tuuid: {"type": output_sharding_type, "axis": [output_axis]}
-            },
-            tuuid_map={output_tensor_name: tensor_tuuid},
-        )
-        meta = OperatorMeta(
-            name=sender_op,
-            output_post_sharding={receiver_spmd: [edge]},
-            output_arguments={"tensor": [output_tensor_name]},
-        )
-
-        # Phase 0 topology that Builder would inject: maps receiver_spmd → its physical mesh
-        topology: dict[str, SPMDTopology] = {
-            sender_op: SPMDTopology(
-                successors={
-                    receiver_spmd: SPMDTopologyInfo(
-                        spmd_id=receiver_spmd,
-                        world_size=receiver_mesh.size,
-                        mesh=receiver_mesh,
-                        tuuid_sharding=edge.tuuid_sharding,
-                        tuuid_map=edge.tuuid_map,
-                    )
-                }
-            )
-        }
-
-        config = SPMDConfig(
-            mesh=sender_mesh,
-            operators={sender_op: sender_op},
-            operator_metas={sender_op: meta},
-            topology=topology,
-            active_operator_names=(sender_op, sender_op),
-        )
-
-        mgr = OperatorManager(config, rank=0, spmd_id="EmbeddingTable")
-        return mgr
-
-    def test_successor_tensor_sharding_uses_receiver_mesh(self):
-        SENDER_SIZE = 4
-        RECEIVER_SIZE = 6
-
-        sender_mesh = DeviceMesh(device_shape=(SENDER_SIZE,), axis_names=("shard",))
-        receiver_mesh = DeviceMesh(device_shape=(RECEIVER_SIZE,), axis_names=("dp",))
-
-        mgr = self._build_operator_manager(
-            sender_mesh=sender_mesh,
-            receiver_mesh=receiver_mesh,
-            output_axis="dp",  # axis name must match the TARGET mesh, not the sender's
-        )
-
-        succ_topo = mgr._successor_topology.get("lookup", {})
-        self.assertIn(
-            "DenseLayers", succ_topo, "Missing DenseLayers in successor topology"
-        )
-
-        succ_entry = succ_topo["DenseLayers"]
-        tensor_tuuid = 123
-        sparse_spec = succ_entry.tuuid_sharding.get(tensor_tuuid)
-        self.assertIsNotNone(
-            sparse_spec,
-            "sparse_features spec missing from successor entry (TUUID lookup)",
-        )
-
-        # In the new architecture, mesh is stored on ResolvedTopologyInfo, not ShardingSpec.
-        # The ShardingSpec is purely logical; binding to a mesh produces a PhysicalLayout.
-        assert succ_entry.mesh is not None
-        self.assertEqual(
-            succ_entry.mesh.size,
-            RECEIVER_SIZE,
-            f"succ_entry.mesh.size should be {RECEIVER_SIZE} (receiver), "
-            f"got {succ_entry.mesh.size}. Phase 2 must use pinned_succ_entry.mesh, not self._mesh.",
-        )
-        self.assertEqual(
-            succ_entry.mesh.axis_names,
-            ("dp",),
-            "succ_entry.mesh.axis_names should be the receiver's.",
-        )
-
-    def test_predecessor_physical_identity_comes_from_phase0(self):
-        """
-        Phase 0 anchors the predecessor entry's physical identity (world_size + mesh) via
-        the Builder-injected SPMDTopologyInfo. Phase 1 only overlays logical sharding on
-        top of that pinned entry. Verify that pred_entry.world_size and pred_entry.mesh
-        reflect the SENDER's physical topology, not whatever self._mesh happens to be.
-        """
-        from fluxway.common.types.configs import (
-            SPMDConfig,
-            SPMDTopology,
-            SPMDTopologyInfo,
-            OperatorMeta,
-            EdgeShardingInfo,
-        )
-        from fluxway.spmd.worker.operator_manager.operator_manager import (
-            OperatorManager,
-        )
-
-        SENDER_SIZE = 4
-        RECEIVER_SIZE = 6
-
-        sender_mesh = DeviceMesh(device_shape=(SENDER_SIZE,), axis_names=("shard",))
-        receiver_mesh = DeviceMesh(device_shape=(RECEIVER_SIZE,), axis_names=("dp",))
-
-        from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
-
-        edge = EdgeShardingInfo(
-            tuuid_sharding={1: {"type": "static", "axis": ["dp"]}},
-            tuuid_map={"emb1": 1},
-        )
-        meta = OperatorMeta(
-            name="forward",
-            input_pre_sharding={"EmbeddingTable": [edge]},
-            input_arguments={"tensor": ["emb1"]},
-            input_sharding={
-                "emb1": ShardingSpec.chunk(PartitionSpec()).bind(receiver_mesh)
-            },
-        )
-        topology = {
-            "forward": SPMDTopology(
-                predecessors={
-                    "EmbeddingTable": SPMDTopologyInfo(
-                        spmd_id="EmbeddingTable",
-                        world_size=SENDER_SIZE,
-                        mesh=sender_mesh,
-                    )
-                }
-            )
-        }
-        config = SPMDConfig(
-            mesh=receiver_mesh,
-            operators={"forward": "forward"},
-            operator_metas={"forward": meta},
-            topology=topology,
-            active_operator_names=("forward", "forward"),
-        )
-        mgr = OperatorManager(config, rank=0, spmd_id="DenseLayers")
-
-        pred_entry = mgr._predecessor_topology.get("forward", {}).get("EmbeddingTable")
-        self.assertIsNotNone(pred_entry, "EmbeddingTable predecessor entry missing")
-        assert pred_entry is not None
-        self.assertIsNotNone(pred_entry.mesh, "EmbeddingTable predecessor mesh missing")
-        assert pred_entry.mesh is not None
-
-        # Physical identity comes from Phase 0 (Builder-injected), not from sharding spec parsing.
-        self.assertEqual(pred_entry.world_size, SENDER_SIZE)
-        assert pred_entry.mesh is not None
-        self.assertEqual(pred_entry.mesh.size, SENDER_SIZE)
-        self.assertEqual(pred_entry.mesh.axis_names, ("shard",))
 
 
 class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
@@ -851,8 +510,8 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
             ):
                 valid_count = int(header.payload_i32[0, 5])
                 if valid_count > 0:
-                    g_begin = int(header.edge_i32[0, 9])
-                    g_count = int(header.edge_i32[0, 10])
+                    g_begin = int(header.entry_i32[0, ENTRY_GLOBAL_SHAPE_BEGIN])
+                    g_count = int(header.entry_i32[0, ENTRY_GLOBAL_SHAPE_COUNT])
                     g_shape = (
                         tuple(
                             int(x)
@@ -869,7 +528,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                         if len(payload_iovs) > 1
                         else None,
                         global_shape=g_shape,
-                        source_step=int(header.edge_i32[0, EDGE_SOURCE_STEP]),
+                        source_step=int(header.entry_i32[0, ENTRY_SOURCE_STEP]),
                     )
                     network_mailbox[target_rank].append(received_tt)
                 return True
@@ -879,7 +538,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                 source=source_spec,
                 target=target_spec,
                 send_fn=mock_send,
-                tuuid=77,
+                transfer_codes=77,
                 sender_rank=rank,
                 sender_world_size=SENDER_SIZE,
             )
@@ -891,48 +550,25 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
         # 4. Receiver Reassembly
         final_results = []
         for r in range(RECEIVER_SIZE):
-            worker: typing.Any = _DirectWorker()
-            worker.rank = r
-            worker.spmd_id = "Dense"
-            worker.op_manager = None
-            worker._flatten_shards = SPMDWorker._flatten_shards.__get__(  # type: ignore
-                worker, _DirectWorker
-            )
-            worker._filter_shards_by_routing = (
-                SPMDWorker._filter_shards_by_routing.__get__(  # type: ignore
-                    worker, _DirectWorker
-                )
-            )
-            worker._get_values = SPMDWorker._get_values.__get__(worker, _DirectWorker)  # type: ignore
-            worker._get_routing_indices = SPMDWorker._get_routing_indices.__get__(  # type: ignore
-                worker, _DirectWorker
-            )
-            worker._normalize_and_cat_shards = (
-                SPMDWorker._normalize_and_cat_shards.__get__(worker, _DirectWorker)  # type: ignore
-            )
-            worker._maybe_merge_receipts = SPMDWorker._maybe_merge_receipts.__get__(  # type: ignore
-                worker, _DirectWorker
-            )
-            assemble = SPMDWorker._assemble_dynamic_to_static_tensor.__get__(  # type: ignore
-                worker, _DirectWorker
-            )
+            worker = _assembly_worker(rank=r)
             shards = {
                 ("Sparse", sender_rank): [shard]
                 for sender_rank, shard in enumerate(network_mailbox[r])
             }
             assemble_plan = _dynamic_to_static_assemble_plan(
                 op_name="step",
-                tuuid=1,
+                transfer_code=1,
+                logical_tuuid=1,
                 input_layout=target_spec,
                 predecessor_spmd_id="Sparse",
             )
-            assembled = assemble(
+            assembled = SPMDWorker._assemble_dynamic_to_static_tensor(
+                worker,
                 "step",
                 1,
-                0,
+                1,
                 shards,
                 target_spec,
-                assemble_plan.predecessor_topology,
                 assemble_plan=assemble_plan,
             )
             final_results.append(assembled)
@@ -1062,7 +698,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
                 source_spec,
                 target_spec,
                 mock_send,
-                tuuid=78,
+                transfer_codes=78,
                 sender_rank=0,
                 sender_world_size=1,
             )
@@ -1092,7 +728,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
                     source_spec,
                     target_spec,
                     mock_send,
-                    tuuid=79,
+                    transfer_codes=79,
                     sender_rank=0,
                     sender_world_size=1,
                 )
@@ -1123,7 +759,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
                     source_spec,
                     target_spec,
                     mock_send,
-                    tuuid=80,
+                    transfer_codes=80,
                     sender_rank=0,
                     sender_world_size=1,
                 )
@@ -1155,7 +791,7 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
                     source_spec,
                     target_spec,
                     mock_send,
-                    tuuid=81,
+                    transfer_codes=81,
                     sender_rank=0,
                     sender_world_size=1,
                 )

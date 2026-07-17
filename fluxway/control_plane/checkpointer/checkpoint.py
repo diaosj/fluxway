@@ -1,12 +1,13 @@
 import itertools
 import pickle
 import logging
-import os
 import shutil
 import inspect
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from collections.abc import Callable
+
+from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class FluxwayCheckpointer:
             validate_deps()
 
         self._controller = controller
-        self._ckpt_dir = os.path.abspath(ckpt_dir)
+        self._ckpt_dir = str(CheckpointDirectory.open(ckpt_dir).path)
         self._interval_steps = interval_steps
         self._force_write = force_write
         self._max_to_keep = max_to_keep
@@ -95,18 +96,24 @@ class FluxwayCheckpointer:
         self._persist(step, manifest)
         logger.info(f"Checkpoint step {step} saved ({list(manifest.keys())})")
 
-    async def restore(self, step: int | None = None) -> int | None:
+    async def restore(self, step: Literal["latest"] | int | None = None) -> int | None:
         """
         Restore state from a checkpoint.
 
-        Returns the step restored, or None if no checkpoint exists and step was None.
+        Returns the step restored, or None if no checkpoint exists and the latest
+        checkpoint was requested.
         Raises FileNotFoundError if a specific step is requested but absent.
         """
-        if step is None:
+        if step is None or step == "latest":
             step = self.latest_step()
             if step is None:
                 logger.info("No existing checkpoint found.")
                 return None
+        if isinstance(step, bool) or not isinstance(step, int):
+            raise TypeError(
+                "Checkpoint restore selector must be 'latest', int, or None, "
+                f"got {step!r}."
+            )
 
         # Single filesystem read — avoids TOCTOU between list_steps() and _load().
         try:

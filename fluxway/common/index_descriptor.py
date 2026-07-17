@@ -2,7 +2,6 @@ from builtins import slice as python_slice
 from dataclasses import dataclass
 import enum
 from typing import Any, Optional
-from collections.abc import Callable
 
 
 from fluxway.common.tensor_backend import get_backend
@@ -312,25 +311,6 @@ class ExplicitIndex(IndexDescriptor):
 
     def __hash__(self):
         return id(self)
-
-
-@dataclass(frozen=True)
-class FunctionalIndex(IndexDescriptor):
-    """IndexDescriptor describing a dynamic functional mapping for hashing (formerly hash_fn dict)."""
-
-    hash_fn: Callable
-
-    @property
-    def morphology(self) -> IndexMorphology:
-        return IndexMorphology.INDEXED
-
-    def materialize(self) -> Any:
-        raise NotImplementedError(
-            "FunctionalIndex cannot be materialized without input."
-        )
-
-    def slice(self, start: Any, end: Any) -> "FunctionalIndex":
-        raise NotImplementedError("FunctionalIndex cannot be sliced directly.")
 
 
 try:

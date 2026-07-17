@@ -11,7 +11,10 @@ from typing import Any
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
-    build_empty_step_frame_groups,
+    DependencyDecisions,
+    StepFrameGroup,
+    build_dependency_decision_only_frame_groups,
+    build_completed_without_tensor_step_frame_groups,
     build_step_frame_groups,
 )
 from fluxway.transport.communication import TransportBatchPlan, TransportFrameBatch
@@ -168,18 +171,16 @@ def _object_requires_cuda_visible(obj: Any, seen: set[int] | None = None) -> boo
     return False
 
 
-async def build_and_send_step_frames(
+async def _build_and_send_frame_groups(
     *,
     compiled_plan: CompiledSendPlan,
-    flat_results: list[Any],
-    step_tuuid_cache: dict[int, Any],
+    frame_group_builder: Callable[[TraceRecorder | None], list[StepFrameGroup]],
     exec_step: int,
     successor_handlers: tuple[dict[int, Any], ...],
     source_spmd_id: str,
     batch_max_frames: int,
     submit_delivery: SubmitDelivery,
     batch_delivery_factory: Callable[..., Awaitable[Any]] | None = None,
-    empty_values: Any | None = None,
     profiler_recorder: TraceRecorder | None = None,
     delivery_schedule_key: ScheduleKey,
 ) -> list[asyncio.Task[Any]]:
@@ -194,18 +195,7 @@ async def build_and_send_step_frames(
 
     def build_frame_groups_sync() -> list[Any]:
         if profiler_recorder is None:
-            if empty_values is None:
-                return build_step_frame_groups(
-                    compiled_plan=compiled_plan,
-                    flat_results=flat_results,
-                    step_tuuid_cache=step_tuuid_cache,
-                    exec_step=exec_step,
-                )
-            return build_empty_step_frame_groups(
-                compiled_plan=compiled_plan,
-                empty_values=empty_values,
-                exec_step=exec_step,
-            )
+            return frame_group_builder(None)
         with profiler_recorder.data_plane_frame_build_sync(
             op_name=compiled_plan.op_name,
             rank=compiled_plan.rank,
@@ -213,19 +203,7 @@ async def build_and_send_step_frames(
             successor_count=len(compiled_plan.successor_routes),
             output_count=compiled_plan.output_count,
         ):
-            if empty_values is None:
-                return build_step_frame_groups(
-                    compiled_plan=compiled_plan,
-                    flat_results=flat_results,
-                    step_tuuid_cache=step_tuuid_cache,
-                    exec_step=exec_step,
-                    profiler_recorder=profiler_recorder,
-                )
-            return build_empty_step_frame_groups(
-                compiled_plan=compiled_plan,
-                empty_values=empty_values,
-                exec_step=exec_step,
-            )
+            return frame_group_builder(profiler_recorder)
 
     frame_groups = await asyncio.to_thread(build_frame_groups_sync)
     if not frame_groups:
@@ -411,26 +389,133 @@ class BatchingDataPlaneExecutor:
     def __init__(self) -> None:
         self._queues: dict[tuple[int, int], _TargetBatchQueue] = {}
 
-    async def send_step_frames(
+    async def send_tensor_frames(
         self,
         *,
         compiled_plan: CompiledSendPlan,
         flat_results: list[Any],
-        step_tuuid_cache: dict[int, Any],
+        step_transfer_cache: dict[int, Any],
         exec_step: int,
         successor_handlers: tuple[dict[int, Any], ...],
         source_spmd_id: str,
         batch_max_frames: int,
         batch_flush_us: int,
         submit_delivery: SubmitDelivery,
-        empty_values: Any | None = None,
+        dependency_decisions: DependencyDecisions = None,
         profiler_recorder: TraceRecorder | None = None,
         delivery_schedule_key: ScheduleKey,
     ) -> list[asyncio.Task[Any]]:
-        return await build_and_send_step_frames(
+        def build_frame_groups(recorder: TraceRecorder | None) -> list[StepFrameGroup]:
+            return build_step_frame_groups(
+                compiled_plan=compiled_plan,
+                flat_results=flat_results,
+                step_transfer_cache=step_transfer_cache,
+                exec_step=exec_step,
+                dependency_decisions=dependency_decisions,
+                profiler_recorder=recorder,
+            )
+
+        return await self._send_frame_groups(
             compiled_plan=compiled_plan,
-            flat_results=flat_results,
-            step_tuuid_cache=step_tuuid_cache,
+            frame_group_builder=build_frame_groups,
+            exec_step=exec_step,
+            successor_handlers=successor_handlers,
+            source_spmd_id=source_spmd_id,
+            batch_max_frames=batch_max_frames,
+            batch_flush_us=batch_flush_us,
+            submit_delivery=submit_delivery,
+            profiler_recorder=profiler_recorder,
+            delivery_schedule_key=delivery_schedule_key,
+        )
+
+    async def send_completed_without_tensor_frames(
+        self,
+        *,
+        compiled_plan: CompiledSendPlan,
+        empty_values: Any,
+        exec_step: int,
+        successor_handlers: tuple[dict[int, Any], ...],
+        source_spmd_id: str,
+        batch_max_frames: int,
+        batch_flush_us: int,
+        submit_delivery: SubmitDelivery,
+        dependency_decisions: DependencyDecisions = None,
+        profiler_recorder: TraceRecorder | None = None,
+        delivery_schedule_key: ScheduleKey,
+    ) -> list[asyncio.Task[Any]]:
+        def build_frame_groups(_recorder: TraceRecorder | None) -> list[StepFrameGroup]:
+            return build_completed_without_tensor_step_frame_groups(
+                compiled_plan=compiled_plan,
+                empty_values=empty_values,
+                exec_step=exec_step,
+                dependency_decisions=dependency_decisions,
+            )
+
+        return await self._send_frame_groups(
+            compiled_plan=compiled_plan,
+            frame_group_builder=build_frame_groups,
+            exec_step=exec_step,
+            successor_handlers=successor_handlers,
+            source_spmd_id=source_spmd_id,
+            batch_max_frames=batch_max_frames,
+            batch_flush_us=batch_flush_us,
+            submit_delivery=submit_delivery,
+            profiler_recorder=profiler_recorder,
+            delivery_schedule_key=delivery_schedule_key,
+        )
+
+    async def send_dependency_decision_frames(
+        self,
+        *,
+        compiled_plan: CompiledSendPlan,
+        exec_step: int,
+        successor_handlers: tuple[dict[int, Any], ...],
+        source_spmd_id: str,
+        batch_max_frames: int,
+        batch_flush_us: int,
+        submit_delivery: SubmitDelivery,
+        dependency_decisions: DependencyDecisions,
+        profiler_recorder: TraceRecorder | None = None,
+        delivery_schedule_key: ScheduleKey,
+    ) -> list[asyncio.Task[Any]]:
+        def build_frame_groups(_recorder: TraceRecorder | None) -> list[StepFrameGroup]:
+            assert dependency_decisions is not None
+            return build_dependency_decision_only_frame_groups(
+                compiled_plan=compiled_plan,
+                dependency_decisions=dependency_decisions,
+                exec_step=exec_step,
+            )
+
+        return await self._send_frame_groups(
+            compiled_plan=compiled_plan,
+            frame_group_builder=build_frame_groups,
+            exec_step=exec_step,
+            successor_handlers=successor_handlers,
+            source_spmd_id=source_spmd_id,
+            batch_max_frames=batch_max_frames,
+            batch_flush_us=batch_flush_us,
+            submit_delivery=submit_delivery,
+            profiler_recorder=profiler_recorder,
+            delivery_schedule_key=delivery_schedule_key,
+        )
+
+    async def _send_frame_groups(
+        self,
+        *,
+        compiled_plan: CompiledSendPlan,
+        frame_group_builder: Callable[[TraceRecorder | None], list[StepFrameGroup]],
+        exec_step: int,
+        successor_handlers: tuple[dict[int, Any], ...],
+        source_spmd_id: str,
+        batch_max_frames: int,
+        batch_flush_us: int,
+        submit_delivery: SubmitDelivery,
+        profiler_recorder: TraceRecorder | None,
+        delivery_schedule_key: ScheduleKey,
+    ) -> list[asyncio.Task[Any]]:
+        return await _build_and_send_frame_groups(
+            compiled_plan=compiled_plan,
+            frame_group_builder=frame_group_builder,
             exec_step=exec_step,
             successor_handlers=successor_handlers,
             source_spmd_id=source_spmd_id,
@@ -441,7 +526,6 @@ class BatchingDataPlaneExecutor:
                 batch_flush_us=batch_flush_us,
                 **kwargs,
             ),
-            empty_values=empty_values,
             profiler_recorder=profiler_recorder,
             delivery_schedule_key=delivery_schedule_key,
         )

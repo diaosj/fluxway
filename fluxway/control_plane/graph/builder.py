@@ -12,40 +12,31 @@ Usage:
     graph = builder.build(name="my_graph")
 """
 
-from fluxway import SPMDConfig
 import copy
+from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from typing import Any
-from collections.abc import Callable
-import logging
 
 from fluxway.common.types import (
     Graph,
     Node,
-    Edge,
-    OperatorMeta,
-    EdgeShardingInfo,
-    ResourceSpec,
 )
+from fluxway.common.compiled_graph import (
+    DependencySpec,
+    OperatorKey,
+    OperatorPort as ExecutionOperatorPort,
+    SPMDGraphSpec,
+    TensorTransfer,
+    compile_graph,
+)
+from fluxway.common.operator_spec import OperatorSpec
+from fluxway.resources import ResourceProfile
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.sharding import (
     ShardingSpec,
-    ShardingConfig,
-    ChunkPartition,
     AlgebraicRouting,
-    ReferentialRouting,
 )
-from fluxway.common.types.configs import ArgumentType
-from fluxway.common.types.manifest import (
-    ComputationGraphManifest,
-    OperatorArguments,
-    OperatorFacts,
-    OperatorPort,
-    ResourceFacts,
-    SPMDFacts,
-    TransferFacts,
-)
-
-logger = logging.getLogger(__name__)
+from fluxway.common.operator_policy import ArgumentType
 
 
 class Builder:
@@ -58,16 +49,8 @@ class Builder:
 
     def __init__(self):
         self._nodes: dict[str, Node] = {}
-        self._edges: list[Edge] = []
+        self._edges: list[DependencySpec] = []
         self._spmd_classes: dict[str, type] = {}
-        self._uuid_counter = 0
-        # Unified Registry for all TUUID slots: {(node, op, direction, name): tuuid}
-        # Includes both definitions (outputs) and references (inputs)
-        self._tuuid_slots: dict[tuple[str, str, str, str], int] = {}
-
-    def _next_uuid(self) -> int:
-        self._uuid_counter += 1
-        return self._uuid_counter
 
     def add_node(
         self,
@@ -109,30 +92,39 @@ class Builder:
                 f"Did you forget to add the @spmd decorator?"
             )
 
-        resource_override = kwargs.pop("resource", None)
+        if "resource" in kwargs:
+            raise TypeError(
+                "resource was removed; pass resource_profile=ResourceProfile(...)"
+            )
+        resource_override = kwargs.pop("resource_profile", None)
         runtime_env_override = kwargs.pop("runtime_env", None)
         operator_configs = kwargs.pop("operator_configs", None)
-        priority = kwargs.pop("priority", None) or getattr(
-            spmd_class, "_priority", None
-        )
-        placement_strategy = kwargs.pop("placement_strategy", None) or getattr(
-            spmd_class, "_placement_strategy", None
-        )
+        if "priority" in kwargs or "placement_strategy" in kwargs:
+            raise TypeError(
+                "priority and placement_strategy were removed; use placement constraints"
+            )
 
-        resource = copy.deepcopy(spmd_class.get_resource())
+        resource_profile = spmd_class.get_resource_profile()
         spmd_config = copy.deepcopy(spmd_class.get_spmd_config())
+        unbound = [
+            name
+            for name, spec in spmd_config.operator_specs.items()
+            if spec.owner is None
+        ]
+        if unbound:
+            raise ValueError(
+                f"SPMD class {spmd_class.__qualname__!r} has operators without "
+                f"an owner class: {sorted(unbound)}"
+            )
 
         if resource_override is not None:
-            resource = ResourceSpec(
-                num_cpus=resource_override.get(
-                    "num_cpus", resource.num_cpus if resource else 1
-                ),
-                num_gpus=resource_override.get(
-                    "num_gpus", resource.num_gpus if resource else 0
-                ),
-                memory_gb=resource_override.get(
-                    "memory_gb", resource.memory_gb if resource else 0.0
-                ),
+            if not isinstance(resource_override, ResourceProfile):
+                raise TypeError("resource_profile must be a ResourceProfile")
+            resource_profile = resource_override
+        if not isinstance(resource_profile, ResourceProfile):
+            raise TypeError(
+                f"SPMD class {spmd_class.__qualname__!r} must declare a "
+                "ResourceProfile or receive resource_profile= when added to a graph"
             )
 
         if runtime_env_override is not None:
@@ -144,10 +136,10 @@ class Builder:
             _apply_operator_configs(spmd_config, operator_configs, spmd_class)
 
         if mesh is not None:
-            for op_name, meta in spmd_config.operator_metas.items():
+            for op_name, spec in spmd_config.operator_specs.items():
                 for kind, sharding in [
-                    ("input", meta.input_sharding),
-                    ("output", meta.output_sharding),
+                    ("input", spec.input_sharding),
+                    ("output", spec.output_sharding),
                 ]:
                     if not sharding:
                         continue
@@ -178,14 +170,6 @@ class Builder:
 
             spmd_config.mesh = mesh
 
-            for meta in spmd_config.operator_metas.values():
-                for sharding_dict in [meta.input_sharding, meta.output_sharding]:
-                    if not sharding_dict:
-                        continue
-                    for k, v in sharding_dict.items():
-                        if isinstance(v, ShardingSpec):
-                            pass
-
         if not isinstance(spmd_config.mesh, DeviceMesh):
             raise ValueError(
                 f"\n[Fluxway Graph Error] Node '{name}' (class '{spmd_class.__name__}') has no valid mesh defined.\n"
@@ -204,28 +188,15 @@ class Builder:
         node = Node(
             name=name,
             description=description,
-            resource=resource,
-            priority=priority,
-            placement_strategy=placement_strategy,
+            resource_profile=resource_profile,
             spmd_config=spmd_config,
-            spmd_class_module=spmd_class.__module__,
-            spmd_class_qualname=spmd_class.__qualname__,
+            spmd_class=spmd_class,
         )
 
         spmd_config.spmd_id = name
 
         self._nodes[name] = node
         self._spmd_classes[name] = spmd_class
-
-        for op_name, meta in spmd_config.operator_metas.items():
-            out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
-            tuuids = []
-            for out_name in out_args:
-                slot = (name, op_name, "out", out_name)
-                if slot not in self._tuuid_slots:
-                    self._tuuid_slots[slot] = self._next_uuid()
-                tuuids.append(self._tuuid_slots[slot])
-            meta.output_uuids = tuuids
 
         return self
 
@@ -241,10 +212,8 @@ class Builder:
         num_workers: int = 1,
         mesh_shape: tuple[int, ...] | None = None,
         mesh_axis_names: tuple[str, ...] | None = None,
-        resource: dict[str, Any] | None = None,
+        resource_profile: ResourceProfile | None = None,
         description: str = "",
-        priority: Any = None,
-        placement_strategy: Any = None,
         **reader_kwargs: Any,
     ) -> "Builder":
         """
@@ -260,7 +229,7 @@ class Builder:
             num_workers: Number of parallel workers if no mesh is provided
             mesh_shape: Optional multi-dimensional mesh shape
             mesh_axis_names: Names for mesh axes
-            resource: Resource requirements (num_cpus, num_gpus, etc.)
+            resource_profile: Per-worker minimum and scalable resources.
             description: Optional description
             **reader_kwargs: Additional configuration (batch_size, shuffle, etc.)
                              that will be passed to the reader as static_args.
@@ -288,8 +257,7 @@ class Builder:
             reader_cls,
             description,
             mesh=reader_mesh,
-            priority=priority,
-            placement_strategy=placement_strategy,
+            resource_profile=resource_profile,
         )
 
         # Inject additional configuration
@@ -300,14 +268,6 @@ class Builder:
         if data_source is not None:
             all_static_args["data_source"] = data_source
         node.spmd_config.static_args.update(all_static_args)
-
-        # Handle resource specification
-        if resource:
-            node.resource = ResourceSpec(
-                num_cpus=resource.get("num_cpus", 1),
-                num_gpus=resource.get("num_gpus", 0),
-                memory_gb=resource.get("memory_gb", 0.0),
-            )
 
         return self
 
@@ -321,7 +281,7 @@ class Builder:
         source_op: str,
         target_node: str,
         target_op: str,
-        condition_fn: Callable[..., bool] | None = None,
+        condition_fn: Callable[..., bool | Awaitable[bool]] | None = None,
         source_output: str | None = None,
         target_input: str | None = None,
         tensor_map: dict[str, str] | None = None,
@@ -365,13 +325,16 @@ class Builder:
                 "local_only edges require source_node == target_node, "
                 f"got {source_node!r} -> {target_node!r}."
             )
+        if condition_fn is not None and not callable(condition_fn):
+            raise TypeError("condition_fn must be callable")
+        condition = condition_fn
 
-        transfers = self._validate_and_link_edge(
+        dependency = self._validate_and_link_edge(
             source_node,
             source_op,
             target_node,
             target_op,
-            condition_fn,
+            condition,
             source_output,
             target_input,
             tensor_map=tensor_map,
@@ -379,20 +342,45 @@ class Builder:
             local_only=local_only,
         )
 
-        self._edges.append(
-            Edge(
-                source_node=source_node,
-                target_node=target_node,
-                source_op=source_op,
-                target_op=target_op,
-                condition_fn=condition_fn,
-                symmetric_to=symmetric_to,
-                local_only=local_only,
-                transfers=transfers,
-            )
-        )
+        self._merge_or_append_edge(dependency)
 
         return self
+
+    def _merge_or_append_edge(
+        self,
+        dependency: DependencySpec,
+    ) -> None:
+        for index, edge in enumerate(self._edges):
+            if edge.key != dependency.key:
+                continue
+            if (
+                edge.local_only != dependency.local_only
+                or edge.symmetric_to != dependency.symmetric_to
+                or edge.condition is not dependency.condition
+            ):
+                raise ValueError(
+                    f"Conflicting dependency metadata: {dependency.key!r}."
+                )
+            existing_transfers = {
+                (transfer.source.name, transfer.target.name)
+                for transfer in edge.transfers
+            }
+            new_transfers = {
+                (transfer.source.name, transfer.target.name)
+                for transfer in dependency.transfers
+            }
+            duplicates = existing_transfers & new_transfers
+            if not dependency.transfers or duplicates:
+                raise ValueError(
+                    f"Duplicate dependency transfers for {dependency.key!r}: "
+                    f"{sorted(duplicates)!r}."
+                )
+            self._edges[index] = replace(
+                dependency,
+                transfers=edge.transfers + dependency.transfers,
+            )
+            return
+        self._edges.append(dependency)
 
     def add_symmetric_path(
         self,
@@ -438,11 +426,14 @@ class Builder:
     # Internal helpers for operator metadata & sharding linking
     # -------------------------------------------------------------------------
 
-    def _ensure_meta_exists(
-        self, node_name: str, method_name: str, meta: OperatorMeta | None, ctx: str
-    ) -> OperatorMeta:
-        """Ensure that an operator meta exists for the given node/method; otherwise raise."""
-        if meta is None:
+    def _require_operator_spec(
+        self,
+        node_name: str,
+        method_name: str,
+        spec: OperatorSpec | None,
+        ctx: str,
+    ) -> OperatorSpec:
+        if spec is None:
             spmd_class = self._spmd_classes[node_name]
             class_name = spmd_class.__name__
 
@@ -450,9 +441,9 @@ class Builder:
             for attr_name in dir(spmd_class):
                 # Use getattr on the class to avoid triggering property descriptors if any
                 attr = getattr(spmd_class, attr_name, None)
-                m = getattr(attr, "_fluxway_operator_meta", None)
-                if m is not None:
-                    op_name_by_fn[attr_name] = m.name
+                operator_spec = getattr(attr, "_fluxway_operator_spec", None)
+                if operator_spec is not None:
+                    op_name_by_fn[attr_name] = operator_spec.name
 
             if method_name in op_name_by_fn:
                 actual_op_name = op_name_by_fn[method_name]
@@ -474,7 +465,7 @@ class Builder:
                 )
 
             available_ops = list(
-                self._nodes[node_name].spmd_config.operator_metas.keys()
+                self._nodes[node_name].spmd_config.operator_specs.keys()
             )
             raise ValueError(
                 f"\n[Fluxway Graph Error] In {ctx}:\n"
@@ -483,7 +474,7 @@ class Builder:
                 f"  Fix: Check for typos in your add_func_edge call, or ensure the method exists and is decorated with @operator."
             )
 
-        return meta
+        return spec
 
     def _validate_and_link_edge(
         self,
@@ -491,21 +482,15 @@ class Builder:
         source_op: str,
         target_node: str,
         target_op: str,
-        condition_fn: Callable[..., bool] | None,
+        condition_fn: Callable[..., bool | Awaitable[bool]] | None,
         source_output: str | None = None,
         target_input: str | None = None,
         tensor_map: dict[str, str] | None = None,
         symmetric_to: tuple[str, str, str, str] | None = None,
         local_only: bool = False,
-    ) -> tuple[TransferFacts, ...]:
-        """
-        Validate and link operator metadata between two nodes.
-        Refactored into discrete validation and linking phases.
-        """
+    ) -> DependencySpec:
         ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
-
-        # 1. Validation Phase (Strict checks on metadata, IO, and Sharding)
-        src_meta, dst_meta, effective_sharding, tensor_map = self._validate_edge_io(
+        resolved_tensor_map = self._resolve_edge_tensor_map(
             source_node,
             source_op,
             target_node,
@@ -515,118 +500,22 @@ class Builder:
             ctx,
             tensor_map=tensor_map,
         )
-
-        # 2. Linking Phase (Update topology and sharding info in SPMDConfigs)
-        # Compute sharding maps for topology before linking
-        src_out_specs = effective_sharding["src_out_specs"]
-        dst_in_specs = effective_sharding["dst_in_specs"]
-
-        # TUUID Generation and Mapping
-        # We assign an integer TUUID to cada tensor produced by an operator
-        tuuid_map: dict[str, int] = {}  # {target_name: tuuid}
-        tuuid_src_out: dict[int, Any] = {}  # {tuuid: src_spec}
-        tuuid_dst_in: dict[int, Any] = {}  # {tuuid: dst_spec}
-
-        if tensor_map:
-            for src_name, target_name in tensor_map.items():
-                u = self._tuuid_slots.get((source_node, source_op, "out", src_name))
-                if u is None:
-                    raise RuntimeError(
-                        f"TUUID Definition not found for {source_node}.{source_op}.out.{src_name}"
-                    )
-
-                # Input-side slot registration with consistency check
-                target_slot = (target_node, target_op, "in", target_name)
-                if (
-                    target_slot in self._tuuid_slots
-                    and self._tuuid_slots[target_slot] != u
-                ):
-                    raise ValueError(
-                        f"TUUID Conflict at {target_node}.{target_op}.in.{target_name}: "
-                        f"already bound to TUUID {self._tuuid_slots[target_slot]}, "
-                        f"attempted to bind to {u} via {source_node}.{source_op}.out.{src_name}"
-                    )
-                self._tuuid_slots[target_slot] = u
-
-                tuuid_map[target_name] = u
-                tuuid_src_out[u] = src_out_specs[src_name]
-                tuuid_dst_in[u] = dst_in_specs[target_name]
-        else:
-            ds_names = effective_sharding["dst_names"]
-            for n in ds_names:
-                u = self._tuuid_slots.get((source_node, source_op, "out", n))
-                if u is None:
-                    raise RuntimeError(
-                        f"TUUID Definition not found for {source_node}.{source_op}.out.{n}"
-                    )
-
-                target_slot = (target_node, target_op, "in", n)
-                if (
-                    target_slot in self._tuuid_slots
-                    and self._tuuid_slots[target_slot] != u
-                ):
-                    raise ValueError(
-                        f"TUUID Conflict at {target_node}.{target_op}.in.{n}"
-                    )
-                self._tuuid_slots[target_slot] = u
-
-                tuuid_map[n] = u
-                tuuid_src_out[u] = src_out_specs[n]
-                tuuid_dst_in[u] = dst_in_specs[n]
-
-        self._link_topology(
-            source_node,
-            source_op,
-            target_node,
-            target_op,
-            condition_fn,
-            tensor_map,
-            src_meta,
-            tuuid_map=tuuid_map,
-            tuuid_src_out=tuuid_src_out,
-            tuuid_dst_in=tuuid_dst_in,
+        return DependencySpec(
+            source=OperatorKey(source_node, source_op),
+            target=OperatorKey(target_node, target_op),
+            transfers=tuple(
+                TensorTransfer(
+                    source=ExecutionOperatorPort(name=source_name),
+                    target=ExecutionOperatorPort(name=target_name),
+                )
+                for source_name, target_name in resolved_tensor_map.items()
+            ),
+            local_only=local_only,
+            condition=condition_fn,
             symmetric_to=symmetric_to,
-            local_only=local_only,
-        )
-        self._link_sharding(
-            source_node,
-            source_op,
-            target_node,
-            target_op,
-            src_meta,
-            dst_meta,
-            effective_sharding,
-            condition_fn,
-            tensor_map,
-            tuuid_map=tuuid_map,
-            tuuid_src_out=tuuid_src_out,
-            tuuid_dst_in=tuuid_dst_in,
-            local_only=local_only,
-        )
-        condition_id = None
-        if condition_fn is not None:
-            condition_id = f"{condition_fn.__module__}.{condition_fn.__qualname__}"
-        return tuple(
-            TransferFacts(
-                source=OperatorPort(
-                    spmd_id=source_node,
-                    op_id=source_op,
-                    name=source_name,
-                ),
-                target=OperatorPort(
-                    spmd_id=target_node,
-                    op_id=target_op,
-                    name=target_name,
-                ),
-                tuuid=tuuid_map[target_name],
-                local_only=local_only,
-                condition_id=condition_id,
-                symmetric_to=symmetric_to,
-            )
-            for source_name, target_name in tensor_map.items()
         )
 
-    def _validate_edge_io(
+    def _resolve_edge_tensor_map(
         self,
         source_node: str,
         source_op: str,
@@ -636,30 +525,19 @@ class Builder:
         target_input: str | None,
         ctx: str,
         tensor_map: dict[str, str] | None = None,
-    ) -> tuple[OperatorMeta, OperatorMeta, dict[str, Any], dict[str, str]]:
-        """
-        Unified validation for edge IO.
-        Returns (source_meta, target_meta, { 'src_specs': ..., 'dst_specs': ..., 'src_names': ..., 'dst_names': ... }, tensor_map)
-        """
+    ) -> dict[str, str]:
         src_cfg = self._nodes[source_node].spmd_config
         dst_cfg = self._nodes[target_node].spmd_config
 
         # 1. Ensure Metadata Exists
-        src_meta = self._ensure_meta_exists(
-            source_node, source_op, src_cfg.operator_metas.get(source_op), ctx
+        src_meta = self._require_operator_spec(
+            source_node, source_op, src_cfg.operator_specs.get(source_op), ctx
         )
-        dst_meta = self._ensure_meta_exists(
-            target_node, target_op, dst_cfg.operator_metas.get(target_op), ctx
+        dst_meta = self._require_operator_spec(
+            target_node, target_op, dst_cfg.operator_specs.get(target_op), ctx
         )
-
-        # 2. Validate State Metadata
-        src_cls = self._spmd_classes[source_node]
-        src_meta.validate_and_update_state_output_match_dest_input(
-            dst_meta=dst_meta,
-            src_spmd_class=src_cls,
-            src_method_name=source_op,
-            ctx=ctx,
-        )
+        if tensor_map is not None:
+            return dict(tensor_map)
 
         # This implementation treats parameter names as placeholders and resolves
         # the underlying flattened tensor fields automatically.
@@ -700,7 +578,7 @@ class Builder:
             target_input = effective_dst_names[0]
             explicit_target = True
 
-        tensor_map = tensor_map if tensor_map is not None else {}
+        tensor_map = {}
 
         # Positional mapping if both endpoints were explicitly specified and their structures match
         if (
@@ -751,336 +629,7 @@ class Builder:
                 f"  Fix: Explicitly specify target arguments using kwargs handling or ensure argument names intersect."
             )
 
-        # 4. Validate and Extract Sharding Specs
-        def to_routing(raw):
-            if isinstance(raw, dict):
-                try:
-                    return ShardingConfig.model_validate(raw).to_routing()
-                except Exception as e:
-                    raise ValueError(
-                        f"\n[Fluxway Sharding Error] In {ctx}:\n"
-                        f"  Invalid sharding configuration: {raw}\n"
-                        f"  Validation Error: {str(e)}\n"
-                        f"  Fix: Ensure the dictionary contains 'type' (e.g. 'static') and 'axis'. Refer to ShardingConfig documentation."
-                    ) from e
-            return raw
-
-        src_meta.output_sharding = {
-            k: to_routing(v) for k, v in (src_meta.output_sharding or {}).items()
-        }
-        src_out_specs = src_meta.output_sharding
-
-        dst_meta.input_sharding = {
-            k: to_routing(v) for k, v in (dst_meta.input_sharding or {}).items()
-        }
-        dst_in_specs = dst_meta.input_sharding
-
-        src_names = list(tensor_map.keys())
-        dst_names = list(tensor_map.values())
-
-        for src_name, dst_name in tensor_map.items():
-            src_spec = src_out_specs[src_name]
-            dst_spec = dst_in_specs[dst_name]
-
-            src_is_mirror = isinstance(src_spec.routing, ReferentialRouting)
-            dst_is_mirror = isinstance(dst_spec.routing, ReferentialRouting)
-
-            if not src_is_mirror and dst_is_mirror:
-                raise ValueError(
-                    f"\n[Fluxway Sharding Protocol Error] In {ctx}:\n"
-                    f"  Invalid asymmetric routing for tensor '{src_name}' -> '{dst_name}'.\n"
-                    f"  Destination uses Mirror (Referential) routing, but Source uses Algebraic (Static/Dynamic).\n"
-                    f"  A destination cannot use Mirror routing unless the source provides a SymmetryReceipt via Mirror routing."
-                )
-
-        return (
-            src_meta,
-            dst_meta,
-            {
-                "src_out_specs": src_out_specs,
-                "dst_in_specs": dst_in_specs,
-                "src_names": src_names,
-                "dst_names": dst_names,
-            },
-            tensor_map,
-        )
-
-    def _link_topology(
-        self,
-        source_node: str,
-        source_op: str,
-        target_node: str,
-        target_op: str,
-        condition_fn: Callable[..., bool] | None,
-        tensor_map: dict[str, str],
-        src_meta: OperatorMeta,
-        tuuid_map: dict[str, int],
-        tuuid_src_out: dict[int, Any],
-        tuuid_dst_in: dict[int, Any],
-        symmetric_to: tuple[str, str, str, str] | None = None,
-        local_only: bool = False,
-    ) -> None:
-        """Link nodes within the SPMDConfig topology dictionaries."""
-        src_cfg = self._nodes[source_node].spmd_config
-        dst_cfg = self._nodes[target_node].spmd_config
-        from fluxway.common.types.configs import SPMDTopology, SPMDTopologyInfo
-
-        # Ensure entries
-        src_cfg.topology.setdefault(source_op, SPMDTopology())
-        dst_cfg.topology.setdefault(target_op, SPMDTopology())
-
-        # Link Successor
-        if target_node not in src_cfg.topology[source_op].successors:
-            src_cfg.topology[source_op].successors[target_node] = SPMDTopologyInfo(
-                spmd_id=target_node,
-                world_size=dst_cfg.num_workers,
-                mesh=dst_cfg.mesh,
-                condition_fn=condition_fn,
-                tuuid_map=tuuid_map,
-                tuuid_sharding=tuuid_dst_in,
-                symmetric_to=symmetric_to,
-                local_only=local_only,
-                is_interleaved=getattr(src_meta, "is_interleaved", False),
-                interleave_unit_size=getattr(src_meta, "interleave_unit_size", 1),
-            )
-        else:
-            topo = src_cfg.topology[source_op].successors[target_node]
-            if topo.local_only != local_only:
-                raise ValueError(
-                    "Cannot mix local_only and remote edges for the same successor "
-                    f"topology {source_node}.{source_op} -> {target_node}."
-                )
-            topo.world_size = dst_cfg.num_workers
-            topo.mesh = dst_cfg.mesh
-            topo.tuuid_map.update(tuuid_map)
-            topo.tuuid_sharding.update(tuuid_dst_in)
-            if symmetric_to:
-                topo.symmetric_to = symmetric_to
-
-        # Link Predecessor
-        if source_node not in dst_cfg.topology[target_op].predecessors:
-            dst_cfg.topology[target_op].predecessors[source_node] = SPMDTopologyInfo(
-                spmd_id=source_node,
-                world_size=src_cfg.num_workers,
-                mesh=src_cfg.mesh,
-                tuuid_map=tuuid_map,
-                tuuid_sharding=tuuid_src_out,
-                symmetric_to=symmetric_to,
-                local_only=local_only,
-                is_interleaved=getattr(src_meta, "is_interleaved", False),
-                interleave_unit_size=getattr(src_meta, "interleave_unit_size", 1),
-            )
-        else:
-            topo = dst_cfg.topology[target_op].predecessors[source_node]
-            if topo.local_only != local_only:
-                raise ValueError(
-                    "Cannot mix local_only and remote edges for the same predecessor "
-                    f"topology {source_node} -> {target_node}.{target_op}."
-                )
-            topo.world_size = src_cfg.num_workers
-            topo.mesh = src_cfg.mesh
-            topo.tuuid_map.update(tuuid_map)
-            topo.tuuid_sharding.update(tuuid_src_out)
-            if symmetric_to:
-                topo.symmetric_to = symmetric_to
-
-        # Eagerly resolve topological and async strategy references
-        dst_meta = dst_cfg.operator_metas[target_op]
-
-        def resolver_src(path: str) -> int | None:
-            return self._resolve_path_to_tuuid(source_node, source_op, "out", path)
-
-        def resolver_dst(path: str) -> int | None:
-            return self._resolve_path_to_tuuid(target_node, target_op, "in", path)
-
-        for meta, res in [(src_meta, resolver_src), (dst_meta, resolver_dst)]:
-            meta.resolve_sharding_topology(res)
-
-    def _infer_interleave_params(
-        self, spmd_config: SPMDConfig, meta: OperatorMeta
-    ) -> tuple[bool, int]:
-        """
-        Infer interleave parameters based on mesh and output sharding.
-
-        Logic:
-        1. If it's not a producer (source), it doesn't interleave by default.
-        2. If it's a source, we look for 'interleavable' axes.
-           An axis is interleavable if it is used for sharding.
-           The workers NOT part of the sharded dimension form a 'unit'.
-        """
-        if spmd_config.mesh is None or not isinstance(spmd_config.mesh, DeviceMesh):
-            raise ValueError(
-                f"\n[Fluxway Topology Error] In {spmd_config.spmd_id}:\n"
-                f"  Mesh is not defined or not a DeviceMesh.\n"
-                f"  Fix: Add mesh_axis_names and mesh_axis_shapes to the @operator decorator."
-            )
-        mesh: DeviceMesh = spmd_config.mesh
-        if not mesh or mesh.size <= 1:
-            return False, 1
-
-        # Identify axes used in output sharding
-        sharded_axes = set()
-        for v in (meta.output_sharding or {}).values():
-            if isinstance(v, dict):
-                axis = v.get("axis", [])
-                if isinstance(axis, str):
-                    sharded_axes.add(axis)
-                else:
-                    sharded_axes.update(axis)
-            elif isinstance(v, ShardingSpec):
-                for sub in v.partitions.values():
-                    sharded_axes.update(sub)
-
-        # interleave_unit_size is the product of sizes of axes NOT used for sharding
-        # These represent "Replicated" or "Model Parallel" groups that must act together.
-        unit_size = 1
-        for ax_name, ax_size in zip(mesh.axis_names, mesh.shape, strict=True):  # type: ignore
-            if ax_name not in sharded_axes:
-                unit_size *= ax_size
-
-        # If we have more than one unit, we can interleave them
-        is_interleaved = mesh.size > unit_size
-        return is_interleaved, unit_size
-
-    def _link_sharding(
-        self,
-        source_node: str,
-        source_op: str,
-        target_node: str,
-        target_op: str,
-        src_meta: OperatorMeta,
-        dst_meta: OperatorMeta,
-        effective_sharding: dict[str, Any],
-        condition_fn: Callable[..., bool] | None,
-        tensor_map: dict[str, str],
-        tuuid_map: dict[str, int],
-        tuuid_src_out: dict[int, Any],
-        tuuid_dst_in: dict[int, Any],
-        local_only: bool = False,
-    ) -> None:
-        """Inject edge sharding information into OperatorMeta objects."""
-        src_cfg = self._nodes[source_node].spmd_config
-        dst_cfg = self._nodes[target_node].spmd_config
-        src_out_specs = effective_sharding["src_out_specs"]
-        dst_in_specs = effective_sharding["dst_in_specs"]
-
-        # Use explicitly defined properties from OperatorMeta
-        is_interleaved = getattr(src_meta, "is_interleaved", False)
-        interleave_unit_size = getattr(src_meta, "interleave_unit_size", 1)
-
-        # Legacy automated inference (if not explicitly set via @spmd_source)
-        is_source = src_meta.is_source
-        if not is_source:
-            # Graph-based fallback: if this node:op has no incoming edges, it's a source
-            has_preds = any(
-                e.target_node == source_node and e.target_op == source_op
-                for e in self._edges
-            )
-            if not has_preds:
-                is_source = True
-
-        if is_source and not is_interleaved:
-            # Inference based on Sharding and Mesh
-            auto_interleaved, auto_unit_size = self._infer_interleave_params(
-                src_cfg, src_meta
-            )
-            if auto_interleaved:
-                is_interleaved = auto_interleaved
-                interleave_unit_size = auto_unit_size
-
-        if is_interleaved:
-            logger.debug(
-                f"[Builder] Edge {source_node}.{source_op} -> {target_node}.{target_op} inferred as INTERLEAVED "
-                f"(unit_size={interleave_unit_size})"
-            )
-
-        dst_meta.input_pre_sharding.setdefault(source_node, []).append(
-            EdgeShardingInfo(
-                condition_fn=condition_fn,
-                tuuid_sharding=tuuid_src_out,
-                tuuid_map=tuuid_map,
-                target_op=target_op,  # type: ignore
-                tensor_map=tensor_map,  # type: ignore
-                input_param_map=dst_meta.input_param_map,
-                output_param_map=src_meta.output_param_map,
-                is_interleaved=is_interleaved,
-                interleave_unit_size=interleave_unit_size,
-                local_only=local_only,
-            )
-        )
-        src_meta.output_post_sharding.setdefault(target_node, []).append(
-            EdgeShardingInfo(
-                condition_fn=condition_fn,
-                tuuid_sharding=tuuid_dst_in,
-                tuuid_map=tuuid_map,
-                target_op=target_op,  # type: ignore
-                tensor_map=tensor_map,  # type: ignore
-                input_param_map=dst_meta.input_param_map,
-                output_param_map=src_meta.output_param_map,
-                is_interleaved=is_interleaved,
-                interleave_unit_size=interleave_unit_size,
-                local_only=local_only,
-            )
-        )
-
-        logger.debug(
-            "Builder linked sharding: %s.%s <-> %s.%s, tuuids=%s",
-            source_node,
-            source_op,
-            target_node,
-            target_op,
-            list(tuuid_map.values()),
-        )
-
-        # When a Static tensor flows from a smaller mesh to a larger one:
-        # - Source ops (interleaved virtual SPMD): round-robin scheduling covers all downstream
-        #   workers regardless of mesh size mismatch. No starving risk; emit INFO only.
-        # - Non-source ops: the tensor is split by mesh size, so the target workers may not
-        #   receive data if the batch is too small. Emit WARNING.
-        for src_name, dst_name in tensor_map.items():
-            s_spec = src_out_specs.get(src_name)
-            t_spec = dst_in_specs.get(dst_name)
-            if (
-                isinstance(s_spec, ShardingSpec)
-                and isinstance(t_spec, ShardingSpec)
-                and isinstance(s_spec.routing, AlgebraicRouting)
-                and isinstance(t_spec.routing, AlgebraicRouting)
-                and isinstance(s_spec.routing.strategy, ChunkPartition)
-                and isinstance(t_spec.routing.strategy, ChunkPartition)
-                and src_cfg.mesh is not None
-                and dst_cfg.mesh is not None
-                and src_cfg.mesh.size < dst_cfg.mesh.size
-            ):
-                if is_source:
-                    logger.info(
-                        "Static tensor '%s' (edge %s.%s -> %s.%s) flows from "
-                        "mesh(size=%d) to mesh(size=%d). Source op uses interleaved "
-                        "virtual SPMD scheduling; all %d downstream workers will "
-                        "receive data in round-robin order.",
-                        src_name,
-                        source_node,
-                        source_op,
-                        target_node,
-                        target_op,
-                        src_cfg.mesh.size,
-                        dst_cfg.mesh.size,
-                        dst_cfg.mesh.size,
-                    )
-                else:
-                    logger.warning(
-                        "\n[Fluxway Config Warning] Static tensor '%s' "
-                        "(edge %s.%s -> %s.%s) flows from mesh(size=%d) to mesh(size=%d). "
-                        "Ensure the data size along every partitioned dimension is >= %d at "
-                        "runtime, otherwise some workers will starve silently.",
-                        src_name,
-                        source_node,
-                        source_op,
-                        target_node,
-                        target_op,
-                        src_cfg.mesh.size,
-                        dst_cfg.mesh.size,
-                        dst_cfg.mesh.size,
-                    )
+        return tensor_map
 
     def build(self, name: str = "") -> Graph:
         """
@@ -1106,61 +655,16 @@ class Builder:
                     f"Edge references non-existent target node: {edge.target_node}"
                 )
 
-        # 1. Build a global mapping of TUUID to its Algebraic/Concrete ShardingSpec
-        global_tuuid_to_spec = {}
-        for node_name, node in self._nodes.items():
-            for op_meta in node.spmd_config.operator_metas.values():
-                for name_in, spec in (op_meta.input_sharding or {}).items():
-                    u = self._resolve_path_to_tuuid(
-                        node_name, op_meta.name, "in", name_in
-                    )
-                    if u is not None:
-                        global_tuuid_to_spec[u] = spec
-                for name_out, spec in (op_meta.output_sharding or {}).items():
-                    u = self._resolve_path_to_tuuid(
-                        node_name, op_meta.name, "out", name_out
-                    )
-                    if u is not None:
-                        global_tuuid_to_spec[u] = spec
-
-        # 2. Recursively resolve referential sharding specs in all topology edges
-        def add_recursive_references(specs_dict):
-            to_add = {}
-            for u, spec in list(specs_dict.items()):
-                if hasattr(spec, "routing") and isinstance(
-                    spec.routing, ReferentialRouting
-                ):
-                    ref_tuuid = getattr(spec.routing, "tuuid", None)
-                    if ref_tuuid is not None and ref_tuuid not in specs_dict:
-                        ref_spec = global_tuuid_to_spec.get(ref_tuuid)
-                        if ref_spec is not None:
-                            to_add[ref_tuuid] = ref_spec
-            if to_add:
-                specs_dict.update(to_add)
-                add_recursive_references(specs_dict)
-
-        # 3. Apply the recursive resolution to all predecessor/successor edges in all nodes
-        for node in self._nodes.values():
-            for top in node.spmd_config.topology.values():
-                for pred in top.predecessors.values():
-                    if pred.tuuid_sharding:
-                        add_recursive_references(pred.tuuid_sharding)
-                for succ in top.successors.values():
-                    if succ.tuuid_sharding:
-                        add_recursive_references(succ.tuuid_sharding)
-
         active_ops_by_node: dict[str, set[str]] = {
             node_name: set() for node_name in self._nodes
         }
         for edge in self._edges:
-            if edge.source_op is not None:
-                active_ops_by_node[edge.source_node].add(edge.source_op)
-            if edge.target_op is not None:
-                active_ops_by_node[edge.target_node].add(edge.target_op)
+            active_ops_by_node[edge.source_node].add(edge.source_op)
+            active_ops_by_node[edge.target_node].add(edge.target_op)
 
         for node_name, node in self._nodes.items():
             active_ops = active_ops_by_node[node_name]
-            unknown_ops = active_ops - set(node.spmd_config.operator_metas)
+            unknown_ops = active_ops - set(node.spmd_config.operator_specs)
             if unknown_ops:
                 raise ValueError(
                     f"Active operators for node {node_name!r} are missing "
@@ -1170,141 +674,51 @@ class Builder:
                 raise ValueError(
                     f"Node {node_name!r} has no active operators in graph {name!r}."
                 )
-            node.spmd_config.active_operator_names = tuple(sorted(active_ops))
 
-        manifest = self._build_manifest(name, active_ops_by_node)
-        graph_nodes = copy.deepcopy(self._nodes)
+        spmd_specs = []
+        for spmd_id in sorted(self._nodes):
+            resource_profile = self._nodes[spmd_id].resource_profile
+            assert resource_profile is not None, (
+                f"Node {spmd_id!r} lacks a resource profile"
+            )
+            spmd_specs.append(
+                SPMDGraphSpec(
+                    spmd_id=spmd_id,
+                    spmd_class=self._nodes[spmd_id].spmd_class,
+                    mesh=self._nodes[spmd_id].spmd_config.mesh,
+                    resource_profile=resource_profile,
+                    operators={
+                        op_id: self._nodes[spmd_id].spmd_config.operator_specs[op_id]
+                        for op_id in sorted(active_ops_by_node[spmd_id])
+                    },
+                )
+            )
+
+        compiled_graph = compile_graph(
+            name=name,
+            spmds=tuple(spmd_specs),
+            dependencies=tuple(self._edges),
+        )
+        graph_nodes = {
+            spmd_id: node.model_copy(
+                update={
+                    "spmd_config": node.spmd_config.model_copy(
+                        update={
+                            "operator_specs": dict(node.spmd_config.operator_specs),
+                            "static_args": dict(node.spmd_config.static_args),
+                            "graph_view": compiled_graph.spmd(spmd_id),
+                        }
+                    )
+                }
+            )
+            for spmd_id, node in self._nodes.items()
+        }
         graph = Graph(
             name=name,
             nodes=graph_nodes,
-            edges=self._edges.copy(),
-            manifest=manifest,
+            compiled_graph=compiled_graph,
         )
-        graph_manifest = graph.manifest
-        if graph_manifest is None:
-            raise ValueError("Built graph is missing its computation manifest.")
-        spmd_facts_by_id = {spmd.spmd_id: spmd for spmd in graph_manifest.spmds}
-        for spmd_id, node in graph.nodes.items():
-            config = node.spmd_config.model_copy(
-                update={
-                    "graph_manifest_id": graph_manifest.manifest_id,
-                    "graph_spmd_facts": spmd_facts_by_id[spmd_id],
-                }
-            )
-            for op_id in active_ops_by_node[spmd_id]:
-                meta = config.operator_metas[op_id]
-                config.operator_metas[op_id] = meta.model_copy(
-                    update={
-                        "graph_facts": graph_manifest.runtime_operator_facts(
-                            spmd_id, op_id
-                        )
-                    }
-                )
-            node.spmd_config = config
-
         return graph
-
-    def _build_manifest(
-        self, graph_name: str, active_ops_by_node: dict[str, set[str]]
-    ) -> ComputationGraphManifest:
-        spmds = []
-        for spmd_id in sorted(self._nodes):
-            node = self._nodes[spmd_id]
-            if node.spmd_class_module is None or node.spmd_class_qualname is None:
-                raise ValueError(f"Node {spmd_id!r} is missing SPMD class metadata.")
-            operators = []
-            for op_id in sorted(active_ops_by_node[spmd_id]):
-                meta = node.spmd_config.operator_metas[op_id]
-                method_name = node.spmd_config.operators.get(op_id)
-                if (
-                    not method_name
-                    or not meta.owner_class_module
-                    or not meta.owner_class_qualname
-                ):
-                    raise ValueError(
-                        f"Operator {spmd_id}.{op_id} is missing function metadata."
-                    )
-                inputs = OperatorArguments(
-                    data=tuple(meta.get_arguments(False, ArgumentType.DATA)),
-                    control=tuple(meta.get_arguments(False, ArgumentType.CONTROL)),
-                    static=tuple(meta.get_arguments(False, ArgumentType.STATIC)),
-                )
-                outputs = OperatorArguments(
-                    data=tuple(meta.get_arguments(True, ArgumentType.DATA)),
-                    control=tuple(meta.get_arguments(True, ArgumentType.CONTROL)),
-                )
-                facts = OperatorFacts(
-                    spmd_id=spmd_id,
-                    op_id=op_id,
-                    function_id=(
-                        f"{meta.owner_class_module}.{meta.owner_class_qualname}."
-                        f"{method_name}"
-                    ),
-                    inputs=inputs,
-                    outputs=outputs,
-                    input_signature_id=inputs.signature_id,
-                    output_signature_id=outputs.signature_id,
-                )
-                operators.append(facts)
-            resource = None
-            if node.resource is not None:
-                resource = ResourceFacts(**node.resource.model_dump())
-            mesh = tuple(
-                zip(
-                    node.spmd_config.mesh.axis_names,
-                    node.spmd_config.mesh.shape,
-                    strict=True,
-                )
-            )
-            spmds.append(
-                SPMDFacts(
-                    spmd_id=spmd_id,
-                    class_id=f"{node.spmd_class_module}.{node.spmd_class_qualname}",
-                    description=node.description,
-                    mesh=mesh,
-                    resource=resource,
-                    priority=str(node.priority) if node.priority is not None else None,
-                    placement_strategy=(
-                        str(node.placement_strategy)
-                        if node.placement_strategy is not None
-                        else None
-                    ),
-                    operators=tuple(operators),
-                )
-            )
-        transfers = []
-        for edge in self._edges:
-            if edge.transfers is None:
-                raise ValueError(
-                    f"Edge {edge.source_node}.{edge.source_op} -> "
-                    f"{edge.target_node}.{edge.target_op} is missing resolved transfers."
-                )
-            transfers.extend(edge.transfers)
-        return ComputationGraphManifest.create(
-            graph_name=graph_name,
-            spmds=tuple(spmds),
-            transfers=tuple(transfers),
-        )
-
-    def _resolve_path_to_tuuid(
-        self, node_name: str, op_name: str, primary_direction: str, path: str
-    ) -> int | None:
-        """
-        Find the physical TUUID for a logical path like 'forward.y'.
-        Searches the unified slot registry (covers both definitions and references).
-        If not found in the primary direction, falls back to the other direction.
-        """
-        if "." in path:
-            target_op, field = path.split(".", 1)
-        else:
-            target_op, field = op_name, path
-
-        tuuid = self._tuuid_slots.get((node_name, target_op, primary_direction, field))
-        if tuuid is not None:
-            return tuuid
-
-        other_direction = "out" if primary_direction == "in" else "in"
-        return self._tuuid_slots.get((node_name, target_op, other_direction, field))
 
     def reset(self) -> "Builder":
         """
@@ -1316,7 +730,6 @@ class Builder:
         self._nodes.clear()
         self._spmd_classes.clear()
         self._edges.clear()
-        self._tuuid_slots.clear()
         return self
 
     def get_spmd_class(self, node_name: str) -> type | None:

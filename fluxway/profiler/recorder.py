@@ -10,8 +10,7 @@ from contextlib import (
 import time
 import threading
 from collections.abc import AsyncGenerator, Generator
-
-from fluxway.common.types.manifest import OperatorFacts
+from typing import Any, TYPE_CHECKING
 
 from fluxway.profiler.record import (
     EMPTY_TRACE_PAYLOAD,
@@ -23,6 +22,9 @@ from fluxway.profiler.record import (
     stable_u64,
 )
 from fluxway.profiler.clock import ClockCalibration
+
+if TYPE_CHECKING:
+    from fluxway.common.compiled_graph import CompiledOperator
 
 
 EMPTY_PAYLOAD_FIELDS: tuple[str, ...] = ()
@@ -187,55 +189,83 @@ DATA_PLANE_TENSOR_SPLIT = TraceEventSpec(
 WORKER_RECEIVE_TRANSPORT_FRAME = TraceEventSpec(
     "worker.receive_transport_frame",
     "transport/recv",
-    ("step", "sender_spmd_code", "edge_count", "payload_count"),
+    ("step", "sender_spmd_code", "entry_count", "payload_count"),
     "step",
 )
 WORKER_DEPOSIT_TRANSPORT_FRAME = TraceEventSpec(
     "worker.deposit_transport_frame",
     "mailbox/deposit",
-    ("op_id", "step", "edge_count", "watermark"),
+    ("op_id", "step", "entry_count", "watermark"),
     "step",
 )
 WORKER_ASSEMBLE_INPUT = TraceEventSpec(
     "worker.assemble_input",
     "tensor/reassemble",
-    ("op_id", "step", "tuuid_count", "state_count"),
+    ("op_id", "step", "transfer_count", "state_count"),
     "step",
 )
 WORKER_ASSEMBLE_TENSOR = TraceEventSpec(
     "worker.assemble_tensor",
     "tensor/reassemble",
-    ("op_id", "tuuid", "step", "sender_count", "shard_count"),
+    (
+        "op_id",
+        "transfer_code",
+        "logical_tuuid",
+        "step",
+        "sender_count",
+        "shard_count",
+    ),
     "step",
 )
 WORKER_ASSEMBLE_FILTER_SHARDS = TraceEventSpec(
     "worker.assemble_tensor.filter_shards",
     "tensor/reassemble/detail",
-    ("op_id", "tuuid", "step", "sender_count", "shard_count"),
+    (
+        "op_id",
+        "transfer_code",
+        "logical_tuuid",
+        "step",
+        "sender_count",
+        "shard_count",
+    ),
     "step",
 )
 WORKER_ASSEMBLE_CAT_VALUES = TraceEventSpec(
     "worker.assemble_tensor.cat_values",
     "tensor/reassemble/detail",
-    ("op_id", "tuuid", "step", "value_count"),
+    ("op_id", "transfer_code", "logical_tuuid", "step", "value_count"),
     "step",
 )
 WORKER_ASSEMBLE_MERGE_METADATA = TraceEventSpec(
     "worker.assemble_tensor.merge_metadata",
     "tensor/reassemble/detail",
-    ("op_id", "tuuid", "step", "shard_count"),
+    ("op_id", "transfer_code", "logical_tuuid", "step", "shard_count"),
     "step",
 )
 WORKER_ASSEMBLE_SORT = TraceEventSpec(
     "worker.assemble_tensor.sort",
     "tensor/reassemble/detail",
-    ("op_id", "tuuid", "step", "actual_len", "capacity"),
+    (
+        "op_id",
+        "transfer_code",
+        "logical_tuuid",
+        "step",
+        "actual_len",
+        "capacity",
+    ),
     "step",
 )
 WORKER_ASSEMBLE_SCATTER = TraceEventSpec(
     "worker.assemble_tensor.scatter",
     "tensor/reassemble/detail",
-    ("op_id", "tuuid", "step", "logical_len", "capacity"),
+    (
+        "op_id",
+        "transfer_code",
+        "logical_tuuid",
+        "step",
+        "logical_len",
+        "capacity",
+    ),
     "step",
 )
 WORKER_SEND_OUTPUT = TraceEventSpec(
@@ -267,7 +297,7 @@ DATA_PLANE_RECEIVER_BATCH = TraceEventSpec(
 DATA_PLANE_RECEIVER_DEPOSIT = TraceEventSpec(
     "data_plane.receiver_deposit",
     "transport/recv/detail",
-    ("step", "sender_spmd_code", "edge_count", "payload_count"),
+    ("step", "sender_spmd_code", "entry_count", "payload_count"),
     "step",
 )
 LOCAL_STEP_PLAN_EXECUTE = TraceEventSpec(
@@ -310,7 +340,7 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
     "user_callable.execute",
     "compute/user_callable",
     (
-        "manifest_id",
+        "graph_id",
         "spmd_id",
         "op_id",
         "function_id",
@@ -319,6 +349,12 @@ USER_CALLABLE_EXECUTE = TraceEventSpec(
         "output_signature_id",
         "execution_mode",
     ),
+    "step",
+)
+USER_CALLABLE_FUNCTION_RUN = TraceEventSpec(
+    "user_callable.function_run",
+    "compute/user_callable",
+    ("op_id", "step", "rank", "execution_mode"),
     "step",
 )
 USER_CUSTOM_PAYLOAD_FIELDS = (
@@ -597,13 +633,7 @@ WORKER_SNAPSHOT_HOOK = TraceEventSpec(
 MAILBOX_DECLARE_STEP = TraceEventSpec(
     "mailbox.declare_step",
     "mailbox/barrier",
-    ("op_id", "step", "tensor_count", "state_count"),
-    "step",
-)
-MAILBOX_EXPECTED_COUNT_UPDATE = TraceEventSpec(
-    "mailbox.expected_count_update",
-    "mailbox/barrier",
-    ("op_id", "step", "tensor_count"),
+    ("op_id", "step", "transfer_count", "state_count"),
     "step",
 )
 MAILBOX_DEPOSIT_CONTROL = TraceEventSpec(
@@ -615,13 +645,13 @@ MAILBOX_DEPOSIT_CONTROL = TraceEventSpec(
 MAILBOX_DEPOSIT_FRAME = TraceEventSpec(
     "mailbox.deposit_frame",
     "mailbox/deposit",
-    ("op_id", "step", "edge_count", "payload_count"),
+    ("op_id", "step", "entry_count", "payload_count"),
     "step",
 )
 MAILBOX_DEPOSIT_LOCAL_TENSOR = TraceEventSpec(
     "mailbox.deposit_local_tensor",
     "mailbox/deposit",
-    ("op_id", "tuuid", "step", "data_count"),
+    ("op_id", "transfer_code", "step", "data_count"),
     "step",
 )
 MAILBOX_READY_FIRE = TraceEventSpec(
@@ -696,6 +726,9 @@ class TraceRecorder:
         }
 
     def intern(self, value: str) -> int:
+        existing = self._interned.get(value)
+        if existing is not None:
+            return existing
         with self._intern_lock:
             existing = self._interned.get(value)
             if existing is not None:
@@ -974,12 +1007,12 @@ class TraceRecorder:
         *,
         step: int,
         sender_spmd_code: int,
-        edge_count: int,
+        entry_count: int,
         payload_count: int,
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             WORKER_RECEIVE_TRANSPORT_FRAME,
-            payload=(step, sender_spmd_code, edge_count, payload_count),
+            payload=(step, sender_spmd_code, entry_count, payload_count),
         )
 
     def worker_deposit_transport_frame(
@@ -987,48 +1020,64 @@ class TraceRecorder:
         *,
         op_name: str,
         step: int,
-        edge_count: int,
+        entry_count: int,
         watermark: int,
     ) -> None:
         self._instant(
             WORKER_DEPOSIT_TRANSPORT_FRAME,
-            payload=(self.intern(op_name), step, edge_count, watermark),
+            payload=(self.intern(op_name), step, entry_count, watermark),
         )
 
     def worker_assemble_input(
-        self, *, op_name: str, step: int, tuuid_count: int, state_count: int
+        self, *, op_name: str, step: int, transfer_count: int, state_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             WORKER_ASSEMBLE_INPUT,
-            payload=(self.intern(op_name), step, tuuid_count, state_count),
+            payload=(self.intern(op_name), step, transfer_count, state_count),
         )
 
     def worker_assemble_tensor(
         self,
         *,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
+        logical_tuuid: int,
         step: int,
         sender_count: int,
         shard_count: int,
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             WORKER_ASSEMBLE_TENSOR,
-            payload=(self.intern(op_name), tuuid, step, sender_count, shard_count),
+            payload=(
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                sender_count,
+                shard_count,
+            ),
         )
 
     def worker_assemble_tensor_sync(
         self,
         *,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
+        logical_tuuid: int,
         step: int,
         sender_count: int,
         shard_count: int,
     ) -> AbstractContextManager[None]:
         return self._span(
             WORKER_ASSEMBLE_TENSOR,
-            payload=(self.intern(op_name), tuuid, step, sender_count, shard_count),
+            payload=(
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                sender_count,
+                shard_count,
+            ),
         )
 
     def worker_assemble_detail(
@@ -1036,21 +1085,43 @@ class TraceRecorder:
         *,
         spec: TraceEventSpec,
         op_name: str,
-        tuuid: int,
+        transfer_code: int,
+        logical_tuuid: int,
         step: int,
         first_count: int,
         second_count: int = 0,
     ) -> AbstractContextManager[None]:
         spec_name = spec.name
+        payload: tuple[Any, ...]
         if spec_name == WORKER_ASSEMBLE_FILTER_SHARDS.name:
-            payload = (self.intern(op_name), tuuid, step, first_count, second_count)
+            payload = (
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                first_count,
+                second_count,
+            )
         elif spec_name in (
             WORKER_ASSEMBLE_CAT_VALUES.name,
             WORKER_ASSEMBLE_MERGE_METADATA.name,
         ):
-            payload = (self.intern(op_name), tuuid, step, first_count)
+            payload = (
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                first_count,
+            )
         elif spec_name in (WORKER_ASSEMBLE_SORT.name, WORKER_ASSEMBLE_SCATTER.name):
-            payload = (self.intern(op_name), tuuid, step, first_count, second_count)
+            payload = (
+                self.intern(op_name),
+                transfer_code,
+                logical_tuuid,
+                step,
+                first_count,
+                second_count,
+            )
         else:
             raise ValueError(f"Unsupported assemble detail spec {spec.name!r}.")
         return self._span(spec, payload=payload)
@@ -1101,21 +1172,39 @@ class TraceRecorder:
     def user_callable_execute(
         self,
         *,
-        manifest_id: str,
-        operator_facts: OperatorFacts,
+        graph_id: str,
+        compiled_operator: CompiledOperator,
         step: int,
         execution_mode: str,
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             USER_CALLABLE_EXECUTE,
             payload=(
-                self.intern(manifest_id),
-                self.intern(operator_facts.spmd_id),
-                self.intern(operator_facts.op_id),
-                self.intern(operator_facts.function_id),
+                self.intern(graph_id),
+                self.intern(compiled_operator.key.spmd_id),
+                self.intern(compiled_operator.key.op_id),
+                self.intern(compiled_operator.function_id),
                 step,
-                self.intern(operator_facts.input_signature_id),
-                self.intern(operator_facts.output_signature_id),
+                self.intern(compiled_operator.input_signature_id),
+                self.intern(compiled_operator.output_signature_id),
+                self.intern(execution_mode),
+            ),
+        )
+
+    def user_callable_function_run(
+        self,
+        *,
+        op_name: str,
+        step: int,
+        rank: int,
+        execution_mode: str,
+    ) -> AbstractContextManager[None]:
+        return self._span(
+            USER_CALLABLE_FUNCTION_RUN,
+            payload=(
+                self.intern(op_name),
+                step,
+                rank,
                 self.intern(execution_mode),
             ),
         )
@@ -1247,12 +1336,12 @@ class TraceRecorder:
         *,
         step: int,
         sender_spmd_code: int,
-        edge_count: int,
+        entry_count: int,
         payload_count: int,
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             DATA_PLANE_RECEIVER_DEPOSIT,
-            payload=(step, sender_spmd_code, edge_count, payload_count),
+            payload=(step, sender_spmd_code, entry_count, payload_count),
         )
 
     def transport_distribute(
@@ -1508,19 +1597,11 @@ class TraceRecorder:
         )
 
     def mailbox_declare_step(
-        self, *, op_name: str, step: int, tensor_count: int, state_count: int
+        self, *, op_name: str, step: int, transfer_count: int, state_count: int
     ) -> None:
         self._instant(
             MAILBOX_DECLARE_STEP,
-            payload=(self.intern(op_name), step, tensor_count, state_count),
-        )
-
-    def mailbox_expected_count_update(
-        self, *, op_name: str, step: int, tensor_count: int
-    ) -> None:
-        self._instant(
-            MAILBOX_EXPECTED_COUNT_UPDATE,
-            payload=(self.intern(op_name), step, tensor_count),
+            payload=(self.intern(op_name), step, transfer_count, state_count),
         )
 
     def mailbox_deposit_control(
@@ -1532,19 +1613,19 @@ class TraceRecorder:
         )
 
     def mailbox_deposit_frame(
-        self, *, op_name: str, step: int, edge_count: int, payload_count: int
+        self, *, op_name: str, step: int, entry_count: int, payload_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             MAILBOX_DEPOSIT_FRAME,
-            payload=(self.intern(op_name), step, edge_count, payload_count),
+            payload=(self.intern(op_name), step, entry_count, payload_count),
         )
 
     def mailbox_deposit_local_tensor(
-        self, *, op_name: str, tuuid: int, step: int, data_count: int
+        self, *, op_name: str, transfer_code: int, step: int, data_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             MAILBOX_DEPOSIT_LOCAL_TENSOR,
-            payload=(self.intern(op_name), tuuid, step, data_count),
+            payload=(self.intern(op_name), transfer_code, step, data_count),
         )
 
     def mailbox_ready_fire(self, *, op_name: str, step: int) -> None:

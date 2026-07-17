@@ -6,6 +6,7 @@ sys.path.append(os.getcwd())
 
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.common.decorators import spmd, operator, data_type
+from fluxway.resources import ResourceProfile
 
 
 @data_type()
@@ -25,7 +26,11 @@ class DummyData:
 REP = {"type": "replicated", "axis": []}
 
 
-@spmd(mesh_axis_names=("data",), mesh_axis_shapes=(1,))
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
 class DummySPMD:
     """Mock SPMD for testing graph topology."""
 
@@ -203,15 +208,15 @@ def test_functional_graph_single_chain():
     h_a = node_a.compute()
     _ = node_b.compute(h_a)
 
-    task_graph = graph.compile()
+    task_graph = graph.build()
 
     assert len(task_graph.nodes) == 2
     assert "NodeA" in task_graph.nodes
     assert "NodeB" in task_graph.nodes
 
     # Check edges
-    assert len(task_graph.edges) == 1
-    edge = task_graph.edges[0]
+    assert len(task_graph.dependency_specs) == 1
+    edge = task_graph.dependency_specs[0]
     assert edge.source_node == "NodeA"
     assert edge.source_op == "compute"
     assert edge.target_node == "NodeB"
@@ -232,14 +237,14 @@ def test_functional_graph_multi_input():
     # FFN takes both
     _ = ffn.compute(input1=h1, input2=h2)
 
-    task_graph = graph.compile()
+    task_graph = graph.build()
 
-    assert len(task_graph.edges) == 2
+    assert len(task_graph.dependency_specs) == 2
 
-    sources = {(e.source_node, e.source_op) for e in task_graph.edges}
+    sources = {(e.source_node, e.source_op) for e in task_graph.dependency_specs}
     assert sources == {("Emb1", "compute"), ("Emb2", "compute")}
 
-    targets = {(e.target_node, e.target_op) for e in task_graph.edges}
+    targets = {(e.target_node, e.target_op) for e in task_graph.dependency_specs}
     assert targets == {("FFN", "compute")}
 
 
@@ -252,10 +257,10 @@ def test_functional_graph_implicit_self_loop():
     h_fwd = actor.compute()
     _ = actor.optimize(h_fwd)
 
-    task_graph = graph.compile()
-    assert len(task_graph.edges) == 1
+    task_graph = graph.build()
+    assert len(task_graph.dependency_specs) == 1
 
-    edge = task_graph.edges[0]
+    edge = task_graph.dependency_specs[0]
     assert edge.source_node == "Actor"
     assert edge.source_op == "compute"
     assert edge.target_node == "Actor"
@@ -274,13 +279,13 @@ def test_functional_graph_agentic_rl():
     h_reward = env.compute_reward(h_action)
     _ = actor.train_step(h_reward)
 
-    task_graph = graph.compile()
+    task_graph = graph.build()
 
     # Edges:
     # 1. Env.step -> Actor.rollout
     # 2. Actor.rollout -> Env.compute_reward
     # 3. Env.compute_reward -> Actor.train_step
-    assert len(task_graph.edges) == 3
+    assert len(task_graph.dependency_specs) == 3
 
 
 def test_functional_graph_arbitrary_rl_loop():
@@ -303,29 +308,75 @@ def test_functional_graph_arbitrary_rl_loop():
     # 4. Feedback to Actor (closed loop)
     _ = actor.rollout(h_train)
 
-    task_graph = graph.compile()
+    task_graph = graph.build()
 
     assert len(task_graph.nodes) == 3
-    assert len(task_graph.edges) == 3
+    assert len(task_graph.dependency_specs) == 3
 
     # Use Builder for secondary verification to ensure metadata can be correctly
-    # injected into OperatorMeta after compilation
+    # injected into OperatorSpec after compilation
     from fluxway.control_plane.graph.builder import Builder
 
     builder = Builder()
     for name in task_graph.nodes:
         builder.add_node(name, DummySPMD)
 
-    for edge in task_graph.edges:
+    for edge in task_graph.dependency_specs:
         builder.add_func_edge(
             edge.source_node, edge.source_op, edge.target_node, edge.target_op
         )
 
     linked_graph = builder.build("linked_graph")
 
-    # Verify that the critical "feedback" edge is effective in operator metadata
-    actor_meta = linked_graph.nodes["Actor"].spmd_config.operator_metas["rollout"]
+    actor_plan = linked_graph.nodes["Actor"].spmd_config.require_graph_view()
+    assert any(
+        dependency.spec.source.spmd_id == "Learner"
+        and dependency.spec.target.op_id == "rollout"
+        for dependency in actor_plan.incoming
+    )
+    assert any(
+        dependency.spec.source.op_id == "rollout"
+        and dependency.spec.target.spmd_id == "Reward"
+        for dependency in actor_plan.outgoing
+    )
 
-    # The operator's predecessor (Input) should include Learner, and the successor (Output) should include Reward
-    assert "Learner" in actor_meta.input_pre_sharding
-    assert "Reward" in actor_meta.output_post_sharding
+
+def test_functional_graph_adds_zero_transfer_dependency():
+    async def condition(_result):
+        return True
+
+    graph = FunctionalGraph()
+    source = graph.node("Source", DummySPMD)
+    target = graph.node("Target", DummySPMD)
+    data = source.compute()
+    gate = source.step()
+    target_handle = target.optimize(data)
+
+    returned = graph.add_dependency(
+        gate,
+        target_handle,
+        condition_fn=condition,
+    )
+    compiled = graph.build("ordering-only").compiled_graph
+    dependencies = {
+        dependency.spec.source.op_id: dependency for dependency in compiled.dependencies
+    }
+
+    assert returned is target_handle
+    assert len(dependencies["compute"].transfers) > 0
+    assert dependencies["step"].transfers == ()
+    assert dependencies["step"].spec.condition is condition
+
+
+def test_functional_graph_rejects_foreign_dependency_handle():
+    first = FunctionalGraph("first")
+    second = FunctionalGraph("second")
+    source = first.node("Source", DummySPMD).compute()
+    target = second.node("Target", DummySPMD).optimize()
+
+    try:
+        first.add_dependency(source, target)
+    except ValueError as error:
+        assert "belong to this FunctionalGraph" in str(error)
+    else:
+        raise AssertionError("foreign FunctionalGraph handle was accepted")

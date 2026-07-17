@@ -2,7 +2,6 @@ import asyncio
 from decimal import Decimal
 import pytest
 
-from fluxway.common.types import Graph
 from fluxway.placement import (
     AFFINITY_FIRST_V1,
     ClusterNode,
@@ -18,9 +17,14 @@ from fluxway.placement import (
 )
 from fluxway.control_plane.scheduler.pg_manager import PGManager
 from fluxway.spmd.driver import SPMDDriver
-from fluxway.placement.worker_group import ray_actor_options
+from fluxway.placement.worker_group import ray_actor_options, worker_tensor_device
 
-from .test_planner import graph_node, scenario
+from .test_planner import (
+    graph_node,
+    placement_graph,
+    placement_inventory,
+    scenario,
+)
 
 
 class MultiAcceleratorSPMD: ...
@@ -48,7 +52,9 @@ def test_pg_manager_materializes_one_pinned_job_placement_group(monkeypatch) -> 
     snapshot = ClusterSnapshot.from_nodes(nodes)
     from fluxway.placement import PlacementPlanner
 
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
     captured = {}
 
     def create_pg(*, bundles, strategy):
@@ -94,7 +100,9 @@ def test_pg_manager_raises_typed_timeout_and_releases_pg(monkeypatch) -> None:
             for index, node in enumerate(snapshot_without_markers.nodes)
         )
     )
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
     removed = []
 
     class NeverReadyPlacementGroup:
@@ -121,7 +129,9 @@ def test_pg_manager_raises_typed_timeout_and_releases_pg(monkeypatch) -> None:
 
 def test_pg_manager_rejects_unexpressible_node_without_marker() -> None:
     graph, recipe, snapshot = scenario(1)
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
 
     with pytest.raises(PlacementMaterializationError, match="usable node resources"):
         asyncio.run(
@@ -130,20 +140,24 @@ def test_pg_manager_rejects_unexpressible_node_without_marker() -> None:
 
 
 def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> None:
-    graph = Graph(
-        nodes={"accelerated": graph_node("accelerated", MultiAcceleratorSPMD, 1)}
+    graph = placement_graph(
+        nodes={
+            "accelerated": graph_node(
+                "accelerated",
+                MultiAcceleratorSPMD,
+                1,
+                ResourceProfile(
+                    base={
+                        "GPU": 1,
+                        "accelerator_type:H100": Decimal("0.001"),
+                    }
+                ),
+            )
+        }
     )
     recipe = PlacementRecipe(
         recipe_id="multi-accelerator",
         version="1.0.0",
-        profiles={
-            MultiAcceleratorSPMD: ResourceProfile(
-                base={
-                    "GPU": 1,
-                    "accelerator_type:H100": Decimal("0.001"),
-                }
-            )
-        },
         constraints=(),
         objective=AFFINITY_FIRST_V1,
     )
@@ -159,7 +173,9 @@ def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> Non
             ),
         )
     )
-    plan = PlacementPlanner(solve_timeout_s=10).resolve(graph, recipe, snapshot)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
     captured = {}
 
     def create_pg(*, bundles, strategy):
@@ -206,6 +222,11 @@ def test_recipe_worker_options_preserve_explicit_zero_accelerators() -> None:
     assert options["num_gpus"] == 0
 
 
+def test_worker_tensor_device_follows_materialized_gpu_resources() -> None:
+    assert worker_tensor_device({"CPU": Decimal("1")}) == "cpu"
+    assert worker_tensor_device({"CPU": Decimal("1"), "GPU": Decimal("0.25")}) == "cuda"
+
+
 def test_default_runtime_uses_zero_resource_driver_actors() -> None:
     runtime = PlacementRuntimeConfig()
 
@@ -217,11 +238,12 @@ def test_default_runtime_uses_zero_resource_driver_actors() -> None:
 
 
 def test_driver_resources_are_reserved_in_the_rank_zero_bundle(monkeypatch) -> None:
-    graph = Graph(nodes={"driver": graph_node("driver", MultiAcceleratorSPMD, 1)})
+    graph = placement_graph(
+        nodes={"driver": graph_node("driver", MultiAcceleratorSPMD, 1)}
+    )
     recipe = PlacementRecipe(
         recipe_id="driver-resources",
         version="1.0.0",
-        profiles={MultiAcceleratorSPMD: ResourceProfile(base={"CPU": 1})},
         constraints=(),
         objective=AFFINITY_FIRST_V1,
     )
@@ -236,7 +258,7 @@ def test_driver_resources_are_reserved_in_the_rank_zero_bundle(monkeypatch) -> N
     plan = PlacementPlanner(
         solve_timeout_s=10,
         driver_resources={"CPU": Decimal("0.5")},
-    ).resolve(graph, recipe, snapshot)
+    ).resolve(placement_inventory(graph), recipe, snapshot)
     captured = {}
 
     def create_pg(*, bundles, strategy):

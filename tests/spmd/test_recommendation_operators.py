@@ -66,8 +66,16 @@ class InputOp:
         name="process",
         input_sharding={"data": {"type": "static", "axis": ["dp"]}},
         output_sharding={
-            "unique_users": {"type": "dynamic", "axis": ["dp"], "fn": "hash_routing"},
-            "unique_items": {"type": "dynamic", "axis": ["dp"], "fn": "hash_routing"},
+            "unique_users": {
+                "type": "dynamic",
+                "axis": ["dp"],
+                "strategy": "modulo",
+            },
+            "unique_items": {
+                "type": "dynamic",
+                "axis": ["dp"],
+                "strategy": "modulo",
+            },
             "user_inv": {"type": "static", "axis": ["dp"]},
             "item_inv": {"type": "static", "axis": ["dp"]},
             "stats": {"type": "static", "axis": ["dp"]},
@@ -87,15 +95,6 @@ class InputOp:
         )
 
 
-def hash_routing(tensor, mesh):
-    val = (
-        tensor.routing_indices
-        if tensor.routing_indices is not None
-        else tensor.flat_values
-    )
-    return jnp.mod(val, mesh.size)
-
-
 @spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class EmbeddingOp:
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 4):
@@ -108,7 +107,11 @@ class EmbeddingOp:
         name="lookup",
         data_argument=["unique_ids"],
         input_sharding={
-            "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
+            "unique_ids": {
+                "type": "dynamic",
+                "axis": ["shard"],
+                "strategy": "modulo",
+            }
         },
         output_sharding={"embeddings": {"type": "dynamic", "axis": ["shard"]}},
     )
