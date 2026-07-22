@@ -40,10 +40,10 @@ async def test_orbax_resharding():
     # Target state for dp4
     target_x = jnp.zeros(16)
     target_x_sharded = jax.device_put(target_x, sharding4)
-    target_state = {"operator_states": {"my_op": target_x_sharded}}
+    restore_layout = {"operator_states": {"my_op": target_x_sharded}}
 
-    # Load using the backend with target_state support
-    loaded_state = await backend.load(metadata, target_state=target_state)
+    # Load using the backend with restore-layout support
+    loaded_state = await backend.load(metadata, restore_layout=restore_layout)
     loaded_x = loaded_state["operator_states"]["my_op"]
 
     assert loaded_x.sharding == target_x_sharded.sharding, (
@@ -97,10 +97,10 @@ async def test_orbax_mixed_resharding():
 
     target_x = jnp.zeros((16, 16, 16))
     target_x_sharded = jax.device_put(target_x, sharding_tgt)
-    target_state = {"operator_states": {"mixed_op": target_x_sharded}}
+    restore_layout = {"operator_states": {"mixed_op": target_x_sharded}}
 
-    # Load with target_state
-    loaded_state = await backend.load(metadata, target_state=target_state)
+    # Load with the restore layout
+    loaded_state = await backend.load(metadata, restore_layout=restore_layout)
     loaded_x = loaded_state["operator_states"]["mixed_op"]
 
     assert loaded_x.sharding == target_x_sharded.sharding, (
@@ -113,7 +113,7 @@ async def test_orbax_mixed_resharding():
 
 
 class MockUserOperator:
-    """Mock user operator demonstrating how save_state/load_state expose target_state."""
+    """Mock user operator demonstrating the restore layout contract."""
 
     def __init__(self, mesh, partition_spec):
         self.mesh = mesh
@@ -122,7 +122,7 @@ class MockUserOperator:
         self.weights = jax.device_put(jnp.zeros((16, 16)), self.sharding)
 
     def save_state(self) -> dict:
-        # The user's save_state automatically acts as the target_state provider during load!
+        # User state and restore layout are explicit separate contracts.
         return {"weights": self.weights}
 
     def restore_state(self, state: dict) -> None:
@@ -156,10 +156,10 @@ async def test_user_operator_api():
     op_dp4 = MockUserOperator(mesh4, jax.sharding.PartitionSpec("dp"))
 
     # The Fluxway Worker dynamically queries the operator for its target state:
-    target_state = {"operator_states": {"my_op": op_dp4.save_state()}}
+    restore_layout = {"operator_states": {"my_op": op_dp4.save_state()}}
 
     # Backend performs the resharded load
-    loaded_state = await backend.load(metadata, target_state=target_state)
+    loaded_state = await backend.load(metadata, restore_layout=restore_layout)
 
     # The Fluxway Worker pushes the loaded state back into the operator
     op_dp4.restore_state(loaded_state["operator_states"]["my_op"])

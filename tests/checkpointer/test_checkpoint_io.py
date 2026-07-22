@@ -18,8 +18,12 @@ import numpy as np
 import pytest
 
 from fluxway.control_plane.checkpointer import (
+    CheckpointArtifactAborter,
+    CheckpointContext,
+    PickleBackend,
     SafeTensorsBackend,
     WorkerCheckpointBackend,
+    abort_participant_checkpoint_artifacts,
 )
 from fluxway.control_plane.checkpointer.safetensors import (
     _flatten_worker_state,
@@ -31,6 +35,23 @@ from fluxway.control_plane.checkpointer.safetensors import (
 # =========================================================================
 # Helpers
 # =========================================================================
+
+
+def test_public_checkpoint_api_exports_distributed_abort() -> None:
+    class Participant:
+        def __init__(self) -> None:
+            self.aborted = False
+
+        def abort_checkpoint_artifacts(self, context: CheckpointContext) -> None:
+            self.aborted = True
+
+    participant = Participant()
+    assert isinstance(participant, CheckpointArtifactAborter)
+    abort_participant_checkpoint_artifacts(
+        participant,
+        CheckpointContext("/tmp/checkpoint", 1, "spmd", 0, 1),
+    )
+    assert participant.aborted
 
 
 def _make_state() -> dict[str, Any]:
@@ -200,6 +221,28 @@ class TestBackendRegistry:
         b = WorkerCheckpointBackend.create("safetensors")
         assert isinstance(b, SafeTensorsBackend)
 
+    def test_create_pickle(self):
+        b = WorkerCheckpointBackend.create("pickle")
+        assert isinstance(b, PickleBackend)
+
+    @pytest.mark.asyncio
+    async def test_pickle_round_trip_preserves_user_callable(self, tmp_path):
+        offset = 1
+
+        def closure(value):
+            return value + offset
+
+        backend = PickleBackend()
+        metadata = await backend.save(
+            {"transform": closure, "value": 3},
+            str(tmp_path),
+            "spmd_user",
+            rank=0,
+            step=1,
+        )
+        restored = await backend.load(metadata)
+        assert restored["transform"](restored["value"]) == 4
+
     def test_create_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown checkpoint backend"):
             WorkerCheckpointBackend.create("no_such_backend")
@@ -207,6 +250,7 @@ class TestBackendRegistry:
     def test_registered_names_contains_defaults(self):
         names = WorkerCheckpointBackend.registered_names()
         assert "safetensors" in names
+        assert "pickle" in names
         assert "orbax" in names
 
     def test_custom_backend_self_registers(self):

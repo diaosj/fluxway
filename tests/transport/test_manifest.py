@@ -17,8 +17,6 @@ from fluxway.transport.manifest import (
     TransportFrameHeader,
     TransportFrameBuilder,
     TransportFrameTemplate,
-    legacy_metadata_nbytes_as_i64,
-    metadata_nbytes,
 )
 
 
@@ -101,7 +99,6 @@ def test_manifest_uses_i32_metadata_and_preserves_u64_payload_and_i64_shape():
     assert frame.payload_segments[0].dtype == np.uint64
     assert int(np.asarray(frame.payload_segments[0])[0]) == 2**40
     assert int(frame.global_shape_i64[0]) == 2**35
-    assert metadata_nbytes(frame) < legacy_metadata_nbytes_as_i64(frame)
 
 
 def test_transport_frame_header_round_trips_without_payload_copy():

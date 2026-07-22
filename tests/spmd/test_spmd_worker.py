@@ -102,6 +102,37 @@ def _worker_cls():
     return cls.modified_class if cls else SPMDWorker
 
 
+@pytest.mark.asyncio
+async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
+    worker_type = SPMDWorker.__ray_actor_class__
+    worker = worker_type.__new__(worker_type)
+    worker._completed_step_count = {"Reader": 0, "Dense": 0}
+    worker._scheduled_step_count = {"Reader": 0, "Dense": 0}
+    worker.spmd_id = "Reader"
+    worker.rank = 0
+    worker.config = type("Config", (), {"max_steps": None})()
+    worker._op_manager = type(
+        "OperatorManager",
+        (),
+        {"is_source_operator": lambda _self, name: name == "Reader"},
+    )()
+    worker._checkpoint_context = lambda root, step: (root, step)
+    restored = []
+    worker._trigger_restored_source_steps = restored.extend
+
+    await worker.load_state_from_disk(
+        {
+            "completed_step_count": {"Reader": 1, "Dense": 1},
+            "checkpoint_root": "/tmp/prove",
+        },
+        rank_storage=None,
+        step=1,
+    )
+
+    assert worker._scheduled_step_count == {"Reader": 1, "Dense": 1}
+    assert restored == [("Reader", 1)]
+
+
 def _values_frame_entry(
     transfer_code: int,
     values,
@@ -1043,8 +1074,6 @@ async def test_send_output_uses_compiled_mesh():
 
 @pytest.mark.asyncio
 async def test_trigger_snapshot_hooks():
-    from pathlib import Path
-
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     worker_cls = cls.modified_class if cls else SPMDWorker
 
@@ -1079,12 +1108,10 @@ async def test_trigger_snapshot_hooks():
     )
 
     # Mock operator manager and operators
-    mock_op1 = MagicMock()
-    mock_op2 = MagicMock()
-
-    # mock_op2 does not have snapshot hooks
-    del mock_op2.on_snapshot_begin
-    del mock_op2.on_snapshot_commit
+    mock_op1 = MagicMock(
+        spec=["prepare_checkpoint_artifacts", "commit_checkpoint_artifacts"]
+    )
+    mock_op2 = MagicMock(spec=[])
 
     worker._op_manager = MagicMock()
 
@@ -1102,14 +1129,62 @@ async def test_trigger_snapshot_hooks():
         ckpt_dir = "/tmp/ckpt"
         step = 42
 
-        await worker.trigger_snapshot_begin(ckpt_dir, step)
+        await worker.prepare_checkpoint_artifacts(ckpt_dir, step)
 
-        expected_spmd_dir = str(Path(ckpt_dir) / str(step) / "test_spmd")
-        mock_op1.on_snapshot_begin.assert_called_once_with(expected_spmd_dir)
+        from fluxway.common.types import CheckpointContext
+
+        expected_context = CheckpointContext(ckpt_dir, step, "test_spmd", 0, 1)
+        mock_op1.prepare_checkpoint_artifacts.assert_called_once_with(expected_context)
 
         gathered_states = {"op1": {0: {"state": 1}}, "op2": {0: {"state": 2}}}
-        await worker.trigger_snapshot_commit(ckpt_dir, step, gathered_states)
+        await worker.commit_checkpoint_artifacts(ckpt_dir, step, gathered_states)
 
-        mock_op1.on_snapshot_commit.assert_called_once_with(
-            expected_spmd_dir, {0: {"state": 1}}
+        mock_op1.commit_checkpoint_artifacts.assert_called_once_with(
+            {0: {"state": 1}}, expected_context
         )
+
+
+@pytest.mark.asyncio
+async def test_prepare_checkpoint_aborts_prepared_local_participants():
+    worker_cls = _worker_cls()
+    owner1 = type("PrepareOwner1", (), {})
+    owner2 = type("PrepareOwner2", (), {})
+    config = single_spmd_config(
+        name="snapshot-prepare-abort",
+        spmd_id="test_spmd",
+        mesh=DeviceMesh(("data",), (1,)),
+        operators={
+            "op1": OperatorSpec(name="op1", owner=owner1, method_name="op1"),
+            "op2": OperatorSpec(name="op2", owner=owner2, method_name="op2"),
+        },
+    )
+    worker = worker_cls(
+        config=config,
+        rank=0,
+        spmd_id="test_spmd",
+        driver_handle=MagicMock(),
+        checkpoint_backend=MagicMock(),
+    )
+    worker._op_manager = MagicMock()
+    prepared = MagicMock(
+        spec=["prepare_checkpoint_artifacts", "abort_checkpoint_artifacts"]
+    )
+    failing = MagicMock(
+        spec=["prepare_checkpoint_artifacts", "abort_checkpoint_artifacts"]
+    )
+    failing.prepare_checkpoint_artifacts.side_effect = RuntimeError("prepare failed")
+
+    from unittest.mock import patch
+    import fluxway.spmd.worker.worker as worker_module
+
+    with patch.object(worker_module, "get_instance_storage") as storage:
+        lock = MagicMock()
+        lock.__enter__ = MagicMock(return_value=None)
+        lock.__exit__ = MagicMock(return_value=None)
+        storage.return_value = ({id(owner1): prepared, id(owner2): failing}, lock)
+
+        with pytest.raises(RuntimeError, match="prepare failed"):
+            await worker.prepare_checkpoint_artifacts("/tmp/ckpt", 42)
+
+    prepared.abort_checkpoint_artifacts.assert_called_once()
+    failing.abort_checkpoint_artifacts.assert_called_once()

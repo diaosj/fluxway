@@ -10,12 +10,12 @@ exactly what they returned from save_state() — zero framework leakage.
 
 import asyncio
 import base64
-import pickle
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from etils import epath
+from ray import cloudpickle
 
 from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
 
@@ -108,7 +108,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             else:
                 local_dict[path_str] = leaf
 
-        pytree_meta_encoded = base64.b64encode(pickle.dumps(treedef)).decode("ascii")
+        pytree_meta_encoded = base64.b64encode(cloudpickle.dumps(treedef)).decode("ascii")
 
         # The canonical SPMD-level checkpoint directory for this step.  All
         # artifact sub-paths are derived from it.  Setting ckpt_dir here
@@ -153,11 +153,11 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                     else:
                         # Non-array leaves (scalars, strings, etc.)
                         with open(str(leaf_path.with_suffix(".pkl")), "wb") as f:
-                            pickle.dump(leaf, f)
+                            cloudpickle.dump(leaf, f)
 
                 # Save the pytree structure so we can reconstruct on load.
                 with open(str(tmp_path / "_local_treedef.pkl"), "wb") as f:
-                    pickle.dump(local_treedef, f)
+                    cloudpickle.dump(local_treedef, f)
 
                 # Atomic rename: tmp → final.
                 if local_final_path.exists():
@@ -200,7 +200,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
         return metadata
 
     async def load(
-        self, metadata: dict[str, Any], target_state: dict[str, Any] | None = None
+        self, metadata: dict[str, Any], restore_layout: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         import jax.tree_util as jtu
 
@@ -212,11 +212,11 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
 
             ckpt_path = epath.Path(metadata["orbax_final_path"])
 
-            # If target_state is provided, extract target_global_dict to pass as `item`.
+            # If a restore layout is provided, extract its global leaves for `item`.
             target_global_dict = None
-            if target_state is not None:
+            if restore_layout is not None:
                 target_global_dict = {}
-                leaves_with_path, _ = jtu.tree_flatten_with_path(target_state)
+                leaves_with_path, _ = jtu.tree_flatten_with_path(restore_layout)
                 for path, leaf in leaves_with_path:
                     path_str = _get_path_str(path)
                     if _is_global_leaf(leaf):
@@ -233,13 +233,13 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                         ),
                     )
                 elif target_global_dict is not None and not target_global_dict:
-                    # target_state was provided but contains no globally-sharded
+                    # restore_layout was provided but contains no globally-sharded
                     # leaves. This means the operator's model params are on
                     # SingleDeviceSharding which is a design error: all model
                     # arrays must be placed on the distributed mesh before
                     # checkpoint restore is called.
                     raise ValueError(
-                        "orbax restore: target_state was provided but yielded an "
+                        "orbax restore: restore_layout was provided but yielded an "
                         "empty target_global_dict (no globally-sharded JAX arrays "
                         "found). This indicates model params are still on "
                         "SingleDeviceSharding at restore time. Ensure model arrays "
@@ -249,7 +249,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                 else:
                     # No target state at all — cannot determine target sharding.
                     raise ValueError(
-                        f"orbax restore: no target_state provided for checkpoint "
+                        f"orbax restore: no restore_layout provided for checkpoint "
                         f"at {ckpt_path}. Cannot restore without knowing the "
                         f"expected pytree structure and sharding."
                     )
@@ -262,7 +262,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             def _read_local():
                 local_dir = Path(metadata["local_state_dir"])
                 with open(str(local_dir / "_local_treedef.pkl"), "rb") as f:
-                    local_treedef = pickle.load(f)
+                    local_treedef = cloudpickle.load(f)
                 leaves = []
                 for i in range(local_treedef.num_leaves):
                     npy_path = local_dir / f"leaf_{i}.npy"
@@ -271,7 +271,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
                         leaves.append(np.load(str(npy_path)))
                     elif pkl_path.exists():
                         with open(str(pkl_path), "rb") as f:
-                            leaves.append(pickle.load(f))
+                            leaves.append(cloudpickle.load(f))
                     else:
                         raise FileNotFoundError(f"Missing leaf {i} in {local_dir}")
                 return local_treedef.unflatten(leaves)
@@ -283,7 +283,7 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
         all_dict = {**global_dict, **local_dict}
 
         if "pytree_meta" in metadata:
-            saved_treedef = pickle.loads(base64.b64decode(metadata["pytree_meta"]))
+            saved_treedef = cloudpickle.loads(base64.b64decode(metadata["pytree_meta"]))
 
             # Reconstruct the original path sequence using a dummy unflatten
             dummy_leaves = list(range(saved_treedef.num_leaves))

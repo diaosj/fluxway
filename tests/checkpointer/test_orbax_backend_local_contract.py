@@ -7,6 +7,10 @@ import numpy as np
 import pytest
 
 
+def _orbax_user_transform(value):
+    return value * 3
+
+
 class _FakeTreeDef:
     """Minimal pytree treedef mock supporting pickle + unflatten."""
 
@@ -243,6 +247,23 @@ async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
     assert dir_rank5.exists()
     assert (dir_rank0 / "_local_treedef.pkl").exists()
     assert (dir_rank5 / "_local_treedef.pkl").exists()
+
+
+@pytest.mark.asyncio
+async def test_local_state_round_trip_preserves_user_callable(monkeypatch, tmp_path):
+    orbax_module, _, _, _ = _install_fake_orbax_runtime(monkeypatch)
+    backend = orbax_module.OrbaxBackend(force_write=True)
+    metadata = await backend.save(
+        {"transform": _orbax_user_transform, "value": 4},
+        str(tmp_path),
+        "UserSPMD",
+        rank=0,
+        step=1,
+    )
+
+    restored = await backend.load(metadata)
+
+    assert restored["transform"](restored["value"]) == 12
 
 
 @pytest.mark.asyncio

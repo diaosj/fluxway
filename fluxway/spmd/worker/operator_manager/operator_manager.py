@@ -185,6 +185,7 @@ class OperatorManager:
         local_world_size: int | None = None,
         node_rank: int = 0,
         num_nodes: int = 1,
+        control_plane_handle: Any | None = None,
     ):
         """
         Initialize OperatorManager.
@@ -210,6 +211,7 @@ class OperatorManager:
         self._local_world_size = local_world_size
         self._node_rank = node_rank
         self._num_nodes = num_nodes
+        self._control_plane_handle = control_plane_handle
 
         self._operators: dict[str, Any] = {}
         self._compiled_operators: dict[str, CompiledOperator] = {}
@@ -1104,11 +1106,14 @@ class OperatorManager:
             static_args=self._static_args,
             rank=self._rank,
             world_size=self._world_size,
+            spmd_id=self._spmd_id,
+            operator_name=op_name,
             operator_ctx=logical_ctx,
             local_rank=self._local_rank,
             local_world_size=self._local_world_size,
             node_rank=self._node_rank,
             num_nodes=self._num_nodes,
+            control_plane=self._control_plane_handle,
             ray_component_limits=self._ray_component_limits,
         ):
             yield

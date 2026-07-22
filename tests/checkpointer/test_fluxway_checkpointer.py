@@ -1,16 +1,11 @@
 """
-Unit tests for FluxwayCheckpointer manifest persistence.
+Unit tests for FluxwayCheckpointer payload persistence.
 
-Covers:
- - _persist / _load round-trip with plain dicts
- - _persist / _load with Python type objects (static_args containing dataclasses)
- - _persist / _load with callable objects
- - list_steps / latest_step / evict old checkpoints
+Covers strict pure-data payloads and checkpoint lifecycle operations.
 """
 
-from dataclasses import make_dataclass
-from typing import Any
-from unittest.mock import MagicMock
+import pickle
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -19,17 +14,6 @@ from fluxway.control_plane.checkpointer.directory import (
     CHECKPOINT_ROOT_MARKER,
     CheckpointDirectoryOwnershipError,
 )
-
-# Module-level dynamic dataclass for pickle compatibility
-DynamicBatch = make_dataclass("DynamicBatch", [("x", int), ("y", float)])
-
-
-def my_activation(x: Any) -> Any:
-    return x * 2
-
-
-def custom_fn(x: Any) -> Any:
-    return x + 42
 
 
 @pytest.fixture
@@ -68,140 +52,213 @@ def test_checkpointer_rejects_existing_unowned_directory(tmp_path):
         )
 
 
-class TestManifestPersistence:
+class TestPayloadPersistence:
     def test_persist_and_load_plain_dict(self, checkpointer, tmp_path):
-        manifest = {
+        payload = {
             "spmd_0": {
                 "spmd_state": {"completed_step_count": 3},
                 "rank_storage": {"0": {"orbax_final_path": "/ckpt/0"}},
             }
         }
-        checkpointer._persist(step=5, manifest=manifest)
+        checkpointer._persist(step=5, payload=payload)
         loaded = checkpointer._load(step=5)
-        assert loaded == manifest
+        assert loaded == payload
 
-    def test_manifest_with_type_object(self, checkpointer, tmp_path):
-        """Test that manifest containing Python type objects can be serialized."""
-        manifest = {
-            "spmd_0": {
-                "spmd_state": {
-                    "completed_step_count": 5,
-                    "static_args": {
-                        "UserBatch": DynamicBatch,
-                        "dataset_path": "/data/train",
-                        "batch_size": 64,
-                    },
-                },
-                "rank_storage": {"0": {"orbax_final_path": "/ckpt/0"}},
-            }
-        }
-        checkpointer._persist(step=10, manifest=manifest)
-        loaded = checkpointer._load(step=10)
-
-        assert loaded["spmd_0"]["spmd_state"]["completed_step_count"] == 5
-        assert (
-            loaded["spmd_0"]["spmd_state"]["static_args"]["dataset_path"]
-            == "/data/train"
-        )
-        assert loaded["spmd_0"]["spmd_state"]["static_args"]["batch_size"] == 64
-        # Verify the type object is correctly restored
-        RestoredBatch = loaded["spmd_0"]["spmd_state"]["static_args"]["UserBatch"]
-        assert RestoredBatch is DynamicBatch
-        instance = RestoredBatch(x=1, y=2.0)
-        assert instance.x == 1
-        assert instance.y == 2.0
-
-    def test_manifest_with_callable(self, checkpointer, tmp_path):
-        """Test that manifest containing callable objects can be serialized."""
-        manifest = {
-            "spmd_0": {
-                "spmd_state": {
-                    "completed_step_count": 7,
-                    "static_args": {
-                        "activation": my_activation,
-                        "scale": 1.5,
-                    },
-                },
-                "rank_storage": {"0": {"orbax_final_path": "/ckpt/0"}},
-            }
-        }
-        checkpointer._persist(step=20, manifest=manifest)
-        loaded = checkpointer._load(step=20)
-
-        restored_callable = loaded["spmd_0"]["spmd_state"]["static_args"]["activation"]
-        assert restored_callable(5) == 10
-        assert loaded["spmd_0"]["spmd_state"]["static_args"]["scale"] == 1.5
-
-    def test_manifest_with_builtin_callable(self, checkpointer, tmp_path):
-        """Test that manifest containing built-in callable can be serialized."""
-        manifest = {
-            "spmd_0": {
-                "spmd_state": {
-                    "completed_step_count": 8,
-                    "static_args": {
-                        "transform": len,
-                    },
-                },
-                "rank_storage": {"0": {"orbax_final_path": "/ckpt/0"}},
-            }
-        }
-        checkpointer._persist(step=30, manifest=manifest)
-        loaded = checkpointer._load(step=30)
-
-        restored = loaded["spmd_0"]["spmd_state"]["static_args"]["transform"]
-        assert restored([1, 2, 3]) == 3
-
-    def test_checkpoint_save_load_roundtrip(self, checkpointer, tmp_path):
-        """Test full save-load roundtrip with complex static_args."""
-        manifest = {
-            "spmd_0": {
-                "spmd_state": {
-                    "completed_step_count": 100,
-                    "static_args": {
-                        "UserBatch": DynamicBatch,
-                        "fn": custom_fn,
-                        "config": {"lr": 0.01, "epochs": 10},
-                    },
-                },
-                "rank_storage": {
-                    "0": {"orbax_final_path": "/ckpt/spmd_0/0"},
-                    "1": {"orbax_final_path": "/ckpt/spmd_0/1"},
-                },
-            },
-            "spmd_1": {
-                "spmd_state": {
-                    "completed_step_count": 100,
-                    "static_args": {
-                        "batch_size": 64,
-                    },
-                },
-                "rank_storage": {
-                    "0": {"orbax_final_path": "/ckpt/spmd_1/0"},
-                },
-            },
-        }
-        checkpointer._persist(step=50, manifest=manifest)
-        loaded = checkpointer._load(step=50)
-
-        assert loaded == manifest
-        # Ensure type object is usable
-        Batch = loaded["spmd_0"]["spmd_state"]["static_args"]["UserBatch"]
-        assert Batch is DynamicBatch
-        # Ensure callable is usable
-        fn = loaded["spmd_0"]["spmd_state"]["static_args"]["fn"]
-        assert fn(0) == 42
+    @pytest.mark.parametrize("runtime_object", [len, MagicMock])
+    def test_payload_rejects_runtime_objects(self, checkpointer, runtime_object):
+        payload = {"spmd_0": {"spmd_state": {"value": runtime_object}}}
+        with pytest.raises(TypeError, match="unsupported checkpoint state type"):
+            checkpointer._persist(step=10, payload=payload)
 
 
 class TestCheckpointLifecycle:
+    @pytest.mark.asyncio
+    async def test_save_finalizes_control_progress_after_payload_persist(
+        self, tmp_path
+    ):
+        controller = MagicMock()
+        control_state = {"control_ledger": {"durable_cuts": {}}}
+        payload = {
+            "spmd_0": {},
+            "__fluxway_control_plane__": control_state,
+        }
+        controller.request_snapshot = AsyncMock(return_value=payload)
+        controller.commit_snapshot_artifacts = AsyncMock()
+        controller.abort_snapshot_artifacts = AsyncMock()
+        controller.finalize_snapshot = AsyncMock()
+        checkpointer = FluxwayCheckpointer(
+            controller=controller,
+            ckpt_dir=str(tmp_path / "ordered"),
+            interval_steps=1,
+        )
+
+        await checkpointer.save(3)
+
+        assert checkpointer._load(3) == payload
+        controller.finalize_snapshot.assert_awaited_once_with(3, control_state)
+
+    @pytest.mark.asyncio
+    async def test_save_does_not_finalize_when_payload_persist_fails(self, tmp_path):
+        controller = MagicMock()
+        control_state = {"control_ledger": {"durable_cuts": {}}}
+        controller.request_snapshot = AsyncMock(
+            return_value={
+                "spmd_0": {"state": object()},
+                "__fluxway_control_plane__": control_state,
+            }
+        )
+        controller.commit_snapshot_artifacts = AsyncMock()
+        controller.abort_snapshot_artifacts = AsyncMock()
+        controller.finalize_snapshot = AsyncMock()
+        checkpointer = FluxwayCheckpointer(
+            controller=controller,
+            ckpt_dir=str(tmp_path / "failed"),
+            interval_steps=1,
+        )
+
+        with pytest.raises(TypeError, match="unsupported checkpoint state type"):
+            await checkpointer.save(3)
+
+        controller.finalize_snapshot.assert_not_awaited()
+        controller.commit_snapshot_artifacts.assert_not_awaited()
+        controller.abort_snapshot_artifacts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_save_preserves_primary_and_abort_failures(self, tmp_path):
+        controller = MagicMock()
+        controller.request_snapshot = AsyncMock(
+            return_value={
+                "spmd_0": {},
+                "__fluxway_control_plane__": {"control_ledger": {}},
+            }
+        )
+        controller.commit_snapshot_artifacts = AsyncMock()
+        controller.abort_snapshot_artifacts = AsyncMock(
+            side_effect=RuntimeError("abort failed")
+        )
+        controller.finalize_snapshot = AsyncMock()
+        checkpointer = FluxwayCheckpointer(
+            controller=controller,
+            ckpt_dir=str(tmp_path / "grouped-failure"),
+            interval_steps=1,
+        )
+        checkpointer._prepare = MagicMock(side_effect=ValueError("prepare failed"))
+
+        with pytest.raises(BaseExceptionGroup) as captured:
+            await checkpointer.save(3)
+
+        messages = {str(error) for error in captured.value.exceptions}
+        assert messages == {"prepare failed", "abort failed"}
+        controller.finalize_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_request_snapshot_failure_aborts_distributed_artifacts(
+        self, tmp_path
+    ):
+        controller = MagicMock()
+        controller.request_snapshot = AsyncMock(
+            side_effect=RuntimeError("driver save failed")
+        )
+        controller.abort_snapshot_artifacts = AsyncMock()
+        controller.finalize_snapshot = AsyncMock()
+        checkpointer = FluxwayCheckpointer(
+            controller=controller,
+            ckpt_dir=str(tmp_path / "request-failure"),
+            interval_steps=1,
+        )
+
+        with pytest.raises(RuntimeError, match="driver save failed"):
+            await checkpointer.save(3)
+
+        controller.abort_snapshot_artifacts.assert_awaited_once()
+        controller.finalize_snapshot.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_force_write_failure_preserves_published_checkpoint(self, tmp_path):
+        checkpoint_root = tmp_path / "overwrite"
+        controller = MagicMock()
+        checkpointer = FluxwayCheckpointer(
+            controller=controller,
+            ckpt_dir=str(checkpoint_root),
+            interval_steps=1,
+            force_write=True,
+        )
+        old_orbax = checkpoint_root / "1" / "orbax"
+        old_orbax.mkdir(parents=True)
+        (old_orbax / "value").write_text("old")
+        new_orbax = checkpoint_root / "1" / "orbax.tmp"
+        new_orbax.mkdir()
+        (new_orbax / "value").write_text("new")
+
+        payload = {
+            "spmd_0": {
+                "rank_storage": {
+                    "0": {
+                        "orbax_tmp_path": str(new_orbax),
+                        "orbax_final_path": str(old_orbax),
+                    }
+                }
+            },
+            "__fluxway_control_plane__": {"control_ledger": {}},
+        }
+        controller.request_snapshot = AsyncMock(return_value=payload)
+        controller.commit_snapshot_artifacts = AsyncMock(
+            side_effect=RuntimeError("commit failed")
+        )
+        controller.abort_snapshot_artifacts = AsyncMock()
+        controller.finalize_snapshot = AsyncMock()
+        old_payload = {
+            "spmd_0": {"version": 1},
+            "__fluxway_control_plane__": {"control_ledger": {}},
+        }
+        with open(checkpoint_root / "1" / "payload.pkl", "wb") as file:
+            pickle.dump(old_payload, file)
+
+        with pytest.raises(RuntimeError, match="commit failed"):
+            await checkpointer.save(1)
+
+        assert checkpointer._load(1) == old_payload
+        assert (old_orbax / "value").read_text() == "old"
+        controller.abort_snapshot_artifacts.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_failure_keeps_publish_and_closes_local_transaction(
+        self, tmp_path
+    ):
+        controller = MagicMock()
+        payload = {
+            "spmd_0": {},
+            "__fluxway_control_plane__": {"control_ledger": {}},
+        }
+        controller.request_snapshot = AsyncMock(return_value=payload)
+        controller.commit_snapshot_artifacts = AsyncMock()
+        controller.abort_snapshot_artifacts = AsyncMock()
+        controller.finalize_snapshot = AsyncMock(
+            side_effect=RuntimeError("finalize failed")
+        )
+        checkpointer = FluxwayCheckpointer(
+            controller=controller,
+            ckpt_dir=str(tmp_path / "finalize-failure"),
+            interval_steps=1,
+        )
+
+        with pytest.raises(RuntimeError, match="finalize failed"):
+            await checkpointer.save(1)
+
+        assert checkpointer._load(1) == payload
+        assert checkpointer._prepared_steps == {}
+        assert checkpointer._published_steps == {}
+        controller.abort_snapshot_artifacts.assert_not_awaited()
+
     def test_list_steps_and_latest_step(self, checkpointer, tmp_path):
         for step in [1, 3, 5]:
-            checkpointer._persist(step=step, manifest={"spmd_0": {}})
+            checkpointer._persist(step=step, payload={"spmd_0": {}})
 
         assert checkpointer.list_steps() == [1, 3, 5]
         assert checkpointer.latest_step() == 5
 
     def test_load_missing_step_raises(self, checkpointer):
-        with pytest.raises(FileNotFoundError, match="manifest not found"):
+        with pytest.raises(FileNotFoundError, match="payload not found"):
             checkpointer._load(step=999)
 
     @pytest.mark.asyncio
@@ -213,22 +270,22 @@ class TestCheckpointLifecycle:
     def test_evict_old_checkpoints(self, checkpointer, tmp_path):
         checkpointer._max_to_keep = 2
         for step in [1, 2, 3, 4]:
-            checkpointer._persist(step=step, manifest={"spmd_0": {}})
+            checkpointer._persist(step=step, payload={"spmd_0": {}})
 
         # Only the latest 2 should remain
         assert checkpointer.list_steps() == [3, 4]
 
     def test_force_write_overwrite_existing(self, checkpointer, tmp_path):
-        manifest_v1 = {"spmd_0": {"version": 1}}
-        manifest_v2 = {"spmd_0": {"version": 2}}
-        checkpointer._persist(step=1, manifest=manifest_v1)
+        payload_v1 = {"spmd_0": {"version": 1}}
+        payload_v2 = {"spmd_0": {"version": 2}}
+        checkpointer._persist(step=1, payload=payload_v1)
 
         # Without force_write, should raise
         with pytest.raises(FileExistsError):
-            checkpointer._persist(step=1, manifest=manifest_v2)
+            checkpointer._persist(step=1, payload=payload_v2)
 
         # With force_write, should succeed
         checkpointer._force_write = True
-        checkpointer._persist(step=1, manifest=manifest_v2)
+        checkpointer._persist(step=1, payload=payload_v2)
         loaded = checkpointer._load(step=1)
         assert loaded["spmd_0"]["version"] == 2

@@ -1,8 +1,6 @@
 """Resharding regression tests over the strict-typed ``RoutingDomain`` API.
 
-These cases used to call the legacy ``TransportPlanner.plan(src_spec=...,
-dst_spec=...)`` entry, which has been removed. The L2 planner now consumes
-a pre-built ``RoutingDomain``; resharding semantics are validated by
+The planner consumes a pre-built ``RoutingDomain``; resharding semantics are validated by
 constructing the domain through ``RoutingDomain.from_layout`` and supplying
 the per-rank ``axis_indices`` explicitly. ``IndicesSpec`` subclasses are
 mandatory — bare tensors and ``None`` are rejected at the API boundary.

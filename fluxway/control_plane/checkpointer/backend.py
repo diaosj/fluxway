@@ -49,9 +49,9 @@ class WorkerCheckpointBackend(ABC):
 
     @abstractmethod
     async def load(
-        self, metadata: dict[str, Any], target_state: dict[str, Any] | None = None
+        self, metadata: dict[str, Any], restore_layout: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Reconstruct and return the state dict described by ``metadata``."""
+        """Reconstruct state using the live restore layout when required."""
 
     @abstractmethod
     def finalize(self) -> None:

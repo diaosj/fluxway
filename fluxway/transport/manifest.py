@@ -55,6 +55,7 @@ class PayloadDType(IntEnum):
     FLOAT32 = 6
     FLOAT64 = 7
     BFLOAT16 = 8
+    BOOL = 9
 
 
 class SenderEmissionMode(IntEnum):
@@ -174,6 +175,8 @@ def _as_i64(value: int, field: str) -> int:
 
 def dtype_code(dtype: Any) -> int:
     dt = np.dtype(dtype)
+    if dt == np.dtype(np.bool_):
+        return int(PayloadDType.BOOL)
     if dt == np.dtype(np.int32):
         return int(PayloadDType.INT32)
     if dt == np.dtype(np.int64):
@@ -216,6 +219,8 @@ def dtype_from_code(code: int) -> np.dtype:
             raise TypeError(
                 "bfloat16 dtype is not available in this NumPy runtime."
             ) from exc
+    if payload_dtype is PayloadDType.BOOL:
+        return np.dtype(np.bool_)
     raise ValueError(f"Unsupported transport payload dtype code {code}.")
 
 
@@ -1064,20 +1069,6 @@ def metadata_nbytes(frame: TransportFrame) -> int:
         + frame.entry_i32.nbytes
         + frame.payload_i32.nbytes
         + frame.shape_i32.nbytes
-        + frame.global_shape_i64.nbytes
-        + frame.compact_i64.nbytes
-    )
-
-
-def legacy_metadata_nbytes_as_i64(frame: TransportFrame) -> int:
-    return (
-        (
-            frame.frame_i32.size
-            + frame.entry_i32.size
-            + frame.payload_i32.size
-            + frame.shape_i32.size
-        )
-        * np.dtype(np.int64).itemsize
         + frame.global_shape_i64.nbytes
         + frame.compact_i64.nbytes
     )
