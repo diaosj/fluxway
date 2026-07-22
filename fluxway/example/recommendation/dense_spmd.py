@@ -15,6 +15,7 @@ from fluxway.common.tensor_components import (
     fill_nested_dense_inv_with_pad,
 )
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.types import CheckpointContext
 from fluxway import ResourceProfile
 from .data_types import DPFeatures
 
@@ -391,10 +392,16 @@ class DenseSPMD:
             nnx.state(self.model),
         )
 
-    def save_state(self) -> dict:
+    def _checkpoint_state(self) -> dict:
         return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
 
-    def restore_state(self, state: dict) -> None:
+    def save_state(self, context: CheckpointContext) -> dict:
+        return self._checkpoint_state()
+
+    def checkpoint_restore_layout(self, context: CheckpointContext) -> dict:
+        return self._checkpoint_state()
+
+    def restore_state(self, state: dict, context: CheckpointContext) -> None:
         nnx.update(self.model, state["model_state"])
         self.grad_accum = state["grad_accum"]
 

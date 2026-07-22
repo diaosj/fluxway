@@ -139,10 +139,13 @@ class TestGrainReaderSharding:
         ds = MockDataSource(10)
         reader = _make_reader(ds, rank=0, world_size=2)
         assert [int(reader.next_item().features[0]) for _ in range(2)] == [0, 2]
-        state = reader.save_state()
+        from fluxway.common.types import CheckpointContext
+
+        context = CheckpointContext("/tmp/checkpoint", 1, "reader", 0, 2)
+        state = reader.save_state(context)
 
         restored = _make_reader(ds, rank=0, world_size=2)
-        restored.restore_state(state)
+        restored.restore_state(state, context)
         batch = restored.next_item()
 
         assert batch is not None

@@ -16,7 +16,6 @@ from fluxway.placement import (
     SPMDWorkerGroup,
 )
 from fluxway.control_plane.scheduler.pg_manager import PGManager
-from fluxway.spmd.driver import SPMDDriver
 from fluxway.placement.worker_group import ray_actor_options, worker_tensor_device
 
 from .test_planner import (
@@ -210,13 +209,8 @@ def test_worker_group_attestation_rejects_rank_node_mismatch() -> None:
         group.attest(("node-b", "node-a"))
 
 
-def test_recipe_worker_options_preserve_explicit_zero_accelerators() -> None:
-    driver = object.__new__(SPMDDriver.__ray_actor_class__)  # type: ignore[attr-defined]
-    driver.placement_group = object()
-    driver._runtime_env = None
-    driver.worker_resource = {"CPU": Decimal("0"), "GPU": Decimal("0")}
-
-    options = driver._build_worker_opts(0, "worker")
+def test_ray_actor_options_preserve_explicit_zero_accelerators() -> None:
+    options = ray_actor_options({"CPU": Decimal("0"), "GPU": Decimal("0")})
 
     assert options["num_cpus"] == 0
     assert options["num_gpus"] == 0

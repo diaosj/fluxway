@@ -163,7 +163,9 @@ class CreditManager:
         self._credit_epoch = 0
         self._upstream_credit_state = UpstreamCreditState((), self._credit_epoch)
         self._upstream_credit_edges_by_id: dict[str, CreditEdge] = {}
-        self._downstream_credit_edges_by_target_op: dict[str, list[CreditEdge]] = defaultdict(list)
+        self._downstream_credit_edges_by_target_op: dict[str, list[CreditEdge]] = (
+            defaultdict(list)
+        )
         self._upstream_driver_handles: dict[str, Any] = {}
         self._controller_credit_windows_by_op: dict[str, int] = {}
         self._peer_credit_hints_by_op: dict[str, int] = {}

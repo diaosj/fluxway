@@ -14,6 +14,8 @@ def _bare_manager(name: str, fn, *, coroutine_function: bool) -> OperatorManager
     manager._operator_is_coroutine_function = {name: coroutine_function}
     manager._dispatchers = {name: StandardDispatcher()}
     manager._static_args = {}
+    manager._spmd_id = "test"
+    manager._control_plane_handle = None
     manager._ray_component_limits = ResourceProfile(base={}).ray_component_limits
     manager._rank = 0
     manager._world_size = 1

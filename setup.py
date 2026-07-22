@@ -32,7 +32,7 @@ setup(
     author="Fluxway Contributors",
     python_requires=">=3.8",
     packages=find_packages(exclude=["tests", "tests.*"]),
-    install_requires=["numpy>=1.20.0", "ray>=2.0.0"],
+    install_requires=["numpy>=1.22.0, <2.5", "ray>=2.0.0"],
     extras_require={
         "dev": [
             "pytest>=7.0.0",

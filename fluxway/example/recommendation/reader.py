@@ -1,5 +1,3 @@
-import json
-import pathlib
 import numpy as np
 from typing import Any
 
@@ -7,6 +5,7 @@ from fluxway.common.decorators import spmd_source, operator, requires_worker_pro
 from fluxway.common.index_descriptor import ContinuousIndex
 from fluxway.common.operator_policy import AsyncPolicy
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.types import CheckpointContext
 from fluxway.reader import GrainReader
 from fluxway import ResourceProfile
 from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
@@ -46,6 +45,9 @@ class RecommendationReader(GrainReader):
     Produces batches of UserBatch in col-store layout (Active / Passive / Label).
     When no data_source is provided, generates a 1000-sample synthetic dataset.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
 
     def _create_data_loader(
         self,
@@ -150,7 +152,7 @@ class RecommendationReader(GrainReader):
             "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    def read(self) -> UserBatch | None:
+    async def read(self) -> UserBatch | None:
         static_args = getattr(self, "static_args", {})
         batch_size = static_args.get("batch_size", 24)
 
@@ -279,43 +281,26 @@ class RecommendationReader(GrainReader):
 
         return UserBatch(active=active, passive=passive, labels=labels)
 
-    def save_state(self, ckpt_dir: str) -> dict[str, Any]:  # type: ignore
-        shard_count = getattr(self, "world_size", 1)
-        static_args = getattr(self, "static_args", {})
-        path = pathlib.Path(ckpt_dir) / f"reader_rank_{self.rank}_of_{shard_count}.json"
-        with open(path, "w") as f:
-            json.dump(
-                {
-                    "completed_steps": getattr(self, "_completed_steps", 0),
-                    "batch_size": static_args.get("batch_size", 24),
-                },
-                f,
-            )
-        return {}
+    def save_state(self, context: CheckpointContext) -> dict[str, Any]:
+        static_args = self.static_args
+        state = {
+            "completed_steps": int(self._completed_steps),
+            "batch_size": int(static_args["batch_size"]),
+        }
+        state["mode"] = "iterator"
+        state["grain_state"] = super().save_state(context)
+        return state
 
-    def restore_state(self, state: dict[str, Any], ckpt_dir: str) -> None:  # type: ignore
-        # completed_steps is identical across all ranks, so take the max.
-        # Pair it with the saved batch_size to get the exact items-per-rank to skip,
-        # regardless of the new world_size or batch_size.
-        completed_steps = 0
-        saved_batch_size = None
-        for p in sorted(pathlib.Path(ckpt_dir).glob("reader_rank_*_of_*.json")):
-            with open(p) as f:
-                data = json.load(f)
-            steps = data.get("completed_steps", 0)
-            if steps > completed_steps:
-                completed_steps = steps
-                saved_batch_size = data.get("batch_size")
-
-        new_shard_count = getattr(self, "world_size", 1)
-        static_args = getattr(self, "static_args", {})
-        if saved_batch_size is None:
-            saved_batch_size = static_args.get("batch_size", 24)
-
-        per_rank_skip = completed_steps * saved_batch_size
-
-        self._create_data_loader(static_args, getattr(self, "rank", 0), new_shard_count)
-        for _ in range(per_rank_skip):
-            self.next_item()
-
+    def restore_state(self, state: dict[str, Any], context: CheckpointContext) -> None:
+        completed_steps = int(state["completed_steps"])
+        saved_batch_size = int(state["batch_size"])
+        if completed_steps < 0 or saved_batch_size <= 0:
+            raise ValueError("Reader checkpoint state contains invalid progress")
+        mode = state.get("mode")
+        if mode != "iterator":
+            raise ValueError(f"unsupported reader checkpoint mode: {mode!r}")
+        grain_state = state.get("grain_state")
+        if not isinstance(grain_state, dict):
+            raise ValueError("iterator checkpoint is missing grain_state")
+        super().restore_state(grain_state, context)
         self._completed_steps = completed_steps

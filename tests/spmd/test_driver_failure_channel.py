@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -50,7 +51,7 @@ def _running_fsm() -> tuple[DriverStateMachine, MagicMock]:
     return fsm, driver
 
 
-def _driver() -> tuple[object, MagicMock]:
+def _driver() -> tuple[Any, MagicMock]:
     controller = MagicMock()
     config = single_spmd_config(
         name="driver-failure-channel",
@@ -58,7 +59,7 @@ def _driver() -> tuple[object, MagicMock]:
         mesh=DeviceMesh(("worker",), (1,)),
         operators={"train": OperatorSpec(name="train")},
     )
-    driver = SPMDDriver.__ray_actor_class__(
+    driver = SPMDDriver.__ray_actor_class__(  # type: ignore[reportAttributeAccessIssue]
         spmd_id="dense",
         config=config,
         placement_group=object(),
@@ -330,12 +331,16 @@ def test_driver_initialization_timeout_is_a_named_structured_failure(
 ) -> None:
     driver, controller = _driver()
     driver.state_machine.reset()
-    driver.heartbeat_manager._init_start_time = time.time() - driver.heartbeat_manager._init_timeout - 1.0
+    driver.heartbeat_manager._init_start_time = (
+        time.time() - driver.heartbeat_manager._init_timeout - 1.0
+    )
     driver.heartbeat_manager._heartbeat_running = True
     driver.heartbeat_manager._send_heartbeat = MagicMock()
     monkeypatch.setattr(
         "fluxway.spmd.driver.heartbeat.time.sleep",
-        lambda _interval: setattr(driver.heartbeat_manager, "_heartbeat_running", False),
+        lambda _interval: setattr(
+            driver.heartbeat_manager, "_heartbeat_running", False
+        ),
     )
 
     driver.heartbeat_manager._heartbeat_loop()

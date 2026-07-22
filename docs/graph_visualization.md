@@ -16,7 +16,7 @@ The visualization extra installs `ai-edge-model-explorer`.
 ```python
 from fluxway import view_graph, visualize_graph
 
-bundle = visualize_graph(graph, "/tmp/training-graph")
+bundle = visualize_graph(graph, "./output/training-graph")
 view_graph(bundle)
 ```
 
@@ -30,7 +30,7 @@ view_graph(bundle)
 The function writes exactly one file:
 
 ```text
-/tmp/training-graph/model_explorer.json
+./output/training-graph/model_explorer.json
 ```
 
 This JSON file is a Model Explorer export artifact. Fluxway does not use it to
@@ -204,7 +204,7 @@ Bind the viewer to loopback and use SSH forwarding:
 
 ```python
 view_graph(
-    "/tmp/training-graph",
+    "./output/training-graph",
     host="127.0.0.1",
     port=8080,
     open_browser=False,
@@ -218,7 +218,7 @@ ssh -L 8080:127.0.0.1:8080 user@training-host
 The exported file can also be copied to another machine and opened directly:
 
 ```bash
-scp user@training-host:/tmp/training-graph/model_explorer.json \
+scp user@training-host:./output/training-graph/model_explorer.json \
   "$HOME/Downloads/training-graph.json"
 model-explorer "$HOME/Downloads/training-graph.json"
 ```
@@ -227,7 +227,7 @@ To compare the graph with a trace, copy the `.pftrace` file and load it with
 Perfetto:
 
 ```bash
-scp user@training-host:/tmp/recommendation-traces/run.pftrace \
+scp user@training-host:./output/recommendation-traces/run.pftrace \
   "$HOME/Downloads/run.pftrace"
 ```
 

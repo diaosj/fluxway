@@ -108,7 +108,9 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             else:
                 local_dict[path_str] = leaf
 
-        pytree_meta_encoded = base64.b64encode(cloudpickle.dumps(treedef)).decode("ascii")
+        pytree_meta_encoded = base64.b64encode(cloudpickle.dumps(treedef)).decode(
+            "ascii"
+        )
 
         # The canonical SPMD-level checkpoint directory for this step.  All
         # artifact sub-paths are derived from it.  Setting ckpt_dir here

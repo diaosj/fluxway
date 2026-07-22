@@ -49,7 +49,9 @@ except ModuleNotFoundError as exc:
         ) -> dict:
             raise NotImplementedError()
 
-        async def load(self, metadata: dict, restore_layout: dict | None = None) -> dict:
+        async def load(
+            self, metadata: dict, restore_layout: dict | None = None
+        ) -> dict:
             raise NotImplementedError()
 
         def finalize(self) -> None:

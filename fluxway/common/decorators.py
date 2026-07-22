@@ -24,9 +24,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _OperatorContextState:
     static_args: dict[str, Any] = field(default_factory=dict)
+    spmd_id: str | None = None
+    operator_name: str | None = None
     rank: int = 0
     world_size: int = 1
     ctx: Any = None
+    control_plane: Any = None
     local_rank: int | None = None
     local_world_size: int | None = None
     node_rank: int = 0
@@ -83,7 +86,10 @@ def operator_context(
     static_args: dict[str, Any],
     rank: int,
     world_size: int,
+    spmd_id: str | None = None,
+    operator_name: str | None = None,
     operator_ctx: Any | None = None,
+    control_plane: Any | None = None,
     local_rank: int | None = None,
     local_world_size: int | None = None,
     node_rank: int = 0,
@@ -105,9 +111,12 @@ def operator_context(
     )
     state = _OperatorContextState(
         static_args=static_args,
+        spmd_id=spmd_id,
+        operator_name=operator_name,
         rank=rank,
         world_size=world_size,
         ctx=operator_ctx,
+        control_plane=control_plane,
         local_rank=local_rank,
         local_world_size=local_world_size,
         node_rank=node_rank,
@@ -607,6 +616,7 @@ def operator(
     static_argument: list[str] | None = None,
     periodic_barrier: int | None = None,
     is_source: bool | None = None,
+    source: Any | None = None,
     barrier_config: Any | None = None,
     async_policy: Any | None = None,
 ) -> "Any":
@@ -632,6 +642,7 @@ def operator(
             static_argument,
             periodic_barrier,
             is_source,
+            source,
             barrier_config,
             async_policy,
         )
@@ -649,6 +660,7 @@ def operator(
             static_argument,
             periodic_barrier,
             is_source,
+            source,
             barrier_config,
             async_policy,
         )
@@ -666,6 +678,7 @@ def _create_operator_wrapper(
     static_argument,
     periodic_barrier,
     is_source,
+    source,
     barrier_config=None,
     async_policy=None,
 ):
@@ -767,6 +780,7 @@ def _create_operator_wrapper(
         owner=None,
         method_name=func.__name__,
         is_source=is_source,
+        source=source,
         async_policy=normalized_async_policy,
         input_arguments={
             ArgumentType.CONTROL.value: final_states,

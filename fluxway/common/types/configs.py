@@ -66,16 +66,6 @@ class NodeType(StrEnum):
     SPMD = "spmd"  # Normal SPMD node
 
 
-class ReaderState(StrEnum):
-    """Reader state for data reading nodes."""
-
-    INITIALIZING = "initializing"
-    READING = "reading"
-    PAUSED = "paused"  # Paused due to backpressure
-    COMPLETED = "completed"
-    ERROR = "error"
-
-
 class MailboxStatus(FluxwayBaseSchema):
     """Mailbox status for backpressure monitoring."""
 
@@ -450,6 +440,7 @@ class DriverEvent(StrEnum):
     INIT_FAILED = "init_failed"
     START = "start"
     WORKER_ERROR = "worker_error"
+    COMPONENT_ERROR = "component_error"
     BLOCK_REQUESTED = "block_requested"
     UNBLOCK_REQUESTED = "unblock_requested"
     ALL_WORKERS_COMPLETED = "all_workers_completed"

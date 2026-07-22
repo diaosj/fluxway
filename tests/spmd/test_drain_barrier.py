@@ -184,9 +184,7 @@ class TestDrainAndAllowedStepIndependence:
         sync = _make_sync(num_workers=1)
         blocked = []
         sync.set_callbacks(
-            block_worker_op=lambda rank, op, epoch: blocked.append(
-                (rank, op, epoch)
-            ),
+            block_worker_op=lambda rank, op, epoch: blocked.append((rank, op, epoch)),
             unblock_worker_op=lambda rank, op, epoch: None,
         )
 

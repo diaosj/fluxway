@@ -15,6 +15,7 @@ Supports async callbacks for Ray Actor Controller.
 """
 
 import asyncio
+import inspect
 from typing import TYPE_CHECKING
 
 from fluxway.common.types import ControllerEvent, ControllerState, ExecutionFailure
@@ -169,6 +170,11 @@ class ControllerStateMachine:
             )
 
         # Execute entry callback (outside lock to prevent deadlock)
+        notify = getattr(self._controller, "_notify_control_plane_components", None)
+        if notify is not None:
+            result = notify(next_state)
+            if inspect.isawaitable(result):
+                await result
         await self._execute_entry_callback(next_state)
 
         return True

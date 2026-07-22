@@ -21,7 +21,7 @@ import inspect
 import os
 from pathlib import Path
 from typing import Any, TypeVar
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import numpy as np
 import ray
@@ -46,6 +46,13 @@ from fluxway.control_plane.heartbeat import HeartbeatManager
 from fluxway.control_plane.flow_control import FlowControlManager
 from fluxway.control_plane.state_machine import ControllerStateMachine
 from fluxway.control_plane.async_manager import AsyncStepManager
+from fluxway.control_plane.control_ledger import ControlLedger
+from fluxway.control_plane.ledger_client import ControlRecord
+from fluxway.control_plane.components import (
+    ControlPlaneComponentRegistry,
+    driver_component_id,
+)
+from fluxway.control_plane.checkpointer.protocol import validate_checkpoint_state
 from fluxway.control_plane.errors import ExecutionFailedError
 from fluxway.common.types import CheckpointConfig
 from fluxway.common.types.drain import DrainStrategy, GraphModeDrainStrategy
@@ -201,6 +208,12 @@ class ControllerActor:
         return self.__dict__["_state_machine"]
 
     @property
+    def control_plane_components(self) -> ControlPlaneComponentRegistry:
+        if "_control_plane_components" not in self.__dict__:
+            raise AttributeError("control_plane_components")
+        return self.__dict__["_control_plane_components"]
+
+    @property
     def monitor(self) -> "Monitor":
         if "_monitor" not in self.__dict__:
             raise AttributeError("monitor")
@@ -261,6 +274,12 @@ class ControllerActor:
         )
         # snapshot_id → {expected, received, metadata, event}
         self._pending_snapshots: dict[str, Any] = {}
+        self._control_ledger = (
+            None
+            if checkpoint_config is None
+            else ControlLedger(checkpoint_config.interval_steps)
+        )
+        self._control_plane_components = ControlPlaneComponentRegistry()
 
         self._checkpoint_task: asyncio.Task | None = None
         self._last_checkpointed_step: int = 0
@@ -279,6 +298,8 @@ class ControllerActor:
         self._drain_strategy: DrainStrategy | None = None
         self._last_requested_drain_target: int = 0
         self._last_completed_drain_target: int = 0
+        self._terminal_drain_target: int | None = None
+        self._terminal_drain_dispatched_target: int | None = None
         self._drained_drivers: set = set()
         self._ready_event = asyncio.Event()
 
@@ -480,8 +501,15 @@ class ControllerActor:
             if not success:
                 raise RuntimeError("Failed to transition to RUNNING from READY")
 
+            if self._control_ledger is not None:
+                await self._schedule_terminal_drain_if_complete()
+                if not self.state_machine.is_running():
+                    return restored_step
+
             # 5. Issue initial drain
-            if getattr(self, "_issue_initial_drain", None):
+            if self._terminal_drain_target is None and getattr(
+                self, "_issue_initial_drain", None
+            ):
                 await self._issue_initial_drain()
 
             # 6. Start source operators
@@ -607,6 +635,232 @@ class ControllerActor:
                 ControllerEvent.ALL_DRIVERS_COMPLETED
             )
 
+    def _require_control_ledger(self) -> ControlLedger:
+        if self._control_ledger is None:
+            raise RuntimeError(
+                "ordered control streams require checkpoint configuration"
+            )
+        return self._control_ledger
+
+    async def append_control_records(self, records: list[dict[str, Any]]) -> None:
+        await self._require_control_ledger().append(
+            tuple(ControlRecord.from_mapping(record) for record in records)
+        )
+
+    async def try_append_control_records(self, records: list[dict[str, Any]]) -> bool:
+        return await self._require_control_ledger().try_append(
+            tuple(ControlRecord.from_mapping(record) for record in records)
+        )
+
+    async def receive_control_record(
+        self, stream_id: str, position: int
+    ) -> dict[str, Any] | None:
+        record = await self._require_control_ledger().receive(stream_id, position)
+        return None if record is None else record.to_dict()
+
+    async def close_control_stream(self, stream_id: str) -> None:
+        ledger = self._require_control_ledger()
+        await ledger.seal(stream_id)
+        await self._schedule_terminal_drain_if_complete()
+
+    async def control_stream_progress(self, stream_id: str):
+        return await self._require_control_ledger().progress(stream_id)
+
+    def _source_control_stream_bindings(self) -> dict[str, tuple[str, str]]:
+        bindings: dict[str, tuple[str, str]] = {}
+        compiled_graph = self._graph.require_compiled_graph()
+        for spmd_id in compiled_graph.spmd_ids:
+            graph_view = compiled_graph.spmd(spmd_id)
+            for operator_name in graph_view.operator_ids:
+                if graph_view.operator(operator_name).spec.source is None:
+                    continue
+                component_id = driver_component_id(spmd_id, operator_name)
+                bindings[component_id] = (spmd_id, operator_name)
+        return bindings
+
+    async def _schedule_terminal_drain_if_complete(self) -> None:
+        ledger = self._require_control_ledger()
+        bindings = self._source_control_stream_bindings()
+        target = self._terminal_target(bindings, ledger.terminal_ends)
+        if target is None:
+            return
+        self._terminal_drain_target = target
+        if not self.state_machine.is_running():
+            return
+        if self._terminal_drain_dispatched_target == target:
+            return
+        if target == 0:
+            await self.state_machine.trigger_event(
+                ControllerEvent.ALL_DRIVERS_COMPLETED
+            )
+            self._terminal_drain_dispatched_target = target
+            return
+        tasks = []
+        for spmd_id in self.spmd_manager.get_all_spmd_ids():
+            driver = self.spmd_manager.get_driver_handle(spmd_id)
+            if driver is None:
+                raise RuntimeError(
+                    f"terminal drain is missing Driver handle {spmd_id!r}"
+                )
+            tasks.append(driver.request_terminal_drain.remote(target))
+        await asyncio.gather(*tasks)
+        self._terminal_drain_dispatched_target = target
+        self._last_requested_drain_target = target
+
+    @staticmethod
+    def _terminal_target(
+        bindings: Mapping[str, tuple[str, str]],
+        terminal_ends: Mapping[str, int],
+    ) -> int | None:
+        if not bindings:
+            if terminal_ends:
+                raise ValueError(
+                    "terminal control streams exist without compiled source bindings"
+                )
+            return None
+        unknown = set(terminal_ends) - set(bindings)
+        if unknown:
+            raise ValueError(
+                f"terminal control streams are not compiled sources: {sorted(unknown)}"
+            )
+        if set(terminal_ends) != set(bindings):
+            return None
+        terminal_counts = set(terminal_ends.values())
+        if len(terminal_counts) != 1:
+            raise RuntimeError(
+                "scalar graph drain requires aligned source terminal counts: "
+                f"{dict(terminal_ends)}"
+            )
+        return terminal_counts.pop()
+
+    async def _notify_control_plane_components(self, state: ControllerState) -> None:
+        await self.control_plane_components.notify_state(state)
+
+    def control_stream_cuts(self, spmd_payload: Mapping[str, Any]) -> dict[str, int]:
+        if not isinstance(spmd_payload, Mapping):
+            raise TypeError("SPMD checkpoint payload must be a mapping")
+        ledger = self._require_control_ledger()
+        streams = set(ledger.stream_ids)
+        bindings = self._source_control_stream_bindings()
+
+        unknown = streams - set(bindings)
+        if unknown:
+            raise ValueError(
+                "control streams are not bound to compiled source operators: "
+                f"{sorted(unknown)}"
+            )
+
+        cuts: dict[str, int] = {}
+        for stream_id in ledger.stream_ids:
+            spmd_id, operator_name = bindings[stream_id]
+            try:
+                spmd_entry = spmd_payload[spmd_id]
+            except KeyError as exc:
+                raise ValueError(
+                    f"SPMD checkpoint payload is missing {spmd_id!r}"
+                ) from exc
+            if not isinstance(spmd_entry, Mapping):
+                raise TypeError(f"SPMD checkpoint entry {spmd_id!r} must be a mapping")
+            spmd_state = spmd_entry.get("spmd_state")
+            if not isinstance(spmd_state, Mapping):
+                raise ValueError(
+                    f"SPMD checkpoint entry {spmd_id!r} is missing spmd_state"
+                )
+            completed = spmd_state.get("completed_step_count")
+            if not isinstance(completed, Mapping):
+                raise ValueError(
+                    f"SPMD checkpoint state {spmd_id!r} is missing completed_step_count"
+                )
+            try:
+                cut = completed[operator_name]
+            except KeyError as exc:
+                raise ValueError(
+                    f"SPMD checkpoint state {spmd_id!r} is missing completion "
+                    f"for source operator {operator_name!r}"
+                ) from exc
+            if not isinstance(cut, int) or isinstance(cut, bool) or cut < 0:
+                raise ValueError(
+                    f"source operator completion must be a non-negative integer: "
+                    f"{spmd_id}.{operator_name}={cut!r}"
+                )
+            cuts[stream_id] = cut
+        return cuts
+
+    def checkpoint_state(self, *, cuts: Mapping[str, int]) -> dict[str, Any]:
+        """Return all control-plane progress needed by a global checkpoint."""
+        ledger = self._require_control_ledger()
+        state = {
+            "control_ledger": ledger.checkpoint_state(cuts=cuts),
+            "components": self.control_plane_components.checkpoint_state(),
+            "last_checkpointed_step": self._last_checkpointed_step,
+        }
+        validate_checkpoint_state(state)
+        return state
+
+    def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+        """Restore control-plane progress before any SPMD source is resumed."""
+        if not isinstance(state, dict):
+            raise TypeError("checkpoint control state must be a dictionary")
+        expected_fields = {
+            "control_ledger",
+            "components",
+            "last_checkpointed_step",
+        }
+        if set(state) != expected_fields:
+            raise ValueError(
+                "checkpoint control state fields do not match protocol: "
+                f"expected={sorted(expected_fields)} actual={sorted(state)}"
+            )
+        ledger_state = state.get("control_ledger")
+        if not isinstance(ledger_state, dict):
+            raise ValueError("checkpoint control state is missing control_ledger")
+        self._require_control_ledger().restore_state(ledger_state)
+        self._terminal_drain_target = self._terminal_target(
+            self._source_control_stream_bindings(),
+            self._require_control_ledger().terminal_ends,
+        )
+        components = state.get("components")
+        if not isinstance(components, Mapping):
+            raise ValueError("checkpoint control state is missing components")
+        self.control_plane_components.restore_state(components)
+        step = state.get("last_checkpointed_step")
+        if not isinstance(step, int) or isinstance(step, bool) or step < 0:
+            raise ValueError("checkpoint control state has invalid step watermark")
+        self._last_checkpointed_step = step
+
+    async def finalize_snapshot(
+        self, step: int, control_state: Mapping[str, Any]
+    ) -> None:
+        ledger_state = control_state.get("control_ledger")
+        if not isinstance(ledger_state, Mapping):
+            raise ValueError("finalized checkpoint is missing control_ledger state")
+        await self._require_control_ledger().commit_checkpoint(ledger_state)
+        self._last_checkpointed_step = step
+
+    @require_spmd_manager
+    async def commit_snapshot_artifacts(self, snapshot_id: str) -> None:
+        tasks = []
+        for spmd_id in self.spmd_manager.get_all_spmd_ids():
+            driver = self.spmd_manager.get_driver_handle(spmd_id)
+            if driver is None:
+                raise RuntimeError(
+                    f"snapshot artifact commit is missing Driver {spmd_id!r}"
+                )
+            tasks.append(driver.commit_snapshot_artifacts.remote(snapshot_id))
+        await asyncio.gather(*tasks)
+
+    @require_spmd_manager
+    async def abort_snapshot_artifacts(self, snapshot_id: str) -> None:
+        tasks = []
+        for spmd_id in self.spmd_manager.get_all_spmd_ids():
+            driver = self.spmd_manager.get_driver_handle(spmd_id)
+            if driver is None:
+                raise RuntimeError(
+                    f"snapshot artifact abort is missing Driver {spmd_id!r}"
+                )
+            tasks.append(driver.abort_snapshot_artifacts.remote(snapshot_id))
+        await asyncio.gather(*tasks)
+
     async def report_flow_control_state(self, state: FlowControlState) -> None:
         self._flow_control_manager.report_state(state)
 
@@ -706,9 +960,18 @@ class ControllerActor:
                             await self._checkpointer.save(boundary)
                 except Exception as e:
                     logger.error(f"Checkpoint save failed: {e}")
-                finally:
-                    # Always release drain and schedule the next iteration
-                    await self._resume_and_schedule_next_drain()
+                    await self.report_spmd_error(
+                        "controller",
+                        ExecutionFailure.from_exception(
+                            spmd_id="controller",
+                            rank=None,
+                            phase="CHECKPOINT",
+                            exception=e,
+                            step=boundary,
+                        ),
+                    )
+                    return
+                await self._resume_and_schedule_next_drain()
 
             self._checkpoint_task = asyncio.create_task(do_ckpt(boundary))
         else:
@@ -719,6 +982,15 @@ class ControllerActor:
     async def _resume_and_schedule_next_drain(self) -> None:
         self._last_completed_drain_target = self._last_requested_drain_target
         max_steps = getattr(self.async_step_manager._config, "max_steps", None)
+
+        if (
+            self._terminal_drain_target is not None
+            and self._last_completed_drain_target >= self._terminal_drain_target
+        ):
+            await self.state_machine.trigger_event(
+                ControllerEvent.ALL_DRIVERS_COMPLETED
+            )
+            return
 
         if max_steps is not None and self._last_completed_drain_target >= max_steps:
             logger.debug(
@@ -826,7 +1098,7 @@ class ControllerActor:
         Trigger a global snapshot and block until all Workers have persisted
         their state and all Drivers have reported metadata back.
 
-        Returns the assembled manifest directly — no polling required.
+        Returns the assembled payload directly — no polling required.
         """
         logger.info(
             f"Requesting global snapshot '{snapshot_id}' at step {target_count}"
@@ -843,7 +1115,7 @@ class ControllerActor:
             if driver is None:
                 raise RuntimeError(
                     f"request_snapshot: driver for spmd_id '{spmd_id}' not found. "
-                    f"Cannot perform partial snapshot — aborting to prevent corrupt manifest."
+                    f"Cannot perform partial snapshot — aborting to prevent corrupt payload."
                 )
             drivers[spmd_id] = driver
 
@@ -883,9 +1155,9 @@ class ControllerActor:
 
             raise RuntimeError(
                 f"Snapshot '{snapshot_id}' failed for SPMDs: {snap_info['errors']}. "
-                f"Refusing to persist incomplete manifest."
+                f"Refusing to persist incomplete payload."
             )
-        manifest = {
+        payload = {
             sid: {
                 "spmd_state": per_rank_or_state["spmd_state"],
                 "rank_storage": {
@@ -895,7 +1167,10 @@ class ControllerActor:
             }
             for sid, per_rank_or_state in snap_info["metadata"].items()
         }
-        return manifest
+        payload["__fluxway_control_plane__"] = self.checkpoint_state(
+            cuts=self.control_stream_cuts(payload)
+        )
+        return payload
 
     @require_spmd_manager
     async def receive_snapshot_metadata(
@@ -984,7 +1259,7 @@ class ControllerActor:
 
     @require_spmd_manager
     async def restore_snapshot(
-        self, snapshot_id: str, step: int, manifest: dict[str, Any]
+        self, snapshot_id: str, step: int, payload: dict[str, Any]
     ) -> None:
         """
         Restore a snapshot: each Driver loads its Workers' tensors from disk directly.
@@ -992,7 +1267,7 @@ class ControllerActor:
         Args:
             snapshot_id: Snapshot identifier for bookkeeping.
             step:        The logical step count of this snapshot.
-            manifest:    {spmd_id: {"spmd_state": {...}, "rank_storage": {str(rank): {...}}}}
+            payload:    {spmd_id: {"spmd_state": {...}, "rank_storage": {str(rank): {...}}}}
         """
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.controller_restore(
@@ -1001,15 +1276,29 @@ class ControllerActor:
                 await self._restore_snapshot_unprofiled(
                     snapshot_id,
                     step,
-                    manifest,
+                    payload,
                 )
             return
-        await self._restore_snapshot_unprofiled(snapshot_id, step, manifest)
+        await self._restore_snapshot_unprofiled(snapshot_id, step, payload)
 
     async def _restore_snapshot_unprofiled(
-        self, snapshot_id: str, step: int, manifest: dict[str, Any]
+        self, snapshot_id: str, step: int, payload: dict[str, Any]
     ) -> None:
         logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
+
+        if not isinstance(payload, dict):
+            raise TypeError("checkpoint payload must be a dictionary")
+        control_state = payload.get("__fluxway_control_plane__")
+        if not isinstance(control_state, dict):
+            raise ValueError(
+                "checkpoint payload is missing Fluxway control-plane state"
+            )
+        self.restore_checkpoint_state(control_state)
+        payload = {
+            spmd_id: entry
+            for spmd_id, entry in payload.items()
+            if spmd_id != "__fluxway_control_plane__"
+        }
 
         if self.heartbeat_manager is not None:
             logger.debug(
@@ -1031,13 +1320,22 @@ class ControllerActor:
         self._last_checkpointed_step = step
         self._last_requested_drain_target = step
 
-        self.state_manager.save_snapshot(snapshot_id, manifest)
+        self.state_manager.save_snapshot(snapshot_id, payload)
 
         # Hydrate Control Plane step watermarks from spmd_state before unblocking.
         flow_control_updates: dict[str, tuple[Any, ...]] = {}
-        for spmd_id, spmd_entry in manifest.items():
-            spmd_state = spmd_entry.get("spmd_state", {})
-            for op_name, count in spmd_state.get("completed_step_count", {}).items():
+        for spmd_id, spmd_entry in payload.items():
+            if not isinstance(spmd_entry, Mapping):
+                raise TypeError(f"checkpoint entry {spmd_id!r} must be a mapping")
+            spmd_state = spmd_entry.get("spmd_state")
+            if not isinstance(spmd_state, Mapping):
+                raise ValueError(f"checkpoint entry {spmd_id!r} is missing spmd_state")
+            completed = spmd_state.get("completed_step_count")
+            if not isinstance(completed, Mapping):
+                raise ValueError(
+                    f"checkpoint SPMD state {spmd_id!r} is missing completed_step_count"
+                )
+            for op_name, count in completed.items():
                 self.async_step_manager.report_op_completed(spmd_id, op_name, count)
                 flow_control_updates.update(
                     self._flow_control_manager.observe_op_completed(
@@ -1048,9 +1346,14 @@ class ControllerActor:
 
         await self.block_all_spmds()
 
+        terminal_boundary_restored = (
+            self._terminal_drain_target is not None
+            and step >= self._terminal_drain_target
+        )
+        restore_completed = False
         try:
             restore_tasks = []
-            for spmd_id, spmd_entry in manifest.items():
+            for spmd_id, spmd_entry in payload.items():
                 driver = self.spmd_manager.get_driver_handle(spmd_id)
                 if driver is None:
                     raise RuntimeError(
@@ -1058,16 +1361,24 @@ class ControllerActor:
                         f"Cannot perform partial restore — aborting to prevent split-brain."
                     )
                 spmd_state = spmd_entry["spmd_state"]
-                rank_storage = {
-                    int(k): v for k, v in spmd_entry.get("rank_storage", {}).items()
-                }
+                serialized_rank_storage = spmd_entry.get("rank_storage")
+                if not isinstance(serialized_rank_storage, Mapping):
+                    raise ValueError(
+                        f"checkpoint entry {spmd_id!r} is missing rank_storage"
+                    )
+                rank_storage = {int(k): v for k, v in serialized_rank_storage.items()}
                 restore_tasks.append(
-                    driver.restore_from_disk.remote(spmd_state, rank_storage)
+                    driver.restore_from_disk.remote(spmd_state, rank_storage, step)
                 )
             if restore_tasks:
                 await asyncio.gather(*restore_tasks)
+            restore_completed = True
         finally:
-            await self.unblock_all_spmds()
+            if not restore_completed or not terminal_boundary_restored:
+                await self.unblock_all_spmds()
+
+        if terminal_boundary_restored:
+            await self._resume_and_schedule_next_drain()
 
         logger.info("Snapshot restored successfully")
 

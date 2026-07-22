@@ -185,6 +185,41 @@ def test_bind_spmd_as_source():
     assert meta.is_source is True
 
 
+def test_bind_spmd_source_descriptor_is_validated_with_source_trait():
+    class Descriptor:
+        def build_component(self, context):
+            raise AssertionError("descriptor construction is a Driver responsibility")
+
+    BoundCls = bind_spmd(
+        PlainBusinessClass,
+        resource_profile=ResourceProfile(base={"CPU": 1}),
+        mesh_axis_names=("worker",),
+        mesh_axis_shapes=(2,),
+        is_source=True,
+        interleaved=True,
+        interleave_unit_size=1,
+        step={"source": Descriptor()},
+    )
+
+    spec = BoundCls.get_spmd_config().operator_specs["step"]
+    assert spec.is_source is True
+    assert spec.is_interleaved is True
+    assert spec.interleave_unit_size == 1
+    assert isinstance(spec.source, Descriptor)
+
+
+def test_bind_spmd_rejects_source_trait_conflict():
+    with pytest.raises(ValueError, match="cannot set is_source=False"):
+        bind_spmd(
+            PlainBusinessClass,
+            resource_profile=ResourceProfile(base={"CPU": 1}),
+            mesh_axis_names=("worker",),
+            mesh_axis_shapes=(1,),
+            is_source=True,
+            step={"is_source": False},
+        )
+
+
 def test_bind_spmd_raises_on_missing_method():
     with pytest.raises(ValueError, match="method not found"):
         bind_spmd(

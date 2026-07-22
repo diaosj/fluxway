@@ -9,6 +9,8 @@ from fluxway.common.types.drain import DrainStrategy
 from fluxway.common.decorators import operator, spmd
 from fluxway.control_plane import ExecutionFailedError
 from fluxway.control_plane.controller import ControllerActor
+from fluxway.control_plane.control_ledger import ControlLedger
+from fluxway.control_plane.ledger_client import ControlRecord
 from fluxway.control_plane.graph.builder import Builder
 from fluxway.resources import ResourceProfile
 
@@ -77,6 +79,19 @@ def controller(mock_spmd_manager):
     return ctrl
 
 
+def test_whole_job_terminal_rejects_divergent_source_clocks() -> None:
+    bindings = {
+        "source_a:read": ("source_a", "read"),
+        "source_b:read": ("source_b", "read"),
+    }
+
+    with pytest.raises(RuntimeError, match="aligned source terminal counts"):
+        ControllerActor.__ray_metadata__.modified_class._terminal_target(
+            bindings,
+            {"source_a:read": 3, "source_b:read": 5},
+        )
+
+
 @pytest.mark.asyncio
 async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
     controller._last_requested_drain_target = 0
@@ -106,12 +121,165 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
 
 
 @pytest.mark.asyncio
+async def test_terminal_control_stream_reuses_driver_drain(
+    controller, mock_spmd_manager
+):
+    ledger = ControlLedger(4)
+    await ledger.append(
+        tuple(
+            ControlRecord(
+                stream_id="op1:read",
+                position=position,
+                payload={"batch": position},
+            )
+            for position in range(3)
+        )
+    )
+    controller._control_ledger = ledger
+    controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
+    controller._state_machine._state = ControllerState.RUNNING
+
+    await controller.close_control_stream("op1:read")
+
+    assert controller._terminal_drain_target == 3
+    assert controller._last_requested_drain_target == 3
+    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_called_once_with(
+        3
+    )
+    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
+        3
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_control_stream_defers_driver_rpc_until_running(
+    controller, mock_spmd_manager
+):
+    ledger = ControlLedger(4)
+    await ledger.append(
+        tuple(
+            ControlRecord(
+                stream_id="op1:read",
+                position=position,
+                payload={"batch": position},
+            )
+            for position in range(3)
+        )
+    )
+    controller._control_ledger = ledger
+    controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
+    controller._state_machine._state = ControllerState.READY
+
+    await controller.close_control_stream("op1:read")
+
+    assert controller._terminal_drain_target == 3
+    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_not_called()
+    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_not_called()
+
+    controller._state_machine._state = ControllerState.RUNNING
+    await controller._schedule_terminal_drain_if_complete()
+
+    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_called_once_with(
+        3
+    )
+    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
+        3
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_dispatches_latched_terminal_without_periodic_drain(controller):
+    events = []
+    controller.initialize = AsyncMock()
+    controller._ready_event.set()
+    controller._state_machine._state = ControllerState.READY
+    controller._control_ledger = MagicMock()
+
+    async def schedule_terminal():
+        assert controller._state_machine.state is ControllerState.RUNNING
+        controller._terminal_drain_target = 3
+        events.append("terminal")
+
+    async def start_sources():
+        events.append("sources")
+
+    controller._schedule_terminal_drain_if_complete = AsyncMock(
+        side_effect=schedule_terminal
+    )
+    controller._issue_initial_drain = AsyncMock()
+    controller.start_source_operators = AsyncMock(side_effect=start_sources)
+
+    assert await controller.start() is None
+
+    assert events == ["terminal", "sources"]
+    controller._issue_initial_drain.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_start_without_checkpoint_skips_terminal_ledger(controller):
+    controller.initialize = AsyncMock()
+    controller._ready_event.set()
+    controller._state_machine._state = ControllerState.READY
+    controller._control_ledger = None
+    controller._issue_initial_drain = AsyncMock()
+    controller.start_source_operators = AsyncMock()
+    controller._schedule_terminal_drain_if_complete = AsyncMock()
+
+    assert await controller.start() is None
+
+    controller._schedule_terminal_drain_if_complete.assert_not_awaited()
+    controller._issue_initial_drain.assert_awaited_once_with()
+    controller.start_source_operators.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_zero_terminal_target_completes_without_starting_sources(controller):
+    controller.initialize = AsyncMock()
+    controller._ready_event.set()
+    controller._state_machine._state = ControllerState.READY
+    controller._control_ledger = MagicMock()
+    controller._issue_initial_drain = AsyncMock()
+    controller.start_source_operators = AsyncMock()
+
+    async def complete_terminal():
+        controller._terminal_drain_target = 0
+        controller._state_machine._state = ControllerState.COMPLETED
+
+    controller._schedule_terminal_drain_if_complete = AsyncMock(
+        side_effect=complete_terminal
+    )
+
+    assert await controller.start() is None
+
+    controller._issue_initial_drain.assert_not_awaited()
+    controller.start_source_operators.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_stop_checkpointer_skips_self_await(controller):
     controller._checkpoint_task = asyncio.current_task()
 
     await controller.stop_checkpointer()
 
     assert controller._checkpoint_task is None
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_failure_enters_failed_without_resuming(controller):
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._last_requested_drain_target = 2
+    controller._checkpointer.save.side_effect = RuntimeError("storage unavailable")
+    controller._finalize_runtime = AsyncMock()
+    controller._resume_and_schedule_next_drain = AsyncMock()
+
+    await controller._on_all_drivers_drained()
+    await controller._checkpoint_task
+
+    assert controller._state_machine.state is ControllerState.FAILED
+    controller._resume_and_schedule_next_drain.assert_not_awaited()
+    failure = controller._state_machine.get_failures()["controller"]
+    assert failure.phase == "CHECKPOINT"
+    assert failure.step == 2
 
 
 @pytest.mark.asyncio
@@ -484,7 +652,12 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
     controller.block_all_spmds = AsyncMock()
     controller.unblock_all_spmds = AsyncMock()
 
-    spmd_state = {"completed_step_count": {}, "static_args": {}}
+    spmd_state = {
+        "completed_step_count": {},
+        "static_args": {},
+        "driver_components": {},
+    }
+    controller._control_ledger = ControlLedger(1)
     manifest = {
         "op1": {
             "spmd_state": spmd_state,
@@ -493,6 +666,11 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
         "op2": {
             "spmd_state": spmd_state,
             "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
+        },
+        "__fluxway_control_plane__": {
+            "control_ledger": controller._control_ledger.checkpoint_state(cuts={}),
+            "components": {},
+            "last_checkpointed_step": 0,
         },
     }
 
@@ -514,8 +692,65 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
 
     controller.block_all_spmds.assert_awaited_once_with()
     mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_called_once_with(
-        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}
+        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}, 10
     )
     mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_called_once_with(
-        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}
+        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}, 10
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_restore_uses_existing_completion_path(
+    controller, mock_spmd_manager
+):
+    terminal_ledger = ControlLedger(4)
+    records = tuple(
+        ControlRecord(
+            stream_id="op1:read",
+            position=position,
+            payload={"batch": position},
+        )
+        for position in range(3)
+    )
+    await terminal_ledger.append(records)
+    for position in range(3):
+        await terminal_ledger.receive("op1:read", position)
+    await terminal_ledger.seal("op1:read")
+    terminal_state = terminal_ledger.checkpoint_state(cuts={"op1:read": 3})
+
+    controller._control_ledger = ControlLedger(4)
+    controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
+    controller._heartbeat_manager = MagicMock()
+    controller._heartbeat_manager.wait_until_all_drivers_ready = AsyncMock(
+        return_value=True
+    )
+    controller._state_manager = MagicMock()
+    controller._async_step_manager = MagicMock()
+    controller._flow_control_manager = MagicMock()
+    controller._flow_control_manager.observe_op_completed.return_value = {}
+    controller._apply_flow_control_windows = AsyncMock()
+    controller.block_all_spmds = AsyncMock()
+    controller.unblock_all_spmds = AsyncMock()
+    controller._resume_and_schedule_next_drain = AsyncMock()
+    spmd_state = {
+        "completed_step_count": {"read": 3},
+        "static_args": {},
+        "driver_components": {},
+    }
+    manifest = {
+        spmd_id: {
+            "spmd_state": spmd_state,
+            "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
+        }
+        for spmd_id in ("op1", "op2")
+    }
+    manifest["__fluxway_control_plane__"] = {
+        "control_ledger": terminal_state,
+        "components": {},
+        "last_checkpointed_step": 3,
+    }
+
+    await controller.restore_snapshot("restore_terminal", 3, manifest)
+
+    controller.unblock_all_spmds.assert_not_awaited()
+    controller._resume_and_schedule_next_drain.assert_awaited_once_with()

@@ -29,7 +29,6 @@ from .configs import (
     DriverHeartbeat,
     FlowControlState,
     HeartbeatConfig,
-    ReaderState,
     MailboxStatus,
     # Step/Lock Types
     AsyncStepConfig,
@@ -65,7 +64,14 @@ from .tensor import TransportTensor
 from .failure import ExecutionFailure
 
 # Operator interfaces
-from .operator import StatefulOperatorProtocol
+from .operator import (
+    CheckpointContext,
+    CheckpointArtifactCommitter,
+    CheckpointArtifactPreparer,
+    CheckpointMetadataProvider,
+    CheckpointParticipant,
+    CheckpointRestoreLayoutProvider,
+)
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.compiled_graph import DependencySpec
 
@@ -93,7 +99,6 @@ __all__ = [
     "DriverHeartbeat",
     "FlowControlState",
     "HeartbeatConfig",
-    "ReaderState",
     "MailboxStatus",
     "AsyncStepConfig",
     "SPMDOpStep",
@@ -117,6 +122,11 @@ __all__ = [
     "PhysicalLayout",
     "TransportTensor",
     "ExecutionFailure",
-    "StatefulOperatorProtocol",
+    "CheckpointParticipant",
+    "CheckpointContext",
+    "CheckpointArtifactPreparer",
+    "CheckpointMetadataProvider",
+    "CheckpointArtifactCommitter",
+    "CheckpointRestoreLayoutProvider",
     "OperatorSpec",
 ]

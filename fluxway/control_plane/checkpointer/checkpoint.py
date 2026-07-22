@@ -197,7 +197,9 @@ class FluxwayCheckpointer:
         payload_path = step_dir / "payload.pkl"
 
         if step in self._prepared_steps or step in self._published_steps:
-            raise RuntimeError(f"checkpoint step {step} already has an active transaction")
+            raise RuntimeError(
+                f"checkpoint step {step} already has an active transaction"
+            )
         planned_paths: list[tuple[Path, Path, Path | None]] = []
         renamed_paths: set[str] = set()
         for spmd_entry in payload.values():

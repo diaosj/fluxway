@@ -99,6 +99,21 @@ placement 内部分为六个单向职责层：`mathematics.py` 定义 frozen AST
 
 driver 不执行用户算子，也不构造 transport frame。worker 错误由 driver 上报，整作业失败清理由 Controller 负责。
 
+### Driver Components And Source Coordination
+
+Controller 和每个 SPMD Driver 分别承载 `ControlPlaneComponentRegistry` 与
+`DriverComponentRegistry`，两个宿主复用同一个内部 `ControlPlaneComponent` 协议。
+组件通过 `on_state(state)` 响应宿主的生命周期 FSM 转换（Controller 对应 `ControllerState`，
+Driver 对应 `DriverState`），并通过 `checkpoint_state()` 与 `restore_state()` 统一参与控制面状态快照与容错恢复。
+source descriptor 只存在于 compiled `OperatorSpec`；source coordinator 由对应 Driver 构造并复用
+`DriverState`、drain 和 snapshot，不建立第二套 source lifecycle 或 barrier。
+
+全局 `ControlLedger` 只实现 opaque ordered metadata retention、等待式共享读取、durable
+checkpoint cut、terminal 和 replay。持久 identity 只有
+`(stream_id, position)`；virtual owner 由当前 operator step 与 interleave topology 推导。
+ledger 本身不包含 virtual unit、source revision、文件 lineage 或 executor lane 语义。完整协议与 exactly-once 不变量见
+[Source Coordination](source_coordination.md)。
+
 ## Worker Scheduler
 
 `SPMDWorker` 是 Ray async actor。它只负责：
@@ -218,6 +233,11 @@ frame、mailbox polling 或逐 tensor 分支；future eager 复用同一控制�
 
 checkpoint、heartbeat、driver report 只读取 contiguous committed watermark。
 
+checkpoint artifact 使用嵌套 transaction：Worker 负责本地 participant rollback，Driver 负责
+rank save rollback，Controller-side checkpointer 负责所有 SPMD artifact 与 payload 的全局
+prepare/commit/abort。payload 原子发布后才 finalize control-plane durable cut；abort 失败与原始
+失败通过异常组同时保留。terminal checkpoint 恢复后复用现有 drain completion，不增加 source gate。
+
 ## Profiler Semantics
 
 local-step span 和 data-plane span 分层显示：
@@ -277,7 +297,7 @@ worker 可以拆成本地流水阶段：
 
 ## Dense Split Performance Notes
 
-2026-07-09 的 Dense split trace 和 `/tmp` probe 给出两个当前热点：
+2026-07-09 的 Dense split trace 和性能探针（Probe）分析给出两个当前热点：
 
 - `update` 的 Python flat split/slice/unflatten/add 路径约 350ms；改成预编译
   JAX accumulator 后，独立 `_update_impl` probe 为 14.5ms mean，trace 中

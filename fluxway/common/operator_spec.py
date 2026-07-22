@@ -58,6 +58,7 @@ class OperatorSpec(BaseModel):
     method_name: str = Field(default="", min_length=1)
     requires_worker_process: bool = False
     is_source: bool | None = None
+    source: Any | None = None
     is_interleaved: bool = False
     interleave_unit_size: int = Field(default=1, gt=0)
     async_policy: AsyncPolicy = Field(default_factory=AsyncPolicy.sync)
@@ -143,6 +144,18 @@ class OperatorSpec(BaseModel):
 
     def model_post_init(self, __context: Any) -> None:
         object.__setattr__(self, "_runtime_policy", self.async_policy.compile())
+
+    @model_validator(mode="after")
+    def validate_source_descriptor(self) -> OperatorSpec:
+        if self.source is None:
+            return self
+        if self.is_source is not True:
+            raise ValueError("operator source descriptor requires is_source=True")
+        if not callable(getattr(self.source, "build_component", None)):
+            raise TypeError(
+                "operator source descriptor must implement build_component(context)"
+            )
+        return self
 
     @property
     def runtime_policy(self) -> CompiledAsyncPolicy:

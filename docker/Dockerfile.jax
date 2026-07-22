@@ -59,6 +59,7 @@ RUN pip install --default-timeout=1000 --no-cache-dir \
     rich \
     s3fs \
     scikit-learn \
+    tyro \
     vortex-data \
     fastparquet
 

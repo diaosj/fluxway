@@ -382,7 +382,7 @@ class NestedSparseLayout:
 
 
 def row_partition_sparse_feature(
-    field_name: str, tensor: Any, dtype: Any = np.uint64
+    field_name: str, tensor: Any, dtype: Any = None
 ) -> NestedSparseLayout:
     from fluxway.common.types.tensor import TransportTensor
 

@@ -138,9 +138,7 @@ def test_component_is_quiesced_before_driver_reports_drained() -> None:
 
 def test_snapshot_envelope_contains_driver_component_state(tmp_path) -> None:
     events = []
-    orchestrator, controller, _ = _orchestrator(
-        events, state=DriverState.SNAPSHOTTING
-    )
+    orchestrator, controller, _ = _orchestrator(events, state=DriverState.SNAPSHOTTING)
     orchestrator._pending_snapshot_id = "snapshot"
     orchestrator._pending_target_step_count = 5
     orchestrator._pending_ckpt_dir = str(tmp_path)
@@ -189,9 +187,7 @@ def test_driver_component_restore_rejects_missing_state() -> None:
 
 
 @pytest.mark.parametrize("phase", ["prepare", "save"])
-def test_driver_aborts_artifacts_when_worker_persistence_fails(
-    tmp_path, phase
-) -> None:
+def test_driver_aborts_artifacts_when_worker_persistence_fails(tmp_path, phase) -> None:
     events = []
     orchestrator, _, _ = _orchestrator(events, state=DriverState.SNAPSHOTTING)
     orchestrator._pending_snapshot_id = "snapshot"

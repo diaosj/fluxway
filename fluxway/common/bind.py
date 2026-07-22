@@ -107,7 +107,14 @@ def bind_spmd(
         elif hasattr(original_method, "__func__"):
             raw_func = original_method.__func__
 
-        decorated = operator(name=op_name, **op_cfg)(raw_func)
+        effective_op_config = dict(op_cfg)
+        if is_source:
+            if effective_op_config.get("is_source") is False:
+                raise ValueError(
+                    f"Source SPMD operator {op_name!r} cannot set is_source=False"
+                )
+            effective_op_config["is_source"] = True
+        decorated = operator(name=op_name, **effective_op_config)(raw_func)
         setattr(dynamic_cls, op_name, decorated)
 
     if is_source:

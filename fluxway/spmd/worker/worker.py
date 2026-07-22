@@ -1895,7 +1895,7 @@ class SPMDWorker:
             return 0
         priorities = policy.lane_priorities
         if lane in priorities:
-            return int(priorities[lane])
+            return priorities[lane]
         lane_order = policy.lane_ordering
         if not lane_order:
             return 0
@@ -1944,7 +1944,7 @@ class SPMDWorker:
             committed,
             default=self._completed_step_count.get(op_name, 0),
         )
-        return step - slowest_committed >= int(max_async_lag)
+        return step - slowest_committed >= max_async_lag
 
     def _operator_send_context(self, op_name: str) -> _OperatorSendContext:
         cached = self._operator_send_context_cache.get(op_name)
@@ -2550,7 +2550,7 @@ class SPMDWorker:
         own_completed = self._completed_step_count.get(op_name, 0)
         if own_completed <= slowest_completed:
             return False
-        return step - slowest_completed > int(max_async_lag)
+        return step - slowest_completed > max_async_lag
 
     async def _release_async_lag_steps(self) -> None:
         for op_name in self._bounded_async_ops():
@@ -5501,9 +5501,7 @@ class SPMDWorker:
     ) -> None:
         self._call_operator_restore_state(operator_states, context)
 
-    def _call_operator_save_state(
-        self, context: CheckpointContext
-    ) -> dict[str, Any]:
+    def _call_operator_save_state(self, context: CheckpointContext) -> dict[str, Any]:
         """Call save_state() on each operator instance and collect results."""
         states: dict[str, Any] = {}
         for op_name in self._operator_instances():

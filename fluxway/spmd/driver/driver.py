@@ -1,4 +1,3 @@
-
 """
 SPMD Driver: Master controller for an SPMD instance.
 
@@ -157,7 +156,9 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             get_workers_running=lambda: self._workers_running,
             get_worker_heartbeat_times=lambda: self._worker_heartbeat_times,
             controller_handle=self.controller_handle,
-            trigger_state_event=lambda e, failure: self.state_machine.trigger(e, failure=failure),
+            trigger_state_event=lambda e, failure: self.state_machine.trigger(
+                e, failure=failure
+            ),
             receive_worker_failure=self.receive_worker_failure,
             profiler_runtime=self._profiler_runtime,
         )
@@ -200,7 +201,9 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             except Exception:
                 self_handle = None
 
-            await self.executor.start_workers(self.spmd_id, self_handle, self.controller_handle)
+            await self.executor.start_workers(
+                self.spmd_id, self_handle, self.controller_handle
+            )
 
             if checkpoint_id is not None:
                 raise NotImplementedError(
@@ -344,7 +347,9 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
     async def request_snapshot(
         self, snapshot_id: str, target_count: int, ckpt_dir: str
     ) -> None:
-        await self.snapshot_orchestrator.request_snapshot(snapshot_id, target_count, ckpt_dir)
+        await self.snapshot_orchestrator.request_snapshot(
+            snapshot_id, target_count, ckpt_dir
+        )
 
     async def resume(self) -> None:
         await self.snapshot_orchestrator.resume()
@@ -361,7 +366,9 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         rank_storage: dict[int, dict[str, Any]],
         step: int,
     ) -> None:
-        await self.snapshot_orchestrator.restore_from_disk(spmd_state, rank_storage, step)
+        await self.snapshot_orchestrator.restore_from_disk(
+            spmd_state, rank_storage, step
+        )
 
     # =====================================================================
     # Worker Heartbeat Handling

@@ -6,6 +6,7 @@ import base64
 from typing import Any
 
 from fluxway.common.decorators import spmd, operator
+from fluxway.common.types import CheckpointContext
 from fluxway.common.utils.logging import get_logger
 from fluxway.reader.base_reader import BaseReader
 
@@ -203,7 +204,7 @@ class GrainReader(BaseReader):
 
     _GRAIN_STATE_KEY = "__grain_iter_state__"
 
-    def save_state(self) -> dict[str, Any]:
+    def save_state(self, context: CheckpointContext) -> dict[str, Any]:
         """
         Return the iterator position as a framework-compatible dict.
 
@@ -217,7 +218,12 @@ class GrainReader(BaseReader):
             return {self._GRAIN_STATE_KEY: base64.b64encode(raw).decode()}
         return {}
 
-    def restore_state(self, state: dict[str, Any]) -> None:
+    def checkpoint_metadata(
+        self, saved_state: dict[str, Any], context: CheckpointContext
+    ) -> dict[str, Any]:
+        return dict(saved_state)
+
+    def restore_state(self, state: dict[str, Any], context: CheckpointContext) -> None:
         """
         Restore the iterator to a previously saved position.
 
