@@ -439,10 +439,13 @@ def test_driver_combines_controller_window_and_peer_hint_by_min():
     )
     driver.spmd_synchronizer.update_allowed_step.assert_called_once_with("produce", 5)
 
-    with pytest.raises(ValueError, match="cannot decrease"):
-        driver.apply_credit_window(
-            (CreditWindow(epoch=0, op_name="produce", allowed_step=4),)
-        )
+    driver.spmd_synchronizer.update_allowed_step.reset_mock()
+    driver.apply_credit_window(
+        (CreditWindow(epoch=0, op_name="produce", allowed_step=4),)
+    )
+    driver.spmd_synchronizer.update_allowed_step.assert_not_called()
+    assert driver.credit_manager._controller_credit_windows_by_op == {"produce": 5}
+
     with pytest.raises(ValueError, match="epoch mismatch"):
         driver.apply_credit_window(
             (CreditWindow(epoch=1, op_name="produce", allowed_step=6),)

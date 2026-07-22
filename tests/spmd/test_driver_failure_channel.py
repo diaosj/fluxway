@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -134,6 +135,44 @@ def test_driver_receive_worker_failure_reports_the_same_structured_fact() -> Non
     controller.report_spmd_error.remote.assert_called_once_with("dense", failure)
 
 
+@pytest.mark.asyncio
+async def test_worker_failure_notifies_registered_driver_components() -> None:
+    driver, _ = _driver()
+    component = MagicMock()
+    component.component_id = "dense:train"
+    component.on_state = AsyncMock()
+    component.checkpoint_state.return_value = {}
+    driver.driver_components.register(component)
+
+    driver.receive_worker_failure(0, _failure())
+    await driver._wait_for_driver_component_notifications()
+
+    component.on_state.assert_awaited_once_with(DriverState.ERROR)
+
+
+@pytest.mark.asyncio
+async def test_driver_retains_error_component_task_until_lifecycle_join() -> None:
+    driver, _ = _driver()
+    release = asyncio.Event()
+    component = MagicMock()
+    component.component_id = "dense:train"
+
+    async def on_state(state):
+        assert state is DriverState.ERROR
+        await release.wait()
+
+    component.on_state = on_state
+    component.checkpoint_state.return_value = {}
+    driver.driver_components.register(component)
+
+    driver.receive_worker_failure(0, _failure())
+    await asyncio.sleep(0)
+    assert len(driver._driver_component_notification_tasks) == 1
+    release.set()
+    await driver._wait_for_driver_component_notifications()
+    assert driver._driver_component_notification_tasks == set()
+
+
 def test_worker_failure_propagates_controller_report_submission_error() -> None:
     driver, controller = _driver()
     failure = _failure()
@@ -184,7 +223,7 @@ def test_driver_heartbeat_exposes_failure_only_in_error_state() -> None:
     driver, controller = _driver()
     driver._worker_heartbeat_times[0] = time.time()
 
-    driver._send_heartbeat()
+    driver.heartbeat_manager._send_heartbeat()
 
     healthy = controller.receive_driver_heartbeat.remote.call_args.args[0]
     assert healthy.status is DriverStatus.HEALTHY
@@ -192,7 +231,7 @@ def test_driver_heartbeat_exposes_failure_only_in_error_state() -> None:
 
     failure = _failure()
     driver.receive_worker_failure(0, failure)
-    driver._send_heartbeat()
+    driver.heartbeat_manager._send_heartbeat()
 
     failed = controller.receive_driver_heartbeat.remote.call_args.args[0]
     assert failed.status is DriverStatus.ERROR
@@ -202,10 +241,10 @@ def test_driver_heartbeat_exposes_failure_only_in_error_state() -> None:
 def test_running_worker_heartbeat_timeout_fails_immediately() -> None:
     driver, controller = _driver()
     driver._worker_heartbeat_times[0] = (
-        time.time() - driver._heartbeat_config.heartbeat_timeout - 1.0
+        time.time() - driver.heartbeat_manager._heartbeat_config.heartbeat_timeout - 1.0
     )
 
-    driver._send_heartbeat()
+    driver.heartbeat_manager._send_heartbeat()
 
     failure = driver.state_machine.failure
     assert failure is not None
@@ -235,10 +274,10 @@ def test_worker_heartbeat_timeout_fails_other_live_states(
         assert driver.state_machine.trigger(DriverEvent.BLOCK_REQUESTED)
     assert driver.state_machine.state is live_state
     driver._worker_heartbeat_times[0] = (
-        time.time() - driver._heartbeat_config.heartbeat_timeout - 1.0
+        time.time() - driver.heartbeat_manager._heartbeat_config.heartbeat_timeout - 1.0
     )
 
-    driver._send_heartbeat()
+    driver.heartbeat_manager._send_heartbeat()
 
     failure = driver.state_machine.failure
     assert failure is not None
@@ -252,10 +291,10 @@ def test_initializing_worker_heartbeat_age_is_governed_by_init_timeout() -> None
     driver, controller = _driver()
     driver.state_machine.reset()
     driver._worker_heartbeat_times[0] = (
-        time.time() - driver._heartbeat_config.heartbeat_timeout - 1.0
+        time.time() - driver.heartbeat_manager._heartbeat_config.heartbeat_timeout - 1.0
     )
 
-    driver._send_heartbeat()
+    driver.heartbeat_manager._send_heartbeat()
 
     assert driver.state_machine.state is DriverState.INITIALIZING
     assert driver.state_machine.failure is None
@@ -269,7 +308,7 @@ def test_initializing_worker_heartbeat_age_is_governed_by_init_timeout() -> None
 async def test_driver_initialization_exception_preserves_exception_context() -> None:
     driver, controller = _driver()
     driver.state_machine.reset()
-    driver._start_workers = AsyncMock(side_effect=RuntimeError("startup boom"))
+    driver.executor.start_workers = AsyncMock(side_effect=RuntimeError("startup boom"))
 
     with pytest.raises(RuntimeError, match="startup boom"):
         await driver.initialize()
@@ -291,15 +330,15 @@ def test_driver_initialization_timeout_is_a_named_structured_failure(
 ) -> None:
     driver, controller = _driver()
     driver.state_machine.reset()
-    driver._init_start_time = time.time() - driver._init_timeout - 1.0
-    driver._heartbeat_running = True
-    driver._send_heartbeat = MagicMock()
+    driver.heartbeat_manager._init_start_time = time.time() - driver.heartbeat_manager._init_timeout - 1.0
+    driver.heartbeat_manager._heartbeat_running = True
+    driver.heartbeat_manager._send_heartbeat = MagicMock()
     monkeypatch.setattr(
-        "fluxway.spmd.driver.driver.time.sleep",
-        lambda _interval: setattr(driver, "_heartbeat_running", False),
+        "fluxway.spmd.driver.heartbeat.time.sleep",
+        lambda _interval: setattr(driver.heartbeat_manager, "_heartbeat_running", False),
     )
 
-    driver._heartbeat_loop()
+    driver.heartbeat_manager._heartbeat_loop()
 
     failure = driver.state_machine.failure
     assert failure is not None

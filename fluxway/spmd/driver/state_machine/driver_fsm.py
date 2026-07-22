@@ -33,25 +33,32 @@ class DriverStateMachine:
         (DriverState.INITIALIZING, DriverEvent.INIT_COMPLETE): DriverState.READY,
         (DriverState.INITIALIZING, DriverEvent.INIT_FAILED): DriverState.ERROR,
         (DriverState.INITIALIZING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.INITIALIZING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.READY, DriverEvent.START): DriverState.RUNNING,
         (DriverState.READY, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.READY, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.RUNNING, DriverEvent.BLOCK_REQUESTED): DriverState.BLOCKED,
         (DriverState.RUNNING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.RUNNING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.BLOCKED, DriverEvent.UNBLOCK_REQUESTED): DriverState.RUNNING,
         (DriverState.BLOCKED, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.BLOCKED, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.RUNNING, DriverEvent.ALL_WORKERS_COMPLETED): DriverState.COMPLETED,
         (DriverState.RUNNING, DriverEvent.COMPLETE): DriverState.COMPLETED,
         # Drain → Drained → Snapshot → Running
         (DriverState.RUNNING, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
         (DriverState.DRAINING, DriverEvent.DRAIN_COMPLETE): DriverState.DRAINED,
         (DriverState.DRAINING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.DRAINING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.DRAINED, DriverEvent.SNAPSHOT_REQUESTED): DriverState.SNAPSHOTTING,
         (DriverState.DRAINED, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.DRAINED, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         # Allow resuming even if we didn't snapshot
         (DriverState.DRAINED, DriverEvent.SNAPSHOT_COMPLETE): DriverState.RUNNING,
         (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_COMPLETE): DriverState.RUNNING,
         (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_FAILED): DriverState.ERROR,
         (DriverState.SNAPSHOTTING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.SNAPSHOTTING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
     }
 
     def __init__(self, driver: "Any"):
@@ -179,6 +186,8 @@ class DriverStateMachine:
             return failure
         if event is DriverEvent.WORKER_ERROR:
             raise TypeError("WORKER_ERROR requires failure=ExecutionFailure(...).")
+        if event is DriverEvent.COMPONENT_ERROR:
+            raise TypeError("COMPONENT_ERROR requires failure=ExecutionFailure(...).")
         if event is DriverEvent.INIT_FAILED:
             return ExecutionFailure(
                 spmd_id=self._driver.spmd_id,
@@ -275,6 +284,7 @@ class DriverStateMachine:
     def _on_enter_error(self) -> None:
         """Called when entering ERROR state."""
         logger.error(f"SPMD {self._driver.spmd_id} entered ERROR state")
+        self._driver._schedule_driver_component_state(DriverState.ERROR)
         failure = self.failure
         if failure is None:
             raise RuntimeError("ERROR state requires an ExecutionFailure.")

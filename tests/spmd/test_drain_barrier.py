@@ -61,6 +61,24 @@ class TestDrainSetup:
         """Calling clear_drain when not draining must not raise."""
         sync = _make_sync()
         sync.clear_drain()
+
+    def test_shorten_drain_recomputes_existing_acknowledgements(self):
+        fired = threading.Event()
+        sync = _make_sync(num_workers=2)
+        _register_op(sync, "op_a", step=3)
+        sync.drain_to_step_count(target_count=5, on_drained=fired.set)
+
+        sync.shorten_drain_to_step_count(3)
+
+        assert fired.is_set()
+
+    def test_shorten_drain_rejects_target_extension(self):
+        sync = _make_sync(num_workers=1)
+        _register_op(sync, "op_a", step=0)
+        sync.drain_to_step_count(target_count=3, on_drained=lambda: None)
+
+        with pytest.raises(ValueError, match="only shrink"):
+            sync.shorten_drain_to_step_count(4)
         sync.clear_drain()
 
 
@@ -161,6 +179,30 @@ class TestDrainAndAllowedStepIndependence:
         sync.drain_to_step_count(target_count=5, on_drained=lambda: None)
         sync.clear_drain()
         assert sync._allowed_steps.get("op_a") == 10
+
+    def test_restore_does_not_create_credit_ceiling_for_uncontrolled_op(self):
+        sync = _make_sync(num_workers=1)
+        blocked = []
+        sync.set_callbacks(
+            block_worker_op=lambda rank, op, epoch: blocked.append(
+                (rank, op, epoch)
+            ),
+            unblock_worker_op=lambda rank, op, epoch: None,
+        )
+
+        sync.load_spmd_state({"completed_step_count": {"train_core": 2}})
+        sync.report_worker_op_completed(0, "train_core", 3)
+
+        assert "train_core" not in sync._allowed_steps
+        assert blocked == []
+
+    def test_restore_raises_existing_credit_to_restored_count(self):
+        sync = _make_sync(num_workers=1)
+        sync.update_allowed_step("controlled", 1)
+
+        sync.load_spmd_state({"completed_step_count": {"controlled": 2}})
+
+        assert sync._allowed_steps == {"controlled": 2}
 
 
 class TestWorkerDrainTarget:

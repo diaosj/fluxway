@@ -144,8 +144,8 @@ class SPMDSynchronizer:
                     self._worker_completed_count[rank][op_name] = count
                 self._spmd_completed_count[op_name] = count
                 if (
-                    op_name not in self._allowed_steps
-                    or self._allowed_steps[op_name] < count
+                    op_name in self._allowed_steps
+                    and self._allowed_steps[op_name] < count
                 ):
                     self._allowed_steps[op_name] = count
 
@@ -358,6 +358,30 @@ class SPMDSynchronizer:
 
         if drain_complete:
             on_drained()
+
+    def shorten_drain_to_step_count(self, target_count: int) -> None:
+        callback = None
+        with self._lock:
+            current = self._drain_target_count
+            if current is None:
+                raise RuntimeError("cannot shorten an inactive SPMD drain")
+            if target_count > current:
+                raise ValueError(
+                    f"drain target can only shrink: current={current} "
+                    f"requested={target_count}"
+                )
+            self._drain_target_count = target_count
+            known_ops = self._active_ops_for_drain()
+            self._drain_acked_ops = {
+                op_name
+                for op_name in known_ops
+                if self._all_workers_reached_count_internal(op_name, target_count)
+            }
+            if self._drain_acked_ops >= known_ops and known_ops:
+                callback = self._drain_on_drained
+                self._drain_on_drained = None
+        if callback is not None:
+            callback()
 
     def clear_drain(self) -> None:
         """Remove the drain target and unblock workers so training resumes."""

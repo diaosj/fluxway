@@ -154,3 +154,150 @@ def credit_topology_for_driver(
         edge for edge in all_credit_edges if edge.target_spmd_id == spmd_id
     )
     return upstream_edges, downstream_edges
+
+
+class CreditManager:
+    def __init__(self, spmd_id: str, synchronizer: Any):
+        self.spmd_id = spmd_id
+        self.synchronizer = synchronizer
+        self._credit_epoch = 0
+        self._upstream_credit_state = UpstreamCreditState((), self._credit_epoch)
+        self._upstream_credit_edges_by_id: dict[str, CreditEdge] = {}
+        self._downstream_credit_edges_by_target_op: dict[str, list[CreditEdge]] = defaultdict(list)
+        self._upstream_driver_handles: dict[str, Any] = {}
+        self._controller_credit_windows_by_op: dict[str, int] = {}
+        self._peer_credit_hints_by_op: dict[str, int] = {}
+        self._credit_sequence_by_edge_id: dict[str, int] = {}
+        self._last_sent_allowed_by_edge_id: dict[str, int] = {}
+
+    def get_credit_epoch(self) -> int:
+        return self._credit_epoch
+
+    def register_credit_topology(
+        self,
+        upstream_driver_handles: dict[str, Any],
+        upstream_edges: tuple[CreditEdge, ...],
+        downstream_edges: tuple[CreditEdge, ...],
+        epoch: int = 0,
+    ) -> None:
+        self._credit_epoch = epoch
+        self._upstream_driver_handles = dict(upstream_driver_handles)
+        self._upstream_credit_state = UpstreamCreditState(
+            tuple(upstream_edges), self._credit_epoch
+        )
+        self._upstream_credit_edges_by_id = {
+            edge.edge_id: edge for edge in upstream_edges
+        }
+        self._downstream_credit_edges_by_target_op = defaultdict(list)
+        self._controller_credit_windows_by_op = {}
+        self._peer_credit_hints_by_op = {}
+        self._credit_sequence_by_edge_id = {}
+        self._last_sent_allowed_by_edge_id = {}
+
+        for edge in downstream_edges:
+            handle = self._upstream_driver_handles.get(edge.source_spmd_id)
+            if handle is None:
+                raise ValueError(
+                    f"Missing upstream driver handle for credit edge {edge.edge_id!r} "
+                    f"on driver {self.spmd_id!r}."
+                )
+            self._downstream_credit_edges_by_target_op[edge.target_op].append(edge)
+            self._credit_sequence_by_edge_id[edge.edge_id] = 0
+            self._last_sent_allowed_by_edge_id[edge.edge_id] = edge.max_inflight_steps
+
+        initial_allowed_steps = self._upstream_credit_state.allowed_steps()
+        self._peer_credit_hints_by_op = dict(initial_allowed_steps)
+        self._controller_credit_windows_by_op = dict(initial_allowed_steps)
+        self._apply_effective_credit_windows(tuple(initial_allowed_steps))
+
+    def apply_credit_window(self, windows: tuple[CreditWindow, ...]) -> None:
+        changed_ops: set[str] = set()
+        for window in windows:
+            if window.epoch != self._credit_epoch:
+                raise ValueError(
+                    f"Credit window epoch mismatch for {self.spmd_id}.{window.op_name}: "
+                    f"expected={self._credit_epoch}, got={window.epoch}."
+                )
+            allowed_step = window.allowed_step
+            if allowed_step < 0:
+                raise ValueError(
+                    f"Credit window cannot be negative for {self.spmd_id}.{window.op_name}: "
+                    f"{allowed_step}."
+                )
+            if window.op_name not in self._peer_credit_hints_by_op:
+                raise ValueError(
+                    f"Driver {self.spmd_id!r} received controller credit window "
+                    f"for unknown upstream op {window.op_name!r}."
+                )
+            current = self._controller_credit_windows_by_op.get(window.op_name)
+            if current is not None and allowed_step <= current:
+                continue
+            if current != allowed_step:
+                self._controller_credit_windows_by_op[window.op_name] = allowed_step
+                changed_ops.add(window.op_name)
+        self._apply_effective_credit_windows(changed_ops)
+
+    def receive_credit_update(
+        self, downstream_id: str, edge_id: str, update: CreditUpdate
+    ) -> None:
+        edge = self._upstream_credit_edges_by_id.get(edge_id)
+        if edge is None:
+            raise ValueError(
+                f"Driver {self.spmd_id!r} received unknown credit edge {edge_id!r}."
+            )
+        if edge.target_spmd_id != downstream_id:
+            raise ValueError(
+                f"Credit edge {edge_id!r} downstream mismatch: "
+                f"expected={edge.target_spmd_id!r}, got={downstream_id!r}."
+            )
+        if self._upstream_credit_state.receive(edge_id, update):
+            self._peer_credit_hints_by_op[edge.source_op] = (
+                self._upstream_credit_state.allowed_step(edge.source_op)
+            )
+            self._apply_effective_credit_windows((edge.source_op,))
+
+    def _apply_effective_credit_windows(
+        self, op_names: tuple[str, ...] | set[str]
+    ) -> None:
+        for op_name in op_names:
+            controller_allowed = self._controller_credit_windows_by_op.get(op_name)
+            peer_allowed = self._peer_credit_hints_by_op.get(op_name)
+            if controller_allowed is None:
+                raise RuntimeError(
+                    f"Driver {self.spmd_id!r} has no controller credit window "
+                    f"for op {op_name!r}."
+                )
+            if peer_allowed is None:
+                raise RuntimeError(
+                    f"Driver {self.spmd_id!r} has no peer credit hint "
+                    f"for op {op_name!r}."
+                )
+            self.synchronizer.update_allowed_step(
+                op_name, min(controller_allowed, peer_allowed)
+            )
+
+    def send_credit_updates(self, op_name: str, completed_count: int) -> None:
+        edges = self._downstream_credit_edges_by_target_op.get(op_name, ())
+        for edge in edges:
+            allowed_step = completed_count + edge.max_inflight_steps
+            last_allowed = self._last_sent_allowed_by_edge_id[edge.edge_id]
+            if allowed_step <= last_allowed:
+                continue
+            handle = self._upstream_driver_handles.get(edge.source_spmd_id)
+            if handle is None:
+                raise ValueError(
+                    f"Missing upstream driver handle for credit edge {edge.edge_id!r} "
+                    f"on driver {self.spmd_id!r}."
+                )
+            sequence = self._credit_sequence_by_edge_id[edge.edge_id] + 1
+            self._credit_sequence_by_edge_id[edge.edge_id] = sequence
+            self._last_sent_allowed_by_edge_id[edge.edge_id] = allowed_step
+            handle.receive_credit_update.remote(
+                self.spmd_id,
+                edge.edge_id,
+                CreditUpdate(
+                    epoch=self._credit_epoch,
+                    sequence=sequence,
+                    allowed_step=allowed_step,
+                ),
+            )

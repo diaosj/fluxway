@@ -49,7 +49,7 @@ def test_compute_rank_info_single_node():
     driver = _make_driver()
     node_ids = {0: "node-a", 1: "node-a", 2: "node-a"}
 
-    assert driver._compute_rank_info(node_ids) == {
+    assert driver.executor._compute_rank_info(node_ids) == {
         0: {"local_rank": 0, "local_world_size": 3, "node_rank": 0, "num_nodes": 1},
         1: {"local_rank": 1, "local_world_size": 3, "node_rank": 0, "num_nodes": 1},
         2: {"local_rank": 2, "local_world_size": 3, "node_rank": 0, "num_nodes": 1},
@@ -60,7 +60,7 @@ def test_compute_rank_info_partial_fill_orders_node_rank_by_smallest_rank():
     driver = _make_driver()
     node_ids = {0: "node-b", 1: "node-b", 2: "node-a", 3: "node-a", 4: "node-a"}
 
-    assert driver._compute_rank_info(node_ids) == {
+    assert driver.executor._compute_rank_info(node_ids) == {
         0: {"local_rank": 0, "local_world_size": 2, "node_rank": 0, "num_nodes": 2},
         1: {"local_rank": 1, "local_world_size": 2, "node_rank": 0, "num_nodes": 2},
         2: {"local_rank": 0, "local_world_size": 3, "node_rank": 1, "num_nodes": 2},
@@ -107,8 +107,8 @@ class FakeWorker:
 @pytest.mark.asyncio
 async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
     driver = _make_driver()
-    driver.worker_bundle_indices = [0, 1, 2]
-    driver.expected_node_ids = ["node-a", "node-a", "node-b"]
+    driver.executor.worker_bundle_indices = [0, 1, 2]
+    driver.executor.expected_node_ids = ["node-a", "node-a", "node-b"]
     fake_workers = [FakeWorker("node-a"), FakeWorker("node-a"), FakeWorker("node-b")]
     worker_iter = iter(fake_workers)
 
@@ -120,16 +120,10 @@ async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
             return next(worker_iter)
 
     monkeypatch.setattr(
-        "fluxway.spmd.driver.driver.SPMDWorker",
+        "fluxway.spmd.driver.executor.ray_executor.SPMDWorker",
         _FakeActorClass(),
     )
-    monkeypatch.setattr(
-        "fluxway.spmd.driver.driver.ray.get_runtime_context",
-        lambda: type("Ctx", (), {"current_actor": object()})(),
-    )
-    monkeypatch.setattr("fluxway.spmd.driver.driver.ray.get", lambda refs: refs)
-
-    await driver._start_workers()
+    await driver.executor.start_workers(driver.spmd_id, None, driver.controller_handle)
 
     assert fake_workers[0].setup_calls == [
         {

@@ -55,17 +55,17 @@ async def test_driver_stop_waits_for_worker_shutdown():
     worker1.stop.remote = AsyncMock(return_value=None)
     worker1.set_driver_handle.remote = AsyncMock(return_value=None)
 
-    driver._worker_handles = {0: worker0, 1: worker1}
-    driver._stop_heartbeat = AsyncMock()
+    driver.executor._worker_handles = {0: worker0, 1: worker1}
+    driver.heartbeat_manager.stop = AsyncMock()
 
     await driver.stop()
 
-    driver._stop_heartbeat.assert_called_once_with()
+    driver.heartbeat_manager.stop.assert_awaited_once_with()
     worker0.stop.remote.assert_awaited_once_with()
     worker1.stop.remote.assert_awaited_once_with()
     worker0.set_driver_handle.remote.assert_awaited_once_with(None)
     worker1.set_driver_handle.remote.assert_awaited_once_with(None)
-    assert driver._worker_handles == {}
+    assert driver.executor._worker_handles == {}
 
 
 @pytest.mark.asyncio
@@ -85,15 +85,15 @@ async def test_driver_stop_propagates_worker_shutdown_failure_after_detach():
     worker = MagicMock()
     worker.stop.remote = AsyncMock(side_effect=RuntimeError("drain failed"))
     worker.set_driver_handle.remote = AsyncMock(return_value=None)
-    driver._worker_handles = {0: worker}
-    driver._stop_heartbeat = AsyncMock()
+    driver.executor._worker_handles = {0: worker}
+    driver.heartbeat_manager.stop = AsyncMock()
 
     with pytest.raises(ExceptionGroup, match="SPMD .* shutdown failed") as raised:
         await driver.stop()
 
     assert str(raised.value.exceptions[0]) == "drain failed"
     worker.set_driver_handle.remote.assert_awaited_once_with(None)
-    assert driver._worker_handles == {}
+    assert driver.executor._worker_handles == {}
 
 
 @pytest.mark.asyncio
@@ -118,8 +118,8 @@ async def test_driver_stop_reports_submission_and_detach_failures():
     healthy = MagicMock()
     healthy.stop.remote = AsyncMock(return_value=None)
     healthy.set_driver_handle.remote = AsyncMock(return_value=None)
-    driver._worker_handles = {0: failed, 1: healthy}
-    driver._stop_heartbeat = AsyncMock()
+    driver.executor._worker_handles = {0: failed, 1: healthy}
+    driver.heartbeat_manager.stop = AsyncMock()
 
     with pytest.raises(ExceptionGroup, match="SPMD .* shutdown failed") as raised:
         await driver.stop()
@@ -130,7 +130,7 @@ async def test_driver_stop_reports_submission_and_detach_failures():
     }
     healthy.stop.remote.assert_awaited_once_with()
     healthy.set_driver_handle.remote.assert_awaited_once_with(None)
-    assert driver._worker_handles == {}
+    assert driver.executor._worker_handles == {}
 
 
 @pytest.mark.asyncio
@@ -150,8 +150,8 @@ async def test_driver_stop_shuts_down_workers_when_heartbeat_stop_fails():
     worker = MagicMock()
     worker.stop.remote = AsyncMock(return_value=None)
     worker.set_driver_handle.remote = AsyncMock(return_value=None)
-    driver._worker_handles = {0: worker}
-    driver._stop_heartbeat = AsyncMock(
+    driver.executor._worker_handles = {0: worker}
+    driver.heartbeat_manager.stop = AsyncMock(
         side_effect=RuntimeError("heartbeat stop failed")
     )
 
@@ -161,7 +161,7 @@ async def test_driver_stop_shuts_down_workers_when_heartbeat_stop_fails():
     assert str(raised.value.exceptions[0]) == "heartbeat stop failed"
     worker.stop.remote.assert_awaited_once_with()
     worker.set_driver_handle.remote.assert_awaited_once_with(None)
-    assert driver._worker_handles == {}
+    assert driver.executor._worker_handles == {}
 
 
 @pytest.mark.asyncio
@@ -184,13 +184,13 @@ async def test_stop_heartbeat_joins_background_thread():
     fake_thread.is_alive.return_value = True
     fake_thread.join = join_mock
 
-    driver._heartbeat_running = True
-    driver._heartbeat_thread = fake_thread
+    driver.heartbeat_manager._heartbeat_running = True
+    driver.heartbeat_manager._heartbeat_thread = fake_thread
 
-    await driver._stop_heartbeat()
+    await driver.heartbeat_manager.stop()
 
     join_mock.assert_called_once()
-    assert driver._heartbeat_thread is None
+    assert driver.heartbeat_manager._heartbeat_thread is None
 
 
 def test_driver_ignores_worker_callbacks_while_stopping():
