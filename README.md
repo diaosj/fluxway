@@ -23,5 +23,5 @@ fluxway.view_graph(bundle)
 ```
 
 See [Computation Graph Visualization](docs/graph_visualization.md) for Model
-Explorer usage, dependency and transfer colors, potential-overlap layout,
+Explorer usage, dependency metadata, potential-overlap layout,
 remote viewing, trace correlation, and bundle semantics.

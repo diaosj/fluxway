@@ -215,23 +215,13 @@ def test_visualize_graph_projects_graph_and_compiled_graph(tmp_path):
     )
     relation_overlays = overlap_graph["tasksData"]["edgeOverlaysDataListLeftPane"][0]
     overlays = {overlay["name"]: overlay for overlay in relation_overlays["overlays"]}
-    assert set(overlays) == {
-        "Tensor dependency / cross-SPMD",
-        "Ordering dependency / worker-local",
-        "Cross-step phase / worker-local",
-    }
-    assert overlays["Tensor dependency / cross-SPMD"]["edgeColor"] == "#1967D2"
-    assert overlays["Tensor dependency / cross-SPMD"]["edgeWidth"] == 3
-    assert len(overlays["Tensor dependency / cross-SPMD"]["edges"]) == 1
-    assert overlays["Ordering dependency / worker-local"]["edgeColor"] == "#B06000"
-    assert overlays["Ordering dependency / worker-local"]["edgeWidth"] == 1
-    assert len(overlays["Ordering dependency / worker-local"]["edges"]) == 1
-    assert overlays["Cross-step phase / worker-local"]["edgeColor"] == "#007B83"
-    assert overlays["Cross-step phase / worker-local"]["edgeWidth"] == 1
-    assert len(overlays["Cross-step phase / worker-local"]["edges"]) == 1
+    assert set(overlays) == {"Cross-step phase"}
+    assert overlays["Cross-step phase"]["edgeColor"] == "#007B83"
+    assert overlays["Cross-step phase"]["edgeWidth"] == 1
+    assert len(overlays["Cross-step phase"]["edges"]) == 1
     cross_step_pairs = {
         (edge["sourceNodeId"], edge["targetNodeId"])
-        for edge in overlays["Cross-step phase / worker-local"]["edges"]
+        for edge in overlays["Cross-step phase"]["edges"]
     }
     assert cross_step_pairs.isdisjoint(
         (source, target) for source, target, _ in overlap_native_edges

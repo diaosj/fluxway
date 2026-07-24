@@ -125,6 +125,9 @@ line-ending = "auto"
 "fluxway/__init__.py" = ["I"]
 "release/*_tests/*.py" = ["I"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 
 [tool.mypy]
 python_version = "3.12"

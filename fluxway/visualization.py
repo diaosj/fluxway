@@ -29,16 +29,7 @@ _NODE_STYLES = {
     "cyclic": ("#F3E8FD", "#8430CE"),
     "isolated": ("#F1F3F4", "#5F6368"),
 }
-_RELATION_COLORS = {
-    "Tensor dependency": "#1967D2",
-    "Ordering dependency": "#B06000",
-    "Cross-step phase": "#007B83",
-}
-_RELATION_WIDTHS = {
-    "worker-local": 1,
-    "intra-SPMD": 2,
-    "cross-SPMD": 3,
-}
+_CROSS_STEP_PHASE_COLOR = "#007B83"
 _LAYOUT_NODE_SEPARATION = 36
 _LAYOUT_RANK_SEPARATION = 96
 _LAYOUT_ENTRY_SEPARATION = 24
@@ -72,13 +63,6 @@ class _CausalRelation:
     @property
     def blocks_same_step(self) -> bool:
         return bool(self.dependencies or 0 in self.phase_step_deltas)
-
-
-@dataclass(frozen=True, slots=True, order=True)
-class _RelationStyle:
-    name: str
-    color: str
-    width: int
 
 
 def visualize_graph(
@@ -594,71 +578,14 @@ def _operator_layout(
     )
 
 
-def _overlay(
-    graph_builder,
-    *,
-    style: _RelationStyle,
-    edges: list[Any],
-):
-    return graph_builder.EdgeOverlay(
-        name=style.name,
-        edgeColor=style.color,
-        edgeWidth=style.width,
-        edges=edges,
-    )
-
-
-def _relation_style(relation: _CausalRelation) -> _RelationStyle:
-    if any(dependency.transfers for dependency in relation.dependencies):
-        kind = "Tensor dependency"
-    elif relation.dependencies or 0 in relation.phase_step_deltas:
-        kind = "Ordering dependency"
-    else:
-        kind = "Cross-step phase"
-
-    if relation.source.spmd_id != relation.target.spmd_id:
-        scope = "cross-SPMD"
-    elif any(not dependency.spec.local_only for dependency in relation.dependencies):
-        scope = "intra-SPMD"
-    else:
-        scope = "worker-local"
-    return _RelationStyle(
-        name=f"{kind} / {scope}",
-        color=_RELATION_COLORS[kind],
-        width=_RELATION_WIDTHS[scope],
-    )
-
-
-def _relation_label(relation: _CausalRelation) -> str:
-    transfers = tuple(
-        transfer
-        for dependency in relation.dependencies
-        for transfer in dependency.transfers
-    )
-    values = []
-    if len(transfers) == 1:
-        values.append(transfers[0].spec.source.name)
-    elif transfers:
-        values.append(f"{len(transfers)} tensors")
-    elif relation.dependencies:
-        values.append("ordering")
-
-    if relation.phase_step_deltas:
-        deltas = ",".join(str(value) for value in relation.phase_step_deltas)
-        values.append(f"phase step_delta={deltas}")
-    if any(
-        dependency.spec.condition is not None for dependency in relation.dependencies
-    ):
-        values.append("conditional")
-    if any(
-        dependency.spec.symmetric_to is not None for dependency in relation.dependencies
-    ):
-        values.append("symmetric")
-    if not values:
+def _cross_step_phase_label(relation: _CausalRelation) -> str:
+    deltas = tuple(delta for delta in relation.phase_step_deltas if delta != 0)
+    if not deltas:
         raise ValueError(
-            f"Causal relation {relation.source!r}->{relation.target!r} has no facts."
+            f"Causal relation {relation.source!r}->{relation.target!r} "
+            "has no cross-step phase facts."
         )
-    return " | ".join(values)
+    return f"step_delta={','.join(str(delta) for delta in deltas)}"
 
 
 def _add_native_dependency_edges(
@@ -895,7 +822,7 @@ def _model_explorer_graph(
             ),
         )
 
-    relation_edges: dict[_RelationStyle, list[Any]] = {}
+    cross_step_phase_edges: list[Any] = []
     if view == "dependencies":
         connected_inputs, connected_outputs = _add_native_dependency_edges(
             graph_builder,
@@ -912,12 +839,13 @@ def _model_explorer_graph(
     elif view == "potential_overlap":
         _add_native_layout_edges(graph_builder, nodes, causal_relations)
         for relation in causal_relations:
-            style = _relation_style(relation)
-            relation_edges.setdefault(style, []).append(
+            if not any(delta != 0 for delta in relation.phase_step_deltas):
+                continue
+            cross_step_phase_edges.append(
                 graph_builder.Edge(
                     sourceNodeId=nodes[relation.source].id,
                     targetNodeId=nodes[relation.target].id,
-                    label=_relation_label(relation),
+                    label=_cross_step_phase_label(relation),
                 )
             )
     else:
@@ -959,22 +887,20 @@ def _model_explorer_graph(
                 }
 
     overlay_data = []
-    if view == "potential_overlap":
-        relation_overlays = [
-            _overlay(
-                graph_builder,
-                style=style,
-                edges=edges,
+    if view == "potential_overlap" and cross_step_phase_edges:
+        overlay_data.append(
+            graph_builder.EdgeOverlaysData(
+                name="Fluxway cross-step constraints",
+                overlays=[
+                    graph_builder.EdgeOverlay(
+                        name="Cross-step phase",
+                        edgeColor=_CROSS_STEP_PHASE_COLOR,
+                        edgeWidth=1,
+                        edges=cross_step_phase_edges,
+                    )
+                ],
             )
-            for style, edges in sorted(relation_edges.items())
-        ]
-        if relation_overlays:
-            overlay_data.append(
-                graph_builder.EdgeOverlaysData(
-                    name="Fluxway causal constraints",
-                    overlays=relation_overlays,
-                )
-            )
+        )
 
     tasks_data = graph_builder.TasksData(
         edgeOverlaysDataListLeftPane=overlay_data,

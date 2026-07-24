@@ -105,11 +105,12 @@ logical TUUID, source port, and target port. It has no overlays.
 The `Potential overlap` view contains one thin, unlabeled native layout edge
 for each same-step causal operator pair. These edges use Model Explorer's
 default ports and have no tensor metadata. The view aggregates compiled
-dependencies and phase schedule relations by ordered operator pair, then emits
-at most one colored overlay edge for each pair. Local-only, conditional,
-symmetric, multiple-transfer, and phase facts never create parallel overlays.
-Cross-step phase relations are overlay-only because they must not change the
-same-step layout rank.
+dependencies and phase schedule relations by ordered operator pair. Tensor and
+ordering dependencies do not create colored overlays because their same-step
+causality is already represented by the native layout edge and their complete
+metadata belongs to the `Dependencies` view. Only nonzero-step phase relations
+create a teal overlay. They cannot become native edges because they must not
+change the same-step layout rank.
 
 ## Visual Language
 
@@ -126,32 +127,16 @@ Operator box colors describe structural roles in the compiled dependency graph.
 The `Dependencies` view has no overlays. Its native Model Explorer edges are
 the complete dependency projection and carry all tensor port metadata.
 
-In `Potential overlap`, faint native edges provide a stable same-step layout
-skeleton. Colored overlays describe causal kinds and can be selected
-independently.
+In `Potential overlap`, faint native edges are the complete same-step causal
+layout. The only colored overlay is a nonzero-step phase constraint that cannot
+participate in that layout.
 
 | Color | Meaning |
 |---|---|
-| Blue `#1967D2` | One or more tensors move along the dependency |
-| Amber `#B06000` | Same-step ordering without a tensor payload |
-| Teal `#007B83` | Cross-step phase dependency from `AsyncPolicy` |
-
-Width independently describes execution scope.
-
-| Width | Meaning |
-|---|---|
-| 1 | Worker-local relation |
-| 2 | Same SPMD, but not worker-local |
-| 3 | Cross-SPMD relation |
-
-Width never represents tensor bytes or traffic. Dynamic tensor sizes are not
-known when the static graph is exported. Conditional and symmetric facts are
-appended to the single relation label and remain available in dependency
-metadata.
+| Teal `#007B83` | Nonzero-step phase dependency from `AsyncPolicy` |
 
 Model Explorer's edge schema supports color, width, and labels, but has no
-dashed or dotted stroke field. Fluxway therefore uses a thin amber labelled
-line for ordering-only dependencies. It does not emit unsupported JSON fields
+dashed or dotted stroke field. Fluxway does not emit unsupported JSON fields
 that the viewer would silently ignore.
 
 ## Async Scheduling Facts
