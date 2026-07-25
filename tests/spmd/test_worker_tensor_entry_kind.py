@@ -124,7 +124,7 @@ def _worker(mailbox):
     worker.spmd_id = "Target"
     worker._mailbox = mailbox
     worker._op_manager = cast(OperatorManager, FakeOpManager())
-    worker._profiler_runtime = SimpleNamespace(enabled=False)
+    worker._profiler_runtime = SimpleNamespace(enabled=False)  # type: ignore[assignment]
     assemble_plan = compile_assemble_plan(
         op_manager=worker.op_manager,
         op_name="lookup",

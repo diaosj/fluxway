@@ -357,7 +357,7 @@ def test_functional_graph_adds_zero_transfer_dependency():
         target_handle,
         condition_fn=condition,
     )
-    compiled = graph.build("ordering-only").compiled_graph
+    compiled = graph.build("ordering-only").require_compiled_graph()
     dependencies = {
         dependency.spec.source.op_id: dependency for dependency in compiled.dependencies
     }

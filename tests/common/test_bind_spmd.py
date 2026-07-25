@@ -233,7 +233,7 @@ def test_bind_spmd_raises_on_missing_method():
 
 
 def test_apply_operator_configs_override_existing():
-    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())
+    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())  # type: ignore[attr-defined]
     _apply_operator_configs(
         config,
         {
@@ -253,7 +253,7 @@ def test_apply_operator_configs_override_existing():
 
 
 def test_apply_operator_configs_register_new():
-    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())
+    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())  # type: ignore[attr-defined]
     _apply_operator_configs(
         config,
         {"new_method": {"input_sharding": {"x": {"type": "static", "axis": ["dp"]}}}},
@@ -265,7 +265,7 @@ def test_apply_operator_configs_register_new():
 
 
 def test_apply_operator_configs_raises_on_missing_method():
-    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())
+    config = copy.deepcopy(ConfigurableSPMD.get_spmd_config())  # type: ignore[attr-defined]
     with pytest.raises(ValueError, match="method not found"):
         _apply_operator_configs(
             config,

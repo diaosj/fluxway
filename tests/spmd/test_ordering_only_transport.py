@@ -168,7 +168,7 @@ def test_operator_manager_compiles_ordering_route_from_compiled_graph():
     config = graph.nodes["pipeline"].spmd_config
     manager = OperatorManager(config, rank=0, spmd_id="pipeline", static_args={})
 
-    plan = graph.compiled_graph
+    plan = graph.require_compiled_graph()
     assert plan is not None
     dependency = plan.dependencies[0]
     code = dependency.code
@@ -179,7 +179,7 @@ def test_operator_manager_compiles_ordering_route_from_compiled_graph():
 
 @pytest.mark.asyncio
 async def test_worker_receives_ordering_frames_through_existing_batch_rpc_abi():
-    raw_worker = SPMDWorker.__ray_metadata__.modified_class
+    raw_worker = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(raw_worker)
     worker.spmd_id = "target"
     worker.rank = 0

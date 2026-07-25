@@ -261,7 +261,7 @@ class TestBackendRegistry:
             async def save(self, state, ckpt_dir, spmd_id, rank, step):
                 return {}
 
-            async def load(self, metadata):
+            async def load(self, metadata: dict, restore_layout: dict | None = None):  # type: ignore[override]
                 return {}
 
             def finalize(self):
@@ -295,7 +295,7 @@ class _CapturingBackend(WorkerCheckpointBackend, backend_name="_capturing_"):
         )
         return {"_captured": True}
 
-    async def load(self, metadata):
+    async def load(self, metadata: dict, restore_layout: dict | None = None):  # type: ignore[override]
         return self.load_return
 
     def finalize(self):
@@ -326,7 +326,7 @@ class TestWorkerCheckpointContract:
         metadata = await backend.save(
             state, str(tmp_path), spmd_id="spmd_test", rank=0, step=10
         )
-        metadata["completed_step_count"] = dict(completed_step_count)
+        metadata["completed_step_count"] = dict(completed_step_count)  # type: ignore[index]
 
         assert len(backend.saved_states) == 1
         call = backend.saved_states[0]

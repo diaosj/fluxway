@@ -102,13 +102,19 @@ def test_compiled_graph_compiler_is_mode_neutral():
     assert graph_plan.spmd("target").transfer(1) is compiled_transfer
     assert compiled_dependency.source_world_size == 2
     assert compiled_dependency.target_world_size == 4
-    assert compiled_dependency.spec.condition(4) is True
-    assert compiled_dependency.spec.condition(3) is False
+    assert (
+        compiled_dependency.spec.condition is not None
+        and compiled_dependency.spec.condition(4) is True
+    )
+    assert (
+        compiled_dependency.spec.condition is not None
+        and compiled_dependency.spec.condition(3) is False
+    )
     assert graph_plan.spmd("source").outgoing == (compiled_dependency,)
     assert graph_plan.spmd("target").incoming == (compiled_dependency,)
 
     with pytest.raises(FrozenInstanceError):
-        graph_operator.output_uuids = ()
+        graph_operator.output_uuids = ()  # type: ignore[misc]
 
     restored = cloudpickle.loads(cloudpickle.dumps(graph_plan))
     restored_operator = restored.spmd("source").operator("produce")
@@ -280,7 +286,11 @@ def test_compiler_resolves_referential_sharding_without_rewriting_spec():
     )
 
     compiled = plan.spmd("source").operator("produce")
+    from fluxway.common.types.sharding import ReferentialRouting
+
+    assert isinstance(produce.output_sharding["mirror"].routing, ReferentialRouting)
     assert produce.output_sharding["mirror"].routing.tuuid is None
+    assert isinstance(compiled.output_sharding["mirror"].routing, ReferentialRouting)
     assert compiled.output_sharding["mirror"].routing.tuuid == 1
     assert compiled.output_uuids == (1, 2)
 

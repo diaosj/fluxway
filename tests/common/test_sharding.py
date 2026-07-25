@@ -207,13 +207,16 @@ def test_follow_layout():
     follow_spec = ShardingSpec.follow("train_step.embedding.weight")
     follow_layout = follow_spec.bind(mesh)
 
+    from fluxway.common.types.sharding import ReferentialRouting
+
     assert follow_layout.is_referential is True
+    assert isinstance(follow_layout.spec.routing, ReferentialRouting)
     assert follow_layout.spec.routing.path == "train_step.embedding.weight"
 
     # Passing a non-string should raise immediately
     src_layout = ShardingSpec.hash(P("x")).bind(mesh)
     try:
-        ShardingSpec.follow(src_layout)
+        ShardingSpec.follow(src_layout)  # type: ignore[arg-type]
         raise AssertionError("Expected TypeError was not raised")
     except TypeError as e:
         assert "string path" in str(e)

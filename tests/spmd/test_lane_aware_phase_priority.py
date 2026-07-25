@@ -25,7 +25,7 @@ class DummyManager:
 
 def worker_with(metas):
     worker_cls = (
-        SPMDWorker.__ray_metadata__.modified_class
+        SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     )  # pyrefly: ignore [missing-attribute]
     worker = object.__new__(worker_cls)
     worker._op_manager = DummyManager(metas)

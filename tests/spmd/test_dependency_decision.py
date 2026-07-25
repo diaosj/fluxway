@@ -578,7 +578,7 @@ async def test_local_skipped_ordering_does_not_deposit_success_completion():
     async def deposit_ordering(*args, **kwargs):
         deposits.append((args, kwargs))
 
-    worker_class = SPMDWorker.__ray_metadata__.modified_class
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(worker_class)
     worker.rank = 0
     worker.spmd_id = "pipeline"
@@ -786,7 +786,7 @@ async def test_worker_receives_multi_sender_condition_completion_through_batch_a
     plan = _compiled_condition_plan(lambda _result: False)
     route = plan.successor_routes[0].dependency_decision_routes[0]
     transfer_code = plan.successor_routes[0].tensor_routes[0].transfer_code
-    worker_class = SPMDWorker.__ray_metadata__.modified_class
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(worker_class)
     worker.spmd_id = "target"
     worker.rank = 0
@@ -841,7 +841,7 @@ async def test_worker_receives_multi_sender_condition_completion_through_batch_a
 
 
 def test_skipped_result_uses_async_send_registration_path():
-    worker_class = SPMDWorker.__ray_metadata__.modified_class
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(worker_class)
     skipped = ExecutionResult(status=ExecutionStatus.SKIPPED)
 
@@ -850,7 +850,7 @@ def test_skipped_result_uses_async_send_registration_path():
 
 @pytest.mark.asyncio
 async def test_skipped_ready_step_does_not_call_user_function():
-    worker_class = SPMDWorker.__ray_metadata__.modified_class
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(worker_class)
     worker.rank = 0
     worker._world_size = 1

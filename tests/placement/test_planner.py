@@ -96,7 +96,7 @@ def placement_graph(
                 spmd_id=spmd_id,
                 spmd_class=node.spmd_class,
                 mesh=node.spmd_config.mesh,
-                resource_profile=node.resource_profile,
+                resource_profile=node.resource_profile,  # type: ignore[arg-type]
                 operators={},
             )
             for spmd_id, node in sorted(graph_nodes.items())

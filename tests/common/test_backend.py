@@ -47,11 +47,10 @@ def test_jax_dlpack_slice_multidim():
         if hasattr(dlpack, "__cuda_array_interface__"):
             import jax.numpy as jnp
 
+            view_jnp = None
             try:
                 view_jnp = jnp.asarray(dlpack)
             except Exception as e:
-                import pytest
-
                 pytest.skip(f"JAX failed to consume __cuda_array_interface__: {e}")
 
             np.testing.assert_array_equal(
@@ -75,11 +74,10 @@ def test_jax_dlpack_slice_multidim():
         if hasattr(dlpack, "__cuda_array_interface__"):
             import jax.numpy as jnp
 
+            view_jnp = None
             try:
                 view_jnp = jnp.asarray(dlpack)
             except Exception as e:
-                import pytest
-
                 pytest.skip(f"JAX failed to consume __cuda_array_interface__: {e}")
             np.testing.assert_array_equal(
                 backend.to_numpy(view_jnp), backend.to_numpy(arr[::2, ::2])
@@ -95,11 +93,10 @@ def test_jax_dlpack_slice_multidim():
         if hasattr(dlpack, "__cuda_array_interface__"):
             import jax.numpy as jnp
 
+            view_jnp = None
             try:
                 view_jnp = jnp.asarray(dlpack)
             except Exception as e:
-                import pytest
-
                 pytest.skip(f"JAX failed to consume __cuda_array_interface__: {e}")
             np.testing.assert_array_equal(
                 backend.to_numpy(view_jnp), backend.to_numpy(arr[1, :])
@@ -159,6 +156,7 @@ def test_contiguous_view_jax_returns_wrapper():
         import jax.numpy as jnp
     except ImportError:
         pytest.skip("JAX not available")
+        return  # unreachable, but informs pyrefly that imports are always bound
 
     b = JaxBackend()
     assert b.supports_zero_copy_view is True
@@ -179,6 +177,7 @@ def test_contiguous_view_jax_wrapper_array_interface():
         from fluxway.common.tensor_backend import JAXViewWrapper
     except ImportError:
         pytest.skip("JAX not available")
+        return  # unreachable, but informs pyrefly that imports are always bound
 
     arr = np.arange(100, dtype=np.float32)
     wrapper = JAXViewWrapper(arr, slice(5, 25))

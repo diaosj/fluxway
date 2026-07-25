@@ -10,7 +10,7 @@ ENV FLUXWAY_LOG_LEVEL=WARNING \
 # Configure APT sources for faster mirroring
 ARG APT_MIRROR=archive.ubuntu.com
 ARG PIP_INDEX_URL=https://pypi.org/simple
-ARG PIP_MIRROR=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_MIRROR=https://pypi.org/simple
 RUN chmod 1777 /tmp && \
     sed -i "s@http://archive.ubuntu.com/ubuntu/@http://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list.d/ubuntu.sources && \
     sed -i "s@http://security.ubuntu.com/ubuntu/@http://${APT_MIRROR}/ubuntu/@g" /etc/apt/sources.list.d/ubuntu.sources
@@ -72,11 +72,19 @@ RUN pip install --default-timeout=1000 --no-cache-dir --extra-index-url https://
 # Copy project files into the container
 # NOTE: Ensure you run `docker build` from the repository root, e.g.:
 # docker build -t fluxway -f docker/Dockerfile .
-COPY . /workspace/
+COPY . /workspace/fluxway
 
 # Install Fluxway core, JAX, profiling, and graph visualization dependencies
-RUN cd /workspace && \
-    pip install --default-timeout=1000 --no-cache-dir -e ".[jax,profiler,visualization]"
+RUN cd /workspace/fluxway && \
+    CUDA_MAJOR=$(nvcc --version | grep "release" | awk '{print $5}' | cut -d'.' -f1) && \
+    if [ "$CUDA_MAJOR" = "12" ]; then \
+        CUDA_EXTRA=",cuda12x"; \
+    elif [ "$CUDA_MAJOR" = "13" ]; then \
+        CUDA_EXTRA=",cuda13x"; \
+    else \
+        CUDA_EXTRA=""; \
+    fi && \
+    pip install --default-timeout=1000 --no-cache-dir -e ".[jax,profiler,visualization${CUDA_EXTRA}]"
 
 # Default command
 CMD ["/bin/bash"]

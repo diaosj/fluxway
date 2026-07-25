@@ -9,6 +9,7 @@ on fluxway.example.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import jax.numpy as jnp
 import pytest
@@ -97,6 +98,8 @@ class InputOp:
 
 @spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class EmbeddingOp:
+    ctx: Any
+
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 4):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim

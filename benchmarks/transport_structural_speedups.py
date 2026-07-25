@@ -1,3 +1,5 @@
+# pyright: reportMissingImports=false
+# pyright: reportAttributeAccessIssue=false
 from __future__ import annotations
 
 import argparse
@@ -12,20 +14,20 @@ from typing import Any
 import numpy as np
 from numba import njit
 
-from fluxway.transport.manifest import (
-    EDGE_COMPACT_BEGIN,
-    EDGE_COMPACT_COUNT,
-    EDGE_EMPTY_KIND,
-    EDGE_EXPECTED_COUNT,
-    EDGE_GLOBAL_SHAPE_BEGIN,
-    EDGE_GLOBAL_SHAPE_COUNT,
-    EDGE_META_STATE,
-    EDGE_MIN_ROWS,
-    EDGE_PAYLOAD_BEGIN,
-    EDGE_PAYLOAD_COUNT,
-    EDGE_TUUID,
-    EDGE_WIDTH,
-    FRAME_EDGE_COUNT,
+from fluxway.transport.manifest import (  # type: ignore
+    ENTRY_COMPACT_BEGIN,
+    ENTRY_COMPACT_COUNT,
+    ENTRY_EMPTY_KIND,  # type: ignore
+    ENTRY_EXPECTED_COUNT,
+    ENTRY_GLOBAL_SHAPE_BEGIN,
+    ENTRY_GLOBAL_SHAPE_COUNT,
+    ENTRY_META_STATE,
+    ENTRY_MIN_ROWS,  # type: ignore
+    ENTRY_PAYLOAD_BEGIN,
+    ENTRY_PAYLOAD_COUNT,
+    ENTRY_TUUID,  # type: ignore
+    ENTRY_WIDTH,
+    FRAME_ENTRY_COUNT,
     FRAME_FLAGS,
     FRAME_PAYLOAD_COUNT,
     FRAME_SENDER_RANK,
@@ -43,7 +45,7 @@ from fluxway.transport.manifest import (
     PAYLOAD_VALID_COUNT,
     PAYLOAD_WIDTH,
     PROTOCOL_VERSION,
-    EmptyKind,
+    TensorEntryKind,
     PayloadRole,
     TransportFrame,
     TransportFrameBuilder,
@@ -98,7 +100,7 @@ def median_ms(
 def frame_metadata_nbytes(frame: TransportFrame) -> int:
     return (
         frame.frame_i32.nbytes
-        + frame.edge_i32.nbytes
+        + frame.entry_i32.nbytes
         + frame.payload_i32.nbytes
         + frame.shape_i32.nbytes
         + frame.global_shape_i64.nbytes
@@ -108,17 +110,18 @@ def frame_metadata_nbytes(frame: TransportFrame) -> int:
 
 def build_current_frame(edge_count: int, rows: int, cols: int) -> TransportFrame:
     segment = np.zeros((rows, cols), dtype=np.float32)
-    builder = TransportFrameBuilder(
+    builder = TransportFrameBuilder(  # type: ignore
+
         step=7,
         sender_spmd_code=3,
         sender_rank=1,
         sender_world_size=4,
     )
     for edge_idx in range(edge_count):
-        edge = builder.add_edge(
+        edge = builder.add_entry(  # type: ignore
             tuuid=1000 + edge_idx,
             meta_state=0,
-            empty_kind=EmptyKind.DATA_EMPTY_ALLOWED,
+            empty_kind=TensorEntryKind.DATA_EMPTY_ALLOWED,  # type: ignore
             min_rows=0,
             expected_count=4,
             global_shape=(rows, cols),
@@ -136,22 +139,22 @@ def build_preallocated_frame(edge_count: int, rows: int, cols: int) -> Transport
     frame_i32[FRAME_SENDER_SPMD_CODE] = 3
     frame_i32[FRAME_SENDER_RANK] = 1
     frame_i32[FRAME_SENDER_WORLD_SIZE] = 4
-    frame_i32[FRAME_EDGE_COUNT] = edge_count
+    frame_i32[FRAME_ENTRY_COUNT] = edge_count
     frame_i32[FRAME_PAYLOAD_COUNT] = edge_count
     frame_i32[FRAME_FLAGS] = 0
 
-    edge_i32 = np.zeros((edge_count, EDGE_WIDTH), dtype=np.int32)
-    edge_i32[:, EDGE_TUUID] = 1000 + idx
-    edge_i32[:, EDGE_META_STATE] = 0
-    edge_i32[:, EDGE_EMPTY_KIND] = int(EmptyKind.DATA_EMPTY_ALLOWED)
-    edge_i32[:, EDGE_PAYLOAD_BEGIN] = idx
-    edge_i32[:, EDGE_PAYLOAD_COUNT] = 1
-    edge_i32[:, EDGE_MIN_ROWS] = 0
-    edge_i32[:, EDGE_EXPECTED_COUNT] = 4
-    edge_i32[:, EDGE_COMPACT_BEGIN] = 0
-    edge_i32[:, EDGE_COMPACT_COUNT] = 0
-    edge_i32[:, EDGE_GLOBAL_SHAPE_BEGIN] = idx * 2
-    edge_i32[:, EDGE_GLOBAL_SHAPE_COUNT] = 2
+    entry_i32 = np.zeros((edge_count, ENTRY_WIDTH), dtype=np.int32)
+    entry_i32[:, ENTRY_TUUID] = 1000 + idx
+    entry_i32[:, ENTRY_META_STATE] = 0
+    entry_i32[:, ENTRY_EMPTY_KIND] = 0  # type: ignore
+    entry_i32[:, ENTRY_PAYLOAD_BEGIN] = idx
+    entry_i32[:, ENTRY_PAYLOAD_COUNT] = 1
+    entry_i32[:, ENTRY_MIN_ROWS] = 0
+    entry_i32[:, ENTRY_EXPECTED_COUNT] = 4
+    entry_i32[:, ENTRY_COMPACT_BEGIN] = 0
+    entry_i32[:, ENTRY_COMPACT_COUNT] = 0
+    entry_i32[:, ENTRY_GLOBAL_SHAPE_BEGIN] = idx * 2
+    entry_i32[:, ENTRY_GLOBAL_SHAPE_COUNT] = 2
 
     payload_i32 = np.zeros((edge_count, PAYLOAD_WIDTH), dtype=np.int32)
     payload_i32[:, PAYLOAD_ROLE] = int(PayloadRole.VALUES)
@@ -172,7 +175,7 @@ def build_preallocated_frame(edge_count: int, rows: int, cols: int) -> Transport
 
     frame = TransportFrame(
         frame_i32=frame_i32,
-        edge_i32=edge_i32,
+        entry_i32=entry_i32,
         payload_i32=payload_i32,
         shape_i32=shape_i32,
         global_shape_i64=global_shape_i64,

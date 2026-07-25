@@ -33,6 +33,7 @@ def gpu_backend():
         b = HybridBackend(default_device="gpu")
     except Exception:
         pytest.skip("CuPy/CUDA not available")
+        return  # unreachable, but informs pyrefly that b is always bound below
     assert b._cp is not None, "GPU mode must be active, no fallback to CPU"
     return b
 

@@ -23,7 +23,7 @@ def _bare_manager(name: str, fn, *, coroutine_function: bool) -> OperatorManager
     manager._local_world_size = 1
     manager._node_rank = 0
     manager._num_nodes = 1
-    manager.is_source_operator = lambda _: False
+    manager.is_source_operator = lambda op_name: False  # type: ignore[method-assign]
     return manager
 
 

@@ -55,8 +55,11 @@ jax = [
     "orbax",
     "grain",
 ]
-cuda = [
+cuda12x = [
     "cupy-cuda12x>=13.0.0",
+]
+cuda13x = [
+    "cupy-cuda13x>=13.0.0",
 ]
 profiler = [
     "perfetto",
@@ -155,4 +158,12 @@ ignore-missing-imports = [
     "ray",
     "safetensors",
     "safetensors.numpy",
+    "setuptools",
+    "torch.utils.dlpack",
+    "perfetto.protos.perfetto.trace",
+]
+
+[tool.pyright]
+exclude = [
+    "benchmarks",
 ]

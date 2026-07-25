@@ -46,7 +46,7 @@ def test_device_mesh_1d_inference():
 def test_device_mesh_required_args():
     """Test that at least one of shape or ids is required."""
     with pytest.raises(TypeError):
-        DeviceMesh(device_shape=(2,))
+        DeviceMesh(device_shape=(2,))  # type: ignore[call-arg]
 
     with pytest.raises(
         ValueError, match="Either device_shape or device_ids must be provided"

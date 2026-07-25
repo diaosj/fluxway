@@ -72,11 +72,11 @@ def test_async_policy_is_the_only_operator_async_fact_source():
 
 def test_async_policy_and_nested_policies_are_immutable():
     with pytest.raises(ValidationError, match="frozen"):
-        _ASYNC_POLICY.depth = 4
+        _ASYNC_POLICY.depth = 4  # type: ignore[misc]
     with pytest.raises(ValidationError, match="frozen"):
-        _ASYNC_POLICY.schedule.base_priority = 8
+        _ASYNC_POLICY.schedule.base_priority = 8  # type: ignore[misc]
     with pytest.raises(ValidationError, match="frozen"):
-        _ASYNC_POLICY.state.access = "exclusive"
+        _ASYNC_POLICY.state.access = "exclusive"  # type: ignore[misc]
 
 
 def test_compiled_graph_reuses_operator_spec_and_ray_preserves_semantics():
@@ -91,14 +91,16 @@ def test_compiled_graph_reuses_operator_spec_and_ray_preserves_semantics():
     )
     graph = builder.build("async-policy-ssot")
     runtime_spec = graph.nodes["pipeline"].spmd_config.operator_specs["step"]
-    compiled = graph.compiled_graph.spmd("pipeline").operator("step")
+    compiled = graph.require_compiled_graph().spmd("pipeline").operator("step")
     assert compiled.spec is runtime_spec
     assert runtime_spec.async_policy is compiled.spec.async_policy
     assert runtime_spec.runtime_policy.schedule is compiled.spec.async_policy.schedule
 
     restored = cloudpickle.loads(cloudpickle.dumps(graph))
     restored_spec = restored.nodes["pipeline"].spmd_config.operator_specs["step"]
-    restored_compiled = restored.compiled_graph.spmd("pipeline").operator("step")
+    restored_compiled = (
+        restored.require_compiled_graph().spmd("pipeline").operator("step")
+    )
     assert restored_compiled.spec is restored_spec
     assert restored_spec.async_policy == runtime_spec.async_policy
     assert restored_spec.runtime_policy == runtime_spec.runtime_policy

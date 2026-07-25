@@ -16,7 +16,7 @@ from .test_planner import scenario
 
 def test_scheduler_requires_graph_and_recipe() -> None:
     with pytest.raises(TypeError):
-        Scheduler()
+        Scheduler()  # type: ignore[call-arg]
 
 
 def test_scheduler_allocates_recipe_as_one_job_pg(monkeypatch) -> None:

@@ -1,4 +1,5 @@
 import asyncio
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -86,7 +87,7 @@ def test_whole_job_terminal_rejects_divergent_source_clocks() -> None:
     }
 
     with pytest.raises(RuntimeError, match="aligned source terminal counts"):
-        ControllerActor.__ray_metadata__.modified_class._terminal_target(
+        ControllerActor.__ray_metadata__.modified_class._terminal_target(  # type: ignore[attr-defined]
             bindings,
             {"source_a:read": 3, "source_b:read": 5},
         )
@@ -737,7 +738,7 @@ async def test_terminal_checkpoint_restore_uses_existing_completion_path(
         "static_args": {},
         "driver_components": {},
     }
-    manifest = {
+    manifest: dict[str, Any] = {
         spmd_id: {
             "spmd_state": spmd_state,
             "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},

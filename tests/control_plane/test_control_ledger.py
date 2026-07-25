@@ -12,7 +12,7 @@ from fluxway.control_plane.controller import ControllerActor
 from fluxway.control_plane.ledger_client import ControlRecord
 
 
-CONTROLLER_CLASS = ControllerActor.__ray_metadata__.modified_class
+CONTROLLER_CLASS = ControllerActor.__ray_metadata__.modified_class  # type: ignore[attr-defined]
 
 
 def _record(position: int, *, stream_id: str = "stream", payload=None):

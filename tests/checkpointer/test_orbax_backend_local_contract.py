@@ -51,24 +51,24 @@ def _install_fake_orbax_runtime(monkeypatch):
 
     import jax.tree_util as real_jtu
 
-    tree_util_module.tree_flatten = real_jtu.tree_flatten
-    tree_util_module.tree_map = real_jtu.tree_map
-    tree_util_module.PyTreeDef = real_jtu.PyTreeDef
-    tree_util_module.tree_leaves = real_jtu.tree_leaves
-    tree_util_module.tree_flatten_with_path = real_jtu.tree_flatten_with_path
-    tree_util_module.tree_unflatten = real_jtu.tree_unflatten
-    tree_util_module.map = getattr(real_jtu, "map", real_jtu.tree_map)
-    tree_util_module.DictKey = real_jtu.DictKey
-    tree_util_module.SequenceKey = real_jtu.SequenceKey
+    tree_util_module.tree_flatten = real_jtu.tree_flatten  # type: ignore[attr-defined]
+    tree_util_module.tree_map = real_jtu.tree_map  # type: ignore[attr-defined]
+    tree_util_module.PyTreeDef = real_jtu.PyTreeDef  # type: ignore[attr-defined]
+    tree_util_module.tree_leaves = real_jtu.tree_leaves  # type: ignore[attr-defined]
+    tree_util_module.tree_flatten_with_path = real_jtu.tree_flatten_with_path  # type: ignore[attr-defined]
+    tree_util_module.tree_unflatten = real_jtu.tree_unflatten  # type: ignore[attr-defined]
+    tree_util_module.map = getattr(real_jtu, "map", real_jtu.tree_map)  # type: ignore[attr-defined]
+    tree_util_module.DictKey = real_jtu.DictKey  # type: ignore[attr-defined]
+    tree_util_module.SequenceKey = real_jtu.SequenceKey  # type: ignore[attr-defined]
 
-    jax_module.Array = _Array
-    jax_module.ShapeDtypeStruct = _ShapeDtypeStruct
-    jax_module.tree_util = tree_util_module
-    jax_module.tree = tree_util_module
-    jax_module.sharding = types.SimpleNamespace(
+    jax_module.Array = _Array  # type: ignore[attr-defined]
+    jax_module.ShapeDtypeStruct = _ShapeDtypeStruct  # type: ignore[attr-defined]
+    jax_module.tree_util = tree_util_module  # type: ignore[attr-defined]
+    jax_module.tree = tree_util_module  # type: ignore[attr-defined]
+    jax_module.sharding = types.SimpleNamespace(  # type: ignore[attr-defined]
         SingleDeviceSharding=_SingleDeviceSharding, NamedSharding=_NamedSharding
     )
-    jax_module.process_index = lambda: 0
+    jax_module.process_index = lambda: 0  # type: ignore[attr-defined]
 
     sync_global_devices_calls = []
 
@@ -80,15 +80,15 @@ def _install_fake_orbax_runtime(monkeypatch):
         )
 
     multihost_utils_module = types.ModuleType("jax.experimental.multihost_utils")
-    multihost_utils_module.sync_global_devices = _unexpected_sync_global_devices
+    multihost_utils_module.sync_global_devices = _unexpected_sync_global_devices  # type: ignore[attr-defined]
     experimental_module = types.ModuleType("jax.experimental")
-    experimental_module.multihost_utils = multihost_utils_module
-    jax_module.experimental = experimental_module
+    experimental_module.multihost_utils = multihost_utils_module  # type: ignore[attr-defined]
+    jax_module.experimental = experimental_module  # type: ignore[attr-defined]
 
     etils_module = types.ModuleType("etils")
     epath_module = types.ModuleType("etils.epath")
-    epath_module.Path = Path
-    etils_module.epath = epath_module
+    epath_module.Path = Path  # type: ignore[attr-defined]
+    etils_module.epath = epath_module  # type: ignore[attr-defined]
 
     save_calls = []
 
@@ -124,13 +124,13 @@ def _install_fake_orbax_runtime(monkeypatch):
             return {"restored_from": str(directory)}
 
     ocp_module = types.ModuleType("orbax.checkpoint")
-    ocp_module.StandardCheckpointHandler = _FakeStandardCheckpointHandler
-    ocp_module.PyTreeCheckpointHandler = _FakePyTreeCheckpointHandler
-    ocp_module.Checkpointer = _FakeCheckpointer
-    ocp_module.args = types.SimpleNamespace(
+    ocp_module.StandardCheckpointHandler = _FakeStandardCheckpointHandler  # type: ignore[attr-defined]
+    ocp_module.PyTreeCheckpointHandler = _FakePyTreeCheckpointHandler  # type: ignore[attr-defined]
+    ocp_module.Checkpointer = _FakeCheckpointer  # type: ignore[attr-defined]
+    ocp_module.args = types.SimpleNamespace(  # type: ignore[attr-defined]
         PyTreeSave=lambda item: item, StandardSave=lambda item: item
     )
-    ocp_module.options = types.SimpleNamespace(
+    ocp_module.options = types.SimpleNamespace(  # type: ignore[attr-defined]
         MultiprocessingOptions=lambda **kw: types.SimpleNamespace(**kw)
     )
 
@@ -164,9 +164,10 @@ def _install_fake_orbax_runtime(monkeypatch):
     backend_spec = importlib.util.spec_from_file_location(
         "fluxway.control_plane.checkpointer.backend", backend_path
     )
+    assert backend_spec is not None
     backend_module = importlib.util.module_from_spec(backend_spec)
     assert backend_spec.loader is not None
-    backend_spec.loader.exec_module(backend_module)
+    backend_spec.loader.exec_module(backend_module)  # type: ignore[union-attr]
     monkeypatch.setitem(
         sys.modules, "fluxway.control_plane.checkpointer.backend", backend_module
     )
@@ -181,9 +182,10 @@ def _install_fake_orbax_runtime(monkeypatch):
     orbax_spec = importlib.util.spec_from_file_location(
         "fluxway.control_plane.checkpointer.orbax", orbax_path
     )
+    assert orbax_spec is not None
     orbax_module = importlib.util.module_from_spec(orbax_spec)
     assert orbax_spec.loader is not None
-    orbax_spec.loader.exec_module(orbax_module)
+    orbax_spec.loader.exec_module(orbax_module)  # type: ignore[union-attr]
 
     return (
         orbax_module,

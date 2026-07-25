@@ -10,7 +10,7 @@ from fluxway.spmd.worker.worker import SPMDWorker, _EXECUTION_STOP_ITEM
 
 
 def _raw_worker_class():
-    return SPMDWorker.__ray_actor_class__
+    return SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
 
 
 def _driver():

@@ -28,8 +28,8 @@ def test_controller_exposes_resolved_recipe_allocation_report() -> None:
     _, recipe, _ = scenario(1)
     runtime = PlacementRuntimeConfig(solve_timeout_s=10, pg_timeout_s=20)
     with FunctionalGraph("controller-recipe") as static_graph:
-        left = _ControllerWorker(name="left")
-        right = _ControllerWorker(name="right")
+        left = _ControllerWorker(name="left")  # type: ignore[call-arg]
+        right = _ControllerWorker(name="right")  # type: ignore[call-arg]
         right.step(left.step())
         task_graph = static_graph.build()
     controller = ControllerActor.__ray_actor_class__(  # type: ignore[attr-defined]

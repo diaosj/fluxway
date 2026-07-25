@@ -104,7 +104,7 @@ def _worker_cls():
 
 @pytest.mark.asyncio
 async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
-    worker_type = SPMDWorker.__ray_actor_class__
+    worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
     worker = worker_type.__new__(worker_type)
     worker._completed_step_count = {"Reader": 0, "Dense": 0}
     worker._scheduled_step_count = {"Reader": 0, "Dense": 0}
@@ -391,8 +391,8 @@ async def test_worker_stop_clears_driver_handle_and_waits_for_tasks():
         background_task_ran.set()
         await asyncio.Future()
 
-    worker._execution_queue = asyncio.Queue()
-    worker._execution_queues = {"__default__": worker._execution_queue}
+    worker._execution_queue = asyncio.Queue()  # type: ignore[assignment]
+    worker._execution_queues = {"__default__": worker._execution_queue}  # type: ignore[assignment]
     worker._run_task = asyncio.create_task(run_forever())
     worker._heartbeat_task = asyncio.create_task(run_forever())
     worker._spawn_background_task(background_task())

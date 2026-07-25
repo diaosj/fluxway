@@ -15,6 +15,10 @@ class BaseReader:
     in the computational graph.
     """
 
+    rank: int
+    world_size: int
+    static_args: dict[str, Any]
+
     def __init__(
         self,
         name: str = "",
@@ -23,11 +27,6 @@ class BaseReader:
         resource: Any = None,
         **kwargs: Any,
     ):
-        # Metadata injected by the framework:
-        # self.spmd_id: str
-        # self.rank: int
-        # self.world_size: int
-        # self.static_args: dict
         pass
 
     @operator("read")

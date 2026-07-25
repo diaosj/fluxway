@@ -283,8 +283,8 @@ class RecommendationReader(GrainReader):
 
     def save_state(self, context: CheckpointContext) -> dict[str, Any]:
         static_args = self.static_args
-        state = {
-            "completed_steps": int(self._completed_steps),
+        state: dict[str, Any] = {
+            "completed_steps": self._completed_steps,
             "batch_size": int(static_args["batch_size"]),
         }
         state["mode"] = "iterator"

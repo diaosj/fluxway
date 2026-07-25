@@ -83,8 +83,8 @@ def make_receipt(sender_ranks, remote_indices, world_size=4) -> SymmetryReceipt:
 def _assembly_worker(rank: int):
     worker = SPMDWorker.__new__(SPMDWorker)
     worker.rank = rank
-    worker._profiler_runtime = SimpleNamespace(enabled=False)
-    worker._op_manager = SimpleNamespace()
+    worker._profiler_runtime = SimpleNamespace(enabled=False)  # type: ignore[assignment]
+    worker._op_manager = SimpleNamespace()  # type: ignore[assignment]
     for name in (
         "_flatten_shards",
         "_filter_shards_by_routing",
@@ -124,7 +124,7 @@ def _dynamic_to_static_assemble_plan(
     )
     return CompiledAssemblePlan(
         op_name=op_name,
-        dependency=SimpleNamespace(code=1),
+        dependency=SimpleNamespace(code=1),  # type: ignore[arg-type]
         transfer=transfer,
         logical_tensor=CompiledLogicalTensor(
             logical_tuuid=logical_tuuid,
@@ -134,7 +134,7 @@ def _dynamic_to_static_assemble_plan(
             effective_sharding=sharding,
         ),
         source_spmd_id=predecessor_spmd_id,
-        source_layout=SimpleNamespace(is_content_addressable=True),
+        source_layout=SimpleNamespace(is_content_addressable=True),  # type: ignore[arg-type]
         target_layout=input_layout,
     )
 
@@ -308,7 +308,7 @@ class TestDynamicToStaticAssembly(unittest.TestCase):
         np.testing.assert_array_equal(data[5], [13, 13])
         np.testing.assert_array_equal(data[1], [0, 0])
         np.testing.assert_array_equal(
-            np.asarray(result.receipt.sender_rank_tags),
+            np.asarray(result.receipt.sender_rank_tags),  # type: ignore[union-attr]
             [0, 4, 1, 4, 4, 1, 4, 4],
         )
 

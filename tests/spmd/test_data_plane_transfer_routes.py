@@ -617,6 +617,7 @@ def test_mirror_route_preserves_transformed_tensor_lineage():
         wrapped_results={},
     )
 
+    assert inherited.receipt is not None
     np.testing.assert_array_equal(
         inherited.receipt.sender_rank_tags,
         np.array([1, 0], dtype=np.int32),

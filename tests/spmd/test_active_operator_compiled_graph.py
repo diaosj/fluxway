@@ -83,7 +83,7 @@ def test_spmd_compiled_graph_caches_canonical_operator_ids() -> None:
 
 
 def test_driver_registers_only_compiled_graph_operators() -> None:
-    driver = SPMDDriver.__ray_actor_class__(
+    driver = SPMDDriver.__ray_actor_class__(  # type: ignore[attr-defined]
         spmd_id="train",
         config=_config("train", "update", "forward"),
         placement_group=None,
@@ -121,7 +121,7 @@ def test_async_manager_completes_only_compiled_graph_operators() -> None:
 def test_active_operator_consumers_reject_missing_compiled_graph() -> None:
     config = SPMDConfig(spmd_id="train")
     with pytest.raises(RuntimeError, match="has no graph view"):
-        SPMDDriver.__ray_actor_class__(
+        SPMDDriver.__ray_actor_class__(  # type: ignore[attr-defined]
             spmd_id="train",
             config=config,
             placement_group=None,

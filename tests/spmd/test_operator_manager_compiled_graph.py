@@ -271,7 +271,7 @@ def test_spmd_graph_view_carries_canonical_referential_sharding_closure():
     )
 
     logical_tensor = plan.logical_tensor(transfer.logical_tuuid)
-    reference_tuuid = logical_tensor.producer_sharding.routing.tuuid
+    reference_tuuid = logical_tensor.producer_sharding.routing.tuuid  # type: ignore[union-attr]
 
     assert transfer.source_sharding.is_referential
     assert reference_tuuid == 2

@@ -22,7 +22,7 @@ class UninspectableInitializer:
         pass
 
 
-UninspectableInitializer.__init__.__signature__ = "invalid"
+UninspectableInitializer.__init__.__signature__ = "invalid"  # type: ignore[attr-defined]
 
 
 def test_explicit_initializer_receives_only_declared_static_arguments() -> None:

@@ -93,7 +93,7 @@ def test_builder_preserves_independent_locality_for_exact_dependencies():
         target_input="x",
     )
 
-    plan = builder.build("mixed-locality").compiled_graph
+    plan = builder.build("mixed-locality").require_compiled_graph()
     assert tuple(dependency.spec.local_only for dependency in plan.dependencies) == (
         True,
         False,

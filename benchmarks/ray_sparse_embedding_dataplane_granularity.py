@@ -414,7 +414,7 @@ def wait_with_responsiveness(
 
 def run_mode(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     ps_actors = [
-        SparseParameterServer.remote(
+        SparseParameterServer.remote(  # type: ignore[attr-defined]
             rank, args.dp, args.tables, args.receiver_compute_rounds
         )
         for rank in range(args.ps)

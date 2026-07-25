@@ -243,7 +243,7 @@ def test_interleaved_source_balances_complete_units_across_steps():
 
 @pytest.mark.asyncio
 async def test_inactive_interleaved_rank_does_not_send():
-    worker_class = SPMDWorker.__ray_metadata__.modified_class
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(worker_class)
     worker.rank = 2
     worker._world_size = 4

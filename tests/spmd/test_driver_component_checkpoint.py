@@ -119,7 +119,7 @@ def _orchestrator(events, *, state=DriverState.RUNNING):
         get_driver_state=lambda: state_box["value"],
         trigger_state_event=trigger,
         profiler_runtime=SimpleNamespace(enabled=False),
-        component_registry=registry,
+        component_registry=registry,  # type: ignore[arg-type]
         notify_component_state=notify,
     )
     return orchestrator, controller, registry

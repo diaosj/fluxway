@@ -23,6 +23,13 @@ from fluxway.placement import (
     workers,
     weighted_dominant_share,
 )
+from fluxway.placement.mathematics import (
+    RankExpr,
+    WorkersExpr,
+    EqualConstraint,
+    SupportExpr,
+    SubsetEqConstraint,
+)
 
 
 class SPMD0: ...
@@ -50,8 +57,16 @@ def test_recipe_preserves_direct_spmd_class_references() -> None:
         objective=lexicographic(minimize(cardinality(support(s0)))),
     )
 
-    assert constraints[0].left.workers.source.spmd.spmd_class is SPMD5
-    assert constraints[0].right.workers.spmd.spmd_class is SPMD0
+    assert isinstance(constraints[0], SubsetEqConstraint)
+    assert isinstance(constraints[0].left, SupportExpr)
+    assert isinstance(constraints[0].right, SupportExpr)
+    left_workers = constraints[0].left.workers
+    right_workers = constraints[0].right.workers
+    assert isinstance(left_workers, RankExpr)
+    assert isinstance(left_workers.source, WorkersExpr)
+    assert isinstance(right_workers, WorkersExpr)
+    assert left_workers.source.spmd.spmd_class is SPMD5
+    assert right_workers.spmd.spmd_class is SPMD0
     assert hash(recipe) == hash(recipe)
 
 
@@ -68,6 +83,7 @@ def test_cluster_resources_share_resource_profile_validation() -> None:
 def test_resource_fragmentation_is_a_hard_constraint_scalar() -> None:
     constraint = equal(resource_fragmentation(), 0)
 
+    assert isinstance(constraint, EqualConstraint)
     assert constraint.left.kind == "resource_fragmentation"
 
 

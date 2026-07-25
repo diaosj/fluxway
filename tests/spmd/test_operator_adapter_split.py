@@ -39,7 +39,7 @@ def _configured_worker(*, coroutine_function: bool, manager):
     )
     manager.get_operator_spec = lambda _: operator
     manager.operator_is_coroutine_function = lambda _: coroutine_function
-    raw_worker = SPMDWorker.__ray_metadata__.modified_class
+    raw_worker = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(raw_worker)
     worker.spmd_id = "test"
     worker.rank = 0

@@ -102,6 +102,7 @@ def test_cuda_pack_preserves_device_plan_domain():
         backend = HybridBackend(default_device="cuda")
     except RuntimeError as exc:
         pytest.skip(str(exc))
+        return
     payload = cp.asarray([10, 20, 30, 40], dtype=cp.int32)
 
     flat_buffers, counts, offsets, send_offsets = _pack_payloads_by_plan(
@@ -130,6 +131,7 @@ def test_cuda_ragged_pack_adopts_numpy_receipt_plan_once():
         backend = HybridBackend(default_device="cuda")
     except RuntimeError as exc:
         pytest.skip(str(exc))
+        return
     payload = cp.asarray([10, 11, 20], dtype=cp.int32)
     row_lengths = cp.asarray([2, 1], dtype=cp.int32)
 
@@ -442,4 +444,4 @@ def test_mirror_routing_builds_single_expected_frame():
 
     assert int(frame.entry_i32[0, ENTRY_EXPECTED_COUNT]) == 1
     assert int(frame.payload_i32[0, PAYLOAD_VALID_COUNT]) == 3
-    np.testing.assert_allclose(frame.payload_segments[0], data)
+    np.testing.assert_allclose(frame.payload_segments[0], data)  # type: ignore[no-matching-overload]

@@ -63,7 +63,7 @@ def test_worker_callable_spec_uses_exact_compiled_operator():
         graph_view=graph_view,
         operator_specs={"run": operator},
     )
-    raw_worker = SPMDWorker.__ray_metadata__.modified_class
+    raw_worker = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(raw_worker)
     worker.spmd_id = "test"
     worker.rank = 0
@@ -127,7 +127,7 @@ def test_process_affine_stateful_coroutine_uses_coroutine_async_lane():
         graph_view=graph_view,
         operator_specs={"run": operator},
     )
-    raw_worker = SPMDWorker.__ray_metadata__.modified_class
+    raw_worker = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(raw_worker)
     worker.spmd_id = "test"
     worker.rank = 0
@@ -178,7 +178,7 @@ def test_coroutine_function_uses_coroutine_async_lane():
 
 
 def test_regular_function_pipeline_depth_sets_worker_process_capacity():
-    raw_worker = SPMDWorker.__ray_metadata__.modified_class
+    raw_worker = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(raw_worker)
     worker._operator_specs = {
         "regular": SimpleNamespace(

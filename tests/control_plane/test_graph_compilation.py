@@ -59,7 +59,7 @@ def _build_graph():
 
 def test_builder_compiles_one_ray_native_compiled_graph():
     graph = _build_graph()
-    plan = graph.compiled_graph
+    plan = graph.require_compiled_graph()
     dependency = plan.dependencies[0]
 
     assert plan.name == "compiled-graph"
@@ -213,5 +213,16 @@ def test_builder_distinguishes_inferred_and_zero_transfer_dependencies():
         tensor_map={},
     )
 
-    assert len(inferred.build("inferred").compiled_graph.dependencies[0].transfers) == 1
-    assert ordering.build("ordering").compiled_graph.dependencies[0].transfers == ()
+    assert (
+        len(
+            inferred.build("inferred")
+            .require_compiled_graph()
+            .dependencies[0]
+            .transfers
+        )
+        == 1
+    )
+    assert (
+        ordering.build("ordering").require_compiled_graph().dependencies[0].transfers
+        == ()
+    )

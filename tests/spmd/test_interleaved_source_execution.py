@@ -23,12 +23,12 @@ def ray_session():
 def _build_exhausted_source_graph():
     with FunctionalGraph("interleaved-source-exhaustion") as graph:
         source = ImmediatelyExhaustedInterleavedSource(
-            name="Reader",
-            mesh=DeviceMesh(("worker",), (2,)),
+            name="Reader",  # type: ignore[call-arg]
+            mesh=DeviceMesh(("worker",), (2,)),  # type: ignore[call-arg]
         )
         sink = InterleavedSourceSink(
-            name="Sink",
-            mesh=DeviceMesh(("worker",), (1,)),
+            name="Sink",  # type: ignore[call-arg]
+            mesh=DeviceMesh(("worker",), (1,)),  # type: ignore[call-arg]
         )
         sink.consume(source.read())
         return graph.build()

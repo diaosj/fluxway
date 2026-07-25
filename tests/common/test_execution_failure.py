@@ -27,6 +27,7 @@ def test_execution_failure_api_is_available_at_fluxway_top_level() -> None:
 
 
 def test_execution_failure_captures_structured_exception_context() -> None:
+    failure: ExecutionFailure | None = None
     try:
         _raise_user_error()
     except RuntimeError as error:
@@ -39,6 +40,7 @@ def test_execution_failure_captures_structured_exception_context() -> None:
             exception=error,
         )
 
+    assert failure is not None
     assert failure.spmd_id == "dense"
     assert failure.rank == 2
     assert failure.op_name == "train"
@@ -46,6 +48,7 @@ def test_execution_failure_captures_structured_exception_context() -> None:
     assert failure.phase == "LOCAL_STEP_PLAN"
     assert failure.exception_type == "RuntimeError"
     assert failure.message == "user async failure"
+    assert failure.traceback is not None
     assert "_raise_user_error" in failure.traceback
     assert str(failure) == (
         "dense rank=2 op=train step=7 phase=LOCAL_STEP_PLAN "
@@ -66,7 +69,7 @@ def test_execution_failure_is_frozen_and_ray_serializable() -> None:
     )
 
     with pytest.raises(FrozenInstanceError):
-        failure.message = "changed"
+        failure.message = "changed"  # type: ignore[misc]
 
     assert pickle.loads(pickle.dumps(failure)) == failure
     assert cloudpickle.loads(cloudpickle.dumps(failure)) == failure
@@ -173,7 +176,7 @@ def test_non_error_heartbeat_rejects_failure(heartbeat) -> None:
     ),
 )
 def test_execution_failure_rejects_invalid_identity(field: str, value: object) -> None:
-    values = {
+    values: dict[str, object] = {
         "spmd_id": "dense",
         "rank": 0,
         "op_name": "train",
@@ -186,4 +189,4 @@ def test_execution_failure_rejects_invalid_identity(field: str, value: object) -
     values[field] = value
 
     with pytest.raises((TypeError, ValueError)):
-        ExecutionFailure(**values)
+        ExecutionFailure(**values)  # type: ignore[arg-type]

@@ -112,7 +112,7 @@ def test_compiled_spmd_declaration_is_the_graph_view_single_source() -> None:
     with pytest.raises(AttributeError, match="frozen"):
         mesh._shape = (9,)
     with pytest.raises(TypeError):
-        mesh.axis_map["other"] = 1
+        mesh.axis_map["other"] = 1  # type: ignore[index]
 
     restored = cloudpickle.loads(cloudpickle.dumps(compiled))
     restored_mesh = restored.spmd("affine").mesh
