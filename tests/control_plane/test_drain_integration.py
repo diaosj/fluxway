@@ -140,7 +140,7 @@ async def test_terminal_control_stream_reuses_driver_drain(
     controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
     controller._state_machine._state = ControllerState.RUNNING
 
-    await controller.close_control_stream("op1:read")
+    await controller.seal_control_stream("op1:read")
 
     assert controller._terminal_drain_target == 3
     assert controller._last_requested_drain_target == 3
@@ -171,7 +171,7 @@ async def test_terminal_control_stream_defers_driver_rpc_until_running(
     controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
     controller._state_machine._state = ControllerState.READY
 
-    await controller.close_control_stream("op1:read")
+    await controller.seal_control_stream("op1:read")
 
     assert controller._terminal_drain_target == 3
     mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_not_called()
@@ -186,6 +186,71 @@ async def test_terminal_control_stream_defers_driver_rpc_until_running(
     mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
         3
     )
+
+
+@pytest.mark.asyncio
+async def test_terminal_beyond_max_steps_drains_to_run_boundary(
+    controller, mock_spmd_manager
+):
+    ledger = ControlLedger(4)
+    await ledger.append(
+        tuple(
+            ControlRecord(
+                stream_id="op1:read",
+                position=position,
+                payload={"batch": position},
+            )
+            for position in range(3)
+        )
+    )
+    controller._control_ledger = ledger
+    controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
+    controller._state_machine._state = ControllerState.RUNNING
+    controller.async_step_manager._config.max_steps = 2
+
+    await controller.seal_control_stream("op1:read")
+
+    assert controller._terminal_drain_target == 3
+    assert controller._last_requested_drain_target == 2
+    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_called_once_with(
+        2
+    )
+    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
+        2
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_terminal_checkpoints_before_completion(
+    controller, mock_spmd_manager
+):
+    events = []
+    controller._control_ledger = ControlLedger(4)
+    controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
+    controller._state_machine._state = ControllerState.RUNNING
+    controller._checkpointer.save.side_effect = lambda step: events.append(
+        ("checkpoint", step)
+    )
+    controller._state_machine.trigger_event = AsyncMock(
+        side_effect=lambda event: events.append(("event", event))
+    )
+
+    await controller.seal_control_stream("op1:read")
+
+    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_awaited_once_with(
+        0
+    )
+    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_awaited_once_with(
+        0
+    )
+    await controller.report_driver_drained("op1")
+    await controller.report_driver_drained("op2")
+    await controller._checkpoint_task
+
+    assert events == [
+        ("checkpoint", 0),
+        ("event", ControllerEvent.ALL_DRIVERS_COMPLETED),
+    ]
 
 
 @pytest.mark.asyncio

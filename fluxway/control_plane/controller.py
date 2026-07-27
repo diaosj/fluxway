@@ -654,11 +654,11 @@ class ControllerActor:
 
     async def receive_control_record(
         self, stream_id: str, position: int
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         record = await self._require_control_ledger().receive(stream_id, position)
-        return None if record is None else record.to_dict()
+        return record.to_dict()
 
-    async def close_control_stream(self, stream_id: str) -> None:
+    async def seal_control_stream(self, stream_id: str) -> None:
         ledger = self._require_control_ledger()
         await ledger.seal(stream_id)
         await self._schedule_terminal_drain_if_complete()
@@ -681,19 +681,15 @@ class ControllerActor:
     async def _schedule_terminal_drain_if_complete(self) -> None:
         ledger = self._require_control_ledger()
         bindings = self._source_control_stream_bindings()
-        target = self._terminal_target(bindings, ledger.terminal_ends)
+        target = self._terminal_target(bindings, ledger.sealed_ends)
         if target is None:
             return
         self._terminal_drain_target = target
+        max_steps = self.async_step_manager._config.max_steps
+        drain_target = target if max_steps is None else min(target, max_steps)
         if not self.state_machine.is_running():
             return
-        if self._terminal_drain_dispatched_target == target:
-            return
-        if target == 0:
-            await self.state_machine.trigger_event(
-                ControllerEvent.ALL_DRIVERS_COMPLETED
-            )
-            self._terminal_drain_dispatched_target = target
+        if self._terminal_drain_dispatched_target == drain_target:
             return
         tasks = []
         for spmd_id in self.spmd_manager.get_all_spmd_ids():
@@ -702,34 +698,34 @@ class ControllerActor:
                 raise RuntimeError(
                     f"terminal drain is missing Driver handle {spmd_id!r}"
                 )
-            tasks.append(driver.request_terminal_drain.remote(target))
+            tasks.append(driver.request_terminal_drain.remote(drain_target))
         await asyncio.gather(*tasks)
-        self._terminal_drain_dispatched_target = target
-        self._last_requested_drain_target = target
+        self._terminal_drain_dispatched_target = drain_target
+        self._last_requested_drain_target = drain_target
 
     @staticmethod
     def _terminal_target(
         bindings: Mapping[str, tuple[str, str]],
-        terminal_ends: Mapping[str, int],
+        sealed_ends: Mapping[str, int],
     ) -> int | None:
         if not bindings:
-            if terminal_ends:
+            if sealed_ends:
                 raise ValueError(
                     "terminal control streams exist without compiled source bindings"
                 )
             return None
-        unknown = set(terminal_ends) - set(bindings)
+        unknown = set(sealed_ends) - set(bindings)
         if unknown:
             raise ValueError(
                 f"terminal control streams are not compiled sources: {sorted(unknown)}"
             )
-        if set(terminal_ends) != set(bindings):
+        if set(sealed_ends) != set(bindings):
             return None
-        terminal_counts = set(terminal_ends.values())
+        terminal_counts = set(sealed_ends.values())
         if len(terminal_counts) != 1:
             raise RuntimeError(
                 "scalar graph drain requires aligned source terminal counts: "
-                f"{dict(terminal_ends)}"
+                f"{dict(sealed_ends)}"
             )
         return terminal_counts.pop()
 
@@ -817,7 +813,7 @@ class ControllerActor:
         self._require_control_ledger().restore_state(ledger_state)
         self._terminal_drain_target = self._terminal_target(
             self._source_control_stream_bindings(),
-            self._require_control_ledger().terminal_ends,
+            self._require_control_ledger().sealed_ends,
         )
         components = state.get("components")
         if not isinstance(components, Mapping):

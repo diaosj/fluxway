@@ -109,7 +109,7 @@ source descriptor 只存在于 compiled `OperatorSpec`；source coordinator 由�
 `DriverState`、drain 和 snapshot，不建立第二套 source lifecycle 或 barrier。
 
 全局 `ControlLedger` 只实现 opaque ordered metadata retention、等待式共享读取、durable
-checkpoint cut、terminal 和 replay。持久 identity 只有
+checkpoint cut、sealed end 和 replay。持久 identity 只有
 `(stream_id, position)`；virtual owner 由当前 operator step 与 interleave topology 推导。
 ledger 本身不包含 virtual unit、source revision、文件 lineage 或 executor lane 语义。完整协议与 exactly-once 不变量见
 [Source Coordination](source_coordination.md)。

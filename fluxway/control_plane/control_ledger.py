@@ -31,8 +31,7 @@ class ControlLedger:
         self._records: dict[ControlKey, ControlRecord] = {}
         self._retained_counts: dict[str, int] = {}
         self._received: set[ControlKey] = set()
-        self._terminal_ends: dict[str, int] = {}
-        self._sealed_streams: set[str] = set()
+        self._sealed_ends: dict[str, int] = {}
         self._condition = asyncio.Condition()
 
     @property
@@ -48,8 +47,8 @@ class ControlLedger:
         return tuple(sorted(self._streams))
 
     @property
-    def terminal_ends(self) -> dict[str, int]:
-        return dict(self._terminal_ends)
+    def sealed_ends(self) -> dict[str, int]:
+        return dict(self._sealed_ends)
 
     @staticmethod
     def _validate_stream_id(stream_id: str) -> None:
@@ -79,8 +78,8 @@ class ControlLedger:
                 raise TypeError("control append accepts only ControlRecord values")
             stream_id = record.stream_id
             position = record.position
-            if stream_id in self._terminal_ends:
-                raise RuntimeError(f"control stream is closed: {stream_id}")
+            if stream_id in self._sealed_ends:
+                raise RuntimeError(f"control stream is sealed: {stream_id}")
             durable_cut = self._durable_cut(stream_id)
             published_end = published_ends.get(
                 stream_id, self._published_end(stream_id)
@@ -164,7 +163,7 @@ class ControlLedger:
             )
         self._condition.notify_all()
 
-    async def receive(self, stream_id: str, position: int) -> ControlRecord | None:
+    async def receive(self, stream_id: str, position: int) -> ControlRecord:
         self._validate_stream_id(stream_id)
         self._validate_position(position)
         async with self._condition:
@@ -187,32 +186,24 @@ class ControlLedger:
                         "control ledger retained interval is not contiguous: "
                         f"stream_id={stream_id!r} position={position}"
                     )
-                terminal_end = self._terminal_ends.get(stream_id)
-                if (
-                    terminal_end is not None
-                    and stream_id not in self._sealed_streams
-                    and position >= terminal_end
-                ):
-                    return None
                 await self._condition.wait()
 
     async def seal(self, stream_id: str) -> None:
         self._validate_stream_id(stream_id)
         async with self._condition:
             self._seal_locked(stream_id)
-            self._sealed_streams.add(stream_id)
 
     def _seal_locked(self, stream_id: str) -> None:
         self._streams.add(stream_id)
         published_end = self._published_end(stream_id)
-        terminal_end = self._terminal_ends.get(stream_id)
-        if terminal_end is not None and terminal_end != published_end:
+        sealed_end = self._sealed_ends.get(stream_id)
+        if sealed_end is not None and sealed_end != published_end:
             raise RuntimeError(
-                "control terminal end conflicts with published end: "
-                f"stream_id={stream_id!r} terminal={terminal_end} "
+                "control sealed end conflicts with published end: "
+                f"stream_id={stream_id!r} sealed={sealed_end} "
                 f"published={published_end}"
             )
-        self._terminal_ends[stream_id] = published_end
+        self._sealed_ends[stream_id] = published_end
 
     async def progress(self, stream_id: str) -> StreamProgress:
         self._validate_stream_id(stream_id)
@@ -221,7 +212,7 @@ class ControlLedger:
             return StreamProgress(
                 durable_cut=self._durable_cut(stream_id),
                 published_end=self._published_end(stream_id),
-                terminal_end=self._terminal_ends.get(stream_id),
+                sealed_end=self._sealed_ends.get(stream_id),
             )
 
     def checkpoint_state(self, *, cuts: Mapping[str, int]) -> dict[str, Any]:
@@ -268,8 +259,7 @@ class ControlLedger:
                 for stream_id in sorted(self._streams)
             },
             "records": replay,
-            "terminal_ends": dict(sorted(self._terminal_ends.items())),
-            "sealed_streams": sorted(self._sealed_streams),
+            "sealed_ends": dict(sorted(self._sealed_ends.items())),
         }
 
     def _validated_checkpoint(
@@ -279,7 +269,6 @@ class ControlLedger:
         dict[str, int],
         dict[ControlKey, ControlRecord],
         dict[str, int],
-        set[str],
     ]:
         if not isinstance(state, Mapping):
             raise TypeError("control checkpoint state must be a mapping")
@@ -287,8 +276,7 @@ class ControlLedger:
             "durable_cuts",
             "published_ends",
             "records",
-            "terminal_ends",
-            "sealed_streams",
+            "sealed_ends",
         }
         if set(state) != expected_fields:
             raise ValueError(
@@ -297,9 +285,8 @@ class ControlLedger:
             )
         durable_cuts = state["durable_cuts"]
         published_ends = state["published_ends"]
-        terminal_ends = state["terminal_ends"]
+        sealed_ends = state["sealed_ends"]
         serialized_records = state["records"]
-        sealed_streams = state["sealed_streams"]
         if not isinstance(durable_cuts, Mapping) or not isinstance(
             published_ends, Mapping
         ):
@@ -320,27 +307,16 @@ class ControlLedger:
                 raise ValueError("control durable cut exceeds published end")
             normalized_cuts[stream_id] = cut
             normalized_ends[stream_id] = end
-        if not isinstance(terminal_ends, Mapping):
-            raise TypeError("control checkpoint terminal ends must be a mapping")
-        normalized_terminal: dict[str, int] = {}
-        for stream_id, terminal_end in terminal_ends.items():
+        if not isinstance(sealed_ends, Mapping):
+            raise TypeError("control checkpoint sealed ends must be a mapping")
+        normalized_sealed: dict[str, int] = {}
+        for stream_id, sealed_end in sealed_ends.items():
             if stream_id not in normalized_ends:
-                raise ValueError(
-                    "control terminal stream is absent from published ends"
-                )
-            self._validate_position(terminal_end, name="terminal end")
-            if terminal_end != normalized_ends[stream_id]:
-                raise ValueError("control terminal end must equal published end")
-            normalized_terminal[stream_id] = terminal_end
-        if not isinstance(sealed_streams, list) or any(
-            not isinstance(stream_id, str) for stream_id in sealed_streams
-        ):
-            raise TypeError("control checkpoint sealed_streams must be a string list")
-        normalized_sealed = set(sealed_streams)
-        if len(normalized_sealed) != len(sealed_streams):
-            raise ValueError("control checkpoint contains duplicate sealed streams")
-        if not normalized_sealed <= set(normalized_terminal):
-            raise ValueError("sealed control streams must be terminal")
+                raise ValueError("control sealed stream is absent from published ends")
+            self._validate_position(sealed_end, name="sealed end")
+            if sealed_end != normalized_ends[stream_id]:
+                raise ValueError("control sealed end must equal published end")
+            normalized_sealed[stream_id] = sealed_end
         if not isinstance(serialized_records, list):
             raise TypeError("control checkpoint records must be a list")
         records: dict[ControlKey, ControlRecord] = {}
@@ -371,21 +347,16 @@ class ControlLedger:
             normalized_cuts,
             normalized_ends,
             records,
-            normalized_terminal,
             normalized_sealed,
         )
 
     async def commit_checkpoint(self, state: Mapping[str, Any]) -> None:
-        cuts, ends, records, terminal, sealed = self._validated_checkpoint(state)
+        cuts, ends, records, sealed = self._validated_checkpoint(state)
         async with self._condition:
             current_ends = {
                 stream_id: self._published_end(stream_id) for stream_id in self._streams
             }
-            if (
-                ends != current_ends
-                or terminal != self._terminal_ends
-                or sealed != self._sealed_streams
-            ):
+            if ends != current_ends or sealed != self._sealed_ends:
                 raise RuntimeError(
                     "control ledger changed after checkpoint preparation"
                 )
@@ -407,9 +378,9 @@ class ControlLedger:
             self._condition.notify_all()
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
-        if self._streams or self._records or self._received or self._terminal_ends:
+        if self._streams or self._records or self._received or self._sealed_ends:
             raise RuntimeError("cannot restore a non-empty control ledger")
-        cuts, ends, records, terminal, sealed = self._validated_checkpoint(state)
+        cuts, ends, records, sealed = self._validated_checkpoint(state)
         self._streams = set(cuts)
         self._durable_cuts = cuts
         self._published_ends = ends
@@ -418,5 +389,4 @@ class ControlLedger:
             self._retained_counts[stream_id] = (
                 self._retained_counts.get(stream_id, 0) + 1
             )
-        self._terminal_ends = terminal
-        self._sealed_streams = sealed
+        self._sealed_ends = sealed

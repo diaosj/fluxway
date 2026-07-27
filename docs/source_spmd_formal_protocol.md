@@ -10,18 +10,17 @@ Source SPMD 不需要 source 专属的调度、barrier、ack 或 checkpoint 接�
 ```python
 append(records: Sequence[ControlRecord]) -> Awaitable[None]
 try_append(records: Sequence[ControlRecord]) -> Awaitable[bool]
-receive(stream_id: str, position: int) -> Awaitable[ControlRecord | None]
-close(stream_id: str) -> Awaitable[None]
+receive(stream_id: str, position: int) -> Awaitable[ControlRecord]
+seal(stream_id: str) -> Awaitable[None]
 progress(stream_id: str) -> Awaitable[StreamProgress]
 ```
 
 - `append` 原子、幂等并提供异步背压。
 - `try_append` 与 `append` 共用同一个状态转换，容量不足时不等待并返回 `False`。
-- `receive` 等待精确位置；有记录时返回记录。普通有限 stream 可在终点返回 `None`，interleaved
-  source 的 sealed terminal 不向单个 physical worker 返回 `None`。
-- `close` 原子固定 stream 的有限终点；Controller 将 source close 转成 sealed terminal 与原生
-  completion，空轮询永远不等于 close。
-- `progress` 只返回 durable checkpoint cut、terminal end 和观测信息，不暴露内部 queue 状态。
+- `receive` 等待精确位置并返回已发布记录，不使用 `None` 表达生命周期。
+- `seal` 原子固定 stream 的有限终点；Controller 将 source seal 转成 terminal drain 与原生
+  completion，空轮询永远不等于 seal。
+- `progress` 只返回 durable checkpoint cut、sealed end 和观测信息，不暴露内部 queue 状态。
 
 `receive` 内部封装 condition notification，因此不再把 `status -> try_claim -> wait -> retry` 状态机
 泄漏给 source 实现。checkpoint 的 prepare、commit 和 restore 复用 Fluxway 现有 checkpoint 控制链，
@@ -44,11 +43,10 @@ L: K -> V          有限偏函数，即有序控制记录
 ```text
 d_s    durable cut，所有 n < d_s 已包含在原子 checkpoint
 h_s    published end，所有 n < h_s 已发布
-z_s    terminal end；未 close 时无定义，close 后 z_s = h_s
-sigma_s terminal 是否由宿主 completion 消化的 sealed bit
+z_s    sealed end；未 seal 时无定义，seal 后 z_s = h_s
 ```
 
-第一次 `append`、`receive`、`close` 或 `progress` 会建立 stream identity。因而尚未产生第一条记录的
+第一次 `append`、`receive`、`seal` 或 `progress` 会建立 stream identity。因而尚未产生第一条记录的
 open stream 也能以 `d_s = h_s = 0` 参与 checkpoint，不需要额外的 source-specific register 操作。
 
 在任意状态都要求：
@@ -57,7 +55,6 @@ open stream 也能以 `d_s = h_s = 0` 参与 checkpoint，不需要额外的 sou
 0 <= d_s <= h_s
 domain(L_s) = [d_s, h_s)
 z_s 有定义 => z_s = h_s
-sigma_s => z_s 有定义
 ```
 
 这里的 cut 使用半开区间计数，不使用 `last_position = cut - 1`。这消除了空 stream 需要 `-1`
@@ -102,21 +99,19 @@ control stream 和有界 retention，因此使用 control stream 会直接报错
 
 ```text
 (s,n) in domain(L)                         => 返回唯一的 L(s,n)
-z_s 有定义且 not sigma_s 且 n >= z_s       => 返回 None
 其他                                       => await 状态版本变化后重试
 ```
 
 `receive` 是共享幂等读取，不是排他 lease。一个 active virtual group 内的多个 rank 获取相同 metadata，
 所以接口不使用容易暗示排他所有权和超时的 `claim/lease/ack` 术语。
 
-### Close
+### Finish
 
 ```text
-close(s): z_s := h_s
-seal(s):  z_s := h_s; sigma_s := true
+seal(s): z_s := h_s
 ```
 
-重复 close 幂等；close 后 append 非法。terminal 是 producer 的显式事实，不能由 timeout、空 catalog
+重复 seal 幂等；seal 后 append 非法。terminal 是 producer 的显式事实，不能由 timeout、空 catalog
 结果或 Reader 的 `None` 猜测。
 
 ## 4. Virtual SPMD 映射
@@ -170,8 +165,7 @@ prepare(kappa):
     snapshot.records = {(s,n,L(s,n)) | kappa(s) <= n < h_s}
     snapshot.durable_cuts = kappa
     snapshot.published_ends = h
-    snapshot.terminal_ends = z
-    snapshot.sealed_streams = sigma
+    snapshot.sealed_ends = z
 
 commit(snapshot):
     仅在完整 checkpoint envelope 原子发布成功后令 d := kappa
@@ -182,7 +176,7 @@ restore(snapshot):
     h := snapshot.published_ends
     require forall s: h_s - d_s <= B_runtime
     所有 snapshot.records 恢复为可 receive
-    sealed terminal checkpoint 恢复后直接进入宿主 completion，不 resume source
+    terminal checkpoint 恢复后直接进入宿主 completion，不 resume source
     不恢复物理 owner、local prefetch 或 payload materialization
 ```
 
@@ -273,8 +267,8 @@ SPMD 数量或 unit size 改变不会遗留旧 owner，也不会改变 global ba
 6. checkpoint cadence 与容量满足 `forall s: h_s-d_s <= B`；
 7. drain 先 quiesce Driver component，再生成 ledger snapshot。
 
-在这些条件下，`receive` 最终返回记录；普通 finite stream 返回 terminal，sealed source 则由宿主
-完成整个图；失败进入现有 failure channel。等待只挂起当前 coroutine；其他 operator、transport 和
+在这些条件下，`receive` 最终返回记录；sealed source 由宿主完成整个图；失败进入现有
+failure channel。等待只挂起当前 coroutine；其他 operator、transport 和
 control task 继续运行。控制路径复杂度为：
 
 ```text
@@ -309,5 +303,5 @@ pytest tests/control_plane/test_control_ledger.py tests/control_plane/test_compo
 ```
 
 形式化校验说明：
-1. **代数状态空间穷举**：穷举双 stream 的 published/cut/terminal 状态，验证集合分割、幂等 receive、原子 append、checkpoint restore、interleave partition 和 topology change，并验证“持久 owner”与“source 局部完成即提交”两个反例的判定。
+1. **代数状态空间穷举**：穷举双 stream 的 published/cut/sealed 状态，验证集合分割、幂等 receive、原子 append、checkpoint restore、interleave partition 和 topology change，并验证“持久 owner”与“source 局部完成即提交”两个反例的判定。
 2. **Dispatcher 精化验证**：直接导入 Fluxway `InterleavedDispatcher`，验证真实 dispatcher 与本规范的 $O_{(w,u)}(n)$ 在小规模拓扑和 step 上满足精确等价契约。

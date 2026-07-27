@@ -99,7 +99,7 @@ class ExampleSourceCoordinator:
 append(records)
 try_append(records)
 receive(stream_id, position)
-close(stream_id)
+seal(stream_id)
 progress(stream_id)
 ```
 
@@ -109,14 +109,14 @@ drain 等待一个背压中的 append。`receive` 在内部异步等待精确 po
 virtual group 的多个 rank 返回同一 metadata。调用方不实现 `status -> acquire -> wait` 循环，也不
 调用 ack。
 
-Controller 的 `close_control_stream()` 将 terminal stream 标记为 sealed。sealed source 不向任一
-physical worker 返回 `None`，而是缩短现有 Driver drain，并在 terminal checkpoint 后触发既有
-`COMPLETING -> COMPLETED` 流程。`sealed_streams` 与 terminal end 一起进入 ledger checkpoint；
+Controller 的 `seal_control_stream()` 将 sealed end 原子固定为当前 published end。完成的
+source 不向任一 physical worker 返回 `None`，而是缩短现有 Driver drain，并在 terminal
+checkpoint 后触发既有 `COMPLETING -> COMPLETED` 流程。sealed end 进入 ledger checkpoint；
 恢复 terminal checkpoint 时保持所有 SPMD blocked，恢复完 model/Driver state 后直接复用同一
 completion 路径，不重启 discovery。
 
-全图 completion 仍使用一个 global logical step，因此所有 coordinated source 的 terminal end
-必须相同。不同 source 的 checkpoint cut 可以是向量；不同 terminal end 不能自动取最小值或最大值，
+全图 completion 仍使用一个 global logical step，因此所有 coordinated source 的 sealed end
+必须相同。不同 source 的 checkpoint cut 可以是向量；不同 sealed end 不能自动取最小值或最大值，
 否则分别会丢弃较长 source 的记录或要求较短 source 产生不存在的 batch。当前实现对此直接报错。
 独立图分支若要在不同位置结束，必须先定义 source position 到各 Driver clock 的显式映射。
 

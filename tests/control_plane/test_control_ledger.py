@@ -10,9 +10,19 @@ from fluxway.control_plane.control_ledger import ControlLedger
 from fluxway.control_plane.components import driver_component_id
 from fluxway.control_plane.controller import ControllerActor
 from fluxway.control_plane.ledger_client import ControlRecord
+from fluxway.control_plane.ledger_client import ControlLedgerClient
 
 
 CONTROLLER_CLASS = ControllerActor.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+
+
+def test_control_ledger_implements_the_single_terminal_interface() -> None:
+    ledger = ControlLedger(1)
+
+    assert isinstance(ledger, ControlLedgerClient)
+    assert hasattr(ledger, "seal")
+    assert not hasattr(ledger, "close")
+    assert not hasattr(ledger, "finish")
 
 
 def _record(position: int, *, stream_id: str = "stream", payload=None):
@@ -64,7 +74,7 @@ async def test_receive_waits_for_append_without_polling() -> None:
 
 
 @pytest.mark.asyncio
-async def test_seal_checkpoints_terminal_without_waking_waiting_receiver() -> None:
+async def test_seal_checkpoints_boundary_without_waking_waiting_receiver() -> None:
     ledger = ControlLedger(1)
     waiting = asyncio.create_task(ledger.receive("stream", 0))
     await asyncio.sleep(0)
@@ -73,9 +83,8 @@ async def test_seal_checkpoints_terminal_without_waking_waiting_receiver() -> No
     await asyncio.sleep(0)
 
     assert not waiting.done()
-    assert ledger.checkpoint_state(cuts={"stream": 0})["terminal_ends"] == {"stream": 0}
+    assert ledger.checkpoint_state(cuts={"stream": 0})["sealed_ends"] == {"stream": 0}
     state = ledger.checkpoint_state(cuts={"stream": 0})
-    assert state["sealed_streams"] == ["stream"]
     await ledger.commit_checkpoint(state)
     await asyncio.sleep(0)
     assert not waiting.done()
@@ -123,9 +132,9 @@ async def test_append_is_idempotent_and_rejects_gaps_and_conflicts() -> None:
 async def test_terminal_is_stream_scoped_and_immutable() -> None:
     ledger = ControlLedger(2)
     await ledger.seal("a")
-    assert (await ledger.progress("a")).terminal_end == 0
-    assert (await ledger.progress("b")).terminal_end is None
-    with pytest.raises(RuntimeError, match="closed"):
+    assert (await ledger.progress("a")).sealed_end == 0
+    assert (await ledger.progress("b")).sealed_end is None
+    with pytest.raises(RuntimeError, match="sealed"):
         await ledger.append((_record(0, stream_id="a"),))
     await ledger.append((_record(0, stream_id="b"),))
 
