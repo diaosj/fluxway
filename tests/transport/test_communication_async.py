@@ -9,11 +9,15 @@ from fluxway.common.ragged import ragged_level_count
 from fluxway.common.tensor_backend import set_backend
 from fluxway.common.types.sharding import P, ShardingSpec
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.transport.communication import AsyncDataDistributor
 from fluxway.transport.manifest import (
     ENTRY_EXPECTED_COUNT,
+    ENTRY_GLOBAL_SHAPE_BEGIN,
+    ENTRY_GLOBAL_SHAPE_COUNT,
     ENTRY_META_STATE,
     ENTRY_ROUTE_CODE,
+    ENTRY_SOURCE_STEP,
     ENTRY_TENSOR_KIND,
     FRAME_ENTRY_COUNT,
     FRAME_FLAGS,
@@ -146,6 +150,98 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
         int(PayloadRole.VALUES),
         int(PayloadRole.ORIGIN),
     ]
+
+
+@pytest.mark.parametrize(
+    "order",
+    (
+        (("dp", 237), ("replicated", 238)),
+        (("replicated", 238), ("dp", 237)),
+    ),
+)
+def test_late_aggregation_preserves_expected_count_per_transfer(order) -> None:
+    source_mesh = DeviceMesh(("dp",), (8,), list(range(8)))
+    target_mesh = DeviceMesh(("dp",), (1,), [0])
+    distributor = AsyncDataDistributor(local_rank=0)
+
+    for kind, transfer_code in order:
+        if kind == "dp":
+            source = ShardingSpec.chunk(P("dp")).bind(source_mesh)
+            target = ShardingSpec.chunk(P("dp")).bind(target_mesh)
+            tensor = TransportTensor(
+                np.asarray([10, 11], dtype=np.int64),
+                global_shape=(16,),
+                source_step=0,
+            )
+        else:
+            source = ShardingSpec.chunk(P()).bind(source_mesh)
+            target = ShardingSpec.chunk(P()).bind(target_mesh)
+            tensor = TransportTensor(
+                np.asarray(16, dtype=np.int32), global_shape=(), source_step=0
+            )
+        asyncio.run(
+            distributor.distribute(
+                local_data=tensor,
+                source=source,
+                target=target,
+                transfer_codes=transfer_code,
+            )
+        )
+
+    expected = {237: 8, 238: 1}
+    _target_id, plain_header, plain_payloads = distributor.build_transport_frame_args(
+        step=0,
+        sender_spmd_code=1,
+        sender_rank=0,
+        sender_world_size=8,
+    )[0]
+    plain = plain_header.to_frame(plain_payloads)
+    template_cache = {}
+    _target_id, template_cold_header, template_cold_payloads = (
+        distributor.build_transport_frame_args(
+            step=0,
+            sender_spmd_code=1,
+            sender_rank=0,
+            sender_world_size=8,
+            template_cache=template_cache,
+        )[0]
+    )
+    template_cold = template_cold_header.to_frame(template_cold_payloads)
+    _target_id, template_warm_header, template_warm_payloads = (
+        distributor.build_transport_frame_args(
+            step=1,
+            sender_spmd_code=1,
+            sender_rank=0,
+            sender_world_size=8,
+            template_cache=template_cache,
+        )[0]
+    )
+    template_warm = template_warm_header.to_frame(template_warm_payloads)
+    for frame in (plain, template_cold, template_warm):
+        assert {
+            int(entry[ENTRY_ROUTE_CODE]): int(entry[ENTRY_EXPECTED_COUNT])
+            for entry in frame.entry_i32
+        } == expected
+        entry_by_transfer = {
+            int(entry[ENTRY_ROUTE_CODE]): entry for entry in frame.entry_i32
+        }
+        assert int(entry_by_transfer[237][ENTRY_SOURCE_STEP]) == 0
+        assert int(entry_by_transfer[238][ENTRY_SOURCE_STEP]) == 0
+        assert int(entry_by_transfer[237][ENTRY_META_STATE]) == 0
+        assert int(entry_by_transfer[238][ENTRY_META_STATE]) == 0
+        dp_shape_begin = int(entry_by_transfer[237][ENTRY_GLOBAL_SHAPE_BEGIN])
+        dp_shape_count = int(entry_by_transfer[237][ENTRY_GLOBAL_SHAPE_COUNT])
+        scalar_shape_begin = int(entry_by_transfer[238][ENTRY_GLOBAL_SHAPE_BEGIN])
+        scalar_shape_count = int(entry_by_transfer[238][ENTRY_GLOBAL_SHAPE_COUNT])
+        assert frame.global_shape_i64[
+            dp_shape_begin : dp_shape_begin + dp_shape_count
+        ].tolist() == [16]
+        assert scalar_shape_count == 0
+        assert scalar_shape_begin >= 0
+
+    mailbox = WorkerMailbox()
+    mailbox.declare_step("step", 0, expected, [])
+    asyncio.run(mailbox.deposit_transport_frame("step", "Input", plain))
 
 
 def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():

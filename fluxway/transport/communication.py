@@ -111,6 +111,25 @@ class TransportFrameEntryPlan:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class AggregatedTransportGroup:
+    transfer_codes: tuple[int, ...]
+    tensors: tuple[Any, ...]
+    counts: tuple[int, ...]
+    global_shapes: tuple[tuple[int, ...] | None, ...]
+    meta_states: tuple[int, ...]
+    compact_params: tuple[tuple[int, ...] | None, ...] | None
+    tensor_kinds: tuple[int, ...]
+    source_steps: tuple[int, ...]
+    expected_count: int
+
+    def __post_init__(self) -> None:
+        if self.expected_count <= 0:
+            raise ValueError(
+                f"aggregated transport expected_count must be positive, got {self.expected_count}."
+            )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class TransportFrameTemplateKey:
     target_rank: int
     sender_spmd_code: int
@@ -704,9 +723,9 @@ class BaseDataDistributor:
         self.local_rank = local_rank
         from collections import defaultdict
 
-        # Internal aggregation for "Late Aggregation"
-        # {target_rank: [(tensors, counts, global_shapes, has_meta_tensor_state_list)]}
-        self._dest_agg: dict[int, list[tuple]] = defaultdict(list)
+        # Internal aggregation retains plan-local ABI metadata per target.
+        # {target_rank: [AggregatedTransportGroup]}
+        self._dest_agg: dict[int, list[AggregatedTransportGroup]] = defaultdict(list)
         self._meta_sort_indices = None
         self._current_source_spec = None
         self._current_target_spec = None
@@ -831,15 +850,16 @@ class BaseDataDistributor:
             emission_mode=SenderEmissionMode.ALL_EXPECTED_SENDERS,
         )
         self._dest_agg[target_rank].append(
-            (
-                transfer_code,
-                [payload],
-                [0],
-                [None],
-                [0],
-                [None],
-                [int(tensor_kind)],
-                [source_step],
+            AggregatedTransportGroup(
+                transfer_codes=(transfer_code,),
+                tensors=(payload,),
+                counts=(0,),
+                global_shapes=(None,),
+                meta_states=(0,),
+                compact_params=None,
+                tensor_kinds=(int(tensor_kind),),
+                source_steps=(source_step,),
+                expected_count=expected_count,
             )
         )
 
@@ -1693,16 +1713,33 @@ class BaseDataDistributor:
             if self._meta_sort_indices is None:
                 self._meta_sort_indices = sort_idx
             for target_id in targets:
+                manifest = self._current_plan_manifest
+                if manifest is None:
+                    raise RuntimeError(
+                        "transport aggregation requires a plan manifest before staging frames."
+                    )
                 self._dest_agg[target_id].append(
-                    (
-                        transfer_codes,
-                        tensors,
-                        counts,
-                        global_shapes_list,
-                        has_meta_tensor_state_list,
-                        slice_compact_desc_params,
-                        tensor_kind_list,
-                        source_steps_list,
+                    AggregatedTransportGroup(
+                        transfer_codes=(
+                            tuple(transfer_codes)
+                            if isinstance(transfer_codes, list | tuple)
+                            else (transfer_codes,)
+                        ),
+                        tensors=tuple(tensors),
+                        counts=tuple(counts),
+                        global_shapes=tuple(global_shapes_list),
+                        meta_states=tuple(has_meta_tensor_state_list),
+                        compact_params=(
+                            None
+                            if slice_compact_desc_params is None
+                            else tuple(
+                                None if compact is None else tuple(compact)
+                                for compact in slice_compact_desc_params
+                            )
+                        ),
+                        tensor_kinds=tuple(tensor_kind_list),
+                        source_steps=tuple(source_steps_list),
+                        expected_count=manifest.expected_count_for(target_id),
                     )
                 )
 
@@ -1842,7 +1879,7 @@ class AsyncDataDistributor(BaseDataDistributor):
         self,
         *,
         target_id: int,
-        groups: list[tuple],
+        groups: list[AggregatedTransportGroup],
         step: int,
         sender_spmd_code: int,
         sender_rank: int,
@@ -1872,7 +1909,7 @@ class AsyncDataDistributor(BaseDataDistributor):
         self,
         *,
         target_id: int,
-        groups: list[tuple],
+        groups: list[AggregatedTransportGroup],
         step: int,
         sender_spmd_code: int,
         sender_rank: int,
@@ -1885,10 +1922,8 @@ class AsyncDataDistributor(BaseDataDistributor):
             sender_world_size=sender_world_size,
             capacity=_frame_table_capacity_for_groups(groups),
         )
-        expected_count = self.expected_n_for_dst(target_id, sender_world_size)
         for entry_plan in _iter_transport_frame_entry_plans(
             groups,
-            expected_count=expected_count,
             target_id=target_id,
         ):
             entry_index = builder.add_tensor_transfer_entry(
@@ -1913,18 +1948,16 @@ class AsyncDataDistributor(BaseDataDistributor):
         self,
         *,
         target_id: int,
-        groups: list[tuple],
+        groups: list[AggregatedTransportGroup],
         step: int,
         sender_spmd_code: int,
         sender_rank: int,
         sender_world_size: int,
         template_cache: TransportFrameTemplateCache,
     ):
-        expected_count = self.expected_n_for_dst(target_id, sender_world_size)
         entry_plans = tuple(
             _iter_transport_frame_entry_plans(
                 groups,
-                expected_count=expected_count,
                 target_id=target_id,
             )
         )
@@ -1963,26 +1996,21 @@ class AsyncDataDistributor(BaseDataDistributor):
 
 
 def _iter_transport_frame_entry_plans(
-    groups: list[tuple],
+    groups: list[AggregatedTransportGroup],
     *,
-    expected_count: int,
     target_id: int,
 ) -> tuple[TransportFrameEntryPlan, ...]:
     entries: list[TransportFrameEntryPlan] = []
-    for group_index, (
-        transfer_codes,
-        tensors,
-        counts,
-        global_shapes,
-        meta_states,
-        compact_params,
-        tensor_kinds,
-        source_steps,
-    ) in enumerate(groups):
-        if isinstance(transfer_codes, list | tuple):
-            transfer_code_seq = tuple(int(code) for code in transfer_codes)
-        else:
-            transfer_code_seq = (int(transfer_codes),)
+    for group_index, group in enumerate(groups):
+        transfer_codes = group.transfer_codes
+        tensors = group.tensors
+        counts = group.counts
+        global_shapes = group.global_shapes
+        meta_states = group.meta_states
+        compact_params = group.compact_params
+        tensor_kinds = group.tensor_kinds
+        source_steps = group.source_steps
+        transfer_code_seq = transfer_codes
         if len(tensor_kinds) != len(transfer_code_seq):
             raise ValueError(
                 f"tensor_kinds length {len(tensor_kinds)} does not match "
@@ -2055,7 +2083,7 @@ def _iter_transport_frame_entry_plans(
                     transfer_code=transfer_code,
                     meta_state=meta_state,
                     tensor_kind=TensorEntryKind(int(tensor_kinds[entry_index])),
-                    expected_count=expected_count,
+                    expected_count=group.expected_count,
                     source_step=int(source_steps[entry_index]),
                     compact_params=compact,
                     global_shape=tuple(int(value) for value in shape)
@@ -2215,27 +2243,24 @@ def _static_identity_payload_group(
     return direct_payloads, counts, compact_params
 
 
-def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
+def _frame_table_capacity_for_groups(
+    groups: list[AggregatedTransportGroup],
+) -> FrameTableCapacity:
     entry_count = 0
     payload_count = 0
     shape_count = 0
     global_shape_count = 0
     compact_count = 0
 
-    for group_index, (
-        transfer_codes,
-        tensors,
-        _counts,
-        global_shapes,
-        meta_states,
-        compact_params,
-        tensor_kinds,
-        _source_steps,
-    ) in enumerate(groups):
-        if isinstance(transfer_codes, list | tuple):
-            transfer_code_seq = tuple(transfer_codes)
-        else:
-            transfer_code_seq = (transfer_codes,)
+    for group_index, group in enumerate(groups):
+        transfer_codes = group.transfer_codes
+        tensors = group.tensors
+        global_shapes = group.global_shapes
+        meta_states = group.meta_states
+        compact_params = group.compact_params
+        tensor_kinds = group.tensor_kinds
+        source_steps = group.source_steps
+        transfer_code_seq = transfer_codes
         if len(tensor_kinds) != len(transfer_code_seq):
             raise ValueError(
                 f"tensor_kinds length {len(tensor_kinds)} does not match "
@@ -2251,9 +2276,9 @@ def _frame_table_capacity_for_groups(groups: list[tuple]) -> FrameTableCapacity:
                 f"global_shapes length {len(global_shapes)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
-        if len(_source_steps) != len(transfer_code_seq):
+        if len(source_steps) != len(transfer_code_seq):
             raise ValueError(
-                f"source_steps length {len(_source_steps)} does not match "
+                f"source_steps length {len(source_steps)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
 

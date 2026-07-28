@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import patch
 
 import numpy as np
@@ -15,6 +16,7 @@ from fluxway.common.compiled_graph import (
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.types.configs import SPMDConfig
 from fluxway.common.types.sharding import P, PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.spmd.worker.data_plane import (
@@ -24,7 +26,10 @@ from fluxway.spmd.worker.data_plane import (
     compile_send_plan,
     prepare_route_tensor,
 )
+from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
+from fluxway.spmd.worker.operator_manager.operator_manager import OperatorManager
 from fluxway.transport.communication import TransportRoutingMode
+from fluxway.transport.manifest import ENTRY_EXPECTED_COUNT, ENTRY_ROUTE_CODE
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
@@ -43,6 +48,358 @@ def _dependency(
                 target=OperatorPort(target_port),
             ),
         ),
+    )
+
+
+class _HeterogeneousSourceOwner:
+    def produce(self) -> dict[str, object]:
+        raise RuntimeError("transport route test operators are not executable")
+
+
+class _HeterogeneousTargetOwner:
+    def consume(self, dense: object, scalar: object) -> None:
+        del dense, scalar
+
+
+def _compiled_sender_plan(graph, *, source_spmd_id: str, source_op_id: str, rank: int):
+    source_view = graph.spmd(source_spmd_id)
+    dependencies = tuple(
+        dependency
+        for dependency in source_view.outgoing
+        if dependency.source_operator.key.op_id == source_op_id
+    )
+    return compile_send_plan(
+        graph_view=source_view,
+        source_op_id=source_op_id,
+        rank=rank,
+        successor_contexts=(
+            SuccessorRouteContext(0, dependencies, effective_rank=rank),
+        ),
+        sender_spmd_code=1,
+        interleave_unit_size=None,
+    )
+
+
+def _build_single_frame(
+    *,
+    compiled_plan,
+    flat_results: list[TransportTensor],
+    exec_step: int,
+):
+    groups = build_step_frame_groups(
+        compiled_plan=compiled_plan,
+        flat_results=flat_results,
+        step_transfer_cache={},
+        exec_step=exec_step,
+    )
+    assert len(groups) == 1
+    _context_index, frame_arg = groups[0]
+    return frame_arg
+
+
+def _frame_expected_counts(frame_arg) -> dict[int, int]:
+    _target_rank, header, payloads = frame_arg
+    frame = header.to_frame(payloads)
+    return {
+        int(entry[ENTRY_ROUTE_CODE]): int(entry[ENTRY_EXPECTED_COUNT])
+        for entry in frame.entry_i32
+    }
+
+
+def _target_manager(graph, *, target_spmd_id: str) -> OperatorManager:
+    graph_view = graph.spmd(target_spmd_id)
+    return OperatorManager(
+        SPMDConfig(
+            spmd_id=target_spmd_id,
+            graph_view=graph_view,
+            mesh=graph_view.mesh,
+            operator_specs={
+                operator.key.op_id: operator.spec for operator in graph_view.operators
+            },
+        ),
+        rank=0,
+        spmd_id=target_spmd_id,
+        static_args={},
+    )
+
+
+def _transfer_codes_by_target_port(graph, *, target_spmd_id: str) -> dict[str, int]:
+    return {
+        transfer.spec.target.name: transfer.transfer_code
+        for dependency in graph.spmd(target_spmd_id).incoming
+        for transfer in dependency.transfers
+    }
+
+
+def test_same_source_operator_heterogeneous_outputs_preserve_route_abi():
+    chunked = ShardingSpec.chunk(P("data"))
+    replicated = ShardingSpec.chunk(PartitionSpec())
+    source = OperatorSpec(
+        name="produce",
+        owner=_HeterogeneousSourceOwner,
+        output_arguments={"data": ("dense", "scalar")},
+        output_sharding={"dense": chunked, "scalar": replicated},
+    )
+    target = OperatorSpec(
+        name="consume",
+        owner=_HeterogeneousTargetOwner,
+        input_arguments={"data": ("dense", "scalar")},
+        input_sharding={"dense": chunked, "scalar": replicated},
+    )
+    graph = compile_graph(
+        name="same-source-heterogeneous-outputs",
+        spmds=(
+            compiled_spmd_spec(
+                "source", DeviceMesh(("data",), (2,)), {"produce": source}
+            ),
+            compiled_spmd_spec(
+                "target", DeviceMesh(("data",), (1,)), {"consume": target}
+            ),
+        ),
+        dependencies=(
+            DependencySpec(
+                source=OperatorKey("source", "produce"),
+                target=OperatorKey("target", "consume"),
+                transfers=(
+                    TensorTransfer(OperatorPort("dense"), OperatorPort("dense")),
+                    TensorTransfer(OperatorPort("scalar"), OperatorPort("scalar")),
+                ),
+            ),
+        ),
+    )
+    transfer_codes = _transfer_codes_by_target_port(graph, target_spmd_id="target")
+    expected = _target_manager(
+        graph, target_spmd_id="target"
+    ).get_expected_transfer_shards("consume")
+    assert expected == {
+        transfer_codes["dense"]: 2,
+        transfer_codes["scalar"]: 1,
+    }
+
+    rank_zero_plan = _compiled_sender_plan(
+        graph, source_spmd_id="source", source_op_id="produce", rank=0
+    )
+    rank_one_plan = _compiled_sender_plan(
+        graph, source_spmd_id="source", source_op_id="produce", rank=1
+    )
+    rank_zero_frame = _build_single_frame(
+        compiled_plan=rank_zero_plan,
+        flat_results=[
+            TransportTensor(np.array([1, 2]), global_shape=(4,), source_step=0),
+            TransportTensor(np.asarray(7), global_shape=(), source_step=0),
+        ],
+        exec_step=0,
+    )
+    rank_one_frame = _build_single_frame(
+        compiled_plan=rank_one_plan,
+        flat_results=[
+            TransportTensor(np.array([3, 4]), global_shape=(4,), source_step=0),
+            TransportTensor(np.asarray(8), global_shape=(), source_step=0),
+        ],
+        exec_step=0,
+    )
+
+    assert _frame_expected_counts(rank_zero_frame) == expected
+    assert _frame_expected_counts(rank_one_frame) == {transfer_codes["dense"]: 2}
+    warm_frame = _build_single_frame(
+        compiled_plan=rank_zero_plan,
+        flat_results=[
+            TransportTensor(np.array([1, 2]), global_shape=(4,), source_step=1),
+            TransportTensor(np.asarray(7), global_shape=(), source_step=1),
+        ],
+        exec_step=1,
+    )
+    assert _frame_expected_counts(warm_frame) == expected
+    assert len(rank_zero_plan.frame_template_cache) == 1
+
+    mailbox = WorkerMailbox()
+    mailbox.declare_step("consume", 0, expected, [])
+    for sender_id, frame_arg in (
+        ("source", rank_zero_frame),
+        ("source", rank_one_frame),
+    ):
+        _target_rank, header, payloads = frame_arg
+        asyncio.run(
+            mailbox.deposit_transport_frame(
+                "consume", sender_id, header.to_frame(payloads)
+            )
+        )
+    assert mailbox.is_step_ready("consume", 0)
+    assert (
+        len(
+            asyncio.run(
+                mailbox.get_tensor_shard_views(
+                    "consume", transfer_codes["dense"], step=0
+                )
+            )
+        )
+        == 2
+    )
+    assert (
+        len(
+            asyncio.run(
+                mailbox.get_tensor_shard_views(
+                    "consume", transfer_codes["scalar"], step=0
+                )
+            )
+        )
+        == 1
+    )
+
+
+def test_same_target_operator_heterogeneous_inputs_preserve_route_abi():
+    chunked = ShardingSpec.chunk(P("data"))
+    replicated = ShardingSpec.chunk(PartitionSpec())
+    dense_source = OperatorSpec(
+        name="produce_dense",
+        owner=_HeterogeneousSourceOwner,
+        output_arguments={"data": ("dense",)},
+        output_sharding={"dense": chunked},
+    )
+    scalar_source = OperatorSpec(
+        name="produce_scalar",
+        owner=_HeterogeneousSourceOwner,
+        output_arguments={"data": ("scalar",)},
+        output_sharding={"scalar": replicated},
+    )
+    target = OperatorSpec(
+        name="consume",
+        owner=_HeterogeneousTargetOwner,
+        input_arguments={"data": ("dense", "scalar")},
+        input_sharding={"dense": chunked, "scalar": replicated},
+    )
+    graph = compile_graph(
+        name="same-target-heterogeneous-inputs",
+        spmds=(
+            compiled_spmd_spec(
+                "dense_source",
+                DeviceMesh(("data",), (2,)),
+                {"produce_dense": dense_source},
+            ),
+            compiled_spmd_spec(
+                "scalar_source",
+                DeviceMesh(("data",), (2,)),
+                {"produce_scalar": scalar_source},
+            ),
+            compiled_spmd_spec(
+                "target", DeviceMesh(("data",), (1,)), {"consume": target}
+            ),
+        ),
+        dependencies=(
+            DependencySpec(
+                source=OperatorKey("dense_source", "produce_dense"),
+                target=OperatorKey("target", "consume"),
+                transfers=(
+                    TensorTransfer(OperatorPort("dense"), OperatorPort("dense")),
+                ),
+            ),
+            DependencySpec(
+                source=OperatorKey("scalar_source", "produce_scalar"),
+                target=OperatorKey("target", "consume"),
+                transfers=(
+                    TensorTransfer(OperatorPort("scalar"), OperatorPort("scalar")),
+                ),
+            ),
+        ),
+    )
+    transfer_codes = _transfer_codes_by_target_port(graph, target_spmd_id="target")
+    expected = _target_manager(
+        graph, target_spmd_id="target"
+    ).get_expected_transfer_shards("consume")
+    assert expected == {
+        transfer_codes["dense"]: 2,
+        transfer_codes["scalar"]: 1,
+    }
+
+    dense_rank_zero = _build_single_frame(
+        compiled_plan=_compiled_sender_plan(
+            graph,
+            source_spmd_id="dense_source",
+            source_op_id="produce_dense",
+            rank=0,
+        ),
+        flat_results=[
+            TransportTensor(np.array([1, 2]), global_shape=(4,), source_step=0)
+        ],
+        exec_step=0,
+    )
+    dense_rank_one = _build_single_frame(
+        compiled_plan=_compiled_sender_plan(
+            graph,
+            source_spmd_id="dense_source",
+            source_op_id="produce_dense",
+            rank=1,
+        ),
+        flat_results=[
+            TransportTensor(np.array([3, 4]), global_shape=(4,), source_step=0)
+        ],
+        exec_step=0,
+    )
+    scalar_rank_zero = _build_single_frame(
+        compiled_plan=_compiled_sender_plan(
+            graph,
+            source_spmd_id="scalar_source",
+            source_op_id="produce_scalar",
+            rank=0,
+        ),
+        flat_results=[TransportTensor(np.asarray(7), global_shape=(), source_step=0)],
+        exec_step=0,
+    )
+    scalar_rank_one_plan = _compiled_sender_plan(
+        graph,
+        source_spmd_id="scalar_source",
+        source_op_id="produce_scalar",
+        rank=1,
+    )
+    assert (
+        build_step_frame_groups(
+            compiled_plan=scalar_rank_one_plan,
+            flat_results=[
+                TransportTensor(np.asarray(8), global_shape=(), source_step=0)
+            ],
+            step_transfer_cache={},
+            exec_step=0,
+        )
+        == []
+    )
+
+    assert _frame_expected_counts(dense_rank_zero) == {transfer_codes["dense"]: 2}
+    assert _frame_expected_counts(dense_rank_one) == {transfer_codes["dense"]: 2}
+    assert _frame_expected_counts(scalar_rank_zero) == {transfer_codes["scalar"]: 1}
+
+    mailbox = WorkerMailbox()
+    mailbox.declare_step("consume", 0, expected, [])
+    for sender_id, frame_arg in (
+        ("dense_source", dense_rank_zero),
+        ("dense_source", dense_rank_one),
+        ("scalar_source", scalar_rank_zero),
+    ):
+        _target_rank, header, payloads = frame_arg
+        asyncio.run(
+            mailbox.deposit_transport_frame(
+                "consume", sender_id, header.to_frame(payloads)
+            )
+        )
+    assert mailbox.is_step_ready("consume", 0)
+    assert (
+        len(
+            asyncio.run(
+                mailbox.get_tensor_shard_views(
+                    "consume", transfer_codes["dense"], step=0
+                )
+            )
+        )
+        == 2
+    )
+    assert (
+        len(
+            asyncio.run(
+                mailbox.get_tensor_shard_views(
+                    "consume", transfer_codes["scalar"], step=0
+                )
+            )
+        )
+        == 1
     )
 
 
