@@ -250,6 +250,11 @@ class TensorBackend(ABC):
         pass
 
     @abstractmethod
+    def empty_cache(self) -> None:
+        """Release unused memory held by this backend's caching allocator."""
+        pass
+
+    @abstractmethod
     def from_dlpack(self, dlpack_capsule: Any) -> Any:
         """Create a tensor from a DLPack capsule."""
         pass
@@ -591,6 +596,10 @@ class TorchBackend(TensorBackend):
 
     def name(self) -> str:
         return "torch"
+
+    def empty_cache(self) -> None:
+        if self._torch.cuda.is_available():
+            self._torch.cuda.empty_cache()
 
     @property
     def is_torch(self) -> bool:
@@ -949,6 +958,10 @@ class JaxBackend(TensorBackend):
 
     def name(self) -> str:
         return "jax"
+
+    def empty_cache(self) -> None:
+        self._jax.clear_caches()
+        self._jax.clear_backends_caches()
 
     @property
     def is_jax(self) -> bool:
@@ -1527,6 +1540,11 @@ class HybridBackend(TensorBackend):
     # ------------------------------------------------------------------
     def name(self) -> str:
         return "hybrid_gpu_avail" if self._cp is not None else "hybrid_cpu_only"
+
+    def empty_cache(self) -> None:
+        if self._cp is not None:
+            self._cp.get_default_memory_pool().free_all_blocks()
+            self._cp.get_default_pinned_memory_pool().free_all_blocks()
 
     def adopt(self, x: Any) -> Any:
         """Zero-copy adopt foreign tensor into this HybridBackend's default device domain.
