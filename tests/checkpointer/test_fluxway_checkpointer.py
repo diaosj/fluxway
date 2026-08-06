@@ -4,7 +4,7 @@ Unit tests for FluxwayCheckpointer payload persistence.
 Covers strict pure-data payloads and checkpoint lifecycle operations.
 """
 
-import pickle
+import msgpack
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -55,14 +55,35 @@ def test_checkpointer_rejects_existing_unowned_directory(tmp_path):
 class TestPayloadPersistence:
     def test_persist_and_load_plain_dict(self, checkpointer, tmp_path):
         payload = {
+            "__fluxway_control_plane__": {},
             "spmd_0": {
                 "spmd_state": {"completed_step_count": 3},
                 "rank_storage": {"0": {"orbax_final_path": "/ckpt/0"}},
-            }
+            },
         }
         checkpointer._persist(step=5, payload=payload)
         loaded = checkpointer._load(step=5)
         assert loaded == payload
+
+    def test_persist_and_load_with_custom_encoder(self, checkpointer, tmp_path):
+        payload = {
+            "__fluxway_control_plane__": {},
+            "spmd_0": {
+                "spmd_state": {
+                    "some_hash": b"\xab\xcd\xef",
+                    "some_set": {"a", "b", "c"},
+                },
+            },
+        }
+        checkpointer._persist(step=6, payload=payload)
+        loaded = checkpointer._load(step=6)
+
+        # Verify custom types are perfectly preserved
+        assert isinstance(loaded["spmd_0"]["spmd_state"]["some_hash"], bytes)
+        assert loaded["spmd_0"]["spmd_state"]["some_hash"] == b"\xab\xcd\xef"
+        # msgpack coerces our set to a list via the hook, so we verify it's a list
+        assert isinstance(loaded["spmd_0"]["spmd_state"]["some_set"], list)
+        assert set(loaded["spmd_0"]["spmd_state"]["some_set"]) == {"a", "b", "c"}
 
     @pytest.mark.parametrize("runtime_object", [len, MagicMock])
     def test_payload_rejects_runtime_objects(self, checkpointer, runtime_object):
@@ -79,6 +100,7 @@ class TestCheckpointLifecycle:
         controller = MagicMock()
         control_state = {"control_ledger": {"durable_cuts": {}}}
         payload = {
+            "schema_version": "1.0",
             "spmd_0": {},
             "__fluxway_control_plane__": control_state,
         }
@@ -208,11 +230,12 @@ class TestCheckpointLifecycle:
         controller.abort_snapshot_artifacts = AsyncMock()
         controller.finalize_snapshot = AsyncMock()
         old_payload = {
+            "schema_version": "1.0",
             "spmd_0": {"version": 1},
             "__fluxway_control_plane__": {"control_ledger": {}},
         }
-        with open(checkpoint_root / "1" / "payload.pkl", "wb") as file:
-            pickle.dump(old_payload, file)
+        with open(checkpoint_root / "1" / "metadata.msgpack", "wb") as file:
+            msgpack.pack(old_payload, file)
 
         with pytest.raises(RuntimeError, match="commit failed"):
             await checkpointer.save(1)
@@ -227,6 +250,7 @@ class TestCheckpointLifecycle:
     ):
         controller = MagicMock()
         payload = {
+            "schema_version": "1.0",
             "spmd_0": {},
             "__fluxway_control_plane__": {"control_ledger": {}},
         }
@@ -276,8 +300,16 @@ class TestCheckpointLifecycle:
         assert checkpointer.list_steps() == [3, 4]
 
     def test_force_write_overwrite_existing(self, checkpointer, tmp_path):
-        payload_v1 = {"spmd_0": {"version": 1}}
-        payload_v2 = {"spmd_0": {"version": 2}}
+        payload_v1 = {
+            "schema_version": "1.0",
+            "__fluxway_control_plane__": {},
+            "spmd_0": {"version": 1},
+        }
+        payload_v2 = {
+            "schema_version": "1.0",
+            "__fluxway_control_plane__": {},
+            "spmd_0": {"version": 2},
+        }
         checkpointer._persist(step=1, payload=payload_v1)
 
         # Without force_write, should raise

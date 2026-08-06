@@ -497,9 +497,9 @@ class FlowControlState(FluxwayBaseSchema):
 class HeartbeatConfig(FluxwayBaseSchema):
     """Heartbeat configuration."""
 
-    heartbeat_interval: float = 5.0  # Heartbeat interval (seconds)
-    heartbeat_timeout: float = 15.0  # Heartbeat timeout (seconds)
-    max_missed_heartbeats: int = 3  # Maximum missed heartbeats before error
+    heartbeat_interval: float = 10.0  # Heartbeat interval (seconds)
+    heartbeat_timeout: float = 600.0  # Heartbeat timeout (seconds)
+    max_missed_heartbeats: int = 60  # Maximum missed heartbeats before error
 
 
 class CheckpointConfig(FluxwayBaseSchema):

@@ -1,7 +1,18 @@
 import pytest
 import pickle
 import jax.numpy as jnp
-from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
+import numpy as np
+from fluxway.common.allocation import AllocationRelation
+from fluxway.common.coherence import (
+    CoherenceStateTransitionError,
+    TensorAccessIntent,
+    UnsupportedAllocationHandoffError,
+)
+from fluxway.common.types.tensor import (
+    SymmetryReceipt,
+    TransportTensor,
+    runtime_allocation_relation,
+)
 from fluxway.common.tensor_backend import set_backend, get_backend
 from fluxway.common.index_descriptor import ContinuousIndex
 
@@ -582,3 +593,53 @@ def test_from_tensor_and_slice():
     assert isinstance(tensor_strided.routing_indices, ContinuousIndex)
     assert tensor_strided.routing_indices.start == 10
     assert tensor_strided.routing_indices.count == 4
+
+
+def test_runtime_readonly_and_invalidation_fail_fast():
+    set_backend("numba_cpu")
+    tensor = TransportTensor(np.arange(4, dtype=np.int64))
+
+    tensor._set_runtime_access_intent(TensorAccessIntent.READONLY)
+    values = tensor.flat_values
+
+    assert not values.flags.writeable
+    with pytest.raises(ValueError):
+        values[0] = 9
+
+    tensor._invalidate_runtime_access()
+    with pytest.raises(CoherenceStateTransitionError, match="invalidated"):
+        _ = tensor.flat_values
+
+
+def test_runtime_allocation_relation_is_exact_overlap_or_disjoint():
+    set_backend("numba_cpu")
+    values = np.arange(8, dtype=np.int64)
+
+    assert (
+        runtime_allocation_relation(values, values.reshape(2, 4))
+        is AllocationRelation.EXACT
+    )
+    assert runtime_allocation_relation(values, values[2:]) is AllocationRelation.OVERLAP
+    assert (
+        runtime_allocation_relation(values, values.copy())
+        is AllocationRelation.DISJOINT
+    )
+    with pytest.raises(UnsupportedAllocationHandoffError):
+        runtime_allocation_relation(object(), object())
+
+
+def test_zero_copy_alias_has_independent_runtime_lifetime():
+    import numpy as np
+    from fluxway.common.types.tensor import TransportTensor
+
+    values = np.arange(6, dtype=np.float32)
+    tensor = TransportTensor(values)
+    alias = tensor.zero_copy_alias()
+
+    assert alias is not tensor
+    assert (
+        alias.flat_values.__array_interface__["data"][0]
+        == values.__array_interface__["data"][0]
+    )
+    tensor._invalidate_runtime_access()
+    assert alias.flat_values.tolist() == values.tolist()

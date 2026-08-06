@@ -619,6 +619,7 @@ def operator(
     source: Any | None = None,
     barrier_config: Any | None = None,
     async_policy: Any | None = None,
+    tensor_access: Mapping[str, Any] | None = None,
 ) -> "Any":
     """
     Mark a function as a Fluxway operator with automatic metadata inference.
@@ -645,6 +646,7 @@ def operator(
             source,
             barrier_config,
             async_policy,
+            tensor_access,
         )
 
     name_str: str | None = name
@@ -663,6 +665,7 @@ def operator(
             source,
             barrier_config,
             async_policy,
+            tensor_access,
         )
 
     return decorator
@@ -681,6 +684,7 @@ def _create_operator_wrapper(
     source,
     barrier_config=None,
     async_policy=None,
+    tensor_access=None,
 ):
     from fluxway.common.operator_policy import (
         ArgumentType,
@@ -782,6 +786,7 @@ def _create_operator_wrapper(
         is_source=is_source,
         source=source,
         async_policy=normalized_async_policy,
+        tensor_access={} if tensor_access is None else tensor_access,
         input_arguments={
             ArgumentType.CONTROL.value: final_states,
             ArgumentType.DATA.value: final_tensors,

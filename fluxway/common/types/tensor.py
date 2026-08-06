@@ -3,6 +3,16 @@ from typing import Any, Optional
 
 import numpy as np
 
+from fluxway.common.allocation import (
+    AllocationDescriptor,
+    AllocationRelation,
+)
+from fluxway.common.coherence import (
+    CoherenceStateTransitionError,
+    TensorAccessIntent,
+    TensorInstance,
+)
+
 from fluxway.common.tensor_backend import get_backend
 from fluxway.common.index_descriptor import (
     ContinuousIndex,
@@ -21,6 +31,23 @@ from fluxway.common.tensor_components import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def runtime_allocation_descriptor(value: Any) -> AllocationDescriptor:
+    if isinstance(value, TransportTensor):
+        return value._runtime_allocation_descriptor()
+    return get_backend().allocation_descriptor(value)
+
+
+def runtime_allocation_relation(left: Any, right: Any) -> AllocationRelation:
+    left_value = left._payload.values if isinstance(left, TransportTensor) else left
+    right_value = right._payload.values if isinstance(right, TransportTensor) else right
+    if left_value is right_value:
+        return AllocationRelation.EXACT
+    return runtime_allocation_descriptor(left).identity.relation(
+        runtime_allocation_descriptor(right).identity
+    )
+
 
 # ============================================================
 # TransportTensor — Unified tensor wrapper
@@ -213,6 +240,10 @@ class TransportTensor:
         self._origin_indices = self._lineage.origin.indices
         self._receipt = self._lineage.receipt
         self._source_step = None
+        self._runtime_access_intent = TensorAccessIntent.WRITABLE
+        self._runtime_valid = True
+        self._coherence_instances: tuple[TensorInstance, ...] = ()
+        self._allocation_descriptor: AllocationDescriptor | None = None
         self.source_step = source_step
         validate_metadata_lengths(
             self._payload,
@@ -407,7 +438,53 @@ class TransportTensor:
 
     @property
     def flat_values(self) -> Any:
-        return self._payload.values
+        if not self._runtime_valid:
+            raise CoherenceStateTransitionError("tensor access is invalidated.")
+        values = self._payload.values
+        if self._runtime_access_intent is TensorAccessIntent.READONLY:
+            return get_backend().readonly_view(values)
+        return values
+
+    def _set_runtime_access_intent(self, intent: TensorAccessIntent) -> None:
+        if not isinstance(intent, TensorAccessIntent):
+            raise TypeError(
+                f"intent must be TensorAccessIntent, got {type(intent).__name__}."
+            )
+        if not self._runtime_valid:
+            raise CoherenceStateTransitionError("cannot grant access to invalid data.")
+        self._runtime_access_intent = intent
+
+    def _invalidate_runtime_access(self) -> None:
+        self._runtime_valid = False
+
+    def _bind_coherence_instances(self, instances: tuple[TensorInstance, ...]) -> None:
+        if self._coherence_instances:
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances are already bound."
+            )
+        if not instances or len(instances) != len(set(instances)):
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances must be non-empty and unique."
+            )
+        self._coherence_instances = instances
+
+    def _handoff_coherence_instance(
+        self,
+        old: TensorInstance,
+        new: TensorInstance,
+    ) -> None:
+        if self._coherence_instances != (old,):
+            raise CoherenceStateTransitionError(
+                "allocation handoff requires one exact coherence instance."
+            )
+        self._coherence_instances = (new,)
+
+    def _runtime_allocation_descriptor(self) -> AllocationDescriptor:
+        descriptor = self._allocation_descriptor
+        if descriptor is None:
+            descriptor = get_backend().allocation_descriptor(self._payload.values)
+            self._allocation_descriptor = descriptor
+        return descriptor
 
     @property
     def payload(self) -> TensorPayload:
@@ -533,6 +610,18 @@ class TransportTensor:
             global_shape=global_shape,
             origin_indices=origin_indices,
             receipt=receipt,
+            routing_axes=self.routing_axes,
+            source_step=self.source_step,
+        )
+
+    def zero_copy_alias(self) -> "TransportTensor":
+        return TransportTensor(
+            self._payload.values,
+            nested_splits=self.nested_splits,
+            origin_indices=self.origin_indices,
+            routing_indices=self.routing_indices,
+            global_shape=self.global_shape,
+            receipt=self.receipt,
             routing_axes=self.routing_axes,
             source_step=self.source_step,
         )

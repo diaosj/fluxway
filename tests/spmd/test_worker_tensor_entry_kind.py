@@ -4,6 +4,8 @@ from typing import cast
 import numpy as np
 import pytest
 
+from fluxway.common.allocation import AllocationRegistry
+from fluxway.common.coherence import CoherenceDirectory
 from fluxway.common.compiled_graph import (
     CompiledLogicalTensor,
     CompiledTensorTransfer,
@@ -34,6 +36,7 @@ class FakeOpManager:
     def __init__(self):
         self._operator_spec = SimpleNamespace(
             runtime_policy=SimpleNamespace(mode="sync"),
+            tensor_access={"value": "readonly"},
             input_param_map={"value": ("value",)},
             input_treedefs={},
         )
@@ -60,6 +63,7 @@ class FakeOpManager:
                 effective_sharding=_TEST_SHARDING,
             ),
             spmd_id="Input",
+            local_only=False,
         )
 
     def get_transfer_source_layout(self, op_name, transfer_code):
@@ -100,11 +104,11 @@ async def _mailbox_with_kinds(kinds):
         )
         entry_index = builder.add_tensor_transfer_entry(
             transfer_code=52,
-            meta_state=0,
+            layout_state=0,
             tensor_kind=tensor_kind,
             expected_count=len(kinds),
             global_shape=(768,),
-            source_step=2,
+            coherence_epoch=2,
         )
         builder.add_payload(
             entry_index,
@@ -131,6 +135,32 @@ def _worker(mailbox):
         transfer_code=52,
     )
     worker._assemble_plan_cache = {("lookup", 52): assemble_plan}
+    worker._coherence_input_grants = {}
+    from fluxway.common.coherence import CoherenceSubject, ExecutionToken, GrantReady
+
+    subject = CoherenceSubject(0, 0, 52)
+    worker._coherence_directory = CoherenceDirectory()
+    worker._coherence_directory.accept_parent_read(subject, 2)
+    read = worker._coherence_directory.request_read(subject, 2, ExecutionToken(2))
+    assert isinstance(read, GrantReady)
+    from fluxway.spmd.worker.worker import _InputCoherenceGrant
+
+    grant = _InputCoherenceGrant(
+        parent_spmd_id="Input",
+        parent_rank=0,
+        subject=subject,
+        route_code=52,
+        epoch=2,
+        local_access_token=read.token,
+    )
+    worker._coherence_input_grants[("lookup", 2)] = {grant.identity: grant}
+    worker._coherence_input_bindings = {}
+    worker._local_input_origins = {}
+    worker._coherence_input_intents = {}
+    worker._coherence_input_tensors = {}
+    worker._coherence_directory = worker._coherence_directory
+    worker._local_spmd_code = 1
+    worker._allocation_registry = AllocationRegistry()
     return worker
 
 

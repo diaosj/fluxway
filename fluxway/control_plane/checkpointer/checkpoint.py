@@ -1,11 +1,12 @@
 import itertools
-import pickle
 import logging
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from collections.abc import Callable
+
+import msgpack
 
 from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
 from fluxway.control_plane.checkpointer.protocol import validate_checkpoint_state
@@ -29,7 +30,7 @@ class FluxwayCheckpointer:
     """
     Controller-side checkpoint orchestrator.
 
-    Manages only the per-step payload.pkl that maps each (spmd_id, rank) to
+    Manages only the per-step metadata.msgpack that maps each (spmd_id, rank) to
     the path metadata returned by the Worker's WorkerCheckpointBackend.  The
     actual tensor serialization is performed by each Worker in its own process.
 
@@ -89,7 +90,7 @@ class FluxwayCheckpointer:
         return sorted(
             int(d.name)
             for d in root.iterdir()
-            if d.is_dir() and d.name.isdigit() and (d / "payload.pkl").exists()
+            if d.is_dir() and d.name.isdigit() and (d / "metadata.msgpack").exists()
         )
 
     def latest_step(self) -> int | None:
@@ -194,7 +195,7 @@ class FluxwayCheckpointer:
     def _prepare(self, step: int, payload: dict[str, Any]) -> None:
         validate_checkpoint_state(payload, path="payload")
         step_dir = Path(self._ckpt_dir) / str(step)
-        payload_path = step_dir / "payload.pkl"
+        payload_path = step_dir / "metadata.msgpack"
 
         if step in self._prepared_steps or step in self._published_steps:
             raise RuntimeError(
@@ -202,7 +203,9 @@ class FluxwayCheckpointer:
             )
         planned_paths: list[tuple[Path, Path, Path | None]] = []
         renamed_paths: set[str] = set()
-        for spmd_entry in payload.values():
+        for key, spmd_entry in payload.items():
+            if not isinstance(spmd_entry, dict):
+                continue
             for meta in spmd_entry.get("rank_storage", {}).values():
                 if "orbax_tmp_path" in meta and "orbax_final_path" in meta:
                     o_tmp = Path(meta["orbax_tmp_path"])
@@ -239,12 +242,18 @@ class FluxwayCheckpointer:
                 "Set force_write=True in CheckpointConfig to overwrite."
             )
         step_dir.mkdir(parents=True, exist_ok=True)
-        tmp_man = step_dir / "payload.pkl.tmp"
+        tmp_man = step_dir / "metadata.msgpack.tmp"
         if tmp_man.exists():
             raise FileExistsError(f"checkpoint prepare file already exists: {tmp_man}")
         try:
             with open(tmp_man, "wb") as f:
-                pickle.dump(payload, f)
+                # set is not natively supported by msgpack, so we convert it if any
+                def _encode_hook(obj):
+                    if isinstance(obj, set):
+                        return list(obj)
+                    return obj
+
+                msgpack.pack(payload, f, default=_encode_hook)
         except BaseException:
             tmp_man.unlink(missing_ok=True)
             raise
@@ -268,7 +277,7 @@ class FluxwayCheckpointer:
 
     def _publish(self, step: int) -> None:
         step_dir = Path(self._ckpt_dir) / str(step)
-        payload_path = step_dir / "payload.pkl"
+        payload_path = step_dir / "metadata.msgpack"
         transaction = self._prepared_steps.get(step)
         if transaction is None:
             raise RuntimeError(f"checkpoint step {step} has no prepared transaction")
@@ -313,13 +322,13 @@ class FluxwayCheckpointer:
 
     def _load(self, step: int) -> dict[str, Any]:
         """Read and return the payload dict for ``step``."""
-        payload_path = Path(self._ckpt_dir) / str(step) / "payload.pkl"
+        payload_path = Path(self._ckpt_dir) / str(step) / "metadata.msgpack"
         if not payload_path.exists():
             raise FileNotFoundError(
                 f"FluxwayCheckpointer: payload not found: {payload_path}"
             )
         with open(payload_path, "rb") as f:
-            payload = pickle.load(f)
+            payload = msgpack.unpack(f, strict_map_key=False)
         if not isinstance(payload, dict):
             raise TypeError("Fluxway checkpoint payload root must be a dictionary")
         return payload

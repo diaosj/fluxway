@@ -8,6 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 import inspect
 import logging
+from types import MappingProxyType
 from typing import Any
 
 from fluxway.common.compiled_graph import (
@@ -16,6 +17,7 @@ from fluxway.common.compiled_graph import (
     CompiledTensorTransfer,
     SPMDGraphView,
 )
+from fluxway.common.coherence import CoherenceAction
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_policy import ArgumentType
 from fluxway.common.types.sharding import (
@@ -48,6 +50,35 @@ logger = logging.getLogger(__name__)
 FrameArg = tuple[int, TransportFrameHeader, tuple[Any, ...]]
 StepFrameGroup = tuple[int, FrameArg]
 type DependencyDecisions = Mapping[int, DependencyDecision] | None
+
+
+def build_coherence_frame(
+    *,
+    step: int,
+    sender_spmd_code: int,
+    sender_rank: int,
+    sender_world_size: int,
+    epoch: int,
+    action: CoherenceAction,
+    route_codes: tuple[int, ...],
+) -> TransportFrameHeader:
+    if not route_codes:
+        raise ValueError("coherence frame requires at least one route code.")
+    builder = TransportFrameBuilder(
+        step=step,
+        sender_spmd_code=sender_spmd_code,
+        sender_rank=sender_rank,
+        sender_world_size=sender_world_size,
+        flags=FrameFlag.COHERENCE,
+        capacity=FrameTableCapacity(entry_count=len(route_codes)),
+    )
+    for route_code in route_codes:
+        builder.add_coherence_entry(
+            route_code=route_code,
+            coherence_epoch=epoch,
+            coherence_action=action,
+        )
+    return builder.build().header
 
 
 class DependencyDecisionEvaluationError(TypeError):
@@ -148,8 +179,17 @@ class CompiledTensorRoute:
     receipt_routing: CompiledReceiptRouting | None
     tensor_name: str
     empty_targets: tuple[tuple[int, int], ...]
+    child_slots: tuple[int, ...]
 
     def __post_init__(self) -> None:
+        if len(self.child_slots) != self.target_spec.mesh.size:
+            raise ValueError(
+                "Compiled tensor route child_slots must cover the target rank domain."
+            )
+        if any(slot < 0 for slot in self.child_slots):
+            raise ValueError("Compiled tensor route child slots must be non-negative.")
+        if len(set(self.child_slots)) != len(self.child_slots):
+            raise ValueError("Compiled tensor route child slots must be injective.")
         if (
             self.receipt_routing is not None
             and self.receipt_routing.rank_count != self.target_spec.mesh.size
@@ -207,6 +247,15 @@ class CompiledSuccessorRoute:
 
 
 @dataclass(frozen=True, slots=True)
+class CompiledCoherenceChild:
+    logical_tuuid: int
+    child_slot: int
+    target_spmd_id: str
+    target_rank: int
+    transfer_code: int
+
+
+@dataclass(frozen=True, slots=True)
 class CompiledSendPlan:
     op_name: str
     source_spmd_id: str
@@ -222,8 +271,79 @@ class CompiledSendPlan:
         compare=False,
         repr=False,
     )
+    _tensor_routes_by_code: Mapping[int, CompiledTensorRoute] = field(
+        init=False,
+        compare=False,
+        repr=False,
+    )
+    _coherence_children_by_slot: Mapping[tuple[int, int], CompiledCoherenceChild] = (
+        field(
+            init=False,
+            compare=False,
+            repr=False,
+        )
+    )
 
     def __post_init__(self) -> None:
+        tensor_routes = tuple(
+            route
+            for context in self.successor_routes
+            for route in context.tensor_routes
+        )
+        routes_by_code = {route.transfer_code: route for route in tensor_routes}
+        if len(routes_by_code) != len(tensor_routes):
+            raise ValueError("Compiled send plan has duplicate tensor transfer codes.")
+        endpoint_by_slot: dict[int, dict[int, tuple[str, int]]] = {}
+        slot_by_endpoint: dict[int, dict[tuple[str, int], int]] = {}
+        route_codes_by_endpoint: dict[tuple[int, str, int], list[int]] = {}
+        for route in tensor_routes:
+            for target_rank, child_slot in enumerate(route.child_slots):
+                endpoint = (route.target_spmd_id, target_rank)
+                logical_slots = endpoint_by_slot.setdefault(route.logical_tuuid, {})
+                existing_endpoint = logical_slots.get(child_slot)
+                if existing_endpoint is not None and existing_endpoint != endpoint:
+                    raise ValueError(
+                        "Compiled coherence child slot maps multiple endpoints: "
+                        f"logical_tuuid={route.logical_tuuid} slot={child_slot}."
+                    )
+                logical_endpoints = slot_by_endpoint.setdefault(route.logical_tuuid, {})
+                existing_slot = logical_endpoints.get(endpoint)
+                if existing_slot is not None and existing_slot != child_slot:
+                    raise ValueError(
+                        "Compiled coherence endpoint maps to multiple child slots: "
+                        f"logical_tuuid={route.logical_tuuid} endpoint={endpoint}."
+                    )
+                logical_slots[child_slot] = endpoint
+                logical_endpoints[endpoint] = child_slot
+                route_codes_by_endpoint.setdefault(
+                    (route.logical_tuuid, route.target_spmd_id, target_rank),
+                    [],
+                ).append(route.transfer_code)
+        object.__setattr__(
+            self,
+            "_tensor_routes_by_code",
+            MappingProxyType(routes_by_code),
+        )
+        coherence_children = {
+            (logical_tuuid, child_slot): CompiledCoherenceChild(
+                logical_tuuid=logical_tuuid,
+                child_slot=child_slot,
+                target_spmd_id=target_spmd_id,
+                target_rank=target_rank,
+                transfer_code=min(
+                    route_codes_by_endpoint[
+                        (logical_tuuid, target_spmd_id, target_rank)
+                    ]
+                ),
+            )
+            for logical_tuuid, slots in endpoint_by_slot.items()
+            for child_slot, (target_spmd_id, target_rank) in slots.items()
+        }
+        object.__setattr__(
+            self,
+            "_coherence_children_by_slot",
+            MappingProxyType(coherence_children),
+        )
         condition_codes = tuple(
             condition.dependency_code for condition in self.dependency_conditions
         )
@@ -244,6 +364,37 @@ class CompiledSendPlan:
                 "Compiled send plan has conditions without decision routes: "
                 f"{sorted(missing_route_codes)}."
             )
+
+    def tensor_route(self, transfer_code: int) -> CompiledTensorRoute:
+        try:
+            return self._tensor_routes_by_code[transfer_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"Compiled send plan has no tensor transfer code {transfer_code}."
+            ) from exc
+
+    def coherence_logical_tuuid(self, transfer_code: int) -> int:
+        return self.tensor_route(transfer_code).logical_tuuid
+
+    def coherence_child_slot(self, transfer_code: int, target_rank: int) -> int:
+        route = self.tensor_route(transfer_code)
+        if target_rank < 0 or target_rank >= len(route.child_slots):
+            raise ValueError(
+                f"target_rank={target_rank} is outside transfer "
+                f"{transfer_code} rank domain {len(route.child_slots)}."
+            )
+        return route.child_slots[target_rank]
+
+    def coherence_child(
+        self, logical_tuuid: int, child_slot: int
+    ) -> CompiledCoherenceChild:
+        try:
+            return self._coherence_children_by_slot[(logical_tuuid, child_slot)]
+        except KeyError as exc:
+            raise ValueError(
+                "Compiled send plan has no coherence child for "
+                f"logical_tuuid={logical_tuuid} child_slot={child_slot}."
+            ) from exc
 
     def project_successors(
         self,
@@ -316,6 +467,7 @@ def compile_send_plan(
         )
     if sender_spmd_code < 0:
         raise ValueError("sender_spmd_code must be non-negative.")
+    coherence_child_slots = _compile_coherence_child_slots(successor_contexts)
     input_bindings = _index_input_bindings(
         source_operator=source_operator,
         incoming_dependencies=graph_view.incoming,
@@ -403,6 +555,7 @@ def compile_send_plan(
                         rank=rank,
                         effective_rank=context.effective_rank,
                         interleave_unit_size=interleave_unit_size,
+                        coherence_child_slots=coherence_child_slots,
                     )
                     existing_name = transfer_code_to_name.get(route.transfer_code)
                     if existing_name is not None:
@@ -444,6 +597,28 @@ def compile_send_plan(
         transfer_code_to_name=transfer_code_to_name,
         dependency_conditions=tuple(dependency_conditions),
     )
+
+
+def _compile_coherence_child_slots(
+    successor_contexts: tuple[SuccessorRouteContext, ...],
+) -> dict[tuple[int, str, int], int]:
+    endpoints_by_logical_tuuid: dict[int, set[tuple[str, int]]] = {}
+    for context in successor_contexts:
+        for dependency in context.dependencies:
+            for transfer in dependency.transfers:
+                endpoints = endpoints_by_logical_tuuid.setdefault(
+                    transfer.logical_tuuid,
+                    set(),
+                )
+                endpoints.update(
+                    (context.spmd_id, target_rank)
+                    for target_rank in range(context.target_world_size)
+                )
+    return {
+        (logical_tuuid, target_spmd_id, target_rank): child_slot
+        for logical_tuuid, endpoints in endpoints_by_logical_tuuid.items()
+        for child_slot, (target_spmd_id, target_rank) in enumerate(sorted(endpoints))
+    }
 
 
 async def evaluate_dependency_decisions(
@@ -578,6 +753,7 @@ def _compile_tensor_route(
     rank: int,
     effective_rank: int,
     interleave_unit_size: int | None,
+    coherence_child_slots: Mapping[tuple[int, str, int], int],
 ) -> CompiledTensorRoute:
     source_port = transfer.spec.source.name
     try:
@@ -643,6 +819,16 @@ def _compile_tensor_route(
         receipt_routing=receipt_routing,
         tensor_name=tensor_name,
         empty_targets=empty_targets,
+        child_slots=tuple(
+            coherence_child_slots[
+                (
+                    transfer.logical_tuuid,
+                    dependency.spec.target.spmd_id,
+                    target_rank,
+                )
+            ]
+            for target_rank in range(dependency.target_world_size)
+        ),
     )
 
 
@@ -996,7 +1182,6 @@ def _build_dependency_decision_frame_groups(
                 dependency_code=route.dependency_code,
                 decision=dependency_decisions[route.dependency_code],
                 expected_count=route.expected_count,
-                source_step=exec_step,
             )
         frame = builder.build()
         frame_groups.append(
@@ -1040,7 +1225,6 @@ def _build_ordering_frame_groups(
             builder.add_ordering_completion_entry(
                 dependency_code=route.dependency_code,
                 expected_count=route.expected_count,
-                source_step=exec_step,
             )
         frame = builder.build()
         frame_groups.append(

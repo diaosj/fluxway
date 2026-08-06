@@ -7,7 +7,7 @@ import numpy as np
 import sparse_embedding as se  # type: ignore
 import sparse_embedding.checkpoint  # type: ignore
 
-from fluxway.common.tensor_backend import get_backend
+from fluxway.common.tensor_backend import get_backend, prepare_dlpack_input
 from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy, StatePolicy
 from fluxway.common.utils.logging import get_logger
@@ -74,7 +74,7 @@ class SparseEmbeddingSPMD:
         self.store = se.EmbeddingStore(
             embedding_config=se.EmbeddingConfig(
                 dims=[embed_dim],
-                num_threads=self.num_threads,
+                thread_budget=self.num_threads,
                 value_dtype="float32",
             ),
             initializer_config=se.Uniform(min_val=-0.01, max_val=0.01),
@@ -175,7 +175,8 @@ class SparseEmbeddingSPMD:
     )
     def lookup(self, unique_ids: TransportTensor) -> LookupOutput:
         step = self.ctx.step
-        ids_np = unique_ids.flat_values.ravel().astype(np.int64)
+        ids_np = np.asarray(unique_ids.flat_values, dtype=np.int64).ravel()
+        ids_np = prepare_dlpack_input(ids_np)
 
         # -- Invariants on input ids --
         assert ids_np.ndim == 1, (
@@ -256,7 +257,9 @@ class SparseEmbeddingSPMD:
                 f"missing forward cache for gradient source step {grad_step}"
             )
 
-        grads_np = grads.flat_values.reshape(keys_np.size, self.embed_dim)
+        grads_np = prepare_dlpack_input(
+            grads.flat_values.reshape(keys_np.size, self.embed_dim)
+        )
 
         # -- Numerical correctness check: gradient layout matches keys --
         assert grads_np.shape == (keys_np.size, self.embed_dim), (

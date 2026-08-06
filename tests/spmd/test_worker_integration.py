@@ -167,10 +167,10 @@ async def test_worker_receive_transport_frame_dispatches_to_mailbox():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=transfer_code,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=0,
+        coherence_epoch=0,
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, test_data, 2)
     frame = builder.build()
@@ -217,10 +217,10 @@ async def test_worker_receive_bundled_frame_dispatches_all_transfers_to_mailbox(
     ):
         entry_index = builder.add_tensor_transfer_entry(
             transfer_code=transfer_code,
-            meta_state=0,
+            layout_state=0,
             tensor_kind=TensorEntryKind.TENSOR,
             expected_count=1,
-            source_step=1,
+            coherence_epoch=1,
         )
         builder.add_payload(entry_index, PayloadRole.VALUES, payload, len(payload))
     frame = builder.build()

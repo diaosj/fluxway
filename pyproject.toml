@@ -37,6 +37,7 @@ dependencies = [
     "ray>=2.55.1",
     "ortools>=9.12",
     "numba>=0.66.0",
+    "msgpack>=1.0.0",
 ]
 
 [project.optional-dependencies]

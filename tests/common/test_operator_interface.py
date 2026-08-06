@@ -244,6 +244,21 @@ def test_operator_rejects_invalid_async_policy():
         AsyncPolicy.bounded_stale(depth=1, max_staleness={"ids": 0})  # type: ignore[arg-type]
 
 
+def test_operator_spec_exposes_port_tensor_access_intents():
+    from fluxway.common.coherence import TensorAccessIntent
+
+    @operator(
+        name="port_access",
+        tensor_access={"cache": TensorAccessIntent.WRITABLE},
+    )
+    def port_access(ids: TransportTensor, cache: TransportTensor):
+        return ids
+
+    spec = port_access._fluxway_operator_spec
+    assert spec.tensor_access["ids"] is TensorAccessIntent.READONLY
+    assert spec.tensor_access["cache"] is TensorAccessIntent.WRITABLE
+
+
 if __name__ == "__main__":
     test_sharding_resolution()
     print("All operator interface tests passed!")

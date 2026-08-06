@@ -45,9 +45,9 @@ RUN pip install --default-timeout=1000 --no-cache-dir \
     Cython \
     grain \
     libclang \
+    msgpack \
     minio \
     numba \
-    orjson \
     psutil \
     flask \
     pandas \
@@ -78,11 +78,11 @@ COPY . /workspace/fluxway
 RUN cd /workspace/fluxway && \
     CUDA_MAJOR=$(nvcc --version | grep "release" | awk '{print $5}' | cut -d'.' -f1) && \
     if [ "$CUDA_MAJOR" = "12" ]; then \
-        CUDA_EXTRA=",cuda12x"; \
+    CUDA_EXTRA=",cuda12x"; \
     elif [ "$CUDA_MAJOR" = "13" ]; then \
-        CUDA_EXTRA=",cuda13x"; \
+    CUDA_EXTRA=",cuda13x"; \
     else \
-        CUDA_EXTRA=""; \
+    CUDA_EXTRA=""; \
     fi && \
     pip install --default-timeout=1000 --no-cache-dir -e ".[jax,profiler,visualization${CUDA_EXTRA}]"
 

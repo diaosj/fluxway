@@ -76,10 +76,10 @@ class ProfilerRuntimeFactory:
             return executor
         return TracingUserCallableExecutor(executor, self._recorder)
 
-    def create_worker_mailbox(self) -> WorkerMailbox:
+    def create_worker_mailbox(self, **kwargs: Any) -> WorkerMailbox:
         if self._recorder is None:
-            return WorkerMailbox()
-        return TracingWorkerMailbox(self._recorder)
+            return WorkerMailbox(**kwargs)
+        return TracingWorkerMailbox(self._recorder, **kwargs)
 
     def heartbeat_observer(self) -> HeartbeatProfilerObserver | None:
         if self._recorder is None:

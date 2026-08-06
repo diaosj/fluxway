@@ -38,7 +38,7 @@ from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.transport.manifest import (
     ENTRY_GLOBAL_SHAPE_BEGIN,
     ENTRY_GLOBAL_SHAPE_COUNT,
-    ENTRY_SOURCE_STEP,
+    ENTRY_AUX,
 )
 from fluxway.spmd.worker.worker import (
     SPMDWorker as RaySPMDWorker,
@@ -528,7 +528,7 @@ class TestEmbeddingToDenseFullCommunication(unittest.TestCase):
                         if len(payload_iovs) > 1
                         else None,
                         global_shape=g_shape,
-                        source_step=int(header.entry_i32[0, ENTRY_SOURCE_STEP]),
+                        source_step=int(header.entry_i32[0, ENTRY_AUX]),
                     )
                     network_mailbox[target_rank].append(received_tt)
                 return True

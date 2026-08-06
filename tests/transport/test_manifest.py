@@ -4,13 +4,14 @@ import pytest
 from fluxway.transport.manifest import (
     ENTRY_EXPECTED_COUNT,
     ENTRY_ROUTE_CODE,
-    ENTRY_SOURCE_STEP,
-    ENTRY_TENSOR_KIND,
+    ENTRY_AUX,
+    ENTRY_STATE_FLAGS,
     ENTRY_WIDTH,
     FRAME_FLAGS,
     FRAME_VERSION,
     PAYLOAD_DTYPE,
     PROTOCOL_VERSION,
+    CoherenceAction,
     FrameFlag,
     PayloadRole,
     TensorEntryKind,
@@ -18,11 +19,12 @@ from fluxway.transport.manifest import (
     TransportFrameBuilder,
     TransportFrameTemplate,
 )
+from fluxway.transport.coherence import entry_tensor_kind, pack_entry_state_flags
 
 
-def test_transport_route_protocol_is_version_four_with_tensor_entry_kind():
-    assert PROTOCOL_VERSION == 4
-    assert ENTRY_WIDTH == 12
+def test_transport_route_protocol_is_version_five_with_tensor_entry_kind():
+    assert PROTOCOL_VERSION == 6
+    assert ENTRY_WIDTH == 9
     assert hasattr(TransportFrameBuilder, "add_tensor_transfer_entry")
 
 
@@ -37,7 +39,6 @@ def test_ordering_frame_is_header_only_and_keeps_entry_width():
     builder.add_ordering_completion_entry(
         dependency_code=17,
         expected_count=8,
-        source_step=5,
     )
 
     frame = builder.build()
@@ -46,14 +47,16 @@ def test_ordering_frame_is_header_only_and_keeps_entry_width():
     assert frame.entry_i32.shape == (1, ENTRY_WIDTH)
     assert int(frame.entry_i32[0, ENTRY_ROUTE_CODE]) == 17
     assert int(frame.entry_i32[0, ENTRY_EXPECTED_COUNT]) == 8
-    assert int(frame.entry_i32[0, ENTRY_SOURCE_STEP]) == 5
-    assert TensorEntryKind(int(frame.entry_i32[0, ENTRY_TENSOR_KIND])) is (
-        TensorEntryKind.NOT_APPLICABLE
-    )
+    assert int(frame.entry_i32[0, ENTRY_AUX]) == 0
+    assert TensorEntryKind(
+        entry_tensor_kind(int(frame.entry_i32[0, ENTRY_STATE_FLAGS]))
+    ) is (TensorEntryKind.NOT_APPLICABLE)
     assert frame.payload_i32.shape == (0, 8)
     assert frame.payload_segments == ()
 
-    frame.entry_i32[0, ENTRY_TENSOR_KIND] = int(TensorEntryKind.ROUTING_MISS)
+    frame.entry_i32[0, ENTRY_STATE_FLAGS] = pack_entry_state_flags(
+        0, int(TensorEntryKind.ROUTING_MISS), CoherenceAction.NONE
+    )
     with pytest.raises(ValueError, match="must use NOT_APPLICABLE"):
         frame.validate()
 
@@ -82,10 +85,10 @@ def test_manifest_uses_i32_metadata_and_preserves_u64_payload_and_i64_shape():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=9,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=4,
-        source_step=1,
+        coherence_epoch=1,
         global_shape=(2**35,),
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, ids, 2)
@@ -108,10 +111,10 @@ def test_transport_frame_header_round_trips_without_payload_copy():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=7,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=2,
+        coherence_epoch=2,
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, values, 2)
     frame = builder.build()
@@ -130,10 +133,10 @@ def test_transport_frame_header_rejects_payload_shape_mismatch():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=7,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=2,
+        coherence_epoch=2,
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, values, 2)
     header = builder.build().header
@@ -149,10 +152,10 @@ def test_transport_frame_template_preserves_route_code_without_payload_copy():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=31,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=2,
+        coherence_epoch=2,
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, values, 2)
     template = TransportFrameTemplate.from_frame(builder.build())
@@ -163,7 +166,7 @@ def test_transport_frame_template_preserves_route_code_without_payload_copy():
         payload_segments=(next_values,),
         payload_valid_counts=(2,),
         global_shapes=(None,),
-        source_steps=(3,),
+        coherence_epochs=(3,),
     )
 
     assert frame.entry_i32.shape == (1, ENTRY_WIDTH)
@@ -189,10 +192,10 @@ def test_manifest_rejects_i32_shape_overflow():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=1,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=1,
+        coherence_epoch=1,
     )
 
     with pytest.raises(OverflowError):
@@ -210,10 +213,10 @@ def test_manifest_validate_rejects_negative_metadata():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=1,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=1,
+        coherence_epoch=1,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.arange(1, dtype=np.int32), 1
@@ -236,7 +239,6 @@ def test_manifest_rejects_previous_protocol_version_without_fallback():
     builder.add_ordering_completion_entry(
         dependency_code=1,
         expected_count=1,
-        source_step=1,
     )
     frame = builder.build()
     frame.frame_i32[FRAME_VERSION] = 3
@@ -251,10 +253,10 @@ def test_manifest_rejects_non_dlpack_payload():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=1,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=1,
+        coherence_epoch=1,
     )
 
     class ArrayMetadataOnly:
@@ -272,10 +274,10 @@ def test_manifest_validate_rejects_dtype_mismatch():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=1,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=1,
+        coherence_epoch=1,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.arange(1, dtype=np.int32), 1
@@ -284,6 +286,31 @@ def test_manifest_validate_rejects_dtype_mismatch():
     frame.payload_i32[0, PAYLOAD_DTYPE] += 1
 
     with pytest.raises(ValueError, match="dtype_code"):
+        frame.validate()
+
+
+def test_tensor_transfer_rejects_non_bus_rd_action():
+    builder = TransportFrameBuilder(
+        step=1, sender_spmd_code=0, sender_rank=0, sender_world_size=1
+    )
+    entry_index = builder.add_tensor_transfer_entry(
+        transfer_code=1,
+        layout_state=0,
+        tensor_kind=TensorEntryKind.TENSOR,
+        expected_count=1,
+        coherence_epoch=1,
+    )
+    builder.add_payload(
+        entry_index, PayloadRole.VALUES, np.arange(1, dtype=np.int32), 1
+    )
+    frame = builder.build()
+    frame.entry_i32[0, ENTRY_STATE_FLAGS] = pack_entry_state_flags(
+        0,
+        int(TensorEntryKind.TENSOR),
+        CoherenceAction.RFO,
+    )
+
+    with pytest.raises(ValueError, match="BUS_RD"):
         frame.validate()
 
 
@@ -298,7 +325,6 @@ def test_frame_flag_rejects_route_kind_mismatch():
         tensor_builder.add_ordering_completion_entry(
             dependency_code=1,
             expected_count=1,
-            source_step=1,
         )
 
     ordering_builder = TransportFrameBuilder(
@@ -311,10 +337,10 @@ def test_frame_flag_rejects_route_kind_mismatch():
     with pytest.raises(ValueError, match="TENSOR_TRANSFER frame"):
         ordering_builder.add_tensor_transfer_entry(
             transfer_code=1,
-            meta_state=0,
+            layout_state=0,
             tensor_kind=TensorEntryKind.TENSOR,
             expected_count=1,
-            source_step=1,
+            coherence_epoch=1,
         )
 
 
@@ -334,10 +360,10 @@ def test_absent_tensor_entry_rejects_nonzero_payload_count(tensor_kind):
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=1,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=tensor_kind,
         expected_count=1,
-        source_step=1,
+        coherence_epoch=1,
     )
     builder.add_payload(
         entry_index,

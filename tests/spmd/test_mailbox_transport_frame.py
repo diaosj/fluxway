@@ -16,10 +16,10 @@ def _tensor_frame(transfer_code: int, payload: np.ndarray):
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=transfer_code,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=9,
+        coherence_epoch=9,
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, payload, len(payload))
     return builder.build()
@@ -34,10 +34,10 @@ async def test_mailbox_deposits_flat_frame_and_preserves_64bit_payload():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=10,
-        meta_state=2,
+        layout_state=2,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=4,
-        source_step=2,
+        coherence_epoch=2,
         global_shape=(2**35,),
     )
     builder.add_payload(entry_index, PayloadRole.VALUES, ids, 1)
@@ -70,10 +70,10 @@ async def test_mailbox_absent_tensor_satisfies_barrier_without_business_slot(
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=11,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=tensor_kind,
         expected_count=1,
-        source_step=3,
+        coherence_epoch=3,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.empty((0,), dtype=np.int32), 0
@@ -100,10 +100,10 @@ async def test_mailbox_tensor_preserves_zero_row_slot():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=15,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=7,
+        coherence_epoch=7,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.empty((0,), dtype=np.int32), 0
@@ -128,10 +128,10 @@ async def test_mailbox_rejects_duplicate_routing_miss_frame():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=16,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.ROUTING_MISS,
         expected_count=1,
-        source_step=8,
+        coherence_epoch=8,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.empty((0,), dtype=np.int64), 0
@@ -146,10 +146,10 @@ async def test_mailbox_rejects_duplicate_routing_miss_frame():
     )
     duplicate_entry_index = duplicate.add_tensor_transfer_entry(
         transfer_code=16,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.ROUTING_MISS,
         expected_count=1,
-        source_step=8,
+        coherence_epoch=8,
     )
     duplicate.add_payload(
         duplicate_entry_index,
@@ -168,10 +168,10 @@ async def test_mailbox_rejects_frame_expected_count_mismatch():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=13,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=4,
-        source_step=5,
+        coherence_epoch=5,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.array([1], dtype=np.int32), 1
@@ -195,10 +195,10 @@ async def test_mailbox_rejects_count_mismatch_after_control_arrival():
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=14,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=4,
-        source_step=6,
+        coherence_epoch=6,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.array([1], dtype=np.int32), 1
@@ -249,11 +249,7 @@ async def test_mailbox_tensor_deposit_rejects_ordering_frame():
         sender_world_size=1,
         flags=FrameFlag.ORDERING_COMPLETION,
     )
-    builder.add_ordering_completion_entry(
-        dependency_code=7,
-        expected_count=1,
-        source_step=9,
-    )
+    builder.add_ordering_completion_entry(dependency_code=7, expected_count=1)
 
     with pytest.raises(ValueError, match="FrameFlag.TENSOR_TRANSFER"):
         await WorkerMailbox().deposit_transport_frame("op", "Input", builder.build())

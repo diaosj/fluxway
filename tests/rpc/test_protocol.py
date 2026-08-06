@@ -30,10 +30,10 @@ def _make_header(payload_segments: tuple[np.ndarray, ...]) -> TransportFrameHead
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=0,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=0,
+        coherence_epoch=0,
     )
     for payload in payload_segments:
         builder.add_payload(
@@ -154,7 +154,6 @@ async def test_ray_actor_data_plane_sends_header_and_payload_buffers():
     emb = np.arange(4, dtype=np.float32)
     payload_segments = (ids, emb)
     header = _make_header(payload_segments)
-
     await adapter.receive_transport_frames(
         (
             TransportFrameEnvelope(

@@ -55,7 +55,8 @@ from fluxway.profiler.wrappers import (
 )
 from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.filtering import filter_steady_state_records
-from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
+from fluxway.rpc.protocol import DataPlaneCallable
+from fluxway.rpc.protocol import TransportFrameEnvelope
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 from fluxway.spmd.worker.mailbox import WorkerMailbox
 from fluxway.spmd.worker.local_plan import LocalStepContext, LocalStepPlan

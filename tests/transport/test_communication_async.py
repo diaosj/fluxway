@@ -11,14 +11,14 @@ from fluxway.common.types.sharding import P, ShardingSpec
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.transport.communication import AsyncDataDistributor
+from fluxway.transport.coherence import entry_layout_state, entry_tensor_kind
 from fluxway.transport.manifest import (
     ENTRY_EXPECTED_COUNT,
     ENTRY_GLOBAL_SHAPE_BEGIN,
     ENTRY_GLOBAL_SHAPE_COUNT,
-    ENTRY_META_STATE,
     ENTRY_ROUTE_CODE,
-    ENTRY_SOURCE_STEP,
-    ENTRY_TENSOR_KIND,
+    ENTRY_AUX,
+    ENTRY_STATE_FLAGS,
     FRAME_ENTRY_COUNT,
     FRAME_FLAGS,
     FRAME_PAYLOAD_COUNT,
@@ -87,9 +87,9 @@ def test_async_distributor_uses_only_flat_frame_abi():
     assert int(header.frame_i32[FRAME_SENDER_SPMD_CODE]) == 5
     assert int(header.frame_i32[FRAME_FLAGS]) == int(FrameFlag.TENSOR_TRANSFER)
     assert int(header.entry_i32[0, ENTRY_ROUTE_CODE]) == 17
-    assert TensorEntryKind(int(header.entry_i32[0, ENTRY_TENSOR_KIND])) is (
-        TensorEntryKind.TENSOR
-    )
+    assert TensorEntryKind(
+        entry_tensor_kind(int(header.entry_i32[0, ENTRY_STATE_FLAGS]))
+    ) is (TensorEntryKind.TENSOR)
     assert int(header.frame_i32[FRAME_ENTRY_COUNT]) == 1
     assert int(header.frame_i32[FRAME_PAYLOAD_COUNT]) == 1
     assert header.entry_i32.dtype == np.int32
@@ -139,10 +139,13 @@ def test_async_distributor_batch_metadata_is_encoded_in_frame_rows():
     entry_i32 = header.entry_i32
     payload_i32 = header.payload_i32
     assert entry_i32[:, ENTRY_ROUTE_CODE].tolist() == [21, 22, 23]
-    assert int(entry_i32[0, ENTRY_META_STATE]) == 0
-    assert ragged_level_count(int(entry_i32[1, ENTRY_META_STATE])) == 1
-    assert bool(int(entry_i32[1, ENTRY_META_STATE]) & 1)
-    assert int(entry_i32[2, ENTRY_META_STATE]) == 2
+    assert entry_layout_state(int(entry_i32[0, ENTRY_STATE_FLAGS])) == 0
+    assert (
+        ragged_level_count(entry_layout_state(int(entry_i32[1, ENTRY_STATE_FLAGS])))
+        == 1
+    )
+    assert bool(entry_layout_state(int(entry_i32[1, ENTRY_STATE_FLAGS])) & 1)
+    assert entry_layout_state(int(entry_i32[2, ENTRY_STATE_FLAGS])) == 2
     assert payload_i32[:, PAYLOAD_ROLE].tolist() == [
         int(PayloadRole.VALUES),
         int(PayloadRole.VALUES),
@@ -225,10 +228,10 @@ def test_late_aggregation_preserves_expected_count_per_transfer(order) -> None:
         entry_by_transfer = {
             int(entry[ENTRY_ROUTE_CODE]): entry for entry in frame.entry_i32
         }
-        assert int(entry_by_transfer[237][ENTRY_SOURCE_STEP]) == 0
-        assert int(entry_by_transfer[238][ENTRY_SOURCE_STEP]) == 0
-        assert int(entry_by_transfer[237][ENTRY_META_STATE]) == 0
-        assert int(entry_by_transfer[238][ENTRY_META_STATE]) == 0
+        assert int(entry_by_transfer[237][ENTRY_AUX]) == 0
+        assert int(entry_by_transfer[238][ENTRY_AUX]) == 0
+        assert entry_layout_state(int(entry_by_transfer[237][ENTRY_STATE_FLAGS])) == 0
+        assert entry_layout_state(int(entry_by_transfer[238][ENTRY_STATE_FLAGS])) == 0
         dp_shape_begin = int(entry_by_transfer[237][ENTRY_GLOBAL_SHAPE_BEGIN])
         dp_shape_count = int(entry_by_transfer[237][ENTRY_GLOBAL_SHAPE_COUNT])
         scalar_shape_begin = int(entry_by_transfer[238][ENTRY_GLOBAL_SHAPE_BEGIN])
@@ -281,7 +284,12 @@ def test_async_distributor_nested_ragged_preserves_payload_dtype_and_levels():
         assert int(header.frame_i32[FRAME_ENTRY_COUNT]) == 1
         assert int(header.frame_i32[FRAME_PAYLOAD_COUNT]) == 3
         assert int(header.entry_i32[0, ENTRY_EXPECTED_COUNT]) == 1
-        assert ragged_level_count(int(header.entry_i32[0, ENTRY_META_STATE])) == 2
+        assert (
+            ragged_level_count(
+                entry_layout_state(int(header.entry_i32[0, ENTRY_STATE_FLAGS]))
+            )
+            == 2
+        )
         assert header.payload_i32[:, PAYLOAD_ROLE].tolist() == [
             int(PayloadRole.VALUES),
             int(PayloadRole.RAGGED_LENGTHS),
@@ -349,11 +357,17 @@ def test_transport_frame_dynamic_manifest_marks_unrouted_targets_as_routing_miss
     for frame in captured.values():
         entry_i32 = frame[0].entry_i32
         assert int(entry_i32[0, ENTRY_EXPECTED_COUNT]) == src_mesh.size
-    assert int(captured[2][0].entry_i32[0, ENTRY_TENSOR_KIND]) == int(
-        TensorEntryKind.ROUTING_MISS
+    assert (
+        TensorEntryKind(
+            entry_tensor_kind(int(captured[2][0].entry_i32[0, ENTRY_STATE_FLAGS]))
+        )
+        is TensorEntryKind.ROUTING_MISS
     )
-    assert int(captured[3][0].entry_i32[0, ENTRY_TENSOR_KIND]) == int(
-        TensorEntryKind.ROUTING_MISS
+    assert (
+        TensorEntryKind(
+            entry_tensor_kind(int(captured[3][0].entry_i32[0, ENTRY_STATE_FLAGS]))
+        )
+        is TensorEntryKind.ROUTING_MISS
     )
 
 
@@ -385,7 +399,7 @@ def test_dynamic_zero_tensor_is_routing_miss_not_completed_without_tensor():
 
     assert set(captured) == {0, 1, 2, 3}
     assert {
-        TensorEntryKind(int(header.entry_i32[0, ENTRY_TENSOR_KIND]))
+        TensorEntryKind(entry_tensor_kind(int(header.entry_i32[0, ENTRY_STATE_FLAGS])))
         for header, _ in captured.values()
     } == {TensorEntryKind.ROUTING_MISS}
 
@@ -418,5 +432,8 @@ def test_absent_tensor_planning_preserves_causal_kind(method_name, expected_kind
     )[0]
 
     assert target_rank == 0
-    assert TensorEntryKind(int(header.entry_i32[0, ENTRY_TENSOR_KIND])) is expected_kind
+    assert (
+        TensorEntryKind(entry_tensor_kind(int(header.entry_i32[0, ENTRY_STATE_FLAGS])))
+        is expected_kind
+    )
     assert payloads[0].shape == (0,)

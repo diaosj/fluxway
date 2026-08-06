@@ -10,6 +10,7 @@ from uuid import uuid4
 from fluxway.common.frozen_mapping import freeze_mapping
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_policy import ArgumentType
+from fluxway.common.coherence import TensorAccessIntent
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types.sharding import ReferentialRouting, ShardingSpec
 from fluxway.resources import ResourceProfile
@@ -1289,6 +1290,13 @@ def _validate_dependencies(
         for transfer in dependency.transfers:
             _validate_port(dependency, transfer.source, source, output=True)
             _validate_port(dependency, transfer.target, target, output=False)
+            intent = target.tensor_access[transfer.target.name]
+            if intent is TensorAccessIntent.DONATE and not dependency.local_only:
+                raise ValueError(
+                    f"DONATE input port {dependency.target.spmd_id}."
+                    f"{dependency.target.op_id}.{transfer.target.name} requires "
+                    "a local_only dependency."
+                )
             source_slot: PortSlot = (
                 dependency.source.spmd_id,
                 dependency.source.op_id,

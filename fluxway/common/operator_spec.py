@@ -15,6 +15,7 @@ from pydantic import (
 )
 
 from fluxway.common.frozen_mapping import freeze_mapping
+from fluxway.common.coherence import TensorAccessIntent
 from fluxway.common.operator_policy import (
     ArgumentType,
     AsyncPolicy,
@@ -41,6 +42,11 @@ type TreeMap = Annotated[
     AfterValidator(freeze_mapping),
     PlainSerializer(lambda value: dict(value), return_type=dict),
 ]
+type TensorAccessMap = Annotated[
+    Mapping[str, TensorAccessIntent],
+    AfterValidator(freeze_mapping),
+    PlainSerializer(lambda value: dict(value), return_type=dict),
+]
 
 
 class OperatorSpec(BaseModel):
@@ -62,6 +68,7 @@ class OperatorSpec(BaseModel):
     is_interleaved: bool = False
     interleave_unit_size: int = Field(default=1, gt=0)
     async_policy: AsyncPolicy = Field(default_factory=AsyncPolicy.sync)
+    tensor_access: TensorAccessMap = Field(default_factory=dict)
     input_arguments: StringTupleMap = Field(default_factory=dict)
     output_arguments: StringTupleMap = Field(default_factory=dict)
     input_sharding: ShardingMap = Field(default_factory=dict)
@@ -96,6 +103,37 @@ class OperatorSpec(BaseModel):
     @classmethod
     def validate_argument_map(cls, value: Any) -> Any:
         return {} if value is None else value
+
+    @field_validator("tensor_access", mode="before")
+    @classmethod
+    def validate_tensor_access(cls, value: Any) -> Any:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping):
+            return value
+        return {
+            name: intent
+            if isinstance(intent, TensorAccessIntent)
+            else TensorAccessIntent(intent)
+            for name, intent in value.items()
+        }
+
+    @model_validator(mode="after")
+    def normalize_tensor_access(self) -> OperatorSpec:
+        data_ports = self.get_arguments(is_output=False, arg_type=ArgumentType.DATA)
+        declared = dict(self.tensor_access)
+        unknown = set(declared).difference(data_ports)
+        if unknown:
+            raise ValueError(
+                f"operator {self.name!r} tensor_access references unknown data "
+                f"ports: {sorted(unknown)}."
+            )
+        normalized = {
+            port: declared.get(port, TensorAccessIntent.READONLY) for port in data_ports
+        }
+        if normalized != declared:
+            object.__setattr__(self, "tensor_access", freeze_mapping(normalized))
+        return self
 
     @field_validator("input_sharding", "output_sharding", mode="before")
     @classmethod

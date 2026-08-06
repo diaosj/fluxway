@@ -14,6 +14,7 @@ from fluxway.common.compiled_graph import (
     compile_graph,
 )
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.coherence import ExecutionFenceState
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.operator_policy import PeriodicBarrierConfig
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
@@ -36,11 +37,11 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
 )
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.rpc.protocol import TransportFrameEnvelope
+from fluxway.transport.coherence import entry_layout_state, entry_tensor_kind
 from fluxway.transport.manifest import (
-    ENTRY_DEPENDENCY_DECISION,
-    ENTRY_TENSOR_KIND,
+    ENTRY_AUX,
     ENTRY_EXPECTED_COUNT,
-    ENTRY_META_STATE,
+    ENTRY_STATE_FLAGS,
     ENTRY_PAYLOAD_COUNT,
     ENTRY_ROUTE_CODE,
     FRAME_FLAGS,
@@ -200,10 +201,10 @@ def _tensor_frame(*, transfer_code: int, step: int):
     )
     entry_index = builder.add_tensor_transfer_entry(
         transfer_code=transfer_code,
-        meta_state=0,
+        layout_state=0,
         tensor_kind=TensorEntryKind.TENSOR,
         expected_count=1,
-        source_step=step,
+        coherence_epoch=step,
     )
     builder.add_payload(
         entry_index, PayloadRole.VALUES, np.array([1], dtype=np.int32), 1
@@ -223,20 +224,18 @@ def test_condition_frame_is_header_only_dependency_outcome():
         dependency_code=17,
         decision=DependencyDecision.SKIP,
         expected_count=2,
-        source_step=7,
     )
     frame = builder.build()
 
     assert int(frame.frame_i32[FRAME_FLAGS]) == int(FrameFlag.DEPENDENCY_DECISION)
     assert int(frame.entry_i32[0, ENTRY_ROUTE_CODE]) == 17
-    assert int(frame.entry_i32[0, ENTRY_DEPENDENCY_DECISION]) == int(
-        DependencyDecision.SKIP
-    )
-    assert int(frame.entry_i32[0, ENTRY_TENSOR_KIND]) == int(
-        TensorEntryKind.NOT_APPLICABLE
+    assert int(frame.entry_i32[0, ENTRY_AUX]) == int(DependencyDecision.SKIP)
+    assert (
+        TensorEntryKind(entry_tensor_kind(int(frame.entry_i32[0, ENTRY_STATE_FLAGS])))
+        is TensorEntryKind.NOT_APPLICABLE
     )
     assert int(frame.entry_i32[0, ENTRY_EXPECTED_COUNT]) == 2
-    assert int(frame.entry_i32[0, ENTRY_META_STATE]) == 0
+    assert entry_layout_state(int(frame.entry_i32[0, ENTRY_STATE_FLAGS])) == 0
     assert int(frame.entry_i32[0, ENTRY_PAYLOAD_COUNT]) == 0
     assert frame.payload_segments == ()
 
@@ -245,7 +244,6 @@ def test_condition_frame_is_header_only_dependency_outcome():
             dependency_code=17,
             decision=DependencyDecision.SKIP,
             expected_count=2,
-            source_step=7,
         )
 
 
@@ -791,6 +789,7 @@ async def test_worker_receives_multi_sender_condition_completion_through_batch_a
     worker.spmd_id = "target"
     worker.rank = 0
     worker._spmd_id_by_code = {3: "source"}
+    worker._fence_state = ExecutionFenceState.OPEN
     worker._profiler_runtime = SimpleNamespace(enabled=False)
     worker._barriers_declared = {}
     worker._mailbox = WorkerMailbox()
@@ -820,7 +819,6 @@ async def test_worker_receives_multi_sender_condition_completion_through_batch_a
             dependency_code=route.dependency_code,
             decision=DependencyDecision.SKIP,
             expected_count=2,
-            source_step=6,
         )
         frame = builder.build()
         envelopes.append(

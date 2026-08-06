@@ -524,8 +524,8 @@ class DenseSPMD:
             "f2_rec": f2_rec,
             "dense_stats": dense_stats,
             "labels": labels_local,
-            "emb1_ref": emb1,
-            "emb2_ref": emb2,
+            "emb1_ref": emb1.zero_copy_alias(),
+            "emb2_ref": emb2.zero_copy_alias(),
             "inv1_dense": inv1_dense,
             "inv2_dense": inv2_dense,
         }
@@ -729,7 +729,7 @@ class DenseSPMD:
         return {
             "grad1": g1_unique,
             "grad2": g2_unique,
-            "dense_grad": dense_grad,
+            "dense_grad": dense_grad.zero_copy_alias(),
         }
 
     @operator(

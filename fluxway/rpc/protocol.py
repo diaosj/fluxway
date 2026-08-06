@@ -348,7 +348,10 @@ class DataPlaneRegistry:
 
     @classmethod
     def create(
-        cls, transport_type: str, handle: Any, sender_spmd_code: int
+        cls,
+        transport_type: str,
+        handle: Any,
+        sender_spmd_code: int,
     ) -> DataPlaneCallable:
         impl_cls = cls._registry.get(transport_type)
         if impl_cls is None:

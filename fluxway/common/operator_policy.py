@@ -49,12 +49,23 @@ class StatePolicy(FluxwayBaseSchema):
     resource: str | None = None
 
     @classmethod
-    def exclusive(cls, resource: str | None = None) -> StatePolicy:
-        return cls(access="exclusive", resource=resource)
+    def exclusive(
+        cls,
+        resource: str | None = None,
+    ) -> StatePolicy:
+        return cls(
+            access="exclusive",
+            resource=resource,
+        )
 
     @classmethod
-    def thread_safe(cls) -> StatePolicy:
-        return cls(access="thread_safe", resource=None)
+    def thread_safe(
+        cls,
+    ) -> StatePolicy:
+        return cls(
+            access="thread_safe",
+            resource=None,
+        )
 
     def model_post_init(self, __context: Any) -> None:
         if self.access not in ("exclusive", "thread_safe"):

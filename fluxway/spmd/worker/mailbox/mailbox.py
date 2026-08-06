@@ -26,17 +26,15 @@ from fluxway.common.types.tensor import Scalar, TransportTensor
 from fluxway.transport.manifest import (
     DependencyDecision,
     DependencyDecisionMismatchError,
-    ENTRY_TENSOR_KIND,
+    ENTRY_AUX,
     ENTRY_COMPACT_BEGIN,
-    ENTRY_COMPACT_COUNT,
     ENTRY_EXPECTED_COUNT,
     ENTRY_GLOBAL_SHAPE_BEGIN,
     ENTRY_GLOBAL_SHAPE_COUNT,
-    ENTRY_META_STATE,
     ENTRY_PAYLOAD_BEGIN,
     ENTRY_PAYLOAD_COUNT,
     ENTRY_ROUTE_CODE,
-    ENTRY_SOURCE_STEP,
+    ENTRY_STATE_FLAGS,
     FRAME_FLAGS,
     FRAME_SENDER_RANK,
     FRAME_SENDER_WORLD_SIZE,
@@ -54,6 +52,7 @@ from fluxway.transport.manifest import (
     TransportFrame,
     dtype_from_code,
 )
+from fluxway.transport.coherence import entry_layout_state, entry_tensor_kind
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +236,7 @@ class StepBarrier:
         "_dependency_decision_barriers",
         "_combined",
         "_periodic",
-        "_periodic_generation",
+        "_periodic_epoch",
         "_last_completion_skipped",
     )
 
@@ -255,7 +254,7 @@ class StepBarrier:
         self._op_name = op_name
         self._step = step
         self._periodic = periodic
-        self._periodic_generation = 0
+        self._periodic_epoch = 0
         self._last_completion_skipped = False
         self._transfer_barriers: dict[int, ArrivalBarrier] = {
             transfer_code: ArrivalBarrier(count)
@@ -461,7 +460,7 @@ class StepBarrier:
         def arrival_is_done(barrier: ArrivalBarrier) -> bool:
             if not self._periodic:
                 return barrier.is_done()
-            return barrier.count >= barrier.target * (self._periodic_generation + 1)
+            return barrier.count >= barrier.target * (self._periodic_epoch + 1)
 
         dependencies_ok = True
         for dependency_code in self._dependency_codes:
@@ -497,7 +496,7 @@ class StepBarrier:
             if self._periodic:
                 self._combined.set()
                 self._combined = asyncio.Event()
-                self._periodic_generation += 1
+                self._periodic_epoch += 1
                 for barrier in self._dependency_decision_barriers.values():
                     barrier.reset()
                 return True
@@ -521,7 +520,7 @@ class StepBarrier:
 
     def is_ready(self) -> bool:
         if self._periodic:
-            return self._periodic_generation > 0
+            return self._periodic_epoch > 0
         return self._combined.is_set()
 
     @property
@@ -1011,10 +1010,11 @@ class WorkerMailbox:
             watermark = 0
             for entry in frame.entry_i32:
                 transfer_code = int(entry[ENTRY_ROUTE_CODE])
-                meta_state = int(entry[ENTRY_META_STATE])
-                tensor_kind = TensorEntryKind(int(entry[ENTRY_TENSOR_KIND]))
+                state_flags = int(entry[ENTRY_STATE_FLAGS])
+                meta_state = entry_layout_state(state_flags)
+                tensor_kind = TensorEntryKind(entry_tensor_kind(state_flags))
                 expected_count = int(entry[ENTRY_EXPECTED_COUNT])
-                source_step = int(entry[ENTRY_SOURCE_STEP])
+                source_step = step
                 if expected_count <= 0:
                     raise ValueError(
                         f"[WorkerMailbox Error] Invalid ENTRY_EXPECTED_COUNT={expected_count}: "
@@ -1032,7 +1032,7 @@ class WorkerMailbox:
                 payload_begin = int(entry[ENTRY_PAYLOAD_BEGIN])
                 payload_count = int(entry[ENTRY_PAYLOAD_COUNT])
                 compact_begin = int(entry[ENTRY_COMPACT_BEGIN])
-                compact_count = int(entry[ENTRY_COMPACT_COUNT])
+                compact_count = 4 if meta_state & 4 else 0
                 global_shape_begin = int(entry[ENTRY_GLOBAL_SHAPE_BEGIN])
                 global_shape_count = int(entry[ENTRY_GLOBAL_SHAPE_COUNT])
 
@@ -1108,7 +1108,7 @@ class WorkerMailbox:
                             global_shape_begin : global_shape_begin + global_shape_count
                         ]
                     )
-                arrival_slot[key] = {
+                arrival_metadata = {
                     "tensor_kind": tensor_kind,
                     "meta_state": meta_state,
                     "payload_schema": tuple(payload_schema),
@@ -1117,6 +1117,7 @@ class WorkerMailbox:
                     "sender_world_size": sender_world_size,
                     "expected_count": expected_count,
                     "source_step": source_step,
+                    "coherence_epoch": int(entry[ENTRY_AUX]),
                 }
 
                 if tensor_kind is TensorEntryKind.TENSOR:
@@ -1144,6 +1145,8 @@ class WorkerMailbox:
                         if compact_params is not None
                         else None,
                     )
+
+                arrival_slot[key] = arrival_metadata
 
                 if barrier.transfer_arrived(transfer_code, current_step=actual_step):
                     any_fired = True

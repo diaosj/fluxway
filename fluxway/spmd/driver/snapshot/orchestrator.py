@@ -215,7 +215,7 @@ class SnapshotOrchestrator:
                     validate_checkpoint_state(
                         candidate_state,
                         path=(
-                            f"manifest.{self.spmd_id}."
+                            f"metadata.{self.spmd_id}."
                             f"spmd_state.operator_states.{op_name}"
                         ),
                     )

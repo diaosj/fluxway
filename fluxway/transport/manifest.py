@@ -9,7 +9,14 @@ from typing import Any, cast
 
 import numpy as np
 
+from fluxway.common.coherence import CoherenceAction
 from fluxway.common.tensor_protocol import DLPackTensor, dlpack_tensor_shape
+from fluxway.transport.coherence import (
+    entry_coherence_action,
+    entry_layout_state,
+    entry_tensor_kind,
+    pack_entry_state_flags,
+)
 from fluxway.transport.kernels import FRAME_TABLE_KERNEL, FrameTableCapacity
 
 
@@ -17,7 +24,7 @@ INT32_MAX = np.iinfo(np.int32).max
 INT64_MAX = np.iinfo(np.int64).max
 INT32_NBYTES = np.dtype(np.int32).itemsize
 INT64_NBYTES = np.dtype(np.int64).itemsize
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 1
 
 
 class TensorEntryKind(IntEnum):
@@ -67,6 +74,7 @@ class FrameFlag(IntEnum):
     TENSOR_TRANSFER = 0
     ORDERING_COMPLETION = 1
     DEPENDENCY_DECISION = 2
+    COHERENCE = 3
 
 
 FRAME_VERSION = 0
@@ -80,18 +88,15 @@ FRAME_FLAGS = 7
 FRAME_WIDTH = 8
 
 ENTRY_ROUTE_CODE = 0
-ENTRY_META_STATE = 1
-ENTRY_TENSOR_KIND = 2
-ENTRY_PAYLOAD_BEGIN = 3
-ENTRY_PAYLOAD_COUNT = 4
-ENTRY_EXPECTED_COUNT = 5
-ENTRY_COMPACT_BEGIN = 6
-ENTRY_COMPACT_COUNT = 7
-ENTRY_GLOBAL_SHAPE_BEGIN = 8
-ENTRY_GLOBAL_SHAPE_COUNT = 9
-ENTRY_SOURCE_STEP = 10
-ENTRY_DEPENDENCY_DECISION = 11
-ENTRY_WIDTH = 12
+ENTRY_STATE_FLAGS = 1
+ENTRY_PAYLOAD_BEGIN = 2
+ENTRY_PAYLOAD_COUNT = 3
+ENTRY_EXPECTED_COUNT = 4
+ENTRY_COMPACT_BEGIN = 5
+ENTRY_GLOBAL_SHAPE_BEGIN = 6
+ENTRY_GLOBAL_SHAPE_COUNT = 7
+ENTRY_AUX = 8
+ENTRY_WIDTH = 9
 
 PAYLOAD_ROLE = 0
 PAYLOAD_DTYPE = 1
@@ -323,7 +328,11 @@ class TransportFrameHeader:
         frame_flag = FrameFlag(frame_flag_value)
         entry_count = int(self.frame_i32[FRAME_ENTRY_COUNT])
         payload_count = int(self.frame_i32[FRAME_PAYLOAD_COUNT])
-        if frame_flag in (FrameFlag.ORDERING_COMPLETION, FrameFlag.DEPENDENCY_DECISION):
+        if frame_flag in (
+            FrameFlag.ORDERING_COMPLETION,
+            FrameFlag.DEPENDENCY_DECISION,
+            FrameFlag.COHERENCE,
+        ):
             if entry_count == 0:
                 raise ValueError(
                     f"{frame_flag.name} transport frames require at least one entry."
@@ -341,18 +350,18 @@ class TransportFrameHeader:
                 f"frame payload_count={payload_count} does not match payload_i32 entries={self.payload_i32.shape[0]}."
             )
         decision_dependency_codes: set[int] = set()
+        coherence_frame_action: CoherenceAction | None = None
+        coherence_frame_epoch: int | None = None
         for entry_index, entry in enumerate(self.entry_i32):
-            _validate_enum(
-                TensorEntryKind,
-                int(entry[ENTRY_TENSOR_KIND]),
-                f"frame entry {entry_index} tensor kind",
-            )
-            tensor_kind = TensorEntryKind(int(entry[ENTRY_TENSOR_KIND]))
-            decision_value = int(entry[ENTRY_DEPENDENCY_DECISION])
+            state_flags = int(entry[ENTRY_STATE_FLAGS])
+            tensor_kind = TensorEntryKind(entry_tensor_kind(state_flags))
+            coherence_action = entry_coherence_action(state_flags)
+            layout_state = entry_layout_state(state_flags)
+            aux_value = int(entry[ENTRY_AUX])
             payload_begin = int(entry[ENTRY_PAYLOAD_BEGIN])
             payload_count_row = int(entry[ENTRY_PAYLOAD_COUNT])
             compact_begin = int(entry[ENTRY_COMPACT_BEGIN])
-            compact_count = int(entry[ENTRY_COMPACT_COUNT])
+            compact_count = COMPACT_PARAM_COUNT if layout_state & 4 else 0
             global_shape_begin = int(entry[ENTRY_GLOBAL_SHAPE_BEGIN])
             global_shape_count = int(entry[ENTRY_GLOBAL_SHAPE_COUNT])
             if frame_flag is FrameFlag.TENSOR_TRANSFER and payload_count_row == 0:
@@ -364,12 +373,13 @@ class TransportFrameHeader:
                     raise ValueError(
                         f"tensor transfer entry {entry_index} requires a tensor entry kind."
                     )
-                if decision_value != 0:
+                if coherence_action is not CoherenceAction.BUS_RD:
                     raise ValueError(
-                        f"tensor transfer entry {entry_index} cannot contain a dependency decision."
+                        f"tensor transfer entry {entry_index} requires BUS_RD, "
+                        f"got {coherence_action.name}."
                     )
             if frame_flag is FrameFlag.ORDERING_COMPLETION:
-                if int(entry[ENTRY_META_STATE]) != 0:
+                if layout_state != 0:
                     raise ValueError(
                         f"ordering dependency entry {entry_index} cannot contain tensor metadata."
                     )
@@ -378,9 +388,9 @@ class TransportFrameHeader:
                         f"ordering dependency entry {entry_index} must use "
                         "NOT_APPLICABLE."
                     )
-                if decision_value != 0:
+                if coherence_action is not CoherenceAction.NONE or aux_value != 0:
                     raise ValueError(
-                        f"ordering dependency entry {entry_index} cannot contain a dependency decision."
+                        f"ordering dependency entry {entry_index} cannot contain aux metadata."
                     )
                 if payload_count_row != 0:
                     raise ValueError(
@@ -393,7 +403,7 @@ class TransportFrameHeader:
             if frame_flag is FrameFlag.DEPENDENCY_DECISION:
                 _validate_enum(
                     DependencyDecision,
-                    decision_value,
+                    aux_value,
                     f"frame entry {entry_index} dependency_decision",
                 )
                 dependency_code = int(entry[ENTRY_ROUTE_CODE])
@@ -403,7 +413,7 @@ class TransportFrameHeader:
                         f"dependency_code={dependency_code}."
                     )
                 decision_dependency_codes.add(dependency_code)
-                if int(entry[ENTRY_META_STATE]) != 0:
+                if layout_state != 0:
                     raise ValueError(
                         f"dependency decision entry {entry_index} cannot contain tensor metadata."
                     )
@@ -418,6 +428,42 @@ class TransportFrameHeader:
                 if compact_count != 0 or global_shape_count != 0:
                     raise ValueError(
                         f"dependency decision entry {entry_index} cannot contain tensor shapes."
+                    )
+            if frame_flag is FrameFlag.COHERENCE:
+                if layout_state != 0:
+                    raise ValueError(
+                        f"coherence entry {entry_index} cannot contain tensor metadata."
+                    )
+                if tensor_kind is not TensorEntryKind.NOT_APPLICABLE:
+                    raise ValueError(
+                        f"coherence entry {entry_index} must use NOT_APPLICABLE."
+                    )
+                if coherence_action is CoherenceAction.NONE:
+                    raise ValueError(
+                        f"coherence entry {entry_index} requires a coherence action."
+                    )
+                if coherence_frame_action is None:
+                    coherence_frame_action = coherence_action
+                    coherence_frame_epoch = aux_value
+                elif (
+                    coherence_action is not coherence_frame_action
+                    or aux_value != coherence_frame_epoch
+                ):
+                    raise ValueError(
+                        "coherence frame entries must use one action and one epoch."
+                    )
+                if aux_value != int(self.frame_i32[FRAME_STEP]):
+                    raise ValueError(
+                        f"coherence entry {entry_index} epoch={aux_value} does not "
+                        f"match frame step={int(self.frame_i32[FRAME_STEP])}."
+                    )
+                if (
+                    payload_count_row != 0
+                    or compact_count != 0
+                    or global_shape_count != 0
+                ):
+                    raise ValueError(
+                        f"coherence entry {entry_index} cannot contain payload metadata."
                     )
             if payload_begin + payload_count_row > payload_count:
                 raise ValueError(
@@ -562,7 +608,7 @@ class TransportFrameTemplate:
         payload_segments: tuple[DLPackTensor, ...],
         payload_valid_counts: tuple[int, ...],
         global_shapes: tuple[tuple[int, ...] | None, ...],
-        source_steps: tuple[int, ...],
+        coherence_epochs: tuple[int, ...],
     ) -> TransportFrame:
         if len(payload_segments) != self.payload_i32.shape[0]:
             raise ValueError(
@@ -579,10 +625,10 @@ class TransportFrameTemplate:
                 "global shape length does not match template entry entries: "
                 f"shapes={len(global_shapes)} entries={self.entry_i32.shape[0]}."
             )
-        if len(source_steps) != self.entry_i32.shape[0]:
+        if len(coherence_epochs) != self.entry_i32.shape[0]:
             raise ValueError(
-                "source step length does not match template entry entries: "
-                f"source_steps={len(source_steps)} entries={self.entry_i32.shape[0]}."
+                "coherence epoch length does not match template entry entries: "
+                f"epochs={len(coherence_epochs)} entries={self.entry_i32.shape[0]}."
             )
 
         frame_i32 = self.frame_i32.copy()
@@ -622,11 +668,11 @@ class TransportFrameTemplate:
                 payload_index, "payload segment index"
             )
 
-        for entry_index, (global_shape, source_step) in enumerate(
-            zip(global_shapes, source_steps, strict=True)
+        for entry_index, (global_shape, coherence_epoch) in enumerate(
+            zip(global_shapes, coherence_epochs, strict=True)
         ):
             entry = entry_i32[entry_index]
-            entry[ENTRY_SOURCE_STEP] = _as_i32(source_step, "source_step")
+            entry[ENTRY_AUX] = _as_i32(coherence_epoch, "coherence_epoch")
             shape_count = int(entry[ENTRY_GLOBAL_SHAPE_COUNT])
             shape_begin = int(entry[ENTRY_GLOBAL_SHAPE_BEGIN])
             if global_shape is None:
@@ -731,10 +777,11 @@ class TransportFrameBuilder:
         self,
         *,
         transfer_code: int,
-        meta_state: int,
+        layout_state: int,
         tensor_kind: TensorEntryKind,
         expected_count: int,
-        source_step: int,
+        coherence_epoch: int,
+        coherence_action: CoherenceAction = CoherenceAction.BUS_RD,
         compact_params: list[int] | tuple[int, ...] | None = None,
         global_shape: tuple[int, ...] | None = None,
     ) -> int:
@@ -742,29 +789,51 @@ class TransportFrameBuilder:
             raise ValueError("Tensor transfers require a TENSOR_TRANSFER frame.")
         return self._add_route(
             route_code=transfer_code,
-            meta_state=meta_state,
+            layout_state=layout_state,
             tensor_kind=tensor_kind,
             expected_count=expected_count,
-            source_step=source_step,
+            aux=coherence_epoch,
+            coherence_action=coherence_action,
             compact_params=compact_params,
             global_shape=global_shape,
+        )
+
+    def add_coherence_entry(
+        self,
+        *,
+        route_code: int,
+        coherence_epoch: int,
+        coherence_action: CoherenceAction,
+        expected_count: int = 1,
+    ) -> int:
+        if self._frame_flag is not FrameFlag.COHERENCE:
+            raise ValueError("Coherence entries require a COHERENCE frame.")
+        if coherence_action is CoherenceAction.NONE:
+            raise ValueError("coherence_action must not be NONE.")
+        return self._add_route(
+            route_code=route_code,
+            layout_state=0,
+            tensor_kind=TensorEntryKind.NOT_APPLICABLE,
+            expected_count=expected_count,
+            aux=coherence_epoch,
+            coherence_action=coherence_action,
         )
 
     def _add_route(
         self,
         *,
         route_code: int,
-        meta_state: int,
+        layout_state: int,
         tensor_kind: TensorEntryKind,
         expected_count: int,
-        source_step: int,
+        aux: int,
+        coherence_action: CoherenceAction = CoherenceAction.NONE,
         compact_params: list[int] | tuple[int, ...] | None = None,
         global_shape: tuple[int, ...] | None = None,
         dependency_decision: DependencyDecision | None = None,
     ) -> int:
         payload_begin = self._payload_count
         compact_begin = self.add_compact_params(compact_params)
-        compact_count = 0 if compact_params is None else COMPACT_PARAM_COUNT
         global_shape_begin = self._global_shape_count
         global_shape_count = 0
         if global_shape is not None:
@@ -789,19 +858,20 @@ class TransportFrameBuilder:
             self._entry_i32_buffer,
             entry_index * self._ENTRY_STRUCT.size,
             _as_i32(route_code, "route_code"),
-            _as_i32(meta_state, "meta_state"),
-            _as_i32(int(tensor_kind), "tensor_kind"),
+            pack_entry_state_flags(
+                layout_state,
+                int(tensor_kind),
+                coherence_action,
+            ),
             _as_i32(payload_begin, "payload_begin"),
             0,
             _as_i32(expected_count, "expected_count"),
             _as_i32(compact_begin, "compact_begin"),
-            _as_i32(compact_count, "compact_count"),
             _as_i32(global_shape_begin, "global_shape_begin"),
             _as_i32(global_shape_count, "global_shape_count"),
-            _as_i32(source_step, "source_step"),
             _as_i32(
-                0 if dependency_decision is None else int(dependency_decision),
-                "dependency_decision",
+                aux if dependency_decision is None else int(dependency_decision),
+                "entry_aux",
             ),
         )
         self._entry_count += 1
@@ -812,7 +882,6 @@ class TransportFrameBuilder:
         *,
         dependency_code: int,
         expected_count: int,
-        source_step: int,
     ) -> int:
         if self._frame_flag is not FrameFlag.ORDERING_COMPLETION:
             raise ValueError(
@@ -820,10 +889,10 @@ class TransportFrameBuilder:
             )
         return self._add_route(
             route_code=dependency_code,
-            meta_state=0,
+            layout_state=0,
             tensor_kind=TensorEntryKind.NOT_APPLICABLE,
             expected_count=expected_count,
-            source_step=source_step,
+            aux=0,
         )
 
     def add_dependency_decision_entry(
@@ -832,7 +901,6 @@ class TransportFrameBuilder:
         dependency_code: int,
         decision: DependencyDecision,
         expected_count: int,
-        source_step: int,
     ) -> int:
         if self._frame_flag is not FrameFlag.DEPENDENCY_DECISION:
             raise ValueError(
@@ -850,10 +918,10 @@ class TransportFrameBuilder:
         self._decision_dependency_codes.add(dependency_code)
         return self._add_route(
             route_code=dependency_code,
-            meta_state=0,
+            layout_state=0,
             tensor_kind=TensorEntryKind.NOT_APPLICABLE,
             expected_count=expected_count,
-            source_step=source_step,
+            aux=int(decision),
             dependency_decision=decision,
         )
 

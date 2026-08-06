@@ -93,7 +93,7 @@ def validate_checkpoint_state(value: Any, path: str = "checkpoint_state") -> Non
                 raise TypeError(f"{path} contains a non-string key: {key!r}")
             validate_checkpoint_state(item, f"{path}.{key}")
         return
-    if isinstance(value, list | tuple):
+    if isinstance(value, list | tuple | set):
         for index, item in enumerate(value):
             validate_checkpoint_state(item, f"{path}[{index}]")
         return

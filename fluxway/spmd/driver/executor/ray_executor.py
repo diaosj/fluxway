@@ -2,6 +2,7 @@ import asyncio
 from typing import Any
 from collections.abc import Mapping
 
+import ray
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from fluxway.common.types import SPMDConfig
@@ -177,6 +178,18 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
 
     async def stop_workers(self) -> list[Exception]:
         shutdown_errors: list[Exception] = []
+
+        async def _wait_with_timeout(
+            rank: int, ref: Any, action: str
+        ) -> Exception | None:
+            try:
+                await asyncio.wait_for(ref, timeout=60.0)
+                return None
+            except TimeoutError:
+                return TimeoutError(f"Worker rank={rank} timed out during {action}")
+            except Exception as e:
+                return e
+
         stop_refs: list[tuple[int, Any]] = []
         for rank, worker in self._worker_handles.items():
             try:
@@ -187,10 +200,10 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
         worker_handles = list(self._worker_handles.items())
         if stop_refs:
             results = await asyncio.gather(
-                *(ref for _, ref in stop_refs), return_exceptions=True
+                *(_wait_with_timeout(rank, ref, "stop()") for rank, ref in stop_refs)
             )
-            for (rank, _), result in zip(stop_refs, results, strict=True):
-                if isinstance(result, Exception):
+            for result in results:
+                if result is not None:
                     shutdown_errors.append(result)
 
         detach_refs: list[tuple[int, Any]] = []
@@ -202,11 +215,20 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
 
         if detach_refs:
             detach_results = await asyncio.gather(
-                *(ref for _, ref in detach_refs), return_exceptions=True
+                *(
+                    _wait_with_timeout(rank, ref, "set_driver_handle()")
+                    for rank, ref in detach_refs
+                )
             )
-            for (rank, _), result in zip(detach_refs, detach_results, strict=True):
-                if isinstance(result, Exception):
+            for result in detach_results:
+                if result is not None:
                     shutdown_errors.append(result)
+
+        for _rank, worker in worker_handles:
+            try:
+                ray.kill(worker, no_restart=True)
+            except Exception as error:
+                shutdown_errors.append(error)
 
         self._worker_handles.clear()
         return shutdown_errors

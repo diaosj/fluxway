@@ -529,6 +529,43 @@ def test_compile_send_plan_preserves_each_canonical_transfer_route():
     assert [route.output_index for route in routes] == [0, 0]
     assert all(route.routing_mode is TransportRoutingMode.ALGEBRAIC for route in routes)
     assert routes[0].target_spec != routes[1].target_spec
+    assert routes[0].child_slots == routes[1].child_slots == (0,)
+    assert {
+        compiled.coherence_logical_tuuid(route.transfer_code) for route in routes
+    } == {1}
+    assert {
+        compiled.coherence_child_slot(route.transfer_code, 0) for route in routes
+    } == {0}
+
+
+def test_coherence_child_slots_are_canonical_bijection():
+    from types import SimpleNamespace
+
+    from fluxway.spmd.worker.data_plane import _compile_coherence_child_slots
+
+    transfer = SimpleNamespace(logical_tuuid=7)
+    contexts = (
+        SimpleNamespace(
+            spmd_id="target_b",
+            target_world_size=2,
+            dependencies=(SimpleNamespace(transfers=(transfer,)),),
+        ),
+        SimpleNamespace(
+            spmd_id="target_a",
+            target_world_size=2,
+            dependencies=(SimpleNamespace(transfers=(transfer,)),),
+        ),
+    )
+
+    slots = _compile_coherence_child_slots(contexts)
+
+    assert slots == {
+        (7, "target_a", 0): 0,
+        (7, "target_a", 1): 1,
+        (7, "target_b", 0): 2,
+        (7, "target_b", 1): 3,
+    }
+    assert set(slots.values()) == set(range(len(slots)))
 
 
 def test_sender_batches_shared_logical_tensor_by_transfer_code_without_rewrapping():
@@ -621,8 +658,8 @@ def test_sender_batches_multiple_outputs_without_payload_copy():
         1,
     ]
     assert call.kwargs["transfer_codes"] == [1, 2]
-    assert tensors[0].flat_values is first
-    assert tensors[1].flat_values is second
+    assert np.shares_memory(tensors[0].flat_values, first)
+    assert np.shares_memory(tensors[1].flat_values, second)
 
 
 def test_sender_separates_content_routed_outputs_with_distinct_values():
@@ -687,7 +724,8 @@ def test_sender_separates_content_routed_outputs_with_distinct_values():
         call.args[0][0].flat_values
         for call in distributor.plan_and_shard.call_args_list
     ]
-    assert routed_values == [first, second]
+    assert np.shares_memory(routed_values[0], first)
+    assert np.shares_memory(routed_values[1], second)
 
 
 def test_completed_without_tensor_rows_use_transfer_codes():

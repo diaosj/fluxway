@@ -20,10 +20,11 @@ from fluxway.transport.communication import (
     _pack_payloads_by_plan,
 )
 from fluxway.transport.manifest import (
-    ENTRY_COMPACT_COUNT,
     ENTRY_EXPECTED_COUNT,
+    ENTRY_STATE_FLAGS,
     PAYLOAD_VALID_COUNT,
 )
+from fluxway.transport.coherence import entry_layout_state
 
 
 @pytest.fixture(autouse=True)
@@ -405,7 +406,9 @@ def test_content_source_to_static_target_keeps_origin_descriptor_symbolic(monkey
     non_empty = [
         (
             target_rank,
-            header.entry_i32[0, ENTRY_COMPACT_COUNT],
+            4
+            if entry_layout_state(int(header.entry_i32[0, ENTRY_STATE_FLAGS])) & 4
+            else 0,
             payload_iovs[0].shape[0],
         )
         for target_rank, (header, payload_iovs) in captured.items()

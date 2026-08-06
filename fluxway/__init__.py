@@ -62,6 +62,7 @@ from fluxway.control_plane import Builder, ExecutionFailedError, start, GraphExe
 # Import runner
 from fluxway.runner import run_in_sandbox
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.coherence import TensorAccessIntent
 from fluxway import profiler
 from fluxway.visualization import view_graph, visualize_graph
 from fluxway.placement import (
@@ -126,6 +127,7 @@ __all__ = [
     "requires_worker_process",
     "bind_spmd",
     "OperatorSpec",
+    "TensorAccessIntent",
     # Types
     "PartitionSpec",
     "SPMDConfig",

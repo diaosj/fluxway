@@ -1,13 +1,66 @@
 # Fluxway Architecture
 
-Fluxway 是面向多 SPMD 图训练的异步数据流框架。当前架构的核心原则是：
+Fluxway 是面向多 SPMD（Single Program, Multiple Data，单程序多数据）图训练的异步
+数据流框架。当前架构的核心原则是：
 
 - 用户算法语义由 `AsyncPolicy` 表达。
 - 单个 `(operator, step)` 的 worker-local 执行统一 lower 到 `LocalStepPlan`。
 - 用户 `CALL`、输入 prepare、输出 delivery 分别由 worker-local runtime 管理，避免阻塞 Ray actor event loop。
 - tensor 切分、frame 构造、batch 分组属于 transport/data-plane 层，不在 worker 调度层重复实现。
 - 所有 tensor/control/state 都是 exact-step 输入，Fluxway 不会用另一个 step 的数据替代当前 step。
-- 同 worker 内部流水线用显式 local-only edge，仍走 transport frame ABI 和 mailbox exact-step barrier，但不注册 Ray/Axon self-loop handler。
+- 同 worker 内部流水线用显式 local-only edge，共享 canonical `TransportTensor` 语义 ABI
+  （Application Binary Interface，应用二进制接口），但优先直接传对象引用，不强制编码
+  wire frame，也不注册 Ray/Axon self-loop handler。
+
+## Endpoint-Local MESI Directory Coherence Tree
+
+MESI（Modified, Exclusive, Shared, Invalid，修改、独占、共享、无效）描述一个 tensor
+instance 在 endpoint-local directory 中的访问权限，不描述 Python 对象类型。
+
+TUUID（Tensor Universally Unique Identifier，tensor 通用唯一标识）是 logical tensor
+identity。DLPack（Deep Learning Pack）是跨 backend tensor payload 接口。BusRd（Bus Read）
+对应 wire action `BUS_RD`；Snoop Invalidate（嗅探无效化）对应
+`SNOOP_INVALIDATE`；Grant Return（授权归还）对应 `GRANT_RETURN`。
+
+Fluxway 使用 endpoint-local 的层次化 directory。每个 endpoint 只维护本地状态、direct
+parent authority 和 direct-child sharing bitmap；禁止全局 holder list、跨层广播和全局
+coherence lock。任一跃迁只访问一个 entry 和它的 direct edges，延迟只反压相关子树。
+
+用户接口只有 `TensorAccessIntent.READONLY`、`WRITABLE` 和 `DONATE`，按 operator 的
+data input port 声明：
+
+```python
+@operator(tensor_access={
+    "input_ids": TensorAccessIntent.READONLY,
+    "cache": TensorAccessIntent.WRITABLE,
+    "activation": TensorAccessIntent.DONATE,
+})
+```
+
+未声明的 data input port 默认是 `READONLY`；mirror/follow 只继承 receipt/origin lineage，
+不会改变 intent。Graph compile、local-only fast path 和 worker CALL 都消费同一份冻结的
+`OperatorSpec.tensor_access`，不再从 `AsyncPolicy` 或 `StatePolicy` 推导第二份事实。
+runtime 在 CALL 前把 intent 转为本地 grant 或 RFO（Request For Ownership，请求所有权）；write grant 未 ready 时 coroutine
+挂起，用户函数绝不会提前执行。完整状态机、
+动作定义和证明见 [Endpoint-Local MESI Directory Protocol](coherence_protocol.md)。
+
+当前 wire 协议只实现 `BUS_RD`、`RFO`、`SNOOP_INVALIDATE`、`GRANT_RETURN`、
+`OWNERSHIP_GRANT` 和 CALL 前的 `OWNERSHIP_CANCEL`。`BUS_UPGR` 是 directory 内部的
+`S -> M` 概念跃迁，不产生 frame。`FLUSH` 在 MESI 中表示 dirty writeback，但 copied
+Ray/Axon data-plane 无法用 header-only frame 恢复 parent payload，因此一执行协议将其 action code
+保留为非法值，不实现 remote writeback。
+
+逻辑 identity 是 `(owner_spmd_code, owner_rank, logical_tuuid, epoch)`；physical allocation
+identity 由 backend 证明。`donate` 只允许 endpoint-local、exact byte-span 的 Allocation
+Handoff：旧 SSA（Static Single Assignment，静态单赋值）instance 进入 I，新 SSA instance
+获得同一 storage owner 并进入 E。跨
+endpoint 仍是普通 tensor payload，不是 FLUSH，也没有 Parameter Server 特例。
+
+正常回收只删除已证明没有 reader、writer、child、delivery、parent authority、pending
+continuation 和 live binding 的 retired instance。watermark 只是 endpoint-local 的回收调度
+frontier，不是安全证明。协议不一致或 progress failure 会 fence 整次 execution：停止 frame
+admission、取消任务、关闭 transport、清空受控 binding 并显式终止 worker actor；当前不支持
+同一 execution 内的 rank replacement。
 
 ## Layering
 
@@ -208,6 +261,18 @@ local-only edge 只允许 `source_node == target_node`。scheduler 建立全局 
 topology 时跳过这类边，因此同 rank 内部 operator 不等待 self-loop remote
 handler。worker 发送边界仍校验编译后目标 rank 必须等于 sender rank；不满足时直接
 抛错，不做 remote fallback。
+
+local-only 与跨 worker 路径共享 logical TUUID（Tensor Universally Unique Identifier，
+tensor 通用唯一标识）、epoch、route、grant 和 `TransportTensor` 语义，不共享同一种物理
+carrier。跨 worker 使用 9-column flat frame 和 DLPack（Deep Learning Pack）payload；
+同 worker 优先把 `TransportTensor` 引用写入 direct-local slot，不满足严格快速路径条件时
+直接 deposit local mailbox。两条 local 路径都避免无意义的 frame 编解码。
+
+`CoherenceDirectory` 由单个 event loop 拥有。同一 event loop 上的多个 coroutine 直接走
+O(1) grant 快速路径；冲突时只挂起相关 coroutine。OS（Operating System，操作系统）线程
+不得直接并发修改 directory，而应通过 thread-safe submission 把请求投递到 owner event
+loop。Fluxway 不为 directory 增加跨线程共享锁，Python 的 GIL（Global Interpreter Lock，
+全局解释器锁）也不构成 tensor coherence 证明。
 
 ## Commit, Fence, And Failure
 

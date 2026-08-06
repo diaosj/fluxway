@@ -19,6 +19,8 @@ def _apply_operator_configs(
                 updates["input_sharding"] = op_cfg["input_sharding"]
             if "output_sharding" in op_cfg:
                 updates["output_sharding"] = op_cfg["output_sharding"]
+            if "tensor_access" in op_cfg:
+                updates["tensor_access"] = op_cfg["tensor_access"]
 
             if "input_sharding" in op_cfg and existing_spec.input_arguments:
                 data_keys = list(op_cfg["input_sharding"].keys())

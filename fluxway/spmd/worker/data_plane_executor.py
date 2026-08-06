@@ -8,6 +8,14 @@ from dataclasses import dataclass
 import heapq
 from typing import Any
 
+from fluxway.common.coherence import (
+    CoherenceDirectory,
+    CoherenceSubject,
+    GrantPending,
+    GrantReady,
+    GrantRejected,
+    GrantToken,
+)
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
@@ -183,6 +191,7 @@ async def _build_and_send_frame_groups(
     batch_delivery_factory: Callable[..., Awaitable[Any]] | None = None,
     profiler_recorder: TraceRecorder | None = None,
     delivery_schedule_key: ScheduleKey,
+    coherence_directory: CoherenceDirectory,
 ) -> list[asyncio.Task[Any]]:
     if len(successor_handlers) != len(compiled_plan.successor_routes):
         raise ValueError(
@@ -226,6 +235,11 @@ async def _build_and_send_frame_groups(
                 output_step=exec_step,
             )
             frames = _batch_envelopes(batch)
+            delegated_tokens = await _delegate_batch_reads(
+                coherence_directory,
+                compiled_plan,
+                batch,
+            )
             delivery = (
                 batch_delivery_factory(
                     handler=handler,
@@ -249,7 +263,14 @@ async def _build_and_send_frame_groups(
                     batch_seq=batch.batch_seq,
                 )
             )
-            delivery_tasks.append(await submit_delivery(delivery))
+            delivery_tasks.append(
+                await _submit_delegated_batch(
+                    directory=coherence_directory,
+                    delegated_tokens=delegated_tokens,
+                    delivery=delivery,
+                    submit_delivery=submit_delivery,
+                )
+            )
         return delivery_tasks
 
     async with profiler_recorder.data_plane_frame_submit(
@@ -269,6 +290,11 @@ async def _build_and_send_frame_groups(
                 output_step=exec_step,
             )
             frames = _batch_envelopes(batch)
+            delegated_tokens = await _delegate_batch_reads(
+                coherence_directory,
+                compiled_plan,
+                batch,
+            )
             async with profiler_recorder.data_plane_enqueue_batch(
                 op_name=compiled_plan.op_name,
                 step=exec_step,
@@ -303,8 +329,94 @@ async def _build_and_send_frame_groups(
                         profiler_recorder=profiler_recorder,
                     )
                 )
-                delivery_tasks.append(await submit_delivery(delivery))
+                delivery_tasks.append(
+                    await _submit_delegated_batch(
+                        directory=coherence_directory,
+                        delegated_tokens=delegated_tokens,
+                        delivery=delivery,
+                        submit_delivery=submit_delivery,
+                    )
+                )
     return delivery_tasks
+
+
+def _delegated_reads(
+    compiled_plan: CompiledSendPlan,
+    batch: TransportFrameBatch,
+) -> set[tuple[CoherenceSubject, int, int]]:
+    return {
+        (
+            CoherenceSubject(
+                compiled_plan.sender_spmd_code,
+                compiled_plan.rank,
+                compiled_plan.coherence_logical_tuuid(item.transfer_code),
+            ),
+            item.epoch,
+            compiled_plan.coherence_child_slot(
+                item.transfer_code,
+                batch.target_rank,
+            ),
+        )
+        for item in batch.delegations
+    }
+
+
+async def _delegate_batch_reads(
+    directory: CoherenceDirectory,
+    compiled_plan: CompiledSendPlan,
+    batch: TransportFrameBatch,
+) -> tuple[GrantToken, ...]:
+    tokens: list[GrantToken] = []
+    try:
+        for subject, epoch, child_slot in _delegated_reads(compiled_plan, batch):
+            result = directory.delegate_local_payload(subject, epoch, child_slot)
+            if isinstance(result, GrantReady):
+                tokens.append(directory.register_child_delivery(result.token))
+                continue
+            if isinstance(result, GrantPending):
+                token = await result.ready
+                tokens.append(directory.register_child_delivery(token))
+                continue
+            if isinstance(result, GrantRejected):
+                raise result.error
+            raise TypeError(f"unsupported grant result={type(result).__name__}.")
+    except BaseException:
+        _complete_delegations(directory, tokens, delivered=False)
+        raise
+    return tuple(tokens)
+
+
+def _complete_delegations(
+    directory: CoherenceDirectory,
+    tokens: list[GrantToken] | tuple[GrantToken, ...],
+    *,
+    delivered: bool,
+) -> None:
+    for token in reversed(tokens):
+        directory.complete_child_delivery(token, delivered=delivered)
+
+
+async def _submit_delegated_batch(
+    *,
+    directory: CoherenceDirectory,
+    delegated_tokens: tuple[GrantToken, ...],
+    delivery: Awaitable[Any],
+    submit_delivery: SubmitDelivery,
+) -> asyncio.Task[Any]:
+    async def deliver_and_complete() -> Any:
+        try:
+            result = await delivery
+        except BaseException:
+            _complete_delegations(directory, delegated_tokens, delivered=False)
+            raise
+        _complete_delegations(directory, delegated_tokens, delivered=True)
+        return result
+
+    try:
+        return await submit_delivery(deliver_and_complete())
+    except BaseException:
+        _complete_delegations(directory, delegated_tokens, delivered=False)
+        raise
 
 
 def _handler_for_batch(
@@ -386,8 +498,9 @@ async def _send_transport_frame_batch_to_handler(
 
 
 class BatchingDataPlaneExecutor:
-    def __init__(self) -> None:
+    def __init__(self, coherence_directory: CoherenceDirectory) -> None:
         self._queues: dict[tuple[int, int], _TargetBatchQueue] = {}
+        self._coherence_directory = coherence_directory
 
     async def send_tensor_frames(
         self,
@@ -528,6 +641,7 @@ class BatchingDataPlaneExecutor:
             ),
             profiler_recorder=profiler_recorder,
             delivery_schedule_key=delivery_schedule_key,
+            coherence_directory=self._coherence_directory,
         )
 
     async def _enqueue_batch_delivery(

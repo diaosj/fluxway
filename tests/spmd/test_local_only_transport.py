@@ -24,6 +24,7 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
 )
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker, _compile_transport_send_context
+from fluxway.common.coherence import CoherenceDirectory
 from fluxway.transport.communication import TransportFrameBatch
 from fluxway.transport.manifest import DependencyDecision
 
@@ -112,11 +113,13 @@ def test_local_only_successor_uses_direct_worker_data_plane():
         op_manager=op_manager,
         receive_transport_frames=_receive_transport_frames,
         receive_control=_receive_control,
+        _coherence_directory=CoherenceDirectory(),
     )
     stub._require_local_spmd_code = types.MethodType(
         raw_cls._require_local_spmd_code,
         stub,
     )
+    stub._coherence_subject = types.MethodType(raw_cls._coherence_subject, stub)
     stub._local_only_successor_handlers = types.MethodType(
         raw_cls._local_only_successor_handlers,
         stub,
@@ -181,6 +184,7 @@ def test_local_only_batch_rejects_non_local_rank():
         target_rank=1,
         batch_seq=0,
         frames=(),
+        delegations=(),
     )
 
     with pytest.raises(ValueError, match="same-rank routing"):
@@ -213,6 +217,7 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
         op_manager=op_manager,
         receive_transport_frames=_receive_transport_frames,
         receive_control=_receive_control,
+        _coherence_directory=CoherenceDirectory(),
     )
     stub._require_local_spmd_code = types.MethodType(
         raw_cls._require_local_spmd_code,
@@ -230,6 +235,7 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
         raw_cls._ensure_step_declared,
         stub,
     )
+    stub._coherence_subject = types.MethodType(raw_cls._coherence_subject, stub)
     stub._deposit_local_only_outputs = types.MethodType(
         raw_cls._deposit_local_only_outputs,
         stub,
@@ -293,6 +299,7 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         _driver_handle=None,
         receive_transport_frames=_receive_transport_frames,
         receive_control=_receive_control,
+        _coherence_directory=CoherenceDirectory(),
     )
     for name in (
         "_require_local_spmd_code",
@@ -305,6 +312,7 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         "_send_control_arguments",
     ):
         setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
+    stub._coherence_subject = types.MethodType(raw_cls._coherence_subject, stub)
     _bind_direct_local_fast_path(stub, raw_cls)
 
     result = ExecutionResult(

@@ -1,6 +1,24 @@
 import pytest
 import numpy as np
-from fluxway.common.tensor_backend import JaxBackend, get_backend, use_backend
+from fluxway.common.tensor_backend import (
+    JaxBackend,
+    get_backend,
+    prepare_dlpack_input,
+    use_backend,
+)
+
+
+def test_prepare_dlpack_input_preserves_readonly_zero_copy_storage():
+    source = np.arange(8, dtype=np.int64)
+    source.flags.writeable = False
+
+    prepared = prepare_dlpack_input(source)
+
+    assert prepared.flags.writeable
+    assert (
+        prepared.__array_interface__["data"][0] == source.__array_interface__["data"][0]
+    )
+    np.testing.assert_array_equal(prepared, source)
 
 
 def test_jax_dlpack_import_preserves_uint64_with_local_scope():

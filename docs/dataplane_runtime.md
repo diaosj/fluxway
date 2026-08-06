@@ -2,7 +2,114 @@
 
 This document describes the current worker-local data-plane path. The important
 contract is that user `CALL` work and Fluxway tensor split/transfer/assemble work
-must not block each other on the SPMD worker actor event loop.
+must not block each other on the SPMD (Single Program, Multiple Data) worker actor
+event loop.
+
+## MESI Coherence Terms And Flat Metadata
+
+MESI means Modified, Exclusive, Shared, Invalid. ABI means Application Binary
+Interface. The first names access state; the second names a stable boundary between
+components.
+
+BUS_RD means Bus Read. RFO means Request For Ownership. SNOOP_INVALIDATE means a
+directory snoop followed by invalidation of shared authority.
+
+Fluxway 的 coherence action 使用现有 data-plane handler 传输，不建立第二套控制服务。
+`TENSOR_TRANSFER` entry 只能携带 `BUS_RD` 和 payload；`COHERENCE` frame 必须
+header-only，并在 mailbox deposit 前处理，因此不会改变 arrival 或 duplicate barrier。
+
+BUS_RD 的顺序是：sender 在 enqueue 前登记 child bit 和 delivery inflight，发送 payload；
+receiver 完成 route/action/epoch 校验并登记 parent shared authority 后才 deposit mailbox。
+send completion 只结束 delivery receipt，不归还 ShareGrant；只有 downstream operator、alias
+lineage 和 descendants 全部静止后才发送 `GRANT_RETURN`。
+
+RFO 的顺序是：writer intent 先阻止新 reader，释放当前 read token，等待 local subtree；child
+发送 RFO 后，parent 等待 delivery、并发 invalidate siblings、清空 sharing set，再进入 I 并发送
+`OWNERSHIP_GRANT`。child 收到 grant 后才进入 M、解析 pending future 并恢复 CALL。
+
+`SNOOP_INVALIDATE` 只能撤销 S。receiver 设置 revoking、等待 controlled readers 和 direct
+children，随后 wrapper fail-fast、进入 I 并发送一次 `GRANT_RETURN`。M holder 无法在没有
+writeback 的情况下响应 invalidation，直接触发 execution failure。`OWNERSHIP_CANCEL` 仅允许
+CALL 开始前使用；CALL 开始后的 dirty authority 只能退休，parent 保持 I。
+
+当前 Python allocation policy 的 epoch 唯一来源是 tensor instance 的 immutable
+`TransportTensor.source_step`；raw output 在 frame build 前绑定当前 execution step。该值被
+lower 到 `ENTRY_AUX`，而 `FRAME_STEP` 继续承担 delivery barrier 的 exact-step 语义。
+
+### Compressed Flat ABI Entry Row
+
+Protocol version 1 (`PROTOCOL_VERSION = 1`) 使用固定 9 列、36 bytes 的
+`entry_i32` 平铺 row，不兼容解析旧协议：
+
+| 列 | 字段 | 语义 |
+|---:|---|---|
+| 0 | `ENTRY_ROUTE_CODE` | direct-edge protocol dispatch code |
+| 1 | `ENTRY_STATE_FLAGS` | layout、ragged level、tensor kind、coherence action |
+| 2 | `ENTRY_PAYLOAD_BEGIN` | payload table 起始行 |
+| 3 | `ENTRY_PAYLOAD_COUNT` | payload table 行数 |
+| 4 | `ENTRY_EXPECTED_COUNT` | arrival barrier 期望 sender 数 |
+| 5 | `ENTRY_COMPACT_BEGIN` | compact origin 的起始位置 |
+| 6 | `ENTRY_GLOBAL_SHAPE_BEGIN` | global shape 起始位置 |
+| 7 | `ENTRY_GLOBAL_SHAPE_COUNT` | global shape 元素数 |
+| 8 | `ENTRY_AUX` | 由 `FrameFlag` 判别的 tagged union |
+
+`ENTRY_STATE_FLAGS` 的 bit layout：
+
+| bits | 语义 |
+|---|---|
+| 0:2 | ragged / explicit origin / compact origin layout flags |
+| 8:15 | ragged level count |
+| 16:17 | `TensorEntryKind` |
+| 20:23 | `CoherenceAction` |
+| 24:31 | reserved，必须为 0 |
+
+`ENTRY_AUX` 在 `TENSOR_TRANSFER` 和 `COHERENCE` frame 中是 coherence epoch，
+在 `DEPENDENCY_DECISION` frame 中是 decision enum，在 `ORDERING_COMPLETION` 中必须为 0。
+`ENTRY_ROUTE_CODE` 只做协议分派。receiver 必须通过 canonical compiled graph 的
+`transfer_code -> logical_tuuid` 映射取得 coherence identity，禁止把 route code 直接写入
+directory key。
+
+coherence action code：`0=NONE`、`1=BUS_RD`、`2=RFO`、`4=SNOOP_INVALIDATE`、
+`5=GRANT_RETURN`、`7=OWNERSHIP_GRANT`、`8=OWNERSHIP_CANCEL`。code 3、6、9-15
+为 reserved，validator 直接抛异常。一个 coherence frame 内所有 entry 必须具有相同 action
+和 epoch，且 epoch 等于 `FRAME_STEP`；sender 按 `(target, action, epoch)` 聚合 route codes。
+
+### Coherence Identity And Child Slots
+
+endpoint-local directory subject 定义为：
+
+```text
+S = (owner_spmd_code, owner_rank, logical_tuuid)
+```
+
+其中 `logical_tuuid` 的唯一事实来源是 `CompiledTensorTransfer`。`CompiledSendPlan` 中的
+索引只是对 canonical transfer routes 的只读投影，并在构造时验证其映射一致性。
+
+对逻辑 tensor `t`，令它的 direct-child endpoint 集合为：
+
+```text
+E_t = {(target_spmd_id, target_rank)}
+```
+
+按 endpoint 字典序排列后，child slot 定义为：
+
+```text
+slot_t(e) = index(e, sorted(E_t))
+```
+
+因此 `slot_t: E_t -> {0, ..., |E_t|-1}` 是双射。不同 successor SPMD 的相同 rank
+不会发生 bitmap 位碰撞；同一 logical tensor 到同一 endpoint 的多条 transfer 共享同一
+slot。send-plan projection 只能删除 endpoint，不能重新编号已有 slot。
+
+当 operator 输出与 donated input 共享 allocation 时，backend identity 给出
+`EXACT/OVERLAP/DISJOINT`。只有相同 root 和 owned byte span 的 EXACT 可以 handoff；OVERLAP
+和无法证明的类型直接失败。commit 先等待 send registration 和 output quiescence，再退休 old
+parent authority。retirement queue 只访问已入队候选，不扫描 directory。
+
+P99 ready path 只允许 O(1) dict lookup、bitmap/count 更新和 frame append，不创建 Future。
+input grants 使用 identity-keyed dict；同 parent 的 RFO/GRANT_RETURN 聚合为 multi-entry frame，
+不同 parent 和 sibling invalidation 并发发送。Future、deadline 和 continuation 只存在于 conflict
+path。
 
 ## End-To-End Path
 
@@ -169,14 +276,53 @@ h_core = dense.train_core(
 `local=True` lowers to `Edge.local_only=True`. The builder accepts it only when
 `source_node == target_node`; cross-node local-only edges raise immediately.
 The scheduler skips local-only edges when establishing global SPMD topology, so
-drivers do not wait for self-loop Ray/Axon handlers. The sending worker creates
-a `LocalWorkerDataPlane` for its own rank and calls
-`receive_transport_frames(...)` directly in the same process.
+drivers do not wait for self-loop Ray/Axon handlers.
 
-Local-only still uses the transport frame ABI and `WorkerMailbox` exact-step
-deposit. It does not bypass TUUID routing, mailbox barriers, or step watermarks.
-If the compiled route targets any rank other than the sender rank, Fluxway raises
-instead of falling back to remote transport.
+Local-only shares the canonical `TransportTensor` semantic ABI with remote delivery,
+but it does not encode the remote flat-frame carrier. A statically eligible edge writes
+the same `TransportTensor` reference into a direct-local slot. Other local-only tensor
+edges call `WorkerMailbox.deposit_local_tensor(...)` directly. Both paths preserve
+logical TUUID (Tensor Universally Unique Identifier), exact step, route validation,
+coherence grants, duplicate rejection and readiness barriers. If the compiled route
+targets any rank other than the sender rank, Fluxway raises instead of falling back to
+remote transport.
+
+The direct-local slot is enabled only when every expected transfer has one shard, all
+routes target the same worker/rank, assemble geometry is static, and the operator has no
+control arguments, ordering counts or dependency decisions. Otherwise Fluxway uses the
+local mailbox path; it does not silently switch to remote transport.
+
+DLPack means Deep Learning Pack.
+
+```mermaid
+flowchart LR
+  P["Producer TransportTensor"] --> C{"Compiled carrier"}
+  C -->|"same worker, strict static contract"| D["Direct-local slot"]
+  C -->|"same worker, mailbox semantics required"| M["Local mailbox deposit"]
+  C -->|"different worker endpoint"| F["9-column flat frame + DLPack payload"]
+  D --> O["Consumer operator"]
+  M --> O
+  F --> V["Frame validation before mailbox"]
+  V --> O
+```
+
+The three carriers are not separate tensor identity systems: compiled route metadata,
+logical TUUID, epoch and directory authority remain the single sources of truth.
+
+### Coroutine And Thread Ownership
+
+`CoherenceDirectory` is owned by one worker event loop. Multiple coroutines on that loop
+may share a tensor through the ready path: one dictionary lookup and bounded entry-local
+counter/bitmap updates, with no Future allocation, polling or operating-system thread
+block. A conflict creates an entry-local Future and suspends only the requesting
+coroutine.
+
+Operating-system threads must not mutate the directory directly. They must marshal an
+intent through the host event loop's thread-safe submission primitive; the owner loop
+performs the state transition and resolves the result. The current directory API remains
+event-loop-only. Fluxway deliberately does not add a shared directory lock. The GIL
+(Global Interpreter Lock) is insufficient because tensor backends may release it while
+executing kernels, and it does not make a multi-step MESI transition atomic.
 
 ## LocalStepPlan Semantics
 
@@ -297,23 +443,24 @@ across successor routes when source payload groups and routing metadata are
 identical. A Dense-specific bypass would duplicate logic owned by
 `AsyncDataDistributor` and couple the example to the transport ABI.
 
-## Ray And Axon ABI
+## Ray And Axon Wire ABI
 
-Ray, Axon, and worker-local delivery all use batch-first delivery:
+Ray and Axon remote delivery use the batch-first wire entry point:
 
 ```python
 receive_transport_frames(frames: tuple[TransportFrameEnvelope, ...])
 ```
 
 The backend adapter is responsible for invoking the physical endpoint. Ray uses
-actor `.remote(...)`, Axon invokes its native endpoint, and local-only self edges
-call the current worker object directly. The transport/data-plane layer decides
+actor `.remote(...)`, and Axon invokes its native endpoint. Local-only tensor delivery
+uses the direct-local or local-mailbox carriers described above. The transport/data-plane
+layer decides
 batch contents by successor context and target rank; it does not merge frames
 across different concrete endpoints.
 
 Every payload segment is a tensor implementing both `__dlpack__()` and
-`__dlpack_device__()`, with `dtype` and `shape` metadata. This is the transport
-payload ABI for Ray, worker-local delivery, and Axon; array interfaces alone are
+`__dlpack_device__()`, with `dtype` and `shape` metadata. This is the remote transport
+payload ABI for Ray and Axon; array interfaces alone are
 not accepted. The validator does not export a DLPack capsule. Axon additionally
 uses `__dlpack_device__()` to require that every payload in one invocation has
 the same CPU or CUDA device class and matches the receiver device class. Empty

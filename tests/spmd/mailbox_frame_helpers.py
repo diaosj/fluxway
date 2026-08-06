@@ -40,10 +40,10 @@ async def deposit_tensor_frame(
     for entry in entries:
         entry_index = builder.add_tensor_transfer_entry(
             transfer_code=entry.transfer_code,
-            meta_state=entry.meta_state,
+            layout_state=entry.meta_state,
             tensor_kind=entry.tensor_kind,
             expected_count=entry.expected_count,
-            source_step=step if entry.source_step is None else entry.source_step,
+            coherence_epoch=step if entry.source_step is None else entry.source_step,
             compact_params=entry.compact_params,
             global_shape=entry.global_shape,
         )

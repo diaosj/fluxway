@@ -11,6 +11,7 @@ from fluxway.common.compiled_graph import (
     compile_graph,
 )
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.coherence import ExecutionFenceState
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
@@ -184,6 +185,7 @@ async def test_worker_receives_ordering_frames_through_existing_batch_rpc_abi():
     worker.spmd_id = "target"
     worker.rank = 0
     worker._spmd_id_by_code = {4: "source"}
+    worker._fence_state = ExecutionFenceState.OPEN
     worker._profiler_runtime = SimpleNamespace(enabled=False)
     worker._barriers_declared = {}
     ready = []
@@ -208,11 +210,7 @@ async def test_worker_receives_ordering_frames_through_existing_batch_rpc_abi():
             sender_world_size=3,
             flags=FrameFlag.ORDERING_COMPLETION,
         )
-        builder.add_ordering_completion_entry(
-            dependency_code=17,
-            expected_count=3,
-            source_step=7,
-        )
+        builder.add_ordering_completion_entry(dependency_code=17, expected_count=3)
         built = builder.build()
         return TransportFrameEnvelope(
             header=built.header,

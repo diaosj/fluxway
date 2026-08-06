@@ -8,7 +8,15 @@ from fluxway.common.compiled_graph import compile_graph
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types import SPMDConfig
 from fluxway.spmd.driver.driver import SPMDDriver
+from fluxway.spmd.driver.executor import ray_executor
 from tests.compiled_graph_fixtures import compiled_spmd_spec
+
+
+@pytest.fixture(autouse=True)
+def terminate_worker_actors(monkeypatch):
+    terminate = MagicMock()
+    monkeypatch.setattr(ray_executor.ray, "kill", terminate)
+    return terminate
 
 
 def _config(spmd_id: str, operator_id: str, world_size: int) -> SPMDConfig:

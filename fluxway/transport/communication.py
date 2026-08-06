@@ -36,9 +36,12 @@ from fluxway.common.tensor_components import (
 )
 from fluxway.transport.manifest import (
     COMPACT_PARAM_COUNT,
+    ENTRY_AUX,
     ENTRY_EXPECTED_COUNT,
+    ENTRY_PAYLOAD_BEGIN,
+    ENTRY_PAYLOAD_COUNT,
     ENTRY_ROUTE_CODE,
-    ENTRY_TENSOR_KIND,
+    ENTRY_STATE_FLAGS,
     PAYLOAD_VALID_COUNT,
     PayloadRole,
     SenderEmissionMode,
@@ -49,6 +52,8 @@ from fluxway.transport.manifest import (
     TransportPlanManifest,
     dtype_code,
 )
+from fluxway.transport.coherence import entry_coherence_action, entry_tensor_kind
+from fluxway.common.coherence import CoherenceAction
 from fluxway.transport.kernels import FrameTableCapacity
 from fluxway.transport.routing import (
     RoutingSourceKind,
@@ -62,11 +67,18 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
+class TransportDelegationDescriptor:
+    transfer_code: int
+    epoch: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class TransportFrameBatch:
     context_index: int
     target_rank: int
     batch_seq: int
     frames: tuple[tuple[TransportFrameHeader, tuple[Any, ...]], ...]
+    delegations: tuple[TransportDelegationDescriptor, ...]
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -101,10 +113,10 @@ class TransportPayloadPlan:
 @dataclasses.dataclass(frozen=True, slots=True)
 class TransportFrameEntryPlan:
     transfer_code: int
-    meta_state: int
+    layout_state: int
     tensor_kind: TensorEntryKind
+    coherence_epoch: int
     expected_count: int
-    source_step: int
     compact_params: tuple[int, ...] | None
     global_shape: tuple[int, ...] | None
     payloads: tuple[TransportPayloadPlan, ...]
@@ -116,10 +128,10 @@ class AggregatedTransportGroup:
     tensors: tuple[Any, ...]
     counts: tuple[int, ...]
     global_shapes: tuple[tuple[int, ...] | None, ...]
-    meta_states: tuple[int, ...]
+    layout_states: tuple[int, ...]
     compact_params: tuple[tuple[int, ...] | None, ...] | None
     tensor_kinds: tuple[int, ...]
-    source_steps: tuple[int, ...]
+    coherence_epochs: tuple[int, ...]
     expected_count: int
 
     def __post_init__(self) -> None:
@@ -167,12 +179,31 @@ def build_transport_frame_batches(
         frames = frames_by_target[key]
         batch_seq = 0
         for start in range(0, len(frames), batch_max_frames):
+            batch_frames = tuple(frames[start : start + batch_max_frames])
+            delegations = {
+                TransportDelegationDescriptor(
+                    int(entry[ENTRY_ROUTE_CODE]),
+                    int(entry[ENTRY_AUX]),
+                )
+                for header, _payload_segments in batch_frames
+                for entry in header.entry_i32
+                if TensorEntryKind(entry_tensor_kind(int(entry[ENTRY_STATE_FLAGS])))
+                is TensorEntryKind.TENSOR
+                and entry_coherence_action(int(entry[ENTRY_STATE_FLAGS]))
+                is CoherenceAction.BUS_RD
+            }
             batches.append(
                 TransportFrameBatch(
                     context_index=context_index,
                     target_rank=target_rank,
                     batch_seq=batch_seq,
-                    frames=tuple(frames[start : start + batch_max_frames]),
+                    frames=batch_frames,
+                    delegations=tuple(
+                        sorted(
+                            delegations,
+                            key=lambda item: (item.transfer_code, item.epoch),
+                        )
+                    ),
                 )
             )
             batch_seq += 1
@@ -855,10 +886,10 @@ class BaseDataDistributor:
                 tensors=(payload,),
                 counts=(0,),
                 global_shapes=(None,),
-                meta_states=(0,),
+                layout_states=(0,),
                 compact_params=None,
                 tensor_kinds=(int(tensor_kind),),
-                source_steps=(source_step,),
+                coherence_epochs=(source_step,),
                 expected_count=expected_count,
             )
         )
@@ -1728,7 +1759,7 @@ class BaseDataDistributor:
                         tensors=tuple(tensors),
                         counts=tuple(counts),
                         global_shapes=tuple(global_shapes_list),
-                        meta_states=tuple(has_meta_tensor_state_list),
+                        layout_states=tuple(has_meta_tensor_state_list),
                         compact_params=(
                             None
                             if slice_compact_desc_params is None
@@ -1738,7 +1769,7 @@ class BaseDataDistributor:
                             )
                         ),
                         tensor_kinds=tuple(tensor_kind_list),
-                        source_steps=tuple(source_steps_list),
+                        coherence_epochs=tuple(source_steps_list),
                         expected_count=manifest.expected_count_for(target_id),
                     )
                 )
@@ -1770,8 +1801,8 @@ class AsyncDataDistributor(BaseDataDistributor):
             if logger.isEnabledFor(logging.DEBUG):
                 entry_summary = []
                 for entry in frame.entry_i32:
-                    payload_begin = int(entry[3])
-                    payload_count = int(entry[4])
+                    payload_begin = int(entry[ENTRY_PAYLOAD_BEGIN])
+                    payload_count = int(entry[ENTRY_PAYLOAD_COUNT])
                     valid_count = 0
                     if payload_count > 0:
                         valid_count = int(
@@ -1781,7 +1812,9 @@ class AsyncDataDistributor(BaseDataDistributor):
                         (
                             int(entry[ENTRY_ROUTE_CODE]),
                             valid_count,
-                            TensorEntryKind(int(entry[ENTRY_TENSOR_KIND])).name,
+                            TensorEntryKind(
+                                entry_tensor_kind(int(entry[ENTRY_STATE_FLAGS]))
+                            ).name,
                             int(entry[ENTRY_EXPECTED_COUNT]),
                         )
                     )
@@ -1928,10 +1961,10 @@ class AsyncDataDistributor(BaseDataDistributor):
         ):
             entry_index = builder.add_tensor_transfer_entry(
                 transfer_code=entry_plan.transfer_code,
-                meta_state=entry_plan.meta_state,
+                layout_state=entry_plan.layout_state,
                 tensor_kind=entry_plan.tensor_kind,
+                coherence_epoch=entry_plan.coherence_epoch,
                 expected_count=entry_plan.expected_count,
-                source_step=entry_plan.source_step,
                 compact_params=entry_plan.compact_params,
                 global_shape=entry_plan.global_shape,
             )
@@ -1991,7 +2024,7 @@ class AsyncDataDistributor(BaseDataDistributor):
                 for payload in entry.payloads
             ),
             global_shapes=tuple(entry.global_shape for entry in entry_plans),
-            source_steps=tuple(entry.source_step for entry in entry_plans),
+            coherence_epochs=tuple(entry.coherence_epoch for entry in entry_plans),
         )
 
 
@@ -2006,19 +2039,19 @@ def _iter_transport_frame_entry_plans(
         tensors = group.tensors
         counts = group.counts
         global_shapes = group.global_shapes
-        meta_states = group.meta_states
+        layout_states = group.layout_states
         compact_params = group.compact_params
         tensor_kinds = group.tensor_kinds
-        source_steps = group.source_steps
+        coherence_epochs = group.coherence_epochs
         transfer_code_seq = transfer_codes
         if len(tensor_kinds) != len(transfer_code_seq):
             raise ValueError(
                 f"tensor_kinds length {len(tensor_kinds)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
-        if len(meta_states) != len(transfer_code_seq):
+        if len(layout_states) != len(transfer_code_seq):
             raise ValueError(
-                f"meta_states length {len(meta_states)} does not match "
+                f"layout_states length {len(layout_states)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
         if len(global_shapes) != len(transfer_code_seq):
@@ -2026,16 +2059,16 @@ def _iter_transport_frame_entry_plans(
                 f"global_shapes length {len(global_shapes)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
-        if len(source_steps) != len(transfer_code_seq):
+        if len(coherence_epochs) != len(transfer_code_seq):
             raise ValueError(
-                f"source_steps length {len(source_steps)} does not match "
+                f"coherence_epochs length {len(coherence_epochs)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for target_id={target_id}."
             )
         cursor = 0
         for entry_index, transfer_code in enumerate(transfer_code_seq):
-            meta_state = int(meta_states[entry_index])
-            component_count = 1 + ragged_level_count(meta_state)
-            if meta_state & 2:
+            layout_state = int(layout_states[entry_index])
+            component_count = 1 + ragged_level_count(layout_state)
+            if layout_state & 2:
                 component_count += 1
             if cursor + component_count > len(tensors):
                 raise ValueError(
@@ -2059,7 +2092,7 @@ def _iter_transport_frame_entry_plans(
                 )
             ]
             cursor += 1
-            for _ in range(ragged_level_count(meta_state)):
+            for _ in range(ragged_level_count(layout_state)):
                 payloads.append(
                     TransportPayloadPlan(
                         role=PayloadRole.RAGGED_LENGTHS,
@@ -2068,7 +2101,7 @@ def _iter_transport_frame_entry_plans(
                     )
                 )
                 cursor += 1
-            if meta_state & 2:
+            if layout_state & 2:
                 payloads.append(
                     TransportPayloadPlan(
                         role=PayloadRole.ORIGIN,
@@ -2081,10 +2114,10 @@ def _iter_transport_frame_entry_plans(
             entries.append(
                 TransportFrameEntryPlan(
                     transfer_code=transfer_code,
-                    meta_state=meta_state,
+                    layout_state=layout_state,
                     tensor_kind=TensorEntryKind(int(tensor_kinds[entry_index])),
+                    coherence_epoch=int(coherence_epochs[entry_index]),
                     expected_count=group.expected_count,
-                    source_step=int(source_steps[entry_index]),
                     compact_params=compact,
                     global_shape=tuple(int(value) for value in shape)
                     if shape is not None
@@ -2116,7 +2149,7 @@ def _transport_frame_template_key(
         entries=tuple(
             (
                 entry.transfer_code,
-                entry.meta_state,
+                entry.layout_state,
                 int(entry.tensor_kind),
                 entry.expected_count,
                 entry.compact_params,
@@ -2256,19 +2289,19 @@ def _frame_table_capacity_for_groups(
         transfer_codes = group.transfer_codes
         tensors = group.tensors
         global_shapes = group.global_shapes
-        meta_states = group.meta_states
+        layout_states = group.layout_states
         compact_params = group.compact_params
         tensor_kinds = group.tensor_kinds
-        source_steps = group.source_steps
+        coherence_epochs = group.coherence_epochs
         transfer_code_seq = transfer_codes
         if len(tensor_kinds) != len(transfer_code_seq):
             raise ValueError(
                 f"tensor_kinds length {len(tensor_kinds)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
-        if len(meta_states) != len(transfer_code_seq):
+        if len(layout_states) != len(transfer_code_seq):
             raise ValueError(
-                f"meta_states length {len(meta_states)} does not match "
+                f"layout_states length {len(layout_states)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
         if len(global_shapes) != len(transfer_code_seq):
@@ -2276,17 +2309,17 @@ def _frame_table_capacity_for_groups(
                 f"global_shapes length {len(global_shapes)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
-        if len(source_steps) != len(transfer_code_seq):
+        if len(coherence_epochs) != len(transfer_code_seq):
             raise ValueError(
-                f"source_steps length {len(source_steps)} does not match "
+                f"coherence_epochs length {len(coherence_epochs)} does not match "
                 f"transfer code count {len(transfer_code_seq)} for group_index={group_index}."
             )
 
         cursor = 0
         entry_count += len(transfer_code_seq)
-        for entry_index, meta_state in enumerate(meta_states):
-            component_count = 1 + ragged_level_count(int(meta_state))
-            if int(meta_state) & 2:
+        for entry_index, layout_state in enumerate(layout_states):
+            component_count = 1 + ragged_level_count(int(layout_state))
+            if int(layout_state) & 2:
                 component_count += 1
             if cursor + component_count > len(tensors):
                 raise ValueError(

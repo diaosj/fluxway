@@ -5,7 +5,7 @@ import numpy as np
 import sparse_embedding as se  # type: ignore
 
 import fluxway as fw
-from fluxway.common.tensor_backend import get_backend
+from fluxway.common.tensor_backend import get_backend, prepare_dlpack_input
 from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.operator_policy import AsyncPolicy, StatePolicy
@@ -114,7 +114,7 @@ async def _sparse_unique(
         first_local = np.empty((0,), dtype=np.int64)
     else:
         unique_dlm, inv_dlm, first_dlm = await se.async_unique(
-            ids_np.ravel(),
+            prepare_dlpack_input(ids_np.ravel()),
             return_inverse=True,
             return_first_indices=True,
         )

@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from fluxway.common.allocation import AllocationRegistry
+from fluxway.common.coherence import CoherenceDirectory, ExecutionFenceState
 from fluxway.spmd.worker.worker import LocalInputPrepareRuntime, SPMDWorker as _ActorCls
 
 
@@ -41,6 +43,10 @@ def _make_worker_stub():
         config=types.SimpleNamespace(operator_specs={}),
         _operator_specs={},
         _op_manager=object(),
+        _fence_state=ExecutionFenceState.OPEN,
+        _coherence_input_tensors={},
+        _coherence_directory=CoherenceDirectory(),
+        _allocation_registry=AllocationRegistry(),
     )
     stub._execution_queues = {"__default__": stub._execution_queue}
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
@@ -124,6 +130,32 @@ class TestStopWakesDrainCondition:
 
         shutdown = stub._local_step_plan_executor.user_callable_executor.shutdown
         shutdown.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_owned_send_tasks(self):
+        stub = _make_worker_stub()
+        send_task = asyncio.create_task(asyncio.Event().wait())
+        stub._send_tasks.add(send_task)
+
+        await stub.stop()
+
+        assert send_task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_stop_reports_send_task_cancellation_cleanup_failure(self):
+        stub = _make_worker_stub()
+
+        async def fail_during_cancellation():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as error:
+                raise RuntimeError("send cancellation cleanup failed") from error
+
+        send_task = asyncio.create_task(fail_during_cancellation())
+        stub._send_tasks.add(send_task)
+
+        with pytest.raises(RuntimeError, match="send cancellation cleanup failed"):
+            await stub.stop()
 
     @pytest.mark.asyncio
     async def test_stop_closes_local_runtimes_when_user_shutdown_fails(self):

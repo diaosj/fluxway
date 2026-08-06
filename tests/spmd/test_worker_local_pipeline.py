@@ -106,6 +106,13 @@ def _make_pipeline_stub_with_profiler(
         spmd_id="test_spmd",
         rank=0,
         _local_spmd_code=7,
+        _coherence_input_grants={},
+        _coherence_input_intents={},
+        _coherence_input_bindings={},
+        _local_input_origins={},
+        _coherence_revocations=set(),
+        _coherence_input_tensors={},
+        _coherence_alias_dependencies={},
         _background_tasks=set(),
         _plan_tasks=set(),
         _send_tasks=set(),
@@ -153,11 +160,29 @@ def _make_pipeline_stub_with_profiler(
     stub._require_local_spmd_code = types.MethodType(
         raw_cls._require_local_spmd_code, stub
     )
+    stub._return_input_coherence = types.MethodType(
+        raw_cls._return_input_coherence, stub
+    )
+    stub._register_coherence_alias_dependencies = types.MethodType(
+        raw_cls._register_coherence_alias_dependencies,
+        stub,
+    )
+    stub._commit_allocation_handoffs = types.MethodType(
+        raw_cls._commit_allocation_handoffs,
+        stub,
+    )
+    stub._await_alias_send_registration = types.MethodType(
+        raw_cls._await_alias_send_registration,
+        stub,
+    )
     stub._on_background_task_done = types.MethodType(
         raw_cls._on_background_task_done, stub
     )
     stub._record_failure = types.MethodType(raw_cls._record_failure, stub)
     stub._spawn_background_task = types.MethodType(raw_cls._spawn_background_task, stub)
+    stub._create_supervised_task = types.MethodType(
+        raw_cls._create_supervised_task, stub
+    )
     stub._on_prepare_ready = types.MethodType(raw_cls._on_prepare_ready, stub)
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
         background_tasks=stub._background_tasks,

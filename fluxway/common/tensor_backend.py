@@ -3,6 +3,12 @@ from typing import Any
 import contextlib
 import numpy as np
 
+from fluxway.common.allocation import AllocationDescriptor, AllocationIdentity
+from fluxway.common.coherence import (
+    CoherenceStateTransitionError,
+    UnsupportedAllocationHandoffError,
+)
+
 
 def force_writable(arr: Any) -> Any:
     """Make a readonly array writable **without copying**.
@@ -83,6 +89,10 @@ def force_writable(arr: Any) -> Any:
 
     # Fallback: non-ndarray types (JAX, Torch, etc.) — return as-is
     return arr
+
+
+def prepare_dlpack_input(value: Any) -> Any:
+    return force_writable(value)
 
 
 def ensure_cpu_serializable(arr: Any) -> Any:
@@ -263,6 +273,18 @@ class TensorBackend(ABC):
     def to_dlpack(self, x: Any) -> Any:
         """Create a DLPack capsule from a tensor."""
         pass
+
+    def allocation_descriptor(self, value: Any) -> AllocationDescriptor:
+        raise UnsupportedAllocationHandoffError(
+            f"backend {self.name()!r} cannot prove allocation identity for "
+            f"{type(value).__name__}."
+        )
+
+    def readonly_view(self, value: Any) -> Any:
+        raise CoherenceStateTransitionError(
+            f"backend {self.name()!r} cannot enforce readonly access for "
+            f"{type(value).__name__}."
+        )
 
     # ------------------------------------------------------------------
     # Capability flags (used to avoid string-based backend dispatch)
@@ -600,6 +622,30 @@ class TorchBackend(TensorBackend):
     def empty_cache(self) -> None:
         if self._torch.cuda.is_available():
             self._torch.cuda.empty_cache()
+
+    def allocation_descriptor(self, value: Any) -> AllocationDescriptor:
+        if not isinstance(value, self._torch.Tensor):
+            return super().allocation_descriptor(value)
+        if not value.is_contiguous():
+            raise UnsupportedAllocationHandoffError(
+                "torch allocation handoff requires a contiguous tensor."
+            )
+        storage = value.untyped_storage()
+        root_address = int(storage.data_ptr())
+        root_nbytes = int(storage.nbytes())
+        view_address = int(value.data_ptr())
+        view_nbytes = int(value.nelement() * value.element_size())
+        return AllocationDescriptor(
+            AllocationIdentity(
+                "torch",
+                str(value.device),
+                root_address,
+                root_nbytes,
+                view_address,
+                view_nbytes,
+            ),
+            storage,
+        )
 
     @property
     def is_torch(self) -> bool:
@@ -962,6 +1008,28 @@ class JaxBackend(TensorBackend):
     def empty_cache(self) -> None:
         self._jax.clear_caches()
         self._jax.clear_backends_caches()
+
+    def allocation_descriptor(self, value: Any) -> AllocationDescriptor:
+        if not isinstance(value, self._jax.Array):
+            return super().allocation_descriptor(value)
+        pointer = int(value.unsafe_buffer_pointer())
+        nbytes = int(value.nbytes)
+        return AllocationDescriptor(
+            AllocationIdentity(
+                "jax",
+                str(value.device),
+                pointer,
+                nbytes,
+                pointer,
+                nbytes,
+            ),
+            value,
+        )
+
+    def readonly_view(self, value: Any) -> Any:
+        if not isinstance(value, self._jax.Array):
+            return super().readonly_view(value)
+        return value
 
     @property
     def is_jax(self) -> bool:
@@ -1506,8 +1574,16 @@ class HybridBackend(TensorBackend):
         if default_device == "gpu":
             default_device = "cuda"
         self._cp = None
+        self._torch = None
         self._use_jit = enable_numba_jit and _NUMBA_AVAILABLE
         self._default_device = default_device
+
+        try:
+            import torch
+
+            self._torch = torch
+        except ImportError:
+            pass
 
         try:
             import cupy as cp
@@ -1545,6 +1621,87 @@ class HybridBackend(TensorBackend):
         if self._cp is not None:
             self._cp.get_default_memory_pool().free_all_blocks()
             self._cp.get_default_pinned_memory_pool().free_all_blocks()
+
+    def allocation_descriptor(self, value: Any) -> AllocationDescriptor:
+        if hasattr(value, "unsafe_buffer_pointer") and hasattr(value, "nbytes"):
+            pointer = int(value.unsafe_buffer_pointer())
+            nbytes = int(value.nbytes)
+            return AllocationDescriptor(
+                AllocationIdentity(
+                    "jax",
+                    str(value.device),
+                    pointer,
+                    nbytes,
+                    pointer,
+                    nbytes,
+                ),
+                value,
+            )
+        if self._torch is not None and isinstance(value, self._torch.Tensor):
+            if not value.is_contiguous():
+                raise UnsupportedAllocationHandoffError(
+                    "torch allocation handoff requires a contiguous tensor."
+                )
+            storage = value.untyped_storage()
+            return AllocationDescriptor(
+                AllocationIdentity(
+                    "torch",
+                    str(value.device),
+                    int(storage.data_ptr()),
+                    int(storage.nbytes()),
+                    int(value.data_ptr()),
+                    int(value.nelement() * value.element_size()),
+                ),
+                storage,
+            )
+        if isinstance(value, np.ndarray):
+            if not (value.flags.c_contiguous or value.flags.f_contiguous):
+                raise UnsupportedAllocationHandoffError(
+                    "numpy allocation handoff requires a contiguous array."
+                )
+            owner = value
+            while isinstance(owner.base, np.ndarray):
+                owner = owner.base
+            root_address = int(owner.__array_interface__["data"][0])
+            view_address = int(value.__array_interface__["data"][0])
+            return AllocationDescriptor(
+                AllocationIdentity(
+                    "numpy",
+                    "cpu",
+                    root_address,
+                    owner.nbytes,
+                    view_address,
+                    value.nbytes,
+                ),
+                owner,
+            )
+        if self._cp is not None and isinstance(value, self._cp.ndarray):
+            if not (value.flags.c_contiguous or value.flags.f_contiguous):
+                raise UnsupportedAllocationHandoffError(
+                    "cupy allocation handoff requires a contiguous array."
+                )
+            memory = value.data.mem
+            return AllocationDescriptor(
+                AllocationIdentity(
+                    "cupy",
+                    f"cuda:{int(value.device.id)}",
+                    int(memory.ptr),
+                    int(memory.size),
+                    int(value.data.ptr),
+                    int(value.nbytes),
+                ),
+                memory,
+            )
+        return super().allocation_descriptor(value)
+
+    def readonly_view(self, value: Any) -> Any:
+        if hasattr(value, "unsafe_buffer_pointer") and hasattr(value, "nbytes"):
+            return value
+        if isinstance(value, np.ndarray):
+            readonly = value.view()
+            readonly.flags.writeable = False
+            return readonly
+        return super().readonly_view(value)
 
     def adopt(self, x: Any) -> Any:
         """Zero-copy adopt foreign tensor into this HybridBackend's default device domain.

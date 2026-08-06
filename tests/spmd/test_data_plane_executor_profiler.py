@@ -1,8 +1,10 @@
 import asyncio
 import threading
+import types
 
 import numpy as np
 import pytest
+from fluxway.common.coherence import CoherenceDirectory
 
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.rpc.protocol import (
@@ -179,7 +181,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         delivery_tasks.append(task)
         return task
 
-    executor = BatchingDataPlaneExecutor()
+    executor = BatchingDataPlaneExecutor(CoherenceDirectory())
     result = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
         flat_results=[],
@@ -226,10 +228,10 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         )
         entry_index = builder.add_tensor_transfer_entry(
             transfer_code=1,
-            meta_state=0,
+            layout_state=0,
             tensor_kind=TensorEntryKind.TENSOR,
             expected_count=1,
-            source_step=step,
+            coherence_epoch=step,
             global_shape=(1,),
         )
         builder.add_payload(entry_index, PayloadRole.VALUES, payload, valid_count=1)
@@ -269,15 +271,22 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
                 context_index=0,
                 spmd_id="succ",
                 effective_rank=0,
-                tensor_routes=(),
+                tensor_routes=(
+                    types.SimpleNamespace(
+                        transfer_code=1,
+                        logical_tuuid=1,
+                        target_spmd_id="succ",
+                        child_slots=(0,),
+                    ),
+                ),
             ),
         ),
         output_count=1,
-        transfer_code_to_name={},
+        transfer_code_to_name={1: "value"},
     )
     handle = AxonHandle()
     axon = AxonDataPlane(handle, sender_spmd_code=7)
-    executor = BatchingDataPlaneExecutor()
+    executor = BatchingDataPlaneExecutor(CoherenceDirectory())
     delivery_tasks = []
 
     async def submit_delivery(coro):
@@ -301,13 +310,13 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         compiled_plan=compiled_plan,
         flat_results=[],
         step_transfer_cache={},
-        exec_step=5,
+        exec_step=4,
         successor_handlers=({0: axon},),
         source_spmd_id="source",
         batch_max_frames=8,
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
-        delivery_schedule_key=(0, 0, 5, "op"),
+        delivery_schedule_key=(0, 0, 4, "op"),
     )
 
     assert first + second == delivery_tasks
@@ -318,5 +327,5 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
     assert handle.calls[0][1] == "cpu"
     assert handle.calls[0][2] == 7
     assert all(isinstance(frame, TransportFrameEnvelope) for frame in frames)
-    assert [int(frame.header.frame_i32[1]) for frame in frames] == [4, 5]
-    assert [float(frame.payload_segments[0][0]) for frame in frames] == [4.0, 5.0]
+    assert [int(frame.header.frame_i32[1]) for frame in frames] == [4, 4]
+    assert [float(frame.payload_segments[0][0]) for frame in frames] == [4.0, 4.0]

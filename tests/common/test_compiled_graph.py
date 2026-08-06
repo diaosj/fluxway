@@ -12,12 +12,49 @@ from fluxway.common.compiled_graph import (
 )
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.coherence import TensorAccessIntent
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
 def _replicated() -> ShardingSpec:
     return ShardingSpec.chunk(PartitionSpec())
+
+
+def test_remote_donate_input_is_rejected_at_compile_time():
+    replicated = _replicated()
+    produce = OperatorSpec(
+        name="produce",
+        output_arguments={"data": ("value",)},
+        output_sharding={"value": replicated},
+    )
+    consume = OperatorSpec(
+        name="consume",
+        input_arguments={"data": ("item",)},
+        input_sharding={"item": replicated},
+        tensor_access={"item": TensorAccessIntent.DONATE},
+    )
+    with pytest.raises(ValueError, match="requires a local_only dependency"):
+        compile_graph(
+            name="remote-donate",
+            spmds=(
+                compiled_spmd_spec(
+                    "source", DeviceMesh(("data",), (1,)), {"produce": produce}
+                ),
+                compiled_spmd_spec(
+                    "target", DeviceMesh(("data",), (1,)), {"consume": consume}
+                ),
+            ),
+            dependencies=(
+                DependencySpec(
+                    source=OperatorKey("source", "produce"),
+                    target=OperatorKey("target", "consume"),
+                    transfers=(
+                        TensorTransfer(OperatorPort("value"), OperatorPort("item")),
+                    ),
+                ),
+            ),
+        )
 
 
 def test_compiled_graph_compiler_is_mode_neutral():
