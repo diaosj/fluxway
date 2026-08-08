@@ -112,15 +112,10 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         self._reverse_topology: dict[
             str, list[str]
         ] = {}  # spmd_id -> upstream spmd_ids
-        self._checkpoint_backend: Any | None = None
 
     def set_controller_handle(self, controller_handle: Any) -> None:
         """Set the controller handle for driver callbacks."""
         self._controller_handle = controller_handle
-
-    def set_checkpoint_backend(self, backend: Any) -> None:
-        """Set the per-worker checkpoint backend to forward to all Drivers."""
-        self._checkpoint_backend = backend
 
     def register_spmd(self, spmd_id: str, handle: SPMDHandle) -> None:
         """
@@ -210,7 +205,6 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
                 worker_bundle_indices=list(worker_group.rank_to_bundle),
                 controller_handle=self._controller_handle,
                 graph_topology=graph_topology,
-                checkpoint_backend=self._checkpoint_backend,
                 worker_resource=worker_group.worker_resources,
                 expected_node_ids=list(worker_group.expected_node_ids),
             )
@@ -244,9 +238,9 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
             spmd_id: ID of SPMD to stop
             save_checkpoint: Whether to save checkpoint before stopping
             release_driver_handle: Whether to clear the controller-side driver
-                reference immediately after stop returns. Terminal cleanup keeps
+                reference immediately after stop returns. Terminal reclaim retentions
                 handles until the controller reaches its terminal state so Ray
-                bookkeeping can settle before actor references are dropped.
+                bookretentioning can settle before actor references are dropped.
         """
         handle = self._spmd_handles.get(spmd_id)
         if handle is None:

@@ -102,7 +102,7 @@ def compile[**P, R](
                 import jax
 
                 # Identify JIT-specific args.
-                # jax.jit(fun, static_argnums=None, device=None, backend=None, donate_argnums=None, inline=False, keep_unused=False, abstracted_axes=None)
+                # jax.jit(fun, static_argnums=None, device=None, backend=None, donate_argnums=None, inline=False, retention_unused=False, abstracted_axes=None)
                 # We pass everything in kwargs to jax.jit
                 cache[backend_name] = jax.jit(func, **kwargs)
 
@@ -110,7 +110,7 @@ def compile[**P, R](
                 import torch  # type: ignore
 
                 # JAX call sites may pass options like static_argnums; torch.compile does
-                # not accept those, so keep only parameters from torch.compile's API.
+                # not accept those, so retention only parameters from torch.compile's API.
                 torch_kwargs = {
                     key: value
                     for key, value in kwargs.items()

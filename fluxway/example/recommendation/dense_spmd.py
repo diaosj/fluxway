@@ -15,7 +15,8 @@ from fluxway.common.tensor_components import (
     fill_nested_dense_inv_with_pad,
 )
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.types import CheckpointContext
+from fluxway.common.types import SaveSession, RestoreSession
+from fluxway.control_plane.checkpointer import OrbaxCheckpointComponent
 from fluxway import ResourceProfile
 from .data_types import DPFeatures
 
@@ -305,6 +306,16 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
 @spmd(
     resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("dp",),
+    checkpoint_components=(
+        OrbaxCheckpointComponent(
+            "dense",
+            lambda owner, context: owner.capture_checkpoint_state(context),
+            lambda owner, state, context: owner.restore_checkpoint_state(
+                state, context
+            ),
+            lambda owner, context: owner.restore_checkpoint_layout(context),
+        ).registration(),
+    ),
 )
 @requires_worker_process
 class DenseSPMD:
@@ -395,13 +406,13 @@ class DenseSPMD:
     def _checkpoint_state(self) -> dict:
         return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
 
-    def save_state(self, context: CheckpointContext) -> dict:
+    def capture_checkpoint_state(self, context: SaveSession) -> dict:
         return self._checkpoint_state()
 
-    def checkpoint_restore_layout(self, context: CheckpointContext) -> dict:
+    def restore_checkpoint_layout(self, context: RestoreSession) -> dict:
         return self._checkpoint_state()
 
-    def restore_state(self, state: dict, context: CheckpointContext) -> None:
+    def restore_checkpoint_state(self, state: dict, context: RestoreSession) -> None:
         nnx.update(self.model, state["model_state"])
         self.grad_accum = state["grad_accum"]
 

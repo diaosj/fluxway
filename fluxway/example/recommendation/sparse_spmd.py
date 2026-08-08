@@ -1,22 +1,26 @@
 from typing import Any
 import os
-from pathlib import Path
-import shutil
 
 import numpy as np
 import sparse_embedding as se  # type: ignore
-import sparse_embedding.checkpoint  # type: ignore
 
 from fluxway.common.tensor_backend import get_backend, prepare_dlpack_input
 from fluxway.common.decorators import spmd, operator, requires_worker_process
 from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy, StatePolicy
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.types import CheckpointContext
 from fluxway import ResourceProfile
 from fluxway.example.recommendation.data_types import LookupOutput
+from fluxway.example.recommendation.sparse_checkpoint import (
+    LocalLanceStorageFactory,
+    SparseEmbeddingCheckpointComponent,
+)
 
 logger = get_logger(__name__)
+
+
+def _partition_for_restore(keys: Any, partition_count: int) -> np.ndarray:
+    return np.asarray(keys, dtype=np.uint64) % partition_count
 
 
 def _balanced_counts(total: int, shard_count: int) -> list[int]:
@@ -31,6 +35,12 @@ def _balanced_counts(total: int, shard_count: int) -> list[int]:
 @spmd(
     resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("shard",),
+    checkpoint_components=(
+        SparseEmbeddingCheckpointComponent(
+            _partition_for_restore,
+            LocalLanceStorageFactory(),
+        ).registration(),
+    ),
 )
 @requires_worker_process
 class SparseEmbeddingSPMD:
@@ -97,54 +107,6 @@ class SparseEmbeddingSPMD:
             self._internal_shard_count,
         )
 
-    # ------------------------------------------------------------------
-    # Checkpoint helpers
-    # ------------------------------------------------------------------
-
-    def prepare_checkpoint_artifacts(self, context: CheckpointContext) -> None:
-        uri = f"{context.spmd_dir}/sparse_lance"
-        backend = se.checkpoint.get_checkpointer("lance")
-        backend.init_dataset(self.store, uri)
-
-    def save_state(self, context: CheckpointContext) -> dict:
-        uri = f"{context.spmd_dir}/sparse_lance"
-        backend = se.checkpoint.get_checkpointer("lance")
-        metas = backend.export_fragments(self.store, uri)
-        return {"uri": uri, "lance_meta": metas}
-
-    def checkpoint_metadata(
-        self, saved_state: dict, context: CheckpointContext
-    ) -> dict:
-        return dict(saved_state)
-
-    def commit_checkpoint_artifacts(
-        self, gathered_metadata: dict[int, dict], context: CheckpointContext
-    ) -> None:
-        uri = f"{context.spmd_dir}/sparse_lance"
-        backend = se.checkpoint.get_checkpointer("lance")
-        all_metas = []
-        for state in gathered_metadata.values():
-            all_metas.extend(state["lance_meta"])
-        if all_metas:
-            backend.commit_fragments(uri, all_metas)
-
-    def abort_checkpoint_artifacts(self, context: CheckpointContext) -> None:
-        uri = Path(context.spmd_dir) / "sparse_lance"
-        if uri.exists():
-            shutil.rmtree(uri)
-
-    def restore_state(self, state: dict, context: CheckpointContext) -> None:
-        uri = state["uri"]
-        backend = se.checkpoint.get_checkpointer("lance")
-        partitioner = se.ModuloPartitioner(num_shards=self.world_size)
-        backend.load(
-            self.store,
-            uri,
-            filter_fn=partitioner,
-            target_shard_id=self.rank,
-        )
-
-    # ------------------------------------------------------------------
     # Forward: lookup
     # ------------------------------------------------------------------
 

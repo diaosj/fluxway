@@ -81,7 +81,7 @@ def test_builder_compiles_one_ray_native_compiled_graph():
     assert "output_uuids" not in operator_fields
 
 
-def test_built_graph_keeps_plan_identity_after_ray_serialization():
+def test_built_graph_retentions_plan_identity_after_ray_serialization():
     graph = cloudpickle.loads(cloudpickle.dumps(_build_graph()))
     plan = graph.compiled_graph
 
@@ -91,7 +91,7 @@ def test_built_graph_keeps_plan_identity_after_ray_serialization():
     assert plan.dependencies[0].spec.condition(object()) is True
 
 
-def test_rebuilding_builder_keeps_existing_compiled_graph_isolated():
+def test_rebuilding_builder_retentions_existing_compiled_graph_isolated():
     builder = fw.Builder()
     builder.add_node("source", _PlanSPMD)
     builder.add_node("target", _PlanSPMD)

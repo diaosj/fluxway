@@ -1,340 +1,407 @@
-import itertools
+"""Controller-side global checkpoint orchestration."""
+
+from __future__ import annotations
+
 import logging
-import shutil
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Literal
-from collections.abc import Callable
+from collections.abc import Mapping
+from typing import Any
 
-import msgpack
-
-from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
-from fluxway.control_plane.checkpointer.protocol import validate_checkpoint_state
+from fluxway.common.types.checkpoint import (
+    CheckpointObjectRef,
+    CheckpointObjectCleanedUpError,
+    CheckpointRuntime,
+    CheckpointRuntimeRole,
+    CheckpointCaptureMode,
+    CheckpointCut,
+    CheckpointTransactionState,
+    CheckpointManifest,
+    SaveCheckpointRequest,
+    CheckpointIdReference,
+    CheckpointId,
+    NameReference,
+    StepReference,
+    CheckpointHold,
+)
+from fluxway.control_plane.checkpointer.backend import (
+    CheckpointComponentRegistration,
+    CheckpointComponentRegistry,
+)
+from fluxway.control_plane.checkpointer.repository import CheckpointRepository
+from fluxway.control_plane.checkpointer.keep import (
+    CheckpointCleanupCoordinator,
+)
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class _PathReplacement:
-    final_path: Path
-    previous_path: Path | None
-
-
-@dataclass(frozen=True, slots=True)
-class _PreparedStep:
-    payload_tmp_path: Path
-    replacements: tuple[_PathReplacement, ...]
-
-
 class FluxwayCheckpointer:
-    """
-    Controller-side checkpoint orchestrator.
-
-    Manages only the per-step metadata.msgpack that maps each (spmd_id, rank) to
-    the path metadata returned by the Worker's WorkerCheckpointBackend.  The
-    actual tensor serialization is performed by each Worker in its own process.
-
-    Lifecycle initiated by Controller.report_op_completed (event-driven):
-      1. save(step)  →  request_snapshot  →  Workers write tensors  →  payload written
-      2. restore(step)  →  payload read  →  Workers read tensors
-
-    Args:
-        controller:     Ray Actor handle of the owning Controller.
-        ckpt_dir:       Root directory on a shared filesystem for all checkpoints.
-        interval_steps: How many completed steps between automatic checkpoints.
-        max_to_keep:    Maximum number of on-disk checkpoint directories to retain.
-        validate_deps:  Optional callable invoked at construction to validate optional
-                        dependencies (e.g. ``import safetensors``). Raises if missing.
-    """
-
     def __init__(
         self,
-        controller,
-        ckpt_dir: str,
+        controller: Any,
+        repository_dir: str,
         *,
         interval_steps: int,
-        force_write: bool = False,
-        max_to_keep: int = 2,
-        validate_deps: Callable | None = None,
+        capture_mode: CheckpointCaptureMode = CheckpointCaptureMode.FENCED,
+        component_registries: Mapping[str, CheckpointComponentRegistry] | None = None,
     ) -> None:
         if interval_steps < 1:
-            raise ValueError(f"interval_steps must be >= 1, got {interval_steps}")
-        if max_to_keep <= 0:
-            raise ValueError(f"max_to_keep must be positive, got {max_to_keep}")
-
-        if validate_deps is not None:
-            validate_deps()
-
+            raise ValueError("interval_steps must be positive")
         self._controller = controller
-        self._ckpt_dir = str(CheckpointDirectory.open(ckpt_dir).path)
+        self._repository = CheckpointRepository(repository_dir)
+        self._coordinator_generation = self._repository.claim_coordinator_generation()
+        self._repository_dir = str(self._repository.root)
         self._interval_steps = interval_steps
-        self._force_write = force_write
-        self._max_to_keep = max_to_keep
-        self._snapshot_counter = itertools.count()
-        self._prepared_steps: dict[int, _PreparedStep] = {}
-        self._published_steps: dict[int, _PreparedStep] = {}
+        self._capture_mode = capture_mode
+        self._registries = dict(component_registries or {})
+        self._keep = CheckpointCleanupCoordinator(self._registries, self._repository)
+        self._control_open = False
+        self._closed = False
 
     @property
     def interval_steps(self) -> int:
         return self._interval_steps
 
-    # =========================================================================
-    # Public API
-    # =========================================================================
+    @property
+    def capture_mode(self) -> CheckpointCaptureMode:
+        return self._capture_mode
 
-    def list_steps(self) -> list[int]:
-        """Return all valid checkpoint steps on disk, ascending."""
-        root = Path(self._ckpt_dir)
-        if not root.exists():
-            return []
-        return sorted(
-            int(d.name)
-            for d in root.iterdir()
-            if d.is_dir() and d.name.isdigit() and (d / "metadata.msgpack").exists()
+    @property
+    def repository(self) -> CheckpointRepository:
+        return self._repository
+
+    async def save(self, request: SaveCheckpointRequest) -> CheckpointManifest:
+        if self._closed:
+            raise RuntimeError("FluxwayCheckpointer is closed")
+        if not isinstance(request, SaveCheckpointRequest):
+            raise TypeError("FluxwayCheckpointer.save requires SaveCheckpointRequest")
+        await self._ensure_control_backends()
+        await self._repair_pending_cleanups()
+        checkpoint_id = CheckpointId.generate()
+        permit = self._repository.issue_commit_permit(
+            request.attempt_id, self._coordinator_generation
         )
-
-    def latest_step(self) -> int | None:
-        steps = self.list_steps()
-        return steps[-1] if steps else None
-
-    async def save(self, step: int) -> None:
-        """Trigger a global snapshot at ``step`` and persist its payload."""
-        snapshot_id = f"ckpt_{step}_{next(self._snapshot_counter)}"
-        logger.info(f"Requesting snapshot '{snapshot_id}' at step {step}")
+        self._repository.write_transaction_state(
+            checkpoint_id, CheckpointTransactionState.CUT_CREATED
+        )
         published = False
+        reservations = ()
         try:
-            payload = await self._controller.request_snapshot(
-                snapshot_id, step, self._ckpt_dir
+            assembly = await self._controller.request_snapshot(
+                str(checkpoint_id),
+                request.attempt_id,
+                permit,
+                request.cut,
+                self._repository_dir,
+                request.capture_mode,
             )
-            if not isinstance(payload, dict):
-                raise RuntimeError(
-                    f"request_snapshot returned {type(payload).__name__} instead of dict; "
-                    "controller may not be fully initialized."
-                )
-            control_state = payload.get("__fluxway_control_plane__")
-            if not isinstance(control_state, dict):
-                raise ValueError(
-                    "snapshot payload is missing Fluxway control-plane state"
-                )
-            self._prepare(step, payload)
-            await self._controller.commit_snapshot_artifacts(snapshot_id)
-            self._publish(step)
+            self._validate_assembly_cut(request, assembly.cut)
+            sequence = self._repository.next_checkpoint_sequence()
+            manifest = CheckpointManifest(
+                schema_version=4,
+                checkpoint_id=str(checkpoint_id),
+                attempt_id=request.attempt_id,
+                coordinator_generation=permit.coordinator_generation,
+                cut=assembly.cut,
+                checkpoint_sequence=sequence,
+                references=request.references,
+                framework_state=assembly.framework_state,
+                spmds=assembly.spmds,
+            )
+            self._validate_manifest_progress(manifest)
+            self._repository.write_transaction_state(
+                str(checkpoint_id), CheckpointTransactionState.COMMITTED
+            )
+            reservations = await self._keep.reserve(
+                permit, manifest, self._repository.list()
+            )
+            self._repository.require_commit_permit(permit)
+            await self._keep.publish(reservations, permit)
+            pending_cleanups = self._keep.pending_cleanups(
+                str(checkpoint_id), reservations
+            )
+            self._repository.publish(manifest, permit, pending_cleanups)
             published = True
+            await self._controller.mark_snapshot_published(str(checkpoint_id), permit)
+            await self._finalize_framework_state(manifest)
+            await self._keep.cleanup(pending_cleanups)
+            logger.info(
+                "checkpoint published snapshot=%s logical_step=%s",
+                checkpoint_id,
+                manifest.cut.logical_step,
+            )
+            return manifest
         except BaseException as primary_error:
-            cleanup_errors = []
+            cleanup_errors: list[BaseException] = []
             if not published:
                 try:
-                    await self._controller.abort_snapshot_artifacts(snapshot_id)
-                except BaseException as abort_error:
-                    cleanup_errors.append(abort_error)
+                    await self._keep.rollback_save(reservations, permit)
+                except BaseException as error:
+                    cleanup_errors.append(error)
                 try:
-                    self._discard_prepared(step)
-                except BaseException as discard_error:
-                    cleanup_errors.append(discard_error)
+                    await self._controller.abort_snapshot_checkpoint_objects(
+                        str(checkpoint_id), permit
+                    )
+                except BaseException as error:
+                    cleanup_errors.append(error)
             if cleanup_errors:
                 raise BaseExceptionGroup(
                     "checkpoint save and cleanup failed",
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
-        try:
-            await self._controller.finalize_snapshot(step, control_state)
-        finally:
-            self._cleanup_published(step)
-            self._evict_old_checkpoints()
-        logger.info(f"Checkpoint step {step} saved ({list(payload.keys())})")
 
-    async def restore(self, step: Literal["latest"] | int | None = None) -> int | None:
-        """
-        Restore state from a checkpoint.
-
-        Returns the step restored, or None if no checkpoint exists and the latest
-        checkpoint was requested.
-        Raises FileNotFoundError if a specific step is requested but absent.
-        """
-        if step is None or step == "latest":
-            step = self.latest_step()
-            if step is None:
-                logger.info("No existing checkpoint found.")
+    async def restore(
+        self,
+        reference: StepReference | CheckpointIdReference | str = "latest",
+    ) -> int | None:
+        if self._closed:
+            raise RuntimeError("FluxwayCheckpointer is closed")
+        await self._ensure_control_backends()
+        if reference == "latest":
+            manifest = self._repository.latest()
+            if manifest is None:
                 return None
-        if isinstance(step, bool) or not isinstance(step, int):
-            raise TypeError(
-                "Checkpoint restore selector must be 'latest', int, or None, "
-                f"got {step!r}."
-            )
+        else:
+            if isinstance(reference, str):
+                raise TypeError(
+                    "restore reference must be latest, StepReference, or CheckpointIdReference"
+                )
+            manifest = self._repository.resolve(reference)
+        self._validate_manifest_progress(manifest)
+        self._assert_restorable(manifest)
+        await self._controller.restore_snapshot(
+            manifest.checkpoint_id,
+            manifest,
+            self._repository_dir,
+        )
+        return manifest.cut.logical_step
 
-        # Single filesystem read — avoids TOCTOU between list_steps() and _load().
+    async def restore_latest(self) -> int | None:
+        return await self.restore()
+
+    async def restore_step(self, step: int) -> int | None:
+        return await self.restore(StepReference(step))
+
+    async def restore_named(self, name: str) -> int | None:
+        return await self.restore(NameReference(name))
+
+    async def restore_checkpoint(self, checkpoint_id: str) -> int | None:
+        return await self.restore(CheckpointIdReference(checkpoint_id))
+
+    def list_steps(self) -> tuple[int, ...]:
+        return self._repository.list_steps()
+
+    def latest(self) -> CheckpointManifest | None:
+        return self._repository.latest()
+
+    async def hold_checkpoint_object(
+        self,
+        spmd_id: str,
+        checkpoint_object: CheckpointObjectRef,
+        owner_id: str,
+        ttl_seconds: float,
+        request_id: str,
+    ) -> CheckpointHold:
+        self._require_open()
+        if not self._repository.contains_checkpoint_object(spmd_id, checkpoint_object):
+            raise KeyError(
+                "cannot lease an checkpoint_object that is not a live published reference"
+            )
+        await self._ensure_control_backends()
+        registration = self._require_backend(spmd_id, checkpoint_object.component_id)
+        if registration.object_lifecycle is None:
+            raise RuntimeError(
+                "backend does not expose checkpoint object lifecycle capability"
+            )
+        return await registration.object_lifecycle.hold_checkpoint_object(
+            checkpoint_object, owner_id, ttl_seconds, request_id
+        )
+
+    async def renew_checkpoint_hold(
+        self,
+        spmd_id: str,
+        lease: CheckpointHold,
+        ttl_seconds: float,
+    ) -> CheckpointHold:
+        self._require_open()
+        await self._ensure_control_backends()
+        registration = self._require_backend(
+            spmd_id, lease.checkpoint_object.component_id
+        )
+        if registration.object_lifecycle is None:
+            raise RuntimeError(
+                "backend does not expose checkpoint object lifecycle capability"
+            )
+        return await registration.object_lifecycle.renew_checkpoint_hold(
+            lease, ttl_seconds
+        )
+
+    async def release_checkpoint_hold(
+        self, spmd_id: str, lease: CheckpointHold
+    ) -> None:
+        self._require_open()
+        await self._ensure_control_backends()
+        registration = self._require_backend(
+            spmd_id, lease.checkpoint_object.component_id
+        )
+        if registration.object_lifecycle is None:
+            raise RuntimeError(
+                "backend does not expose checkpoint object lifecycle capability"
+            )
+        await registration.object_lifecycle.release_checkpoint_hold(lease)
+
+    async def repair_pending_cleanups(self) -> int:
+        self._require_open()
+        await self._ensure_control_backends()
+        return await self._repair_pending_cleanups()
+
+    async def close(self) -> None:
+        if self._closed:
+            raise RuntimeError("FluxwayCheckpointer is already closed")
+        if self._control_open:
+            errors: list[BaseException] = []
+            for registry in reversed(tuple(self._registries.values())):
+                try:
+                    await registry.close_all()
+                except BaseException as error:
+                    errors.append(error)
+            if errors:
+                if len(errors) == 1:
+                    raise errors[0]
+                raise BaseExceptionGroup(
+                    "control checkpoint backend close failed", errors
+                )
+        self._closed = True
+
+    async def _ensure_control_backends(self) -> None:
+        if self._control_open:
+            return
+        opened: list[CheckpointComponentRegistry] = []
         try:
-            payload = self._load(step)
-        except FileNotFoundError as e:
-            available = self.list_steps()
-            raise FileNotFoundError(
-                f"Checkpoint step {step} not found in {self._ckpt_dir}. Available: {available}"
-            ) from e
+            for spmd_id, registry in self._registries.items():
+                await registry.open_all(
+                    CheckpointRuntime(
+                        role=CheckpointRuntimeRole.CONTROL,
+                        repository_root=self._repository_dir,
+                        spmd_id=spmd_id,
+                    )
+                )
+                opened.append(registry)
+        except BaseException as primary_error:
+            cleanup_errors: list[BaseException] = []
+            for registry in reversed(opened):
+                try:
+                    await registry.close_all()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "control backend open and cleanup failed",
+                    [primary_error, *cleanup_errors],
+                ) from None
+            raise
+        self._control_open = True
 
-        if not payload:
-            raise RuntimeError(
-                f"_load({step}) returned empty — checkpoint may be corrupt."
+    async def _repair_pending_cleanups(self) -> int:
+        pending = self._repository.list_pending_cleanups()
+        if not pending:
+            return 0
+        await self._keep.cleanup(pending)
+        return len(pending)
+
+    def _require_backend(
+        self, spmd_id: str, component_id: str
+    ) -> CheckpointComponentRegistration:
+        registry = self._registries.get(spmd_id)
+        if registry is None:
+            raise KeyError(
+                f"checkpoint backend registry not found for SPMD {spmd_id!r}"
             )
-        snapshot_id = f"restore_{step}_{next(self._snapshot_counter)}"
-        await self._controller.restore_snapshot(snapshot_id, step, payload)
-        logger.info(f"Checkpoint step {step} restored.")
-        return step
+        return registry.require(component_id)
 
-    # =========================================================================
-    # Internal Persistence (format-agnostic payload (pickle))
-    # =========================================================================
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("FluxwayCheckpointer is closed")
 
-    def _persist(self, step: int, payload: dict[str, Any]) -> None:
-        """Write the payload that maps spmd_id to {spmd_state, rank_storage}."""
-        self._prepare(step, payload)
-        self._publish(step)
-        self._cleanup_published(step)
-        self._evict_old_checkpoints()
-
-    def _prepare(self, step: int, payload: dict[str, Any]) -> None:
-        validate_checkpoint_state(payload, path="payload")
-        step_dir = Path(self._ckpt_dir) / str(step)
-        payload_path = step_dir / "metadata.msgpack"
-
-        if step in self._prepared_steps or step in self._published_steps:
-            raise RuntimeError(
-                f"checkpoint step {step} already has an active transaction"
-            )
-        planned_paths: list[tuple[Path, Path, Path | None]] = []
-        renamed_paths: set[str] = set()
-        for key, spmd_entry in payload.items():
-            if not isinstance(spmd_entry, dict):
-                continue
-            for meta in spmd_entry.get("rank_storage", {}).values():
-                if "orbax_tmp_path" in meta and "orbax_final_path" in meta:
-                    o_tmp = Path(meta["orbax_tmp_path"])
-                    o_final = Path(meta["orbax_final_path"])
-
-                    if str(o_final) not in renamed_paths:
-                        if o_tmp.exists():
-                            previous_path = None
-                            if o_final.exists():
-                                if not self._force_write:
-                                    raise FileExistsError(
-                                        f"Orbax checkpoint directory already exists at {o_final}. "
-                                        "Set force_write=True to overwrite."
-                                    )
-                                previous_path = o_final.with_name(
-                                    f"{o_final.name}.fluxway-previous"
-                                )
-                                if previous_path.exists():
-                                    raise FileExistsError(
-                                        "checkpoint rollback path already exists: "
-                                        f"{previous_path}"
-                                    )
-                            planned_paths.append((o_tmp, o_final, previous_path))
-                            renamed_paths.add(str(o_final))
-                        elif not o_final.exists():
-                            raise FileNotFoundError(
-                                "Orbax checkpoint has neither prepared nor final path: "
-                                f"prepared={o_tmp} final={o_final}"
+    def _assert_restorable(self, manifest: CheckpointManifest) -> None:
+        for spmd_id, snapshot in manifest.spmds.items():
+            registry = self._registries.get(spmd_id)
+            if registry is None:
+                raise KeyError(
+                    f"checkpoint backend registry not found for SPMD {spmd_id!r}"
+                )
+            for component_id, publication in snapshot.components.items():
+                backend = registry.require(component_id)
+                declared_objects = {
+                    checkpoint_object.checkpoint_object_id: checkpoint_object
+                    for checkpoint_object in backend.descriptor.checkpoint_objects
+                }
+                records = (
+                    *publication.shared_records,
+                    *(partition.record for partition in publication.partitions),
+                )
+                for record in records:
+                    for object_ref in record.checkpoint_objects:
+                        declared_object = declared_objects.get(
+                            object_ref.checkpoint_object_id
+                        )
+                        if declared_object is None:
+                            raise ValueError(
+                                f"manifest checkpoint object {object_ref.checkpoint_object_id!r} "
+                                f"is not declared by backend {component_id!r}"
+                            )
+                        if declared_object.required_for_restore and (
+                            self._repository.is_checkpoint_object_cleaned_up(
+                                spmd_id, object_ref
+                            )
+                        ):
+                            raise CheckpointObjectCleanedUpError(
+                                "checkpoint object was cleaned up: "
+                                f"spmd={spmd_id!r} backend={component_id!r} "
+                                f"checkpoint_object={object_ref.checkpoint_object_id!r} "
+                                f"version={object_ref.version_id!r}"
                             )
 
-        if payload_path.exists() and not self._force_write:
-            raise FileExistsError(
-                f"Checkpoint step {step} already exists at {payload_path}. "
-                "Set force_write=True in CheckpointConfig to overwrite."
-            )
-        step_dir.mkdir(parents=True, exist_ok=True)
-        tmp_man = step_dir / "metadata.msgpack.tmp"
-        if tmp_man.exists():
-            raise FileExistsError(f"checkpoint prepare file already exists: {tmp_man}")
-        try:
-            with open(tmp_man, "wb") as f:
-                # set is not natively supported by msgpack, so we convert it if any
-                def _encode_hook(obj):
-                    if isinstance(obj, set):
-                        return list(obj)
-                    return obj
-
-                msgpack.pack(payload, f, default=_encode_hook)
-        except BaseException:
-            tmp_man.unlink(missing_ok=True)
-            raise
-        replacements: list[_PathReplacement] = []
-        try:
-            for prepared_path, final_path, previous_path in planned_paths:
-                if previous_path is not None:
-                    final_path.rename(previous_path)
-                try:
-                    prepared_path.rename(final_path)
-                except BaseException:
-                    if previous_path is not None:
-                        previous_path.rename(final_path)
-                    raise
-                replacements.append(_PathReplacement(final_path, previous_path))
-        except BaseException:
-            self._rollback_replacements(replacements)
-            tmp_man.unlink(missing_ok=True)
-            raise
-        self._prepared_steps[step] = _PreparedStep(tmp_man, tuple(replacements))
-
-    def _publish(self, step: int) -> None:
-        step_dir = Path(self._ckpt_dir) / str(step)
-        payload_path = step_dir / "metadata.msgpack"
-        transaction = self._prepared_steps.get(step)
-        if transaction is None:
-            raise RuntimeError(f"checkpoint step {step} has no prepared transaction")
-        tmp_man = transaction.payload_tmp_path
-        if not tmp_man.exists():
-            raise FileNotFoundError(f"checkpoint prepare file is missing: {tmp_man}")
-        tmp_man.replace(payload_path)
-        self._published_steps[step] = self._prepared_steps.pop(step)
-
-    def _discard_prepared(self, step: int) -> None:
-        transaction = self._prepared_steps.pop(step, None)
-        if transaction is None:
-            return
-        transaction.payload_tmp_path.unlink(missing_ok=True)
-        self._rollback_replacements(transaction.replacements)
-
-    def _cleanup_published(self, step: int) -> None:
-        transaction = self._published_steps.pop(step, None)
-        if transaction is None:
-            raise RuntimeError(f"checkpoint step {step} has no published transaction")
-        for replacement in transaction.replacements:
-            if replacement.previous_path is not None:
-                self._remove_path(replacement.previous_path)
-
-    @classmethod
-    def _rollback_replacements(
-        cls, replacements: list[_PathReplacement] | tuple[_PathReplacement, ...]
+    @staticmethod
+    def _validate_assembly_cut(
+        request: SaveCheckpointRequest, resolved: CheckpointCut
     ) -> None:
-        for replacement in reversed(replacements):
-            cls._remove_path(replacement.final_path)
-            if replacement.previous_path is not None:
-                replacement.previous_path.rename(replacement.final_path)
+        if not isinstance(resolved, CheckpointCut):
+            raise TypeError("checkpoint assembly returned an invalid checkpoint cut")
+        if resolved.cut_id != request.cut.cut_id:
+            raise ValueError("checkpoint assembly changed the checkpoint cut ID")
+        if resolved.logical_step != request.cut.logical_step:
+            raise ValueError("checkpoint assembly changed the logical checkpoint step")
+        if resolved.control_epoch != request.cut.control_epoch:
+            raise ValueError("checkpoint assembly changed the control epoch")
 
     @staticmethod
-    def _remove_path(path: Path) -> None:
-        if not path.exists():
+    def _validate_manifest_progress(manifest: CheckpointManifest) -> None:
+        ledger = manifest.framework_state.get("control_ledger")
+        if ledger is None:
             return
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-
-    def _load(self, step: int) -> dict[str, Any]:
-        """Read and return the payload dict for ``step``."""
-        payload_path = Path(self._ckpt_dir) / str(step) / "metadata.msgpack"
-        if not payload_path.exists():
-            raise FileNotFoundError(
-                f"FluxwayCheckpointer: payload not found: {payload_path}"
+        if not isinstance(ledger, Mapping):
+            raise TypeError("manifest control ledger state must be a mapping")
+        durable_cuts = ledger.get("durable_cuts")
+        sealed_ends = ledger.get("sealed_ends")
+        if not isinstance(durable_cuts, Mapping):
+            raise TypeError("manifest control ledger durable cuts must be a mapping")
+        if not isinstance(sealed_ends, Mapping):
+            raise TypeError("manifest control ledger sealed ends must be a mapping")
+        if dict(durable_cuts) != dict(manifest.cut.stream_cuts):
+            raise ValueError(
+                "CheckpointCut stream cuts disagree with framework ledger state"
             )
-        with open(payload_path, "rb") as f:
-            payload = msgpack.unpack(f, strict_map_key=False)
-        if not isinstance(payload, dict):
-            raise TypeError("Fluxway checkpoint payload root must be a dictionary")
-        return payload
+        if dict(sealed_ends) != dict(manifest.cut.sealed_ends):
+            raise ValueError(
+                "CheckpointCut sealed ends disagree with framework ledger state"
+            )
 
-    def _evict_old_checkpoints(self) -> None:
-        """Remove oldest checkpoint directories exceeding max_to_keep."""
-        steps = self.list_steps()
-        for old_step in steps[: -self._max_to_keep]:
-            shutil.rmtree(Path(self._ckpt_dir) / str(old_step))
+    async def _finalize_framework_state(self, manifest: CheckpointManifest) -> None:
+        if manifest.cut.logical_step is None:
+            raise RuntimeError(
+                "controller framework ledger finalization requires logical_step"
+            )
+        await self._controller.finalize_snapshot(
+            manifest.cut.logical_step, manifest.framework_state
+        )

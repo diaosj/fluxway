@@ -9,7 +9,7 @@ STEADY_STATE_EVENT_NAMES = frozenset(
     {
         "controller.initialize",
         "controller.completion",
-        "controller.cleanup",
+        "controller.reclaim",
         "driver.initialize",
         "driver.start_workers",
         "spmd_manager.placement_group_create",
@@ -27,10 +27,10 @@ def filter_steady_state_records(
         raise ValueError(f"records must be a 2D array, got ndim={records.ndim}.")
     if len(records) == 0:
         return records
-    keep = np.ones((len(records),), dtype=bool)
+    retention = np.ones((len(records),), dtype=bool)
     for index, row in enumerate(records):
         track_name = metadata.name_for(int(row[3]))
         event_name = metadata.name_for(int(row[4]))
         if "/lifecycle" in track_name or event_name in STEADY_STATE_EVENT_NAMES:
-            keep[index] = False
-    return records[keep]
+            retention[index] = False
+    return records[retention]

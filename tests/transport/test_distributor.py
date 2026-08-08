@@ -162,7 +162,7 @@ def test_cuda_ragged_pack_adopts_numpy_receipt_plan_once():
     cp.testing.assert_array_equal(reordered_levels[0], cp.asarray([1, 2]))
 
 
-def test_cuda_frame_keeps_header_on_host_and_all_payloads_on_device():
+def test_cuda_frame_retentions_header_on_host_and_all_payloads_on_device():
     cp = pytest.importorskip("cupy")
     try:
         set_hybrid_device("cuda")
@@ -335,7 +335,7 @@ def test_grouped_numpy_receipt_avoids_payload_sorting():
     }
 
 
-def test_unordered_numpy_mirror_keeps_general_sorting_contract():
+def test_unordered_numpy_mirror_retentions_general_sorting_contract():
     backend = get_backend()
     world_size = 3
     source_mesh = DeviceMesh(("source",), (1,), [0])
@@ -371,7 +371,9 @@ def test_unordered_numpy_mirror_keeps_general_sorting_contract():
     assert actual == {0: [0.0], 1: [10.0], 2: [20.0, 21.0]}
 
 
-def test_content_source_to_static_target_keeps_origin_descriptor_symbolic(monkeypatch):
+def test_content_source_to_static_target_retentions_origin_descriptor_symbolic(
+    monkeypatch,
+):
     backend = get_backend()
     src_mesh = DeviceMesh(("x",), (2,), [0, 1])
     dst_mesh = DeviceMesh(("y",), (2,), [0, 1])

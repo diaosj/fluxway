@@ -63,9 +63,9 @@ async def _sparse_unique(
 
     * ``unique_tt`` carries a per-row ``ExplicitIndex`` inherited from the
       source tensor's origin lineage at each unique row's first occurrence.
-      This keeps dynamic unique ids, embedding lookup output, and the inverse
+      This retentions dynamic unique ids, embedding lookup output, and the inverse
       tensor tied to the same logical input rows across steps.
-    * ``inv_tt`` keeps ``global_shape`` only; the framework's static-DP
+    * ``inv_tt`` retentions ``global_shape`` only; the framework's static-DP
       path handles its placement deterministically, no extra meta required.
     """
     ids_np = tt.flat_values
@@ -228,7 +228,7 @@ class InputSPMD:
                 "axis": ["dp"],
                 "strategy": "modulo",
             },
-            "unique_item_ids": {
+            "unique_target_ids": {
                 "type": "dynamic",
                 "axis": ["dp"],
                 "strategy": "modulo",
@@ -245,9 +245,9 @@ class InputSPMD:
             f"[InputSPMD.process] user_id must be at least 1D, "
             f"got shape={data.active.user_id.flat_values.shape}"
         )
-        assert data.passive.target_item_id.flat_values.ndim >= 1, (
-            f"[InputSPMD.process] target_item_id must be at least 1D, "
-            f"got shape={data.passive.target_item_id.flat_values.shape}"
+        assert data.passive.target_target_id.flat_values.ndim >= 1, (
+            f"[InputSPMD.process] target_target_id must be at least 1D, "
+            f"got shape={data.passive.target_target_id.flat_values.shape}"
         )
 
         user_task = _sparse_unique(
@@ -257,7 +257,7 @@ class InputSPMD:
             group_name="user",
         )
         item_task = _sparse_unique(
-            data.passive.target_item_id,
+            data.passive.target_target_id,
             rank=self.rank,
             world_size=self.world_size,
             group_name="item",
@@ -287,7 +287,7 @@ class InputSPMD:
         return InputNodeOutput(
             unique_user_ids=u_user,
             user_inv=inv_user,
-            unique_item_ids=u_item,
+            unique_target_ids=u_item,
             item_inv=inv_item,
             dp_data=DPFeatures(
                 labels=data.labels, dense_stats=data.passive.target_item_stats

@@ -1519,7 +1519,7 @@ class WorkerMailbox:
             await barrier.wait()
 
     # ------------------------------------------------------------------
-    # Cleanup
+    # Reclaim
     # ------------------------------------------------------------------
 
     async def clear_step(self, op_name: str, step: int) -> None:

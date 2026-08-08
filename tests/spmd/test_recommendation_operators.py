@@ -27,7 +27,7 @@ from fluxway.common.types.tensor import TransportTensor
 @data_type()
 @dataclass
 class Item:
-    item_id: TransportTensor
+    target_id: TransportTensor
     item_stats: TransportTensor
 
 
@@ -85,7 +85,7 @@ class InputOp:
     )
     def process(self, data: Batch) -> Deduped:
         u_users, inv_users = data.user_id.unique_with_routing()
-        u_items, inv_items = data.item.item_id.unique_with_routing()
+        u_items, inv_items = data.item.target_id.unique_with_routing()
         return Deduped(
             unique_users=u_users,
             user_inv=inv_users,
@@ -230,7 +230,7 @@ def test_input_op_dedup_and_inv():
             jnp.array([100, 101], dtype=jnp.int32), global_shape=(2,)
         ),
         item=Item(
-            item_id=TransportTensor(
+            target_id=TransportTensor(
                 jnp.array([500, 501], dtype=jnp.int32), global_shape=(2,)
             ),
             item_stats=TransportTensor(
@@ -257,7 +257,7 @@ def test_input_op_dedup_repeated_ids():
             jnp.array([7, 7, 9], dtype=jnp.int32), global_shape=(3,)
         ),
         item=Item(
-            item_id=TransportTensor(
+            target_id=TransportTensor(
                 jnp.array([3, 5, 3], dtype=jnp.int32), global_shape=(3,)
             ),
             item_stats=TransportTensor(

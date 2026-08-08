@@ -27,7 +27,11 @@ import numpy as np
 import ray
 
 from fluxway.common.types import (
+    CheckpointObjectRef,
     AsyncStepConfig,
+    CheckpointCaptureMode,
+    CheckpointCommitPermit,
+    CheckpointCut,
     ControllerEvent,
     ControllerState,
     DriverHeartbeat,
@@ -35,6 +39,12 @@ from fluxway.common.types import (
     FlowControlState,
     Graph,
     HeartbeatConfig,
+    CheckpointAssembly,
+    CheckpointManifest,
+    SaveCheckpointRequest,
+    SpmdCheckpoint,
+    StepReference,
+    CheckpointHold,
 )
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
@@ -52,7 +62,7 @@ from fluxway.control_plane.components import (
     ControlPlaneComponentRegistry,
     driver_component_id,
 )
-from fluxway.control_plane.checkpointer.protocol import validate_checkpoint_state
+from fluxway.control_plane.checkpointer.repository import validate_checkpoint_value
 from fluxway.control_plane.errors import ExecutionFailedError
 from fluxway.common.types import CheckpointConfig
 from fluxway.common.types.drain import DrainStrategy, GraphModeDrainStrategy
@@ -272,7 +282,7 @@ class ControllerActor:
         self._flow_control_manager = FlowControlManager(
             self._graph, self._async_step_config
         )
-        # snapshot_id → {expected, received, metadata, event}
+        # checkpoint_id → {expected, received, metadata, event}
         self._pending_snapshots: dict[str, Any] = {}
         self._control_ledger = (
             None
@@ -370,21 +380,23 @@ class ControllerActor:
 
             if self._checkpoint_config is not None:
                 from fluxway.control_plane.checkpointer import (
+                    CheckpointComponentRegistry,
                     FluxwayCheckpointer,
-                    WorkerCheckpointBackend,
                 )
 
+                component_registries = {
+                    (node.spmd_config.spmd_id or node_id): CheckpointComponentRegistry(
+                        tuple(node.spmd_config.checkpoint_components)
+                    )
+                    for node_id, node in self._graph.nodes.items()
+                    if node.spmd_config is not None
+                }
                 self._checkpointer = FluxwayCheckpointer(
                     self,
-                    ckpt_dir=self._checkpoint_config.ckpt_dir,
+                    repository_dir=self._checkpoint_config.repository_dir,
                     interval_steps=self._checkpoint_config.interval_steps,
-                    force_write=self._checkpoint_config.force_write,
-                )
-                self.spmd_manager.set_checkpoint_backend(
-                    WorkerCheckpointBackend.create(
-                        self._checkpoint_config.backend,
-                        force_write=self._checkpoint_config.force_write,
-                    )
+                    capture_mode=self._checkpoint_config.capture_mode,
+                    component_registries=component_registries,
                 )
                 self._drain_strategy = GraphModeDrainStrategy(
                     interval_steps=self._checkpoint_config.interval_steps
@@ -732,7 +744,9 @@ class ControllerActor:
     async def _notify_control_plane_components(self, state: ControllerState) -> None:
         await self.control_plane_components.notify_state(state)
 
-    def control_stream_cuts(self, spmd_payload: Mapping[str, Any]) -> dict[str, int]:
+    def control_stream_cuts(
+        self, spmd_payload: Mapping[str, SpmdCheckpoint]
+    ) -> dict[str, int]:
         if not isinstance(spmd_payload, Mapping):
             raise TypeError("SPMD checkpoint payload must be a mapping")
         ledger = self._require_control_ledger()
@@ -755,14 +769,11 @@ class ControllerActor:
                 raise ValueError(
                     f"SPMD checkpoint payload is missing {spmd_id!r}"
                 ) from exc
-            if not isinstance(spmd_entry, Mapping):
-                raise TypeError(f"SPMD checkpoint entry {spmd_id!r} must be a mapping")
-            spmd_state = spmd_entry.get("spmd_state")
-            if not isinstance(spmd_state, Mapping):
-                raise ValueError(
-                    f"SPMD checkpoint entry {spmd_id!r} is missing spmd_state"
+            if not isinstance(spmd_entry, SpmdCheckpoint):
+                raise TypeError(
+                    f"SPMD checkpoint entry {spmd_id!r} must be SpmdCheckpoint"
                 )
-            completed = spmd_state.get("completed_step_count")
+            completed = spmd_entry.runtime_state.get("completed_step_count")
             if not isinstance(completed, Mapping):
                 raise ValueError(
                     f"SPMD checkpoint state {spmd_id!r} is missing completed_step_count"
@@ -790,7 +801,7 @@ class ControllerActor:
             "components": self.control_plane_components.checkpoint_state(),
             "last_checkpointed_step": self._last_checkpointed_step,
         }
-        validate_checkpoint_state(state)
+        validate_checkpoint_value(state)
         return state
 
     def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
@@ -834,27 +845,33 @@ class ControllerActor:
         self._last_checkpointed_step = step
 
     @require_spmd_manager
-    async def commit_snapshot_artifacts(self, snapshot_id: str) -> None:
+    async def mark_snapshot_published(
+        self, checkpoint_id: str, permit: CheckpointCommitPermit
+    ) -> None:
         tasks = []
         for spmd_id in self.spmd_manager.get_all_spmd_ids():
             driver = self.spmd_manager.get_driver_handle(spmd_id)
             if driver is None:
                 raise RuntimeError(
-                    f"snapshot artifact commit is missing Driver {spmd_id!r}"
+                    f"snapshot checkpoint_object commit is missing Driver {spmd_id!r}"
                 )
-            tasks.append(driver.commit_snapshot_artifacts.remote(snapshot_id))
+            tasks.append(driver.mark_snapshot_published.remote(checkpoint_id, permit))
         await asyncio.gather(*tasks)
 
     @require_spmd_manager
-    async def abort_snapshot_artifacts(self, snapshot_id: str) -> None:
+    async def abort_snapshot_checkpoint_objects(
+        self, checkpoint_id: str, permit: CheckpointCommitPermit
+    ) -> None:
         tasks = []
         for spmd_id in self.spmd_manager.get_all_spmd_ids():
             driver = self.spmd_manager.get_driver_handle(spmd_id)
             if driver is None:
                 raise RuntimeError(
-                    f"snapshot artifact abort is missing Driver {spmd_id!r}"
+                    f"snapshot checkpoint_object abort is missing Driver {spmd_id!r}"
                 )
-            tasks.append(driver.abort_snapshot_artifacts.remote(snapshot_id))
+            tasks.append(
+                driver.abort_snapshot_checkpoint_objects.remote(checkpoint_id, permit)
+            )
         await asyncio.gather(*tasks)
 
     async def report_flow_control_state(self, state: FlowControlState) -> None:
@@ -951,9 +968,19 @@ class ControllerActor:
                                     target_step=boundary,
                                 )
                             ):
-                                await self._checkpointer.save(boundary)
+                                await self._checkpointer.save(
+                                    SaveCheckpointRequest.for_step(
+                                        boundary,
+                                        capture_mode=self._checkpointer.capture_mode,
+                                    )
+                                )
                         else:
-                            await self._checkpointer.save(boundary)
+                            await self._checkpointer.save(
+                                SaveCheckpointRequest.for_step(
+                                    boundary,
+                                    capture_mode=self._checkpointer.capture_mode,
+                                )
+                            )
                 except Exception as e:
                     logger.error(f"Checkpoint save failed: {e}")
                     await self.report_spmd_error(
@@ -1088,140 +1115,108 @@ class ControllerActor:
 
     @require_spmd_manager
     async def request_snapshot(
-        self, snapshot_id: str, target_count: int, ckpt_dir: str
-    ) -> dict[str, Any]:
-        """
-        Trigger a global snapshot and block until all Workers have persisted
-        their state and all Drivers have reported metadata back.
-
-        Returns the assembled payload directly — no polling required.
-        """
+        self,
+        checkpoint_id: str,
+        attempt_id: str,
+        permit: CheckpointCommitPermit,
+        cut: CheckpointCut,
+        repository_root: str,
+        capture_mode: CheckpointCaptureMode,
+    ) -> CheckpointAssembly:
         logger.info(
-            f"Requesting global snapshot '{snapshot_id}' at step {target_count}"
+            "Requesting global snapshot '%s' at cut %s",
+            checkpoint_id,
+            cut.cut_id,
         )
         all_spmd_ids = self.spmd_manager.get_all_spmd_ids()
         if not all_spmd_ids:
-            return {}
+            raise RuntimeError("global snapshot requires at least one SPMD")
 
-        # validate all drivers exist BEFORE registering the snapshot entry
-        # and before dispatching any RPCs.
         drivers: dict[str, Any] = {}
         for spmd_id in all_spmd_ids:
             driver = self.spmd_manager.get_driver_handle(spmd_id)
             if driver is None:
                 raise RuntimeError(
                     f"request_snapshot: driver for spmd_id '{spmd_id}' not found. "
-                    f"Cannot perform partial snapshot — aborting to prevent corrupt payload."
+                    "Cannot perform partial snapshot."
                 )
             drivers[spmd_id] = driver
 
-        # Register the accounting entry, then dispatch — all drivers confirmed.
         done_event = asyncio.Event()
-        self._pending_snapshots[snapshot_id] = {
+        self._pending_snapshots[checkpoint_id] = {
             "expected": len(all_spmd_ids),
             "received": 0,
-            "reported": set(),  # idempotent guard: each spmd_id counted at most once
+            "reported": set(),
             "metadata": {},
             "errors": [],
-            "ckpt_dir": ckpt_dir,
+            "repository_root": repository_root,
             "event": done_event,
         }
-        for spmd_id, driver in drivers.items():
-            driver.request_snapshot.remote(snapshot_id, target_count, ckpt_dir)
+        for driver in drivers.values():
+            driver.request_snapshot.remote(
+                checkpoint_id, attempt_id, permit, cut, repository_root, capture_mode
+            )
 
         snapshot_timeout = int(os.environ.get("FLUXWAY_SNAPSHOT_TIMEOUT_SECS", "600"))
         try:
             await asyncio.wait_for(done_event.wait(), timeout=snapshot_timeout)
-        except TimeoutError as err:
-            for d in drivers.values():
-                if d:
-                    d._clear_drain_and_fail.remote()
-            self._pending_snapshots.pop(snapshot_id, None)
+        except TimeoutError as error:
+            for driver in drivers.values():
+                driver.fail_snapshot.remote(checkpoint_id)
+            self._pending_snapshots.pop(checkpoint_id, None)
             raise RuntimeError(
-                f"Snapshot '{snapshot_id}' timed out after {snapshot_timeout}s. "
-                f"A Driver may have crashed without calling report_snapshot_failed. "
-                f"Set FLUXWAY_SNAPSHOT_TIMEOUT_SECS to adjust."
-            ) from err
+                f"Snapshot '{checkpoint_id}' timed out after {snapshot_timeout}s"
+            ) from error
 
-        snap_info = self._pending_snapshots.pop(snapshot_id)
+        snap_info = self._pending_snapshots.pop(checkpoint_id)
         if snap_info["errors"]:
-            for d in drivers.values():
-                if d:
-                    d._clear_drain_and_fail.remote()
-
+            for driver in drivers.values():
+                driver.fail_snapshot.remote(checkpoint_id)
             raise RuntimeError(
-                f"Snapshot '{snapshot_id}' failed for SPMDs: {snap_info['errors']}. "
-                f"Refusing to persist incomplete payload."
+                f"Snapshot '{checkpoint_id}' failed for SPMDs: {snap_info['errors']}"
             )
-        payload = {
-            sid: {
-                "spmd_state": per_rank_or_state["spmd_state"],
-                "rank_storage": {
-                    str(rank): storage
-                    for rank, storage in per_rank_or_state["rank_storage"].items()
-                },
-            }
-            for sid, per_rank_or_state in snap_info["metadata"].items()
-        }
-        payload["__fluxway_control_plane__"] = self.checkpoint_state(
-            cuts=self.control_stream_cuts(payload)
+        spmds = dict(snap_info["metadata"])
+        stream_cuts = self.control_stream_cuts(spmds)
+        resolved_cut = CheckpointCut(
+            cut_id=cut.cut_id,
+            logical_step=cut.logical_step,
+            stream_cuts=stream_cuts,
+            sealed_ends=self._require_control_ledger().sealed_ends,
+            control_epoch=cut.control_epoch,
         )
-        return payload
+        return CheckpointAssembly(
+            cut=resolved_cut,
+            framework_state=self.checkpoint_state(cuts=stream_cuts),
+            spmds=spmds,
+        )
 
     @require_spmd_manager
     async def receive_snapshot_metadata(
         self,
         spmd_id: str,
-        snapshot_id: str,
-        rank_metadata: dict[int, tuple[dict, dict]],
+        checkpoint_id: str,
+        snapshot: SpmdCheckpoint,
     ) -> None:
-        snap_info = self._pending_snapshots.get(snapshot_id)
+        snap_info = self._pending_snapshots.get(checkpoint_id)
         if snap_info is None:
-            logger.warning(f"Received metadata for unknown snapshot '{snapshot_id}'")
+            logger.warning("Received metadata for unknown snapshot %r", checkpoint_id)
             return
-
-        # Idempotency guard: a Driver may call both receive_snapshot_metadata
-        # (which fails partway) and report_snapshot_failed.  Only the first
-        # call for a given spmd_id is counted to prevent received > expected.
         if spmd_id in snap_info["reported"]:
             logger.warning(
-                f"receive_snapshot_metadata: duplicate report from '{spmd_id}' "
-                f"for snapshot '{snapshot_id}' \u2014 ignoring"
+                "Duplicate snapshot metadata spmd_id=%s checkpoint_id=%s",
+                spmd_id,
+                checkpoint_id,
             )
             return
+        if not isinstance(snapshot, SpmdCheckpoint):
+            raise TypeError("Driver snapshot metadata must be SpmdCheckpoint")
         snap_info["reported"].add(spmd_id)
-
-        # Each entry is a (spmd_state, rank_storage) tuple already resolved
-        # by the Driver via save_state_to_disk.  spmd_state is identical
-        # across all ranks (topology-independent); we use the first
-        # rank's as the canonical value.
-        rank_storage_map: dict[int, dict] = {}
-        canonical_spmd_state: dict | None = None
-        try:
-            for rank, (spmd_state, rank_storage) in rank_metadata.items():
-                if canonical_spmd_state is None:
-                    canonical_spmd_state = spmd_state
-                if rank_storage:
-                    rank_storage_map[rank] = rank_storage
-        except Exception as e:
-            logger.error(f"Failed to resolve snapshot metadata for {spmd_id}: {e}")
-            snap_info["errors"].append(spmd_id)
-            snap_info["received"] += 1
-            if snap_info["received"] == snap_info["expected"]:
-                snap_info["event"].set()
-            return
-
-        snap_info["metadata"][spmd_id] = {
-            "spmd_state": canonical_spmd_state or {},
-            "rank_storage": rank_storage_map,
-        }
+        snap_info["metadata"][spmd_id] = snapshot
         snap_info["received"] += 1
-
         if snap_info["received"] == snap_info["expected"]:
-            logger.info(f"Snapshot '{snapshot_id}' complete")
             snap_info["event"].set()
 
-    async def report_snapshot_failed(self, spmd_id: str, snapshot_id: str) -> None:
+    async def report_snapshot_failed(self, spmd_id: str, checkpoint_id: str) -> None:
         """Unblock request_snapshot when a Driver triggers SNAPSHOT_FAILED.
 
         Called by a Driver that encountered an unrecoverable error during
@@ -1229,10 +1224,10 @@ class ControllerActor:
         receive_snapshot_metadata.  Advances the received counter so the
         Controller's done_event is eventually set rather than waiting forever.
         """
-        snap_info = self._pending_snapshots.get(snapshot_id)
+        snap_info = self._pending_snapshots.get(checkpoint_id)
         if snap_info is None:
             logger.warning(
-                f"report_snapshot_failed: unknown snapshot '{snapshot_id}' from {spmd_id}"
+                f"report_snapshot_failed: unknown snapshot '{checkpoint_id}' from {spmd_id}"
             )
             return
 
@@ -1240,13 +1235,13 @@ class ControllerActor:
         if spmd_id in snap_info["reported"]:
             logger.warning(
                 f"report_snapshot_failed: duplicate report from '{spmd_id}' "
-                f"for snapshot '{snapshot_id}' — ignoring"
+                f"for snapshot '{checkpoint_id}' — ignoring"
             )
             return
         snap_info["reported"].add(spmd_id)
 
         logger.error(
-            f"Snapshot '{snapshot_id}' failed for SPMD '{spmd_id}' — marking as error"
+            f"Snapshot '{checkpoint_id}' failed for SPMD '{spmd_id}' — marking as error"
         )
         snap_info["errors"].append(spmd_id)
         snap_info["received"] += 1
@@ -1255,51 +1250,46 @@ class ControllerActor:
 
     @require_spmd_manager
     async def restore_snapshot(
-        self, snapshot_id: str, step: int, payload: dict[str, Any]
+        self,
+        checkpoint_id: str,
+        manifest: CheckpointManifest,
+        repository_root: str,
     ) -> None:
         """
-        Restore a snapshot: each Driver loads its Workers' tensors from disk directly.
-
-        Args:
-            snapshot_id: Snapshot identifier for bookkeeping.
-            step:        The logical step count of this snapshot.
-            payload:    {spmd_id: {"spmd_state": {...}, "rank_storage": {str(rank): {...}}}}
+        Restore a published schema-v2 manifest through each SPMD backend.
         """
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.controller_restore(
-                checkpoint_id=snapshot_id,
+                checkpoint_id=checkpoint_id,
             ):
                 await self._restore_snapshot_unprofiled(
-                    snapshot_id,
-                    step,
-                    payload,
+                    checkpoint_id, manifest, repository_root
                 )
             return
-        await self._restore_snapshot_unprofiled(snapshot_id, step, payload)
+        await self._restore_snapshot_unprofiled(
+            checkpoint_id, manifest, repository_root
+        )
 
     async def _restore_snapshot_unprofiled(
-        self, snapshot_id: str, step: int, payload: dict[str, Any]
+        self,
+        checkpoint_id: str,
+        manifest: CheckpointManifest,
+        repository_root: str,
     ) -> None:
-        logger.info(f"Controller restoring snapshot {snapshot_id} (step {step})")
-
-        if not isinstance(payload, dict):
-            raise TypeError("checkpoint payload must be a dictionary")
-        control_state = payload.get("__fluxway_control_plane__")
-        if not isinstance(control_state, dict):
-            raise ValueError(
-                "checkpoint payload is missing Fluxway control-plane state"
+        logger.info(
+            "Controller restoring snapshot %s (cut %s)",
+            checkpoint_id,
+            manifest.cut.cut_id,
+        )
+        if manifest.checkpoint_id != checkpoint_id:
+            raise ValueError("manifest checkpoint ID does not match restore request")
+        self.restore_checkpoint_state(dict(manifest.framework_state))
+        logical_step = manifest.cut.logical_step
+        if logical_step is None:
+            raise RuntimeError(
+                "current Controller restore requires a logical checkpoint step"
             )
-        self.restore_checkpoint_state(control_state)
-        payload = {
-            spmd_id: entry
-            for spmd_id, entry in payload.items()
-            if spmd_id != "__fluxway_control_plane__"
-        }
-
         if self.heartbeat_manager is not None:
-            logger.debug(
-                "Waiting for all drivers to report workers_ready before restore"
-            )
             restore_timeout = int(
                 os.environ.get("FLUXWAY_SNAPSHOT_TIMEOUT_SECS", "600")
             )
@@ -1308,28 +1298,21 @@ class ControllerActor:
             )
             if not ready:
                 raise RuntimeError(
-                    f"Timed out after {restore_timeout}s waiting for drivers to "
-                    f"become restore-ready. A Driver may have failed to start. "
-                    f"Set FLUXWAY_SNAPSHOT_TIMEOUT_SECS to adjust."
+                    "timed out waiting for drivers to become restore-ready"
                 )
-
-        self._last_checkpointed_step = step
-        self._last_requested_drain_target = step
-
-        self.state_manager.save_snapshot(snapshot_id, payload)
-
-        # Hydrate Control Plane step watermarks from spmd_state before unblocking.
+        self._last_checkpointed_step = logical_step
+        self._last_requested_drain_target = logical_step
+        runtime_snapshot = {
+            spmd_id: {0: dict(snapshot.runtime_state)}
+            for spmd_id, snapshot in manifest.spmds.items()
+        }
+        self.state_manager.save_snapshot(checkpoint_id, runtime_snapshot)
         flow_control_updates: dict[str, tuple[Any, ...]] = {}
-        for spmd_id, spmd_entry in payload.items():
-            if not isinstance(spmd_entry, Mapping):
-                raise TypeError(f"checkpoint entry {spmd_id!r} must be a mapping")
-            spmd_state = spmd_entry.get("spmd_state")
-            if not isinstance(spmd_state, Mapping):
-                raise ValueError(f"checkpoint entry {spmd_id!r} is missing spmd_state")
-            completed = spmd_state.get("completed_step_count")
+        for spmd_id, snapshot in manifest.spmds.items():
+            completed = snapshot.runtime_state.get("completed_step_count")
             if not isinstance(completed, Mapping):
                 raise ValueError(
-                    f"checkpoint SPMD state {spmd_id!r} is missing completed_step_count"
+                    f"checkpoint runtime state {spmd_id!r} is missing completed_step_count"
                 )
             for op_name, count in completed.items():
                 self.async_step_manager.report_op_completed(spmd_id, op_name, count)
@@ -1339,43 +1322,33 @@ class ControllerActor:
                     )
                 )
         await self._apply_flow_control_windows(flow_control_updates)
-
         await self.block_all_spmds()
-
         terminal_boundary_restored = (
             self._terminal_drain_target is not None
-            and step >= self._terminal_drain_target
+            and logical_step >= self._terminal_drain_target
         )
         restore_completed = False
         try:
-            restore_tasks = []
-            for spmd_id, spmd_entry in payload.items():
+            tasks = []
+            for spmd_id, snapshot in manifest.spmds.items():
                 driver = self.spmd_manager.get_driver_handle(spmd_id)
                 if driver is None:
                     raise RuntimeError(
-                        f"restore_snapshot: driver for spmd_id '{spmd_id}' not found. "
-                        f"Cannot perform partial restore — aborting to prevent split-brain."
+                        f"restore_snapshot: driver for spmd_id {spmd_id!r} not found"
                     )
-                spmd_state = spmd_entry["spmd_state"]
-                serialized_rank_storage = spmd_entry.get("rank_storage")
-                if not isinstance(serialized_rank_storage, Mapping):
-                    raise ValueError(
-                        f"checkpoint entry {spmd_id!r} is missing rank_storage"
+                tasks.append(
+                    driver.restore_from_manifest.remote(
+                        checkpoint_id, manifest.cut, snapshot, repository_root
                     )
-                rank_storage = {int(k): v for k, v in serialized_rank_storage.items()}
-                restore_tasks.append(
-                    driver.restore_from_disk.remote(spmd_state, rank_storage, step)
                 )
-            if restore_tasks:
-                await asyncio.gather(*restore_tasks)
+            if tasks:
+                await asyncio.gather(*tasks)
             restore_completed = True
         finally:
             if not restore_completed or not terminal_boundary_restored:
                 await self.unblock_all_spmds()
-
         if terminal_boundary_restored:
             await self._resume_and_schedule_next_drain()
-
         logger.info("Snapshot restored successfully")
 
     async def restore_checkpoint(self, step: int | None = None) -> int | None:
@@ -1387,12 +1360,52 @@ class ControllerActor:
                 "Checkpoint config was not provided during controller initialization"
             )
 
-        restored_step = await self._checkpointer.restore(step)
+        reference = "latest" if step is None else StepReference(step)
+        restored_step = await self._checkpointer.restore(reference)
         if restored_step is None:
             self._start_sources_when_running = True
             if self.state_machine.is_running():
                 await self.start_source_operators()
         return restored_step
+
+    async def acquire_checkpoint_lease(
+        self,
+        spmd_id: str,
+        checkpoint_object: CheckpointObjectRef,
+        owner_id: str,
+        ttl_seconds: float,
+        request_id: str,
+    ) -> CheckpointHold:
+        if self._checkpointer is None:
+            raise RuntimeError(
+                "Checkpoint config was not provided during controller initialization"
+            )
+        return await self._checkpointer.hold_checkpoint_object(
+            spmd_id, checkpoint_object, owner_id, ttl_seconds, request_id
+        )
+
+    async def renew_checkpoint_lease(
+        self,
+        spmd_id: str,
+        lease: CheckpointHold,
+        ttl_seconds: float,
+    ) -> CheckpointHold:
+        if self._checkpointer is None:
+            raise RuntimeError(
+                "Checkpoint config was not provided during controller initialization"
+            )
+        return await self._checkpointer.renew_checkpoint_hold(
+            spmd_id, lease, ttl_seconds
+        )
+
+    async def release_checkpoint_lease(
+        self, spmd_id: str, lease: CheckpointHold
+    ) -> None:
+        if self._checkpointer is None:
+            raise RuntimeError(
+                "Checkpoint config was not provided during controller initialization"
+            )
+        await self._checkpointer.release_checkpoint_hold(spmd_id, lease)
 
     @require_spmd_manager
     async def start_source_operators(self) -> None:
@@ -1762,12 +1775,12 @@ class ControllerActor:
                 logger.error(f"Failed to collect worker handles for topology: {e}")
                 return
 
-        def _get_transport_type(target_spmd_id: str) -> str:
-            if target_spmd_id in self._transport_config:
-                return self._transport_config[target_spmd_id]
+        def _get_transport_type(checkpoint_object_spmd_id: str) -> str:
+            if checkpoint_object_spmd_id in self._transport_config:
+                return self._transport_config[checkpoint_object_spmd_id]
             if "*" in self._transport_config:
                 return self._transport_config["*"]
-            node = self._graph.nodes.get(target_spmd_id)
+            node = self._graph.nodes.get(checkpoint_object_spmd_id)
             if node and node.spmd_config:
                 return getattr(node.spmd_config, "transport_type", "ray")
             return "ray"
@@ -1868,7 +1881,7 @@ class ControllerActor:
 
     @require_spmd_manager
     @require_heartbeat_manager
-    async def _cleanup_all_spmds(self) -> None:
+    async def _reclaim_all_spmds(self) -> None:
         """
         Cleanup all SPMD resources.
 
@@ -1878,11 +1891,11 @@ class ControllerActor:
             async with self._profiler_runtime.recorder.controller_cleanup(
                 spmd_count=len(self.spmd_manager.get_all_spmd_ids()),
             ):
-                await self._cleanup_all_spmds_unprofiled()
+                await self._reclaim_all_spmds_unprofiled()
             return
-        await self._cleanup_all_spmds_unprofiled()
+        await self._reclaim_all_spmds_unprofiled()
 
-    async def _cleanup_all_spmds_unprofiled(self) -> None:
+    async def _reclaim_all_spmds_unprofiled(self) -> None:
         logger.debug("Cleaning up all SPMDs")
 
         cleanup_errors: list[Exception] = []
@@ -1906,7 +1919,7 @@ class ControllerActor:
             except Exception as error:
                 cleanup_errors.append(error)
         if cleanup_errors:
-            raise ExceptionGroup("SPMD cleanup failed", cleanup_errors)
+            raise ExceptionGroup("SPMD reclaim failed", cleanup_errors)
 
     async def _stop_and_unregister_spmd(self, spmd_id: str) -> tuple[Exception, ...]:
         errors: list[Exception] = []
@@ -1942,6 +1955,11 @@ class ControllerActor:
             await self.stop_checkpointer()
         except Exception as error:
             cleanup_errors.append(error)
+        if self._checkpointer is not None:
+            try:
+                await self._checkpointer.close()
+            except Exception as error:
+                cleanup_errors.append(error)
         if export_profiler_trace:
             try:
                 profiler_snapshots = await self.capture_profiler_snapshots_if_enabled()
@@ -1949,7 +1967,7 @@ class ControllerActor:
             except Exception as error:
                 cleanup_errors.append(error)
         try:
-            await self._cleanup_all_spmds()
+            await self._reclaim_all_spmds()
         except Exception as error:
             cleanup_errors.append(error)
         if export_profiler_trace and profiler_capture_succeeded:
@@ -1964,7 +1982,7 @@ class ControllerActor:
         if len(cleanup_errors) == 1:
             raise cleanup_errors[0]
         if cleanup_errors:
-            raise ExceptionGroup("terminal cleanup failed", cleanup_errors)
+            raise ExceptionGroup("terminal reclaim failed", cleanup_errors)
 
     def _release_stopped_spmd_handles(self) -> None:
         """Release driver handles after terminal cleanup has fully completed."""

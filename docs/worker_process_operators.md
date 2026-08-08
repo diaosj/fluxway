@@ -122,71 +122,26 @@ Fluxway Worker Process Error: ... calls jax.distributed.initialize but is not ma
 The internal protocol field `__fluxway_process_affine__` is intentionally hidden
 behind the decorator. User code should use `@fluxway.requires_worker_process`.
 
-## Checkpoint Participant Protocol
+## Checkpoint Backends
 
-Stateful operators can participate in the whole-job checkpointing and restoration process by implementing the participant protocol. The Controller-orchestrated global checkpointer delegates artifact preparation, state persistence, and aborts/commits to each operator instance via these optional methods. 
+Operators do not implement checkpoint hooks. A checkpoint format is registered once
+through `@spmd(checkpoint_components=(...))` and implements the single
+`CheckpointComponentRegistration` ABI. This keeps user state capture, collective publication,
+physical URI generation, restore, lease, and cleanup behind one explicit extension
+boundary.
 
-Because these methods run in the SPMD worker during the checkpoint fence, they are decoupled from the asynchronous execution lanes (`AsyncPolicy`).
+The worker coordinator invokes the registered persistence capability's `prepare`, `capture`, `finalize`, `commit`, `abort`,
+and `restore` in that order. The Controller owns transaction ordering and Manifest
+publication; a backend owns its checkpoint_object URI, staging layout, version, and physical
+keep operations. A failed transaction calls `abort`; keep of an already
+published checkpoint_object calls `cleanup`; worker shutdown calls `close`.
 
-### Lifecycle Workflow
+`CheckpointContext` carries logical identity only: transaction, snapshot, cut,
+SPMD/rank, topology, and component ID. It deliberately has no physical storage_locator.
+Use `context.checkpoint_object_key(...)` for a logical checkpoint_object identity and return the
+backend-owned opaque `CheckpointObjectRef` from `capture`/`commit`.
 
-The following diagram illustrates the lifecycle of a checkpoint, covering both the save and restore phases:
-
-```mermaid
-sequenceDiagram
-    participant C as Controller Checkpointer
-    participant W as Worker Operator (Rank i)
-    
-    %% Save Phase
-    rect rgba(128, 128, 128, 0.1)
-        note right of C: 1. Global drain & Trigger Snapshot
-        C->>W: prepare_checkpoint_artifacts(context)
-        note right of W: Create tmp dirs, init external storage
-        W-->>C: (Done)
-        
-        C->>W: save_state(context)
-        note right of W: Export process-local state
-        W-->>C: Returns `state`
-        
-        C->>W: checkpoint_metadata(state, context)
-        note right of W: Extract metadata for cross-rank sync
-        W-->>C: Returns `metadata`
-    end
-    
-    %% Commit / Abort Phase
-    alt Success across all ranks
-        C->>C: Gather all metadata
-        C->>W: commit_checkpoint_artifacts(gathered_metadata, context)
-        note right of W: Finalize collective artifacts (e.g., manifest)
-        W-->>C: (Done)
-    else Failure in any rank or Controller
-        C->>W: abort_checkpoint_artifacts(context)
-        note right of W: Clean up tmp dirs/storage
-        W-->>C: (Cleaned up)
-    end
-    
-    %% Restore Phase
-    rect rgba(128, 128, 128, 0.1)
-        note right of C: 2. Restore (on restart/fault)
-        C->>W: restore_state(state, context)
-        note right of W: Rehydrate state from payload
-        W-->>C: (State restored)
-    end
-```
-
-*(Note: The `alt` block in the diagram represents a conditional branch, similar to an `if/else` statement. It shows two alternative execution paths: one for when the save phase succeeds across all ranks, and another for when a failure occurs.)*
-
-### Method Descriptions
-
-- **`prepare_checkpoint_artifacts(self, context: CheckpointContext) -> None`**: 
-  Called first to prepare any local staging directories or external storage.
-- **`save_state(self, context: CheckpointContext) -> Any`**: 
-  Called to export process-local state (e.g., in-memory data, cursor, or storage URIs). The returned object is persisted in the global payload.
-- **`checkpoint_metadata(self, saved_state: Any, context: CheckpointContext) -> Mapping[str, Any]`**: 
-  Optionally extract and return a validated dictionary of metadata from the `saved_state`.
-- **`commit_checkpoint_artifacts(self, gathered_metadata: Mapping[int, Mapping[str, Any]], context: CheckpointContext) -> None`**: 
-  A cross-rank phase. It receives a dictionary mapping rank to the returned `checkpoint_metadata` from all participating ranks, allowing collective finalization (e.g., manifest consolidation).
-- **`abort_checkpoint_artifacts(self, context: CheckpointContext) -> None`**: 
-  Called if any phase of the global checkpoint fails. Cleans up staging directories created during `prepare_checkpoint_artifacts`.
-- **`restore_state(self, state: Any, context: CheckpointContext) -> None`**: 
-  Called during fault recovery. Receives the `state` originally returned by `save_state`.
+Every mutating phase receives Fluxway's `CheckpointCommitPermit`; stale permits are
+rejected after coordinator generation takeover. See [checkpoint.md](checkpoint.md)
+for the capability contract, Manifest schema,
+topology restore rules, keep leases, and built-in backend examples.

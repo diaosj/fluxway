@@ -31,7 +31,7 @@ python -m fluxway.example.recommendation.train \
   --profiler-trace-dir /tmp/recommendation-traces
 ```
 
-On a remote machine, keep Model Explorer on loopback and forward the port:
+On a remote machine, retention Model Explorer on loopback and forward the port:
 
 ```bash
 model-explorer /tmp/recommendation-graph/model_explorer.json \

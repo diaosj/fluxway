@@ -27,7 +27,7 @@ def _make_worker_stub():
     stub = types.SimpleNamespace(
         _running=True,
         _driver_handle=None,
-        _drain_target_count=typing.cast(int | None, 5),
+        _drain_step_count=typing.cast(int | None, 5),
         _drain_cond=asyncio.Condition(),
         _execution_queue=asyncio.PriorityQueue(),
         _execution_queues={},
@@ -47,6 +47,8 @@ def _make_worker_stub():
         _coherence_input_tensors={},
         _coherence_directory=CoherenceDirectory(),
         _allocation_registry=AllocationRegistry(),
+        _checkpoint_coordinator=None,
+        _checkpoint_repository_root=None,
     )
     stub._execution_queues = {"__default__": stub._execution_queue}
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
@@ -67,6 +69,9 @@ def _make_worker_stub():
     stub._shutdown_local_operator_instances = types.MethodType(
         raw_cls._shutdown_local_operator_instances, stub
     )
+    stub._shutdown_checkpoint_coordinator = types.MethodType(
+        raw_cls._shutdown_checkpoint_coordinator, stub
+    )
     stub.stop = types.MethodType(raw_cls.stop, stub)
     return stub
 
@@ -77,13 +82,13 @@ class TestStopWakesDrainCondition:
     @pytest.mark.asyncio
     async def test_drain_cond_woken_by_stop(self):
         stub = _make_worker_stub()
-        assert stub._drain_target_count == 5
+        assert stub._drain_step_count == 5
 
         woke_up = asyncio.Event()
 
         async def blocked_on_drain():
             async with stub._drain_cond:
-                while stub._drain_target_count is not None:  # type: ignore[reportUnnecessaryComparison]
+                while stub._drain_step_count is not None:  # type: ignore[reportUnnecessaryComparison]
                     await stub._drain_cond.wait()
             woke_up.set()
 
@@ -95,7 +100,7 @@ class TestStopWakesDrainCondition:
 
         await asyncio.sleep(0.02)
         assert woke_up.is_set()
-        assert stub._drain_target_count is None  # type: ignore[reportUnnecessaryComparison]
+        assert stub._drain_step_count is None  # type: ignore[reportUnnecessaryComparison]
 
         if not task.done():
             task.cancel()
@@ -107,11 +112,11 @@ class TestStopWakesDrainCondition:
     @pytest.mark.asyncio
     async def test_stop_clears_drain_target(self):
         stub = _make_worker_stub()
-        stub._drain_target_count = 42
+        stub._drain_step_count = 42
 
         await stub.stop()
 
-        assert stub._drain_target_count is None  # type: ignore[reportUnnecessaryComparison]
+        assert stub._drain_step_count is None  # type: ignore[reportUnnecessaryComparison]
 
     @pytest.mark.asyncio
     async def test_stop_sets_running_false(self):

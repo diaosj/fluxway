@@ -35,35 +35,39 @@ class AbstractWorkerExecutor:
     ) -> None:
         raise NotImplementedError
 
-    async def set_drain_target_count(self, target_count: int) -> None:
+    async def set_drain_step_count(self, step_count: int) -> None:
         raise NotImplementedError
 
-    def clear_drain_target_count(self) -> None:
+    def clear_drain_step_count(self) -> None:
         raise NotImplementedError
 
-    async def prepare_checkpoint_artifacts(
-        self, ckpt_dir: str, target_step_count: int
+    async def checkpoint_prepare(
+        self,
+        repository_root: str,
+        checkpoint_id: str,
+        attempt_id: str,
+        permit: Any,
+        cut: Any,
+        capture_mode: Any,
     ) -> None:
         raise NotImplementedError
 
-    async def save_state_to_disk(
-        self, ckpt_dir: str, target_step_count: int
-    ) -> list[tuple[int, Any, Any, Any]]:
+    async def checkpoint_capture(self) -> list[tuple[int, Any, Any]]:
         raise NotImplementedError
 
-    async def commit_checkpoint_artifacts(
-        self, ckpt_dir: str, target_step_count: int, gathered_metadata: dict
-    ) -> None:
+    async def checkpoint_finalize(self) -> None:
         raise NotImplementedError
 
-    async def abort_checkpoint_artifacts(
-        self, ckpt_dir: str, target_step_count: int
-    ) -> None:
+    async def checkpoint_commit(self, gathered_records: Any) -> Any:
         raise NotImplementedError
 
-    async def load_state_from_disk(
-        self, spmd_state: dict, rank_storage: dict, step: int
-    ) -> None:
+    async def checkpoint_abort(self) -> None:
+        raise NotImplementedError
+
+    async def checkpoint_mark_published(self) -> None:
+        raise NotImplementedError
+
+    async def checkpoint_restore(self, *args, **kwargs) -> None:
         raise NotImplementedError
 
     def block_worker_op(self, rank: int, op_name: str, op_runnable_epoch: int) -> None:

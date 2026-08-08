@@ -11,6 +11,7 @@ from fluxway.control_plane.components import driver_component_id
 from fluxway.control_plane.controller import ControllerActor
 from fluxway.control_plane.ledger_client import ControlRecord
 from fluxway.control_plane.ledger_client import ControlLedgerClient
+from fluxway.common.types.checkpoint import SpmdCheckpoint, TopologySnapshot
 
 
 CONTROLLER_CLASS = ControllerActor.__ray_metadata__.modified_class  # type: ignore[attr-defined]
@@ -284,14 +285,16 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
     controller._control_plane_components = SimpleNamespace(checkpoint_state=lambda: {})
     controller._last_checkpointed_step = 0
     payload = {
-        "source_a": {
-            "spmd_state": {"completed_step_count": {"read": 1}},
-            "rank_storage": {},
-        },
-        "source_b": {
-            "spmd_state": {"completed_step_count": {"read": 2}},
-            "rank_storage": {},
-        },
+        "source_a": SpmdCheckpoint(
+            TopologySnapshot(1, (), (), "v1"),
+            {"completed_step_count": {"read": 1}},
+            {},
+        ),
+        "source_b": SpmdCheckpoint(
+            TopologySnapshot(1, (), (), "v1"),
+            {"completed_step_count": {"read": 2}},
+            {},
+        ),
     }
 
     cuts = controller.control_stream_cuts(payload)

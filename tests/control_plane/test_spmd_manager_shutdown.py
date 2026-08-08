@@ -37,7 +37,7 @@ async def test_stop_spmd_releases_driver_without_force_kill():
 
 
 @pytest.mark.asyncio
-async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup():
+async def test_stop_spmd_can_preserve_driver_reference_during_terminal_reclaim():
     manager = SPMDManager()
     handle = SPMDHandle("dense")
     handle.set_initialized(True)
@@ -55,7 +55,7 @@ async def test_stop_spmd_can_preserve_driver_reference_during_terminal_cleanup()
 
 
 @pytest.mark.asyncio
-async def test_stop_spmd_propagates_driver_shutdown_failure_after_state_cleanup():
+async def test_stop_spmd_propagates_driver_shutdown_failure_after_state_reclaim():
     manager = SPMDManager()
     handle = SPMDHandle("metrics")
     handle.set_initialized(True)

@@ -886,7 +886,7 @@ async def test_skipped_ready_step_does_not_call_user_function():
         },
     )()
     worker._drain_cond = asyncio.Condition()
-    worker._drain_target_count = None
+    worker._drain_step_count = None
     worker._barriers_declared = {("consume", 0): True}
     worker._uses_direct_local_input_fast_path = lambda _name: False
     worker._assemble_input = lambda *_args: (_ for _ in ()).throw(

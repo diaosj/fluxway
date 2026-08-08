@@ -50,9 +50,14 @@ from fluxway.common.execution import compile
 from fluxway.common.compiled_graph import CompiledDependency
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types import (
-    CheckpointContext,
+    ComponentCheckpoint,
+    CheckpointCaptureMode,
+    CheckpointCommitPermit,
+    CheckpointCut,
     ExecutionFailure,
+    WorkerSaveResult,
     SPMDConfig,
+    TopologySnapshot,
     WorkerHeartbeat,
     WorkerStatus,
 )
@@ -112,20 +117,13 @@ from fluxway.transport.coherence import entry_coherence_action, entry_tensor_kin
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.utils.tree import tree_flatten, tree_unflatten
-from fluxway.control_plane.checkpointer.protocol import (
-    commit_participant_checkpoint_artifacts,
-    abort_participant_checkpoint_artifacts,
-    participant_checkpoint_metadata,
-    prepare_participant_checkpoint_artifacts,
-    restore_participant_state,
-    save_participant_state,
-)
 from fluxway.rpc.protocol import (
     DataPlaneCallable,
     LocalWorkerDataPlane,
     TransportFrameEnvelope,
 )
 from fluxway.spmd.worker.mailbox import WorkerMailbox
+from fluxway.spmd.worker.checkpoint import WorkerCheckpointCoordinator
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
     DependencyDecisions,
@@ -190,7 +188,6 @@ from fluxway.profiler.recorder import (
     WORKER_QUEUE_DEQUEUE,
     WORKER_QUEUE_ENQUEUE,
     WORKER_RUN_LOOP,
-    WORKER_SNAPSHOT_HOOK,
     WORKER_STALE_TASK,
 )
 from typing import Any, Optional, get_type_hints, cast
@@ -563,7 +560,6 @@ class SPMDWorker:
         rank: int,
         spmd_id: str = "",
         driver_handle: Any | None = None,
-        checkpoint_backend: Any | None = None,
         tensor_device: str = "cpu",
         control_plane_handle: Any | None = None,
     ):
@@ -601,8 +597,8 @@ class SPMDWorker:
             }
         )
 
-        # Pluggable per-worker checkpoint serialization. Defaults to OrbaxBackend.
-        self._checkpoint_backend = checkpoint_backend
+        self._checkpoint_coordinator: WorkerCheckpointCoordinator | None = None
+        self._checkpoint_repository_root: str | None = None
 
         # Driver handle for callbacks (Control Plane - Native Ray)
         self._driver_handle: Any | None = driver_handle
@@ -799,13 +795,13 @@ class SPMDWorker:
         self._source_pause_events: dict[str, asyncio.Event] = {}
 
         # Drain-to-step state
-        self._drain_target_count: int | None = None
+        self._drain_step_count: int | None = None
         self._drain_cond: asyncio.Condition = asyncio.Condition()
         if self.config is not None and getattr(
             self.config, "requires_drain_at_startup", False
         ):
             # Block at step 0 until Controller issues the initial drain target!
-            self._drain_target_count = 0
+            self._drain_step_count = 0
 
         # Expected topology counts for auto-start detection
         # Initialize to None to strictly wait for registration from driver
@@ -821,18 +817,6 @@ class SPMDWorker:
             self.rank,
             self._world_size,
         )
-
-    def __del__(self):
-        # Ensure background I/O is complete (e.g. Orbax AsyncCheckpointer)
-        if hasattr(self, "_checkpoint_backend") and self._checkpoint_backend:
-            self._checkpoint_backend.finalize()
-
-    def _get_checkpoint_backend(self):
-        if self._checkpoint_backend is None:
-            from fluxway.control_plane.checkpointer import OrbaxBackend
-
-            self._checkpoint_backend = OrbaxBackend()
-        return self._checkpoint_backend
 
     # =========================================================================
     # Operator Pre-Instantiation
@@ -2155,7 +2139,7 @@ class SPMDWorker:
     def _should_start_prepare_on_ready(self, op_name: str, step: int) -> bool:
         if not self._should_prepare_inputs_on_ready(op_name):
             return False
-        if self._drain_target_count is not None and step >= self._drain_target_count:
+        if self._drain_step_count is not None and step >= self._drain_step_count:
             return False
         return True
 
@@ -2166,7 +2150,7 @@ class SPMDWorker:
     def _prepare_inputs_if_policy_allows(self, op_name: str, step: int) -> None:
         if not self._should_prepare_inputs_on_ready(op_name):
             return
-        if self._drain_target_count is not None and step >= self._drain_target_count:
+        if self._drain_step_count is not None and step >= self._drain_step_count:
             return
         self._input_prepare_runtime.start(
             op_name,
@@ -2738,7 +2722,7 @@ class SPMDWorker:
         self._driver_handle = None
         # Wake any worker blocked on drain condition
         async with self._drain_cond:
-            self._drain_target_count = None
+            self._drain_step_count = None
             self._drain_cond.notify_all()
         # Put sentinels to unblock all execution lanes.
         await self._execution_queue.put(_EXECUTION_STOP_ITEM)
@@ -2809,6 +2793,7 @@ class SPMDWorker:
             self._send_tasks.clear()
         self._background_tasks.clear()
         user_shutdown_results = await asyncio.gather(
+            self._shutdown_checkpoint_coordinator(),
             self._shutdown_local_operator_instances(),
             self._local_step_plan_executor.user_callable_executor.shutdown(),
             return_exceptions=True,
@@ -2837,6 +2822,26 @@ class SPMDWorker:
             raise ExceptionGroup("worker shutdown failed", shutdown_errors)
 
         logger.debug(f"Worker stopping spmd_id={self.spmd_id} rank={self.rank}")
+
+    async def _shutdown_checkpoint_coordinator(self) -> None:
+        coordinator = self._checkpoint_coordinator
+        if coordinator is None:
+            return
+        errors: list[BaseException] = []
+        try:
+            await coordinator.rollback_active()
+        except BaseException as error:
+            errors.append(error)
+        try:
+            await coordinator.close()
+        except BaseException as error:
+            errors.append(error)
+        self._checkpoint_coordinator = None
+        self._checkpoint_repository_root = None
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("checkpoint coordinator shutdown failed", errors)
 
     async def _propagate_completed_without_tensor(
         self,
@@ -3189,7 +3194,7 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
 
-        def prepare():
+        def start_save():
             if self._should_prepare_inputs_on_ready(op_name):
                 return self._input_prepare_runtime.consume(
                     op_name,
@@ -3199,13 +3204,13 @@ class SPMDWorker:
             return self._execute_operator_prepare_input(op_name, step)
 
         if recorder is None:
-            return await prepare()
+            return await start_save()
         async with recorder.local_step_node(
             spec=LOCAL_STEP_WAIT_INPUTS,
             op_name=op_name,
             step=step,
         ):
-            return await prepare()
+            return await start_save()
 
     async def _local_plan_call_user(
         self, op_name: str, step: int, input_data: Any
@@ -3502,7 +3507,7 @@ class SPMDWorker:
     async def _rollback_ownership_reservations(
         self,
         grants: dict[
-            tuple[str, int, CoherenceSubject, int, int],
+            tuple[str | None, int, CoherenceSubject, int, int],
             _InputCoherenceGrant,
         ],
         reservations: list[_OwnershipReservation],
@@ -3560,7 +3565,7 @@ class SPMDWorker:
         finally:
             for reservation in reservations:
                 for grant in reservation.grants:
-                    grants.pop(grant.identity, None)
+                    grants.pop(cast(Any, grant.identity), None)
 
     def _validate_interleaved_source_result(
         self,
@@ -3995,7 +4000,7 @@ class SPMDWorker:
             return
         if send_task.cancelled():
             raise RuntimeError(
-                f"Local SEND task was cancelled before commit "
+                f"Local SEND task was cancelled before commit_save "
                 f"op={send_token.op_name} step={send_token.step}."
             )
         exc = send_task.exception()
@@ -4004,10 +4009,7 @@ class SPMDWorker:
 
     async def _execute_operator_prepare_input(self, op_name: str, step: int) -> Any:
         async with self._drain_cond:
-            while (
-                self._drain_target_count is not None
-                and step >= self._drain_target_count
-            ):
+            while self._drain_step_count is not None and step >= self._drain_step_count:
                 recorder = (
                     self._profiler_runtime.recorder
                     if self._profiler_runtime.enabled
@@ -4021,7 +4023,7 @@ class SPMDWorker:
                         payload=recorder.worker_op_payload(
                             op_name,
                             step,
-                            self._drain_target_count,
+                            self._drain_step_count,
                         ),
                     ):
                         await self._drain_cond.wait()
@@ -4112,6 +4114,10 @@ class SPMDWorker:
                     grant.epoch,
                 )
                 continue
+            if grant.parent_spmd_id is None:
+                raise ValueError(
+                    "parent_spmd_id cannot be None if parent_return_required is True"
+                )
             handlers = self._predecessor_handlers.get(grant.parent_spmd_id)
             if handlers is None or grant.parent_rank not in handlers:
                 raise ValueError(
@@ -4140,7 +4146,9 @@ class SPMDWorker:
 
         async def send_returns(group: list[_InputCoherenceGrant]) -> None:
             canonical = group[0]
-            handlers = self._predecessor_handlers[canonical.parent_spmd_id]
+            parent_spmd_id = canonical.parent_spmd_id
+            assert parent_spmd_id is not None
+            handlers = self._predecessor_handlers[parent_spmd_id]
             header = build_coherence_frame(
                 step=canonical.epoch,
                 sender_spmd_code=local_code,
@@ -6469,248 +6477,100 @@ class SPMDWorker:
     # State Persistence (checkpoint I/O)
     # =========================================================================
 
-    async def prepare_checkpoint_artifacts(
+    async def checkpoint_prepare(
         self,
-        ckpt_dir: str,
-        step: int,
+        repository_root: str,
+        checkpoint_id: str,
+        attempt_id: str,
+        permit: CheckpointCommitPermit,
+        cut: CheckpointCut,
+        capture_mode: CheckpointCaptureMode,
     ) -> None:
-        """
-        Prepare external checkpoint artifacts on this worker.
-        Called on Rank 0 by the Driver before parallel saving starts.
-        """
-        if self._profiler_runtime.enabled:
-            recorder = self._profiler_runtime.recorder
-            recorder.worker_scheduler_instant(
-                spec=WORKER_SNAPSHOT_HOOK,
-                payload=(recorder.intern("prepare_checkpoint_artifacts"), step),
-            )
         await self._drain_outbound_tasks()
-        context = self._checkpoint_context(ckpt_dir, step)
-        attempted = []
-        try:
-            for instance in self._operator_instances().values():
-                try:
-                    participates = prepare_participant_checkpoint_artifacts(
-                        instance, context
-                    )
-                except BaseException:
-                    attempted.append(instance)
-                    raise
-                if participates:
-                    attempted.append(instance)
-        except BaseException as primary_error:
-            errors = [primary_error]
-            for instance in reversed(attempted):
-                try:
-                    abort_participant_checkpoint_artifacts(instance, context)
-                except BaseException as abort_error:
-                    errors.append(abort_error)
-            if len(errors) > 1:
-                raise BaseExceptionGroup(
-                    "checkpoint participant prepare and rollback failed", errors
-                ) from None
-            raise
-
-    async def commit_checkpoint_artifacts(
-        self,
-        ckpt_dir: str,
-        step: int,
-        gathered_metadata: dict[str, dict[int, dict]],
-    ) -> None:
-        """
-        Commit external checkpoint artifacts after all ranks have persisted.
-        Called on Rank 0 by the Driver after all ranks have saved successfully.
-        """
-        if self._profiler_runtime.enabled:
-            recorder = self._profiler_runtime.recorder
-            recorder.worker_scheduler_instant(
-                spec=WORKER_SNAPSHOT_HOOK,
-                payload=(recorder.intern("commit_checkpoint_artifacts"), step),
-            )
-        await self._drain_outbound_tasks()
-        context = self._checkpoint_context(ckpt_dir, step)
-        for op_name, instance in self._operator_instances().items():
-            commit_participant_checkpoint_artifacts(
-                instance,
-                context,
-                gathered_metadata=gathered_metadata.get(op_name, {}),
-            )
-
-    async def abort_checkpoint_artifacts(self, ckpt_dir: str, step: int) -> None:
-        await self._drain_outbound_tasks()
-        context = self._checkpoint_context(ckpt_dir, step)
-        for instance in self._operator_instances().values():
-            abort_participant_checkpoint_artifacts(instance, context)
-
-    async def save_state_to_disk(
-        self,
-        ckpt_dir: str,
-        step: int,
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-        """
-        Persist this worker's state to disk.
-
-        Returns:
-            A ``(spmd_state, rank_storage, checkpoint_metadata)`` triple:
-
-            - ``spmd_state``: SPMD-level logical state that is topology-independent
-              (``completed_step_count``).  All ranks in the same SPMD share
-              identical values; the Driver stores this once per SPMD.
-            - ``rank_storage``: rank-specific physical storage paths returned by the
-              checkpoint backend (``ckpt_dir``, ``orbax_final_path``,
-              ``local_state_dir``, …).  Empty dict when this rank has no on-disk
-              tensors.
-            - ``checkpoint_metadata``: optional pure metadata exported by
-              ``checkpoint_metadata``. Rank-local payloads stay in the Worker
-              backend and never traverse the control plane.
-        """
-        await self._drain_outbound_tasks()
-        completed_step_count_snapshot = dict(self._completed_step_count)
-
-        context = self._checkpoint_context(ckpt_dir, step)
-        operator_states = await self._collect_operator_save_state(context)
-        checkpoint_metadata = {}
-        for op_name, state in operator_states.items():
-            metadata = participant_checkpoint_metadata(
-                self._operator_instance(op_name), state, context
-            )
-            if metadata is not None:
-                checkpoint_metadata[op_name] = metadata
-
-        if operator_states:
-            if self._profiler_runtime.enabled:
-                recorder = self._profiler_runtime.recorder
-                async with recorder.worker_checkpoint_save(
-                    step=step,
-                    operator_count=len(operator_states),
-                ):
-                    rank_storage = await self._get_checkpoint_backend().save(
-                        {"operator_states": operator_states},
-                        ckpt_dir,
-                        self.spmd_id,
-                        self.rank,
-                        step,
-                    )
-            else:
-                rank_storage = await self._get_checkpoint_backend().save(
-                    {"operator_states": operator_states},
-                    ckpt_dir,
-                    self.spmd_id,
-                    self.rank,
-                    step,
-                )
-        else:
-            rank_storage = {}
-
-        spmd_state = {
-            "completed_step_count": completed_step_count_snapshot,
-            "checkpoint_root": context.root_dir,
-        }
-
-        logger.debug(
-            "State saved to disk spmd_id=%s rank=%s step=%s",
-            self.spmd_id,
-            self.rank,
-            step,
+        coordinator = self._get_checkpoint_coordinator(repository_root)
+        await coordinator.start_save(
+            checkpoint_id, attempt_id, permit, cut, capture_mode
         )
-        return spmd_state, rank_storage, checkpoint_metadata
 
-    async def load_state_from_disk(
+    async def checkpoint_capture(
         self,
-        spmd_state: dict[str, Any],
-        rank_storage: dict[str, Any] | None,
-        step: int,
-    ) -> None:
-        """
-        Restore this worker's state from the manifest.
-
-        Args:
-            spmd_state:   SPMD-level logical state shared by all ranks
-                          (``completed_step_count``).
-            rank_storage: Rank-specific physical storage paths.  ``None`` when
-                          this rank has no on-disk checkpoint (e.g. scale-up to
-                          a larger worker count).
-        """
-        if "completed_step_count" not in spmd_state:
-            raise RuntimeError(
-                f"load_state_from_disk: 'completed_step_count' missing from spmd_state "
-                f"for spmd_id={self.spmd_id} rank={self.rank}. "
-                f"The manifest may be corrupt or was produced by an incompatible version."
-            )
-        if "checkpoint_root" not in spmd_state:
-            raise RuntimeError(
-                f"load_state_from_disk: 'checkpoint_root' missing from spmd_state "
-                f"for spmd_id={self.spmd_id} rank={self.rank}"
-            )
-        context = self._checkpoint_context(spmd_state["checkpoint_root"], step)
-        restored_source_steps: list[tuple[str, int]] = []
-        for op_name, count in spmd_state["completed_step_count"].items():
-            if not isinstance(count, int) or count < 0:
-                raise ValueError(
-                    f"Checkpoint completed step for {op_name!r} must be a non-negative int, "
-                    f"got {count!r}"
-                )
-            self._completed_step_count[op_name] = count
-            # The scheduler's next admissible step is part of the same
-            # checkpoint watermark.  Leaving it at the constructor default
-            # makes a restored source step look like a future task forever.
-            self._scheduled_step_count[op_name] = count
-            if self.op_manager.is_source_operator(op_name):
-                max_steps = self.config.max_steps
-                if max_steps is None or count < max_steps:
-                    restored_source_steps.append((op_name, count))
-
-        shared_operator_states = spmd_state.get("operator_states")
-        if rank_storage is None:
-            if shared_operator_states:
-                await self._restore_operator_state(shared_operator_states, context)
-                logger.debug(
-                    "State loaded from shared operator metadata spmd_id=%s rank=%s",
-                    self.spmd_id,
-                    self.rank,
-                )
-                self._trigger_restored_source_steps(restored_source_steps)
-                return
-            logger.debug(
-                "No on-disk or shared operator state for spmd_id=%s rank=%s",
-                self.spmd_id,
-                self.rank,
-            )
-            self._trigger_restored_source_steps(restored_source_steps)
-            return
-
-        restore_layout: dict[str, Any] = {
-            "completed_step_count": self._completed_step_count,
+    ) -> tuple[dict[str, Any], Mapping[str, WorkerSaveResult]]:
+        await self._drain_outbound_tasks()
+        coordinator = self._require_checkpoint_coordinator()
+        records = await coordinator.save()
+        runtime_state = {
+            "completed_step_count": dict(self._completed_step_count),
         }
-        if "orbax_final_path" in rank_storage:
-            restore_layout["operator_states"] = self._call_operator_restore_layout(
-                context
-            )
-        elif shared_operator_states:
-            restore_layout["operator_states"] = shared_operator_states
-        if self._profiler_runtime.enabled:
-            recorder = self._profiler_runtime.recorder
-            async with recorder.worker_checkpoint_load(
-                operator_count=len(restore_layout.get("operator_states", {})),
-                has_rank_storage=True,
-            ):
-                state = await self._get_checkpoint_backend().load(
-                    rank_storage,
-                    restore_layout=restore_layout,
-                )
-        else:
-            state = await self._get_checkpoint_backend().load(
-                rank_storage,
-                restore_layout=restore_layout,
-            )
+        return runtime_state, records
 
-        operator_states = state.get("operator_states", shared_operator_states)
-        if operator_states:
-            await self._restore_operator_state(operator_states, context)
-        logger.debug(
-            "State loaded from disk spmd_id=%s rank=%s", self.spmd_id, self.rank
+    async def checkpoint_finalize(self) -> None:
+        await self._drain_outbound_tasks()
+        await self._require_checkpoint_coordinator().finish_save()
+
+    async def checkpoint_commit(
+        self,
+        gathered_records: Mapping[str, Mapping[int, WorkerSaveResult]],
+    ) -> Mapping[str, ComponentCheckpoint]:
+        await self._drain_outbound_tasks()
+        return await self._require_checkpoint_coordinator().commit_save(
+            gathered_records
+        )
+
+    async def checkpoint_abort(self) -> None:
+        await self._drain_outbound_tasks()
+        await self._require_checkpoint_coordinator().rollback_active()
+
+    async def checkpoint_mark_published(self) -> None:
+        await self._require_checkpoint_coordinator().mark_available()
+
+    async def checkpoint_restore(
+        self,
+        repository_root: str,
+        checkpoint_id: str,
+        cut: CheckpointCut,
+        source_topology: TopologySnapshot,
+        current_topology: TopologySnapshot,
+        runtime_state: Mapping[str, Any],
+        publications: Mapping[str, ComponentCheckpoint],
+    ) -> None:
+        await self._drain_outbound_tasks()
+        restored_source_steps = self._restore_checkpoint_runtime_state(runtime_state)
+        coordinator = self._get_checkpoint_coordinator(repository_root)
+        await coordinator.restore(
+            checkpoint_id,
+            cut,
+            publications,
+            source_topology,
+            current_topology,
         )
         self._trigger_restored_source_steps(restored_source_steps)
+
+    def _restore_checkpoint_runtime_state(
+        self, runtime_state: Mapping[str, Any]
+    ) -> list[tuple[str, int]]:
+        completed = runtime_state.get("completed_step_count")
+        if not isinstance(completed, Mapping):
+            raise ValueError("checkpoint runtime state is missing completed_step_count")
+        expected = set(self._completed_step_count)
+        if set(completed) != expected:
+            raise ValueError(
+                "checkpoint runtime operator IDs do not match current SPMD: "
+                f"expected={sorted(expected)} actual={sorted(completed)}"
+            )
+        restored_source_steps: list[tuple[str, int]] = []
+        for op_name, count in completed.items():
+            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                raise ValueError(
+                    f"checkpoint completed step for {op_name!r} must be a "
+                    f"non-negative integer, got {count!r}"
+                )
+            self._completed_step_count[op_name] = count
+            self._scheduled_step_count[op_name] = count
+            if self.op_manager.is_source_operator(op_name):
+                maximum = self.config.max_steps
+                if maximum is None or count < maximum:
+                    restored_source_steps.append((op_name, count))
+        return restored_source_steps
 
     def _trigger_restored_source_steps(
         self, restored_source_steps: list[tuple[str, int]]
@@ -6726,78 +6586,57 @@ class SPMDWorker:
             )
             self._spawn_background_task(self._enqueue(op_name, count))
 
-    async def _collect_operator_save_state(
-        self, context: CheckpointContext
-    ) -> dict[str, Any]:
-        return self._call_operator_save_state(context)
-
-    async def _restore_operator_state(
-        self, operator_states: dict[str, Any], context: CheckpointContext
-    ) -> None:
-        self._call_operator_restore_state(operator_states, context)
-
-    def _call_operator_save_state(self, context: CheckpointContext) -> dict[str, Any]:
-        """Call save_state() on each operator instance and collect results."""
-        states: dict[str, Any] = {}
-        for op_name in self._operator_instances():
-            state = self._call_single_operator_save_state(op_name, context)
-            if state is not None:
-                states[op_name] = state
-        return states
-
-    def _call_single_operator_save_state(
-        self, op_name: str, context: CheckpointContext
-    ) -> Any:
-        instance = self._operator_instance(op_name)
-        if instance is None:
-            return None
-        return save_participant_state(instance, context)
-
-    def _call_operator_restore_layout(
-        self, context: CheckpointContext
-    ) -> dict[str, Any]:
-        states: dict[str, Any] = {}
-        for op_name, instance in self._operator_instances().items():
-            target_fn = getattr(instance, "checkpoint_restore_layout", None)
-            if callable(target_fn):
-                states[op_name] = target_fn(context)
-        if not states:
-            raise RuntimeError(
-                f"Global checkpoint restore requires at least one operator to "
-                f"implement checkpoint_restore_layout() spmd_id={self.spmd_id} "
-                f"rank={self.rank}"
-            )
-        return states
-
-    def _call_operator_restore_state(
-        self, operator_states: dict[str, Any], context: CheckpointContext
-    ) -> None:
-        """Call restore_state() on each operator instance with its persisted state."""
-        for op_name, op_state in operator_states.items():
-            self._call_single_operator_restore_state(op_name, op_state, context)
-
-    def _call_single_operator_restore_state(
-        self, op_name: str, op_state: Any, context: CheckpointContext
-    ) -> None:
-        instance = self._operator_instance(op_name)
-        if instance is None:
-            raise RuntimeError(
-                f"Operator {op_name} has no stateful owner during restore "
-                f"spmd_id={self.spmd_id} rank={self.rank}"
-            )
-        restore_participant_state(instance, op_state, context)
-
-    def _checkpoint_context(
-        self,
-        root_dir: str,
-        step: int,
-    ) -> CheckpointContext:
-        return CheckpointContext(
-            root_dir=root_dir,
-            step=step,
+    def _get_checkpoint_coordinator(
+        self, repository_root: str
+    ) -> WorkerCheckpointCoordinator:
+        coordinator = self._checkpoint_coordinator
+        if coordinator is not None:
+            if self._checkpoint_repository_root != repository_root:
+                raise ValueError(
+                    "worker checkpoint repository root changed during its lifetime: "
+                    f"current={self._checkpoint_repository_root!r} "
+                    f"requested={repository_root!r}"
+                )
+            return coordinator
+        checkpoint_components = tuple(self.config.checkpoint_components)
+        operator_instance: Any = None
+        if checkpoint_components:
+            modules = tuple(self._operator_instances().values())
+            if len(modules) != 1:
+                raise RuntimeError(
+                    "checkpoint backends require exactly one SPMD owner instance, "
+                    f"got {len(modules)} for spmd_id={self.spmd_id!r}"
+                )
+            operator_instance = modules[0]
+        coordinator = WorkerCheckpointCoordinator(
+            backends=checkpoint_components,
+            operator_instance=operator_instance,
+            repository_root=repository_root,
             spmd_id=self.spmd_id,
             rank=self.rank,
+            source_topology=self._checkpoint_topology(),
+        )
+        self._checkpoint_coordinator = coordinator
+        self._checkpoint_repository_root = repository_root
+        return coordinator
+
+    def _require_checkpoint_coordinator(self) -> WorkerCheckpointCoordinator:
+        coordinator = self._checkpoint_coordinator
+        if coordinator is None:
+            raise RuntimeError("worker checkpoint transaction is not prepared")
+        return coordinator
+
+    def _checkpoint_topology(self) -> TopologySnapshot:
+        mesh = self._graph_view.mesh
+        if mesh is None:
+            raise RuntimeError(
+                f"checkpoint requires a device mesh for spmd_id={self.spmd_id!r}"
+            )
+        return TopologySnapshot(
             world_size=self._world_size,
+            mesh_axis_names=tuple(mesh.axis_names),
+            mesh_axis_shapes=tuple(mesh.shape),
+            partition_scheme_version="fluxway-device-mesh-v1",
         )
 
     async def inspect_operator_state(self) -> dict[str, Any]:
@@ -6849,7 +6688,7 @@ class SPMDWorker:
             "completed_step_count": dict(self._completed_step_count),
             "operators": snapshots,
             "runtime": {
-                "drain_target_count": self._drain_target_count,
+                "drain_step_count": self._drain_step_count,
                 "scheduled_step_count": dict(self._scheduled_step_count),
                 "barriers_declared": [
                     [op_name, step] for op_name, step in sorted(self._barriers_declared)
@@ -6949,27 +6788,27 @@ class SPMDWorker:
     # Drain Control (called by Driver before drain_to_step_count)
     # =========================================================================
 
-    async def set_drain_target_count(self, target_count: int) -> None:
+    async def set_drain_step_count(self, step_count: int) -> None:
         """
-        Request worker to self-block once 'target_count' steps are finished.
+        Request worker to self-block once 'step_count' steps are finished.
         """
         async with self._drain_cond:
-            self._drain_target_count = target_count
+            self._drain_step_count = step_count
             self._drain_cond.notify_all()
             logger.debug(
-                f"Drain target set to {target_count} spmd_id={self.spmd_id} rank={self.rank}"
+                f"Drain target set to {step_count} spmd_id={self.spmd_id} rank={self.rank}"
             )
         await self._input_prepare_runtime.cancel_matching(
             lambda op_name, step: (
-                step >= target_count
+                step >= step_count
                 and step not in self._running_plan_steps.get(op_name, set())
             )
         )
 
-    async def clear_drain_target_count(self) -> None:
+    async def clear_drain_step_count(self) -> None:
         """Remove the drain target and let deferred executions proceed."""
         async with self._drain_cond:
-            self._drain_target_count = None
+            self._drain_step_count = None
             self._drain_cond.notify_all()
             logger.debug(
                 f"Drain target cleared spmd_id={self.spmd_id} rank={self.rank}"

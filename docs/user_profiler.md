@@ -106,11 +106,11 @@ name. When the compiled `OperatorSpec` contains `input_param_map` or
 `output_param_map`, Perfetto also shows those Python parameter-to-field paths.
 An empty parameter map is displayed as no parameter-path annotation; Fluxway
 does not guess parameter names from ports. Events carrying `transfer_code` show
-the complete source and target operator, function, and port. `logical_tuuid`
+the complete source and artifact operator, function, and port. `logical_tuuid`
 identifies the producer output.
 
-One producer output may feed several target ports. Those events share one
-`logical_tuuid` but have different `transfer_code` values, so each target port
+One producer output may feed several artifact ports. Those events share one
+`logical_tuuid` but have different `transfer_code` values, so each artifact port
 is displayed independently instead of being overwritten by a single tensor
 name map.
 

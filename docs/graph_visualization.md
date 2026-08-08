@@ -78,18 +78,18 @@ Searchable correlation fields include:
 
 Model Explorer may remove a namespace containing only one operator from the
 overview. Fluxway therefore also places SPMD metadata on every operator. Enable
-Model Explorer's `Keep layers with a single op node child` setting when each
+Model Explorer's `Retention layers with a single op node child` setting when each
 SPMD must remain visible as a layer.
 
 ## Dependency And Transfer
 
-A dependency means that a target operator cannot begin the corresponding step
+A dependency means that a artifact operator cannot begin the corresponding step
 until the source operator has satisfied that dependency. A transfer means that
 a tensor also moves along the dependency.
 
 ```text
-dependency: source operator -> target operator
-transfers:  zero or more source port -> target port -> TUUID mappings
+dependency: source operator -> artifact operator
+transfers:  zero or more source port -> artifact port -> TUUID mappings
 ```
 
 Zero transfers is valid. It is an ordering-only dependency and is implemented
@@ -99,8 +99,8 @@ is visible in the same Model Explorer graph as tensor transfers.
 
 The `Dependencies` view contains exactly one native edge per compiled
 dependency. When one dependency carries multiple tensors, the source and
-target metadata contain a structured `transfers` list with every transfer code,
-logical TUUID, source port, and target port. It has no overlays.
+artifact metadata contain a structured `transfers` list with every transfer code,
+logical TUUID, source port, and artifact port. It has no overlays.
 
 The `Potential overlap` view contains one thin, unlabeled native layout edge
 for each same-step causal operator pair. These edges use Model Explorer's
@@ -173,10 +173,10 @@ Fluxway computes overlap groups without recursively traversing Python objects:
 3. Compute the longest dependency rank on the resulting acyclic graph.
 4. Put operators with the same rank into the same outer namespace.
 5. Put schedule lanes inside each rank, following `lane_order` where present.
-6. Keep each SPMD as the innermost namespace.
+6. Retention each SPMD as the innermost namespace.
 
 Every same-step causal relation between different components increases the
-target rank. Cross-step phase relations are visible as teal overlays but do not
+artifact rank. Cross-step phase relations are visible as teal overlays but do not
 increase same-step rank. Operators in one rank are shown as a group rather than
 being connected pairwise; pairwise overlap lines would grow quadratically.
 Members of one group may become ready concurrently, but the view does not claim

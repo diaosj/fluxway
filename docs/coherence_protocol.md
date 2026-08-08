@@ -46,7 +46,7 @@ frames; homogeneous coherence frames use it as their common epoch. No mutable se
 counter, global directory, sibling holder list or cross-level broadcast exists.
 
 For each logical tensor, child slots are assigned by sorting its finite set of
-`(target_spmd_id, target_rank)` endpoints. The mapping is bijective and projections never
+`(artifact_spmd_id, artifact_rank)` endpoints. The mapping is bijective and projections never
 renumber an existing slot.
 
 ## Extended State And Invariants
@@ -165,7 +165,7 @@ coherence protocol uses the existing 4-bit entry action field:
 
 Tensor transfer frames contain only BusRd. Coherence frames contain no payload and are
 handled before mailbox deposit. All entries in one coherence frame have one action and epoch;
-the sender groups them by `(target endpoint, action, epoch)`. Different targets are submitted
+the sender groups them by `(artifact endpoint, action, epoch)`. Different artifacts are submitted
 concurrently. Header-only remote actions reuse the Ray/Axon data-plane handler and never affect
 mailbox arrival counts.
 

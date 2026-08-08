@@ -72,7 +72,7 @@ directory key。
 coherence action code：`0=NONE`、`1=BUS_RD`、`2=RFO`、`4=SNOOP_INVALIDATE`、
 `5=GRANT_RETURN`、`7=OWNERSHIP_GRANT`、`8=OWNERSHIP_CANCEL`。code 3、6、9-15
 为 reserved，validator 直接抛异常。一个 coherence frame 内所有 entry 必须具有相同 action
-和 epoch，且 epoch 等于 `FRAME_STEP`；sender 按 `(target, action, epoch)` 聚合 route codes。
+和 epoch，且 epoch 等于 `FRAME_STEP`；sender 按 `(artifact, action, epoch)` 聚合 route codes。
 
 ### Coherence Identity And Child Slots
 
@@ -88,7 +88,7 @@ S = (owner_spmd_code, owner_rank, logical_tuuid)
 对逻辑 tensor `t`，令它的 direct-child endpoint 集合为：
 
 ```text
-E_t = {(target_spmd_id, target_rank)}
+E_t = {(artifact_spmd_id, artifact_rank)}
 ```
 
 按 endpoint 字典序排列后，child slot 定义为：
@@ -142,10 +142,10 @@ fenced only by drain/checkpoint/export/stop.
 | Call runtime | `WorkerProcessCallRuntime` | asynchronously submit ordinary Python callables away from the actor event loop |
 | Delivery runtime | `OutboundDeliveryRuntime` | own `LocalSendToken`, delivery tasks, semaphore, poison, delivery fence |
 | Assembly | `CompiledAssemblePlan` | cache worker-local input topology and static assemble metadata |
-| Transport | `TransportFrameTemplate`, `TransportBatchPlan` | own frame schema/template, routing batch plan, target grouping |
+| Transport | `TransportFrameTemplate`, `TransportBatchPlan` | own frame schema/template, routing batch plan, artifact grouping |
 | Data-plane executor | `DataPlaneBackendExecutor` | consume compiled send plan and transport batches, call remote or local backend |
 
-The worker must not duplicate transport target grouping or frame construction.
+The worker must not duplicate transport artifact grouping or frame construction.
 The data-plane executor must not duplicate sharding/split logic. Remote edges,
 local-only self edges, normal send, and empty propagation use the same compiled
 send plan and transport frame builder path.
@@ -155,7 +155,7 @@ send plan and transport frame builder path.
 `select_routing_source()` is the only selector used by sender batching and
 transport planning. It distinguishes source-layout, routing-index,
 origin-index, tensor-value, and receipt routing. A routing batch may reuse one
-sort/count plan only when its source and target layouts, routing-source
+sort/count plan only when its source and artifact layouts, routing-source
 identity, routing kind, and routing entity count are equal. Two tensors that
 eventually reach the same set of ranks still use separate plans when their
 per-entity destination assignments differ.
@@ -164,14 +164,14 @@ Receipt tags lower directly to `DestinationAssignment`; receipt routing does
 not own a second sorting or ragged-slicing algorithm. Scalar receipts produce
 an O(1) constant-rank plan. Vector receipts use stable rank grouping and the
 same multi-payload ragged projection as algebraic routing. A tag equal to the
-target rank count is a routing sentinel for a payload slot with no destination;
+artifact rank count is a routing sentinel for a payload slot with no destination;
 it is not an empty tensor and not an execution-error marker.
 
 The receipt rank domain is the original sender domain carried by
 `SymmetryReceipt`, not the mesh size of the operator that most recently passed
 the reference tensor through. A reference received from a two-rank sparse SPMD
 can therefore cross a four-rank dense SPMD and route gradients back to the same
-two sparse ranks. Compilation fixes the expected domain to the gradient target
+two sparse ranks. Compilation fixes the expected domain to the gradient artifact
 mesh; the sender validates the runtime receipt against it before distribution.
 
 ## AsyncPolicy Quickstart
@@ -274,7 +274,7 @@ h_core = dense.train_core(
 ```
 
 `local=True` lowers to `Edge.local_only=True`. The builder accepts it only when
-`source_node == target_node`; cross-node local-only edges raise immediately.
+`source_node == artifact_node`; cross-node local-only edges raise immediately.
 The scheduler skips local-only edges when establishing global SPMD topology, so
 drivers do not wait for self-loop Ray/Axon handlers.
 
@@ -284,11 +284,11 @@ the same `TransportTensor` reference into a direct-local slot. Other local-only 
 edges call `WorkerMailbox.deposit_local_tensor(...)` directly. Both paths preserve
 logical TUUID (Tensor Universally Unique Identifier), exact step, route validation,
 coherence grants, duplicate rejection and readiness barriers. If the compiled route
-targets any rank other than the sender rank, Fluxway raises instead of falling back to
+artifacts any rank other than the sender rank, Fluxway raises instead of falling back to
 remote transport.
 
 The direct-local slot is enabled only when every expected transfer has one shard, all
-routes target the same worker/rank, assemble geometry is static, and the operator has no
+routes artifact the same worker/rank, assemble geometry is static, and the operator has no
 control arguments, ordering counts or dependency decisions. Otherwise Fluxway uses the
 local mailbox path; it does not silently switch to remote transport.
 
@@ -371,7 +371,7 @@ referential-sharding closure once; Worker initialization does not build another
 TUUID registry or repeat the graph traversal.
 
 Each tensor route carries a `TransportRoutingMode`. `ALGEBRAIC` uses the
-effective source and target layouts. `RECEIPT` uses the same effective geometry
+effective source and artifact layouts. `RECEIPT` uses the same effective geometry
 but selects the inherited `SymmetryReceipt` as the routing fact. A referential
 `PhysicalLayout` is rejected by transport, so geometry and mirror semantics
 cannot be inferred from the same object.
@@ -399,15 +399,15 @@ exactly one `FrameFlag` category:
   codes.
 
 A condition callable is only one source of a dependency decision. Every source
-rank evaluates it once per dependency and step. The target waits for the
+rank evaluates it once per dependency and step. The artifact waits for the
 declared source count and rejects mixed decisions. `SKIP` satisfies that
-dependency without manufacturing a tensor, but the target still waits for its
+dependency without manufacturing a tensor, but the artifact still waits for its
 other causal dependencies. A skipped operator registers the same asynchronous
 send task as a successful operator and propagates `SKIP` across every downstream
 dependency, including dependencies without tensor transfer. A conditional
 dependency without tensor transfer emits one dependency decision instead of an
 ordering completion; `PROCEED` completes that dependency and `SKIP` marks the
-target step skipped. A condition may return an exact `bool` directly or an
+artifact step skipped. A condition may return an exact `bool` directly or an
 awaitable that resolves to an exact `bool`. Graph execution uses the async
 evaluator ABI; a graph step with no condition bypasses coroutine creation, and a
 future eager adapter reuses the same plan interface.
@@ -415,7 +415,7 @@ Every tensor-transfer entry has one `TensorEntryKind`:
 
 - `TensorEntryKind.TENSOR` carries a tensor; a zero-element tensor is still a
   tensor.
-- `TensorEntryKind.ROUTING_MISS` means the sender has a tensor but this target
+- `TensorEntryKind.ROUTING_MISS` means the sender has a tensor but this artifact
   rank receives no shard.
 - `TensorEntryKind.COMPLETED_WITHOUT_TENSOR` means the upstream step completed
   successfully without producing a tensor.
@@ -455,7 +455,7 @@ The backend adapter is responsible for invoking the physical endpoint. Ray uses
 actor `.remote(...)`, and Axon invokes its native endpoint. Local-only tensor delivery
 uses the direct-local or local-mailbox carriers described above. The transport/data-plane
 layer decides
-batch contents by successor context and target rank; it does not merge frames
+batch contents by successor context and artifact rank; it does not merge frames
 across different concrete endpoints.
 
 Every payload segment is a tensor implementing both `__dlpack__()` and
@@ -481,7 +481,7 @@ finished.
 ## Failure Channel
 
 `ExecutionFailure` is the only runtime failure fact. The first failure wins and
-keeps its SPMD, rank, operator, step, phase, exception type, message, and Python
+retentions its SPMD, rank, operator, step, phase, exception type, message, and Python
 traceback. User CALL, SEND registration, background delivery, and scheduler
 exceptions all enter the same Worker latch.
 
@@ -493,8 +493,8 @@ driver-heartbeat timeout create the same structured type with their respective
 phases.
 
 The Controller stops all SPMDs concurrently after the first Driver failure.
-`wait_for_completion()` returns `True` after successful cleanup, raises
-`ExecutionFailedError` with the collected failures after failed cleanup, and
+`wait_for_completion()` returns `True` after successful reclaim, raises
+`ExecutionFailedError` with the collected failures after failed reclaim, and
 raises the built-in `TimeoutError` if its caller-supplied timeout expires.
 
 An exception is never represented by a tensor entry. Consequently the graph
@@ -521,7 +521,7 @@ Use these spans to verify nonblocking overlap:
 
 `send_output` and `await_send` correlate by
 `(source_spmd_code, source_rank, op_id, step)`. Batch spans add
-`target_spmd_id`, `target_rank`, and `batch_seq`.
+`artifact_spmd_id`, `artifact_rank`, and `batch_seq`.
 `user_callable.execute` includes `graph_id`, `spmd_id`, `op_id`,
 `function_id`, `step`, `input_signature_id`, `output_signature_id`, and
 `execution_mode`. The static identifiers come directly from the compiled

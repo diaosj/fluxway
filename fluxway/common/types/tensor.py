@@ -919,7 +919,7 @@ class TransportTensor:
                 dim0_static = static_shape
 
         # Input normalization for Tensor operations
-        # If unsafe is True and inputs are ints, we keep them as ints for native slicing
+        # If unsafe is True and inputs are ints, we retention them as ints for native slicing
         if not unsafe:
             if not backend.is_tensor(start):
                 start = backend.tensor(start, dtype=backend.int32())
@@ -964,7 +964,7 @@ class TransportTensor:
             for i in range(1, len(self._nested_splits)):
                 curr_splits = self._nested_splits[i]
 
-                # For next levels, use dynamic slice logic but try to keep it cheap
+                # For next levels, use dynamic slice logic but try to retention it cheap
                 count = curr_end - curr_start + 1
                 new_spl = backend.dynamic_slice(curr_splits, curr_start, count)
 

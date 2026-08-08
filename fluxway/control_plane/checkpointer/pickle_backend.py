@@ -1,63 +1,72 @@
-"""Per-worker pickle backend for user-defined Python checkpoint state."""
+"""Trusted Python state persisted by a backend-owned filesystem checkpoint_object."""
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 from ray import cloudpickle
 
-from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
+from fluxway.common.types.checkpoint import (
+    CheckpointObjectRecord,
+    SaveSession,
+    RestoreSession,
+    RestoreTopologyMode,
+    KeepPolicy,
+)
+from fluxway.control_plane.checkpointer._filesystem_backend import (
+    FilesystemCheckpointComponent,
+)
 
 
-class PickleBackend(WorkerCheckpointBackend, backend_name="pickle"):
-    """Persist arbitrary user state inside a worker-owned checkpoint artifact.
-
-    Pickle is deliberately limited to rank-local operator state. Controller
-    manifests remain strict pure metadata and never contain this payload.
-    Restoring a checkpoint executes its pickle by design, so checkpoints must
-    come from a trusted owner.
-    """
-
-    def __init__(self, force_write: bool = False):
-        self._force_write = force_write
-
-    async def save(
+class PickleCheckpointComponent(FilesystemCheckpointComponent):
+    def __init__(
         self,
-        state: dict[str, Any],
-        ckpt_dir: str,
-        spmd_id: str,
-        rank: int,
-        step: int,
-    ) -> dict[str, Any]:
-        path = Path(ckpt_dir) / str(step) / spmd_id / f"worker_{rank}" / "state.pkl"
-        if path.exists() and not self._force_write:
-            raise FileExistsError(f"Checkpoint file already exists: {path}")
+        component_id: str,
+        capture_state,
+        restore_state,
+        *,
+        keep: KeepPolicy = KeepPolicy(),
+    ) -> None:
+        super().__init__(
+            component_id,
+            capture_state,
+            restore_state,
+            keep=keep,
+            restore_topology=RestoreTopologyMode.EXACT_TOPOLOGY,
+        )
+
+    async def _write_state(
+        self, state: Any, directory: Path, context: SaveSession
+    ) -> Mapping[str, Any]:
+        path = directory / "state.pkl"
 
         def write() -> None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = path.with_suffix(".pkl.tmp")
-            with temporary.open("wb") as stream:
+            with path.open("xb") as stream:
                 cloudpickle.dump(state, stream)
-            temporary.replace(path)
 
         await asyncio.to_thread(write)
-        return {"ckpt_dir": str(path.parent), "pickle_path": str(path)}
+        return {"file": "state.pkl"}
 
-    async def load(
-        self, metadata: dict[str, Any], restore_layout: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        path = Path(metadata["pickle_path"])
+    async def _read_state(
+        self, record: CheckpointObjectRecord, context: RestoreSession
+    ) -> Any:
+        if len(record.checkpoint_objects) != 1:
+            raise ValueError("Pickle record must contain exactly one checkpoint_object")
+        path = (
+            self._file_path(record.checkpoint_objects[0].storage_locator) / "state.pkl"
+        )
 
-        def read() -> dict[str, Any]:
+        def read() -> Any:
             with path.open("rb") as stream:
-                state = cloudpickle.load(stream)
-            if not isinstance(state, dict):
-                raise TypeError("pickle checkpoint root must be a state dictionary")
-            return state
+                return cloudpickle.load(stream)
 
         return await asyncio.to_thread(read)
 
-    def finalize(self) -> None:
+    async def _finalize_io(self, context: SaveSession) -> None:
+        return None
+
+    async def _close_resources(self) -> None:
         return None

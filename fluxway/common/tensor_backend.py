@@ -166,7 +166,7 @@ def as_native_zerocopy(x: Any) -> Any:
 
     Routing rule -- the target domain follows the **source device**, so
     the converted array stays on the same device and the rest of the
-    pipeline keeps benefitting from ``HybridBackend._lib_for``:
+    pipeline retentions benefitting from ``HybridBackend._lib_for``:
 
     +----------------------+--------------------+--------------------+
     | Source               | CPU device         | CUDA/ROCM device   |
@@ -1037,7 +1037,7 @@ class JaxBackend(TensorBackend):
 
     def requires_static_shapes(self) -> bool:
         # JaxBackend always traces through ``jax.jit``; capacity
-        # bucketing is required to keep recompilation rate bounded.
+        # bucketing is required to retention recompilation rate bounded.
         return True
 
     def adopt(self, x: Any) -> Any:
@@ -1712,9 +1712,9 @@ class HybridBackend(TensorBackend):
         *multiple* arguments and only inspect the first.  If ``adopt``
         followed the source device, a CUDA-resident jax.Array would be
         normalized to cupy while ``backend.zeros()`` (driven by
-        ``_default_device``) keeps producing numpy, causing inevitable
+        ``_default_device``) retentions producing numpy, causing inevitable
         cross-device argument mixes (cupy condition + numpy branches).
-        Forcing the *target* domain to ``_default_device`` keeps the
+        Forcing the *target* domain to ``_default_device`` retentions the
         eager pipeline strictly single-domain.
 
         Zero-copy paths:

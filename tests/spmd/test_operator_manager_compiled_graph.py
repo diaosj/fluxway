@@ -299,7 +299,7 @@ def test_operator_manager_consumes_compiled_referential_sharding_closure():
     assert target.resolve_tensor_producers("consume", transfer_code, 0) == [0, 1]
 
 
-def test_referential_transfer_barrier_keeps_all_source_participants():
+def test_referential_transfer_barrier_retentions_all_source_participants():
     replicated = ShardingSpec.chunk(PartitionSpec())
     plan, _ = _cross_spmd_referential_plan(replicated)
 

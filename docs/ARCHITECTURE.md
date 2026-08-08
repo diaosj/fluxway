@@ -106,9 +106,9 @@ worker route、Model Explorer projection 和 profiler identity 都从 compiled g
 派生，不允许反向重建或双写。condition callable 作为原生 Python 对象由 Ray
 传输，不转换为字符串 ID。
 
-`CompiledTensorTransfer.source_sharding/target_sharding` 保留用户声明的
+`CompiledTensorTransfer.source_sharding/checkpoint_object_sharding` 保留用户声明的
 mirror/follow 关系。GraphCompiler 沿完整端口引用图求闭包后，producer 侧非引用执行
-几何只保存在 canonical `CompiledLogicalTensor.effective_sharding`，target port 侧只保存在
+几何只保存在 canonical `CompiledLogicalTensor.effective_sharding`，checkpoint_object port 侧只保存在
 `CompiledOperator.effective_input_sharding`；transfer 不复制这两项。TUUID 只承担 logical
 tensor 的 wire identity，不承担运行时 sharding 推导。编译器对引用闭包做 memoized DFS，
 循环、缺失端口和当前未实现的非 identity dimension map 都在启动前用
@@ -161,7 +161,7 @@ Driver 对应 `DriverState`），并通过 `checkpoint_state()` 与 `restore_sta
 source descriptor 只存在于 compiled `OperatorSpec`；source coordinator 由对应 Driver 构造并复用
 `DriverState`、drain 和 snapshot，不建立第二套 source lifecycle 或 barrier。
 
-全局 `ControlLedger` 只实现 opaque ordered metadata retention、等待式共享读取、durable
+全局 `ControlLedger` 只实现 opaque ordered metadata keep、等待式共享读取、durable
 checkpoint cut、sealed end 和 replay。持久 identity 只有
 `(stream_id, position)`；virtual owner 由当前 operator step 与 interleave topology 推导。
 ledger 本身不包含 virtual unit、source revision、文件 lineage 或 executor lane 语义。完整协议与 exactly-once 不变量见
@@ -234,7 +234,7 @@ transport 层拥有 routing、sharding、frame template 和 batch plan：
   transport 不再从 `PhysicalLayout` 猜测 mirror 语义。
 - `TransportFrameTemplate` 缓存可模板化的 header/table 骨架。
 - `TransportBatchPlan` 按 transport 语义把 frame groups 转成 batch。
-- data-plane executor 只消费 compiled send plan 和 transport batch，不重新实现 target grouping 或 frame construction。
+- data-plane executor 只消费 compiled send plan 和 transport batch，不重新实现 checkpoint_object grouping 或 frame construction。
 
 `TransportFrame.entry_i32` 只包含三类固定宽度 entry：tensor transfer、
 ordering completion、dependency decision。dependency decision 以
@@ -244,10 +244,10 @@ tensor transfer 的状态只有 `TensorEntryKind.TENSOR`、
 `TensorEntryKind.COMPLETED_WITHOUT_TENSOR`；合法的零元素 tensor 仍属于
 `TensorEntryKind.TENSOR`。ordering completion 与 dependency decision 不描述
 tensor，因此固定使用 `TensorEntryKind.NOT_APPLICABLE`。operator 异常不会编码成
-tensor entry。target 收齐同一 dependency 的全部
+tensor entry。checkpoint_object 收齐同一 dependency 的全部
 source rank decision 后要求一致，混合 decision 直接抛协议异常。`SKIP` 只旁路该
 dependency 的 tensor 输入，其他因果 dependency 仍须完成。condition 可以直接作用于
-没有 tensor transfer 的 dependency：`PROCEED` 完成该因果依赖，`SKIP` 跳过 target
+没有 tensor transfer 的 dependency：`PROCEED` 完成该因果依赖，`SKIP` 跳过 checkpoint_object
 step。上游 operator 被跳过时，所有下游 dependency 都传播 `SKIP`，不会把 ordering-only
 dependency 伪装成成功完成。condition 可以直接返回严格 `bool`，也可以返回最终解析为
 严格 `bool` 的 awaitable；graph 与 future eager adapter 复用同一个 async evaluator，
@@ -257,7 +257,7 @@ static-to-static 只 patch step 和 payload refs。dynamic 路径只缓存稳定
 
 Ray 和 Axon 共享 batch-first ABI。缺失 batch ABI 或非法 backend state 直接抛错。
 
-local-only edge 只允许 `source_node == target_node`。scheduler 建立全局 SPMD
+local-only edge 只允许 `source_node == checkpoint_object_node`。scheduler 建立全局 SPMD
 topology 时跳过这类边，因此同 rank 内部 operator 不等待 self-loop remote
 handler。worker 发送边界仍校验编译后目标 rank 必须等于 sender rank；不满足时直接
 抛错，不做 remote fallback。
@@ -298,10 +298,12 @@ frame、mailbox polling 或逐 tensor 分支；future eager 复用同一控制�
 
 checkpoint、heartbeat、driver report 只读取 contiguous committed watermark。
 
-checkpoint artifact 使用嵌套 transaction：Worker 负责本地 participant rollback，Driver 负责
-rank save rollback，Controller-side checkpointer 负责所有 SPMD artifact 与 payload 的全局
-prepare/commit/abort。payload 原子发布后才 finalize control-plane durable cut；abort 失败与原始
-失败通过异常组同时保留。terminal checkpoint 恢复后复用现有 drain completion，不增加 source gate。
+checkpoint checkpoint_object 使用一套 `CheckpointComponentRegistration` transaction：Worker coordinator 负责 backend
+的 `prepare/capture/finalize/commit/abort/restore/close` 调度，Driver 只聚合
+`WorkerSaveResult` 与 `ComponentCheckpoint`，Controller-side checkpointer 负责 cut、Manifest、
+reference 和 publication ordering。backend 独占物理 storage_locator、版本、lease 与 cleanup；Manifest 对 storage_locator
+保持 opaque。`finalize` 成功前禁止 commit 和 Manifest publish；publish 前失败执行 abort，已发布版本
+的保留策略执行 cleanup。terminal checkpoint 恢复后复用现有 drain completion，不增加 source gate。
 
 ## Profiler Semantics
 
@@ -320,7 +322,7 @@ local-step span 和 data-plane span 分层显示：
 - `data_plane.receiver_wait`
 - `data_plane.delivery_fence`
 
-`send_output` 与 `await_send` 用 `(source_spmd_code, source_rank, op_id, step)` 关联；batch 级分析再加 `target_spmd_id`, `target_rank`, `batch_seq`。
+`send_output` 与 `await_send` 用 `(source_spmd_code, source_rank, op_id, step)` 关联；batch 级分析再加 `checkpoint_object_spmd_id`, `checkpoint_object_rank`, `batch_seq`。
 `user_callable.execute` 记录 callable/function/operator 名称、`ctx.step`、输入 tensor/control/static 名称和 lane，字段以 interned id 写入 trace metadata。
 
 用户函数内部的细分插桩使用 `fw.profiler.scope(name, **attrs)` 和

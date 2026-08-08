@@ -94,7 +94,7 @@ def _make_pipeline_stub_with_profiler(
         _in_op_step_queue=set(),
         _execution_queue=asyncio.PriorityQueue(),
         _running=True,
-        _drain_target_count=None,
+        _drain_step_count=None,
         _drain_cond=asyncio.Condition(),
         _mailbox=MagicMock(),
         _failure=None,
@@ -248,8 +248,8 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._release_phase_order_steps,
         stub,
     )
-    stub.set_drain_target_count = types.MethodType(
-        raw_cls.set_drain_target_count,
+    stub.set_drain_step_count = types.MethodType(
+        raw_cls.set_drain_step_count,
         stub,
     )
     stub._advance_step = types.MethodType(raw_cls._advance_step, stub)
@@ -313,7 +313,7 @@ async def test_input_prepare_threads_use_stable_schedule_priority():
 
 
 @pytest.mark.asyncio
-async def test_input_prepare_threads_keep_fifo_for_equal_schedule_keys():
+async def test_input_prepare_threads_retention_fifo_for_equal_schedule_keys():
     started = []
     release = threading.Event()
     runtime = LocalInputPrepareRuntime(
@@ -1000,7 +1000,7 @@ async def test_prepare_skips_step_at_active_drain_target():
     stub = _make_pipeline_stub(
         OperatorSpec(name="op", async_policy=AsyncPolicy.pipelined(depth=2))
     )
-    stub._drain_target_count = 1
+    stub._drain_step_count = 1
 
     async def prepare_input(op_name: str, step: int):
         raise AssertionError("prepare should not start while drain target blocks step")
@@ -1028,7 +1028,7 @@ async def test_setting_drain_target_cancels_speculative_prepare_past_target():
     await started.wait()
     assert ("op", 3) in stub._input_prepare_runtime._tasks
 
-    await stub.set_drain_target_count(2)
+    await stub.set_drain_step_count(2)
     assert ("op", 3) not in stub._input_prepare_runtime._tasks
 
 

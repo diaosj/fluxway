@@ -68,6 +68,9 @@ profiler = [
 visualization = [
     "ai-edge-model-explorer",
 ]
+recommendation = [
+    "sparse_embedding[pylance]>=0.1.0",
+]
 
 
 [project.urls]

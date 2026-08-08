@@ -444,7 +444,7 @@ CONTROLLER_COMPLETION = TraceEventSpec(
     ("spmd_count",),
 )
 CONTROLLER_CLEANUP = TraceEventSpec(
-    "controller.cleanup",
+    "controller.reclaim",
     "controller/lifecycle",
     ("spmd_count",),
 )
@@ -1412,7 +1412,7 @@ class TraceRecorder:
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(CONTROLLER_COMPLETION, payload=(spmd_count,))
 
-    def controller_cleanup(
+    def controller_reclaim(
         self, *, spmd_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(CONTROLLER_CLEANUP, payload=(spmd_count,))

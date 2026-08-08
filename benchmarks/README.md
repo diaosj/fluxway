@@ -1,6 +1,6 @@
 Fluxway benchmarks are executable performance probes, not pytest tests.
 
-Keep only benchmarks that exercise the public high-performance runtime shape:
+Retention only benchmarks that exercise the public high-performance runtime shape:
 
 - `ray_sparse_embedding_dataplane_granularity.py` compares Ray data-plane task
   granularity while preserving same-target bundling.

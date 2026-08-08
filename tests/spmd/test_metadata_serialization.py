@@ -152,7 +152,7 @@ print(repr(restored_fn.meta))
             )
 
         finally:
-            # Cleanup
+            # Reclaim
             if "test_module" in sys.modules:
                 del sys.modules["test_module"]
             os.unlink(module_path)

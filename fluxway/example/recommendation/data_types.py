@@ -22,7 +22,7 @@ class ActiveFeatures:
 class PassiveFeatures:
     """Candidate item features."""
 
-    target_item_id: TransportTensor
+    target_target_id: TransportTensor
     target_item_category: TransportTensor
     target_item_stats: TransportTensor
 
@@ -61,7 +61,7 @@ class InputNodeOutput:
 
     unique_user_ids: TransportTensor
     user_inv: TransportTensor
-    unique_item_ids: TransportTensor
+    unique_target_ids: TransportTensor
     item_inv: TransportTensor
     # DP-aligned features
     dp_data: DPFeatures

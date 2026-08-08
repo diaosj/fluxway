@@ -19,12 +19,15 @@ from typing import Any
 
 import ray
 from fluxway.common.types import (
+    CheckpointCaptureMode,
+    CheckpointCut,
     DriverEvent,
     DriverState,
     ExecutionFailure,
     FlowControlState,
     HeartbeatConfig,
     SPMDConfig,
+    SpmdCheckpoint,
     WorkerHeartbeat,
 )
 from fluxway.common.utils import ensure_logging_configured
@@ -67,7 +70,6 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         graph_topology: dict[str, Any],
         worker_resource: Mapping[str, Any],
         expected_node_ids: list[str],
-        checkpoint_backend: Any | None = None,
     ):
         """
         Initialize SPMD Driver.
@@ -129,14 +131,12 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             worker_bundle_indices=worker_bundle_indices,
             worker_resource=worker_resource,
             expected_node_ids=expected_node_ids,
-            checkpoint_backend=checkpoint_backend,
         )
 
         self.snapshot_orchestrator = SnapshotOrchestrator(
             spmd_id=self.spmd_id,
             executor=self.executor,
             synchronizer=self.spmd_synchronizer,
-            checkpoint_backend=checkpoint_backend,
             controller_handle=self.controller_handle,
             get_driver_state=lambda: self.state_machine.state,
             trigger_state_event=lambda e: self.state_machine.trigger(e),
@@ -345,29 +345,45 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         await self.snapshot_orchestrator.request_terminal_drain(target_count)
 
     async def request_snapshot(
-        self, snapshot_id: str, target_count: int, ckpt_dir: str
+        self,
+        snapshot_id: str,
+        attempt_id: str,
+        permit: Any,
+        cut: CheckpointCut,
+        repository_root: str,
+        capture_mode: CheckpointCaptureMode,
     ) -> None:
         await self.snapshot_orchestrator.request_snapshot(
-            snapshot_id, target_count, ckpt_dir
+            snapshot_id, attempt_id, permit, cut, repository_root, capture_mode
         )
 
     async def resume(self) -> None:
         await self.snapshot_orchestrator.resume()
 
-    async def commit_snapshot_artifacts(self, snapshot_id: str) -> None:
-        await self.snapshot_orchestrator.commit_artifacts(snapshot_id)
+    async def mark_snapshot_published(self, snapshot_id: str, permit: Any) -> None:
+        await self.snapshot_orchestrator.mark_published(snapshot_id, permit)
 
-    async def abort_snapshot_artifacts(self, snapshot_id: str) -> None:
-        await self.snapshot_orchestrator.abort_artifacts(snapshot_id)
+    async def abort_snapshot_targets(self, snapshot_id: str, permit: Any) -> None:
+        await self.snapshot_orchestrator.abort_targets(snapshot_id, permit)
 
-    async def restore_from_disk(
+    async def fail_snapshot(self, snapshot_id: str) -> None:
+        try:
+            permit = self.snapshot_orchestrator._pending_permit
+            if permit is None:
+                raise RuntimeError("failed snapshot has no commit permit")
+            await self.snapshot_orchestrator.abort_targets(snapshot_id, permit)
+        finally:
+            self.snapshot_orchestrator._clear_drain_and_fail()
+
+    async def restore_from_manifest(
         self,
-        spmd_state: dict[str, Any],
-        rank_storage: dict[int, dict[str, Any]],
-        step: int,
+        snapshot_id: str,
+        cut: CheckpointCut,
+        snapshot: SpmdCheckpoint,
+        repository_root: str,
     ) -> None:
-        await self.snapshot_orchestrator.restore_from_disk(
-            spmd_state, rank_storage, step
+        await self.snapshot_orchestrator.restore_from_manifest(
+            snapshot_id, cut, snapshot, repository_root
         )
 
     # =====================================================================

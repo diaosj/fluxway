@@ -1,10 +1,15 @@
 import asyncio
-from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from fluxway.common.types import ControllerEvent
+from fluxway.common.types import (
+    CheckpointCut,
+    ControllerEvent,
+    CheckpointManifest,
+    SpmdCheckpoint,
+    TopologySnapshot,
+)
 from fluxway.common.types import ControllerState, ExecutionFailure
 from fluxway.common.types.drain import DrainStrategy
 from fluxway.common.decorators import operator, spmd
@@ -113,7 +118,8 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
 
     await controller._checkpoint_task
 
-    controller._checkpointer.save.assert_called_with(2)
+    request = controller._checkpointer.save.await_args.args[0]
+    assert request.cut.logical_step == 2
     mock_spmd_manager.mock_driver1.resume.remote.assert_called()
     mock_spmd_manager.mock_driver2.resume.remote.assert_called()
 
@@ -228,8 +234,8 @@ async def test_zero_terminal_checkpoints_before_completion(
     controller._control_ledger = ControlLedger(4)
     controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
     controller._state_machine._state = ControllerState.RUNNING
-    controller._checkpointer.save.side_effect = lambda step: events.append(
-        ("checkpoint", step)
+    controller._checkpointer.save.side_effect = lambda request: events.append(
+        ("checkpoint", request.cut.logical_step)
     )
     controller._state_machine.trigger_event = AsyncMock(
         side_effect=lambda event: events.append(("event", event))
@@ -350,9 +356,9 @@ async def test_checkpoint_failure_enters_failed_without_resuming(controller):
 
 @pytest.mark.asyncio
 async def test_all_drivers_completed_transitions_through_completing(controller):
-    cleanup_gate = asyncio.Event()
+    reclaim_gate = asyncio.Event()
     controller._state_machine._state = ControllerState.RUNNING
-    controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller._reclaim_all_spmds = AsyncMock(side_effect=reclaim_gate.wait)
     controller.stop_checkpointer = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
 
@@ -363,7 +369,7 @@ async def test_all_drivers_completed_transitions_through_completing(controller):
     assert controller._state_machine.state == ControllerState.COMPLETING
     assert not transition_task.done()
 
-    cleanup_gate.set()
+    reclaim_gate.set()
 
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.COMPLETED
@@ -371,10 +377,10 @@ async def test_all_drivers_completed_transitions_through_completing(controller):
 
 
 @pytest.mark.asyncio
-async def test_wait_for_completion_observes_completed_after_cleanup(controller):
-    cleanup_gate = asyncio.Event()
+async def test_wait_for_completion_observes_completed_after_reclaim(controller):
+    reclaim_gate = asyncio.Event()
     controller._state_machine._state = ControllerState.RUNNING
-    controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller._reclaim_all_spmds = AsyncMock(side_effect=reclaim_gate.wait)
     controller.stop_checkpointer = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
 
@@ -387,7 +393,7 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
     assert controller._state_machine.state == ControllerState.COMPLETING
     assert not wait_task.done()
 
-    cleanup_gate.set()
+    reclaim_gate.set()
 
     assert await transition_task is True
     assert await asyncio.wait_for(wait_task, timeout=0.2) is True
@@ -397,7 +403,7 @@ async def test_wait_for_completion_observes_completed_after_cleanup(controller):
 @pytest.mark.asyncio
 async def test_shutdown_hook_failure_marks_controller_failed(controller):
     controller._state_machine._state = ControllerState.RUNNING
-    controller._cleanup_all_spmds = AsyncMock(
+    controller._reclaim_all_spmds = AsyncMock(
         side_effect=RuntimeError("metrics drain failed")
     )
     controller.stop_checkpointer = AsyncMock()
@@ -419,7 +425,7 @@ async def test_shutdown_hook_failure_marks_controller_failed(controller):
 @pytest.mark.asyncio
 async def test_driver_handle_release_failure_marks_controller_failed(controller):
     controller._state_machine._state = ControllerState.RUNNING
-    controller._cleanup_all_spmds = AsyncMock()
+    controller._reclaim_all_spmds = AsyncMock()
     controller.stop_checkpointer = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock(
         side_effect=RuntimeError("handle release failed")
@@ -488,7 +494,7 @@ async def test_controller_error_entrypoints_forward_failure(controller, method_n
 async def test_eager_stop_propagates_shutdown_failure_and_releases_handles(controller):
     controller.block_all_spmds = AsyncMock()
     controller.stop_checkpointer = AsyncMock()
-    controller._cleanup_all_spmds = AsyncMock(
+    controller._reclaim_all_spmds = AsyncMock(
         side_effect=RuntimeError("metrics drain failed")
     )
     controller._release_stopped_spmd_handles = MagicMock()
@@ -501,17 +507,17 @@ async def test_eager_stop_propagates_shutdown_failure_and_releases_handles(contr
 
 
 @pytest.mark.asyncio
-async def test_eager_stop_aggregates_cleanup_and_handle_release_failures(controller):
+async def test_eager_stop_aggregates_reclaim_and_handle_release_failures(controller):
     controller.block_all_spmds = AsyncMock()
     controller.stop_checkpointer = AsyncMock()
-    controller._cleanup_all_spmds = AsyncMock(
+    controller._reclaim_all_spmds = AsyncMock(
         side_effect=RuntimeError("metrics drain failed")
     )
     controller._release_stopped_spmd_handles = MagicMock(
         side_effect=RuntimeError("handle release failed")
     )
 
-    with pytest.raises(ExceptionGroup, match="terminal cleanup failed") as raised:
+    with pytest.raises(ExceptionGroup, match="terminal reclaim failed") as raised:
         await controller.stop(save_checkpoint=False)
 
     assert {str(error) for error in raised.value.exceptions} == {
@@ -553,7 +559,7 @@ async def test_block_all_spmds_reports_submission_and_rpc_failures(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release(
+async def test_reclaim_all_spmds_preserves_driver_handles_until_terminal_release(
     controller,
 ):
     controller._heartbeat_manager = MagicMock()
@@ -562,7 +568,7 @@ async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release
     controller._scheduler = MagicMock()
     controller._scheduler.pg_manager.get_all_spmd_ids.return_value = []
 
-    await controller._cleanup_all_spmds()
+    await controller._reclaim_all_spmds()
 
     controller._spmd_manager.stop_spmd.assert_any_call(
         "op1", save_checkpoint=False, release_driver_handle=False
@@ -575,28 +581,28 @@ async def test_cleanup_all_spmds_preserves_driver_handles_until_terminal_release
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_spmds_stops_spmds_concurrently(controller):
+async def test_reclaim_all_spmds_stops_spmds_concurrently(controller):
     both_started = asyncio.Event()
     started: set[str] = set()
-    cleanup_order: list[tuple[str, str]] = []
+    reclaim_order: list[tuple[str, str]] = []
 
     async def stop_spmd(spmd_id, **kwargs):
         started.add(spmd_id)
         if len(started) == 2:
             both_started.set()
         await asyncio.wait_for(both_started.wait(), timeout=0.1)
-        cleanup_order.append(("stop", spmd_id))
+        reclaim_order.append(("stop", spmd_id))
 
     def unregister_spmd(spmd_id):
-        assert ("stop", spmd_id) in cleanup_order
-        cleanup_order.append(("unregister", spmd_id))
+        assert ("stop", spmd_id) in reclaim_order
+        reclaim_order.append(("unregister", spmd_id))
 
     def release_resources():
-        assert {event for event in cleanup_order if event[0] == "unregister"} == {
+        assert {event for event in reclaim_order if event[0] == "unregister"} == {
             ("unregister", "op1"),
             ("unregister", "op2"),
         }
-        cleanup_order.append(("release", "job"))
+        reclaim_order.append(("release", "job"))
 
     controller._heartbeat_manager = MagicMock()
     controller._heartbeat_manager.stop_monitoring_async = AsyncMock()
@@ -606,17 +612,17 @@ async def test_cleanup_all_spmds_stops_spmds_concurrently(controller):
     controller._scheduler.pg_manager.has_job_pg = True
     controller._scheduler.release_resources.side_effect = release_resources
 
-    await controller._cleanup_all_spmds()
+    await controller._reclaim_all_spmds()
 
     assert started == {"op1", "op2"}
     assert controller._spmd_manager.stop_spmd.await_count == 2
     controller._heartbeat_manager.unregister_spmd.assert_any_call("op1")
     controller._heartbeat_manager.unregister_spmd.assert_any_call("op2")
-    assert cleanup_order[-1] == ("release", "job")
+    assert reclaim_order[-1] == ("release", "job")
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_spmds_propagates_failures_after_releasing_resources(
+async def test_reclaim_all_spmds_propagates_failures_after_releasing_resources(
     controller,
 ):
     controller._heartbeat_manager = MagicMock()
@@ -627,8 +633,8 @@ async def test_cleanup_all_spmds_propagates_failures_after_releasing_resources(
     controller._scheduler = MagicMock()
     controller._scheduler.pg_manager.has_job_pg = True
 
-    with pytest.raises(ExceptionGroup, match="SPMD cleanup failed") as raised:
-        await controller._cleanup_all_spmds()
+    with pytest.raises(ExceptionGroup, match="SPMD reclaim failed") as raised:
+        await controller._reclaim_all_spmds()
 
     assert str(raised.value.exceptions[0]) == "metrics drain failed"
     assert controller._spmd_manager.stop_spmd.await_count == 2
@@ -636,7 +642,7 @@ async def test_cleanup_all_spmds_propagates_failures_after_releasing_resources(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_all_spmds_continues_after_monitoring_failures(controller):
+async def test_reclaim_all_spmds_continues_after_monitoring_failures(controller):
     controller._heartbeat_manager = MagicMock()
     controller._heartbeat_manager.stop_monitoring_async = AsyncMock(
         side_effect=RuntimeError("monitor stop failed")
@@ -649,8 +655,8 @@ async def test_cleanup_all_spmds_continues_after_monitoring_failures(controller)
     controller._scheduler = MagicMock()
     controller._scheduler.pg_manager.has_job_pg = True
 
-    with pytest.raises(ExceptionGroup, match="SPMD cleanup failed") as raised:
-        await controller._cleanup_all_spmds()
+    with pytest.raises(ExceptionGroup, match="SPMD reclaim failed") as raised:
+        await controller._reclaim_all_spmds()
 
     assert {str(error) for error in raised.value.exceptions} == {
         "monitor stop failed",
@@ -662,9 +668,9 @@ async def test_cleanup_all_spmds_continues_after_monitoring_failures(controller)
 
 @pytest.mark.asyncio
 async def test_driver_error_transitions_through_failing(controller):
-    cleanup_gate = asyncio.Event()
+    reclaim_gate = asyncio.Event()
     controller._state_machine._state = ControllerState.RUNNING
-    controller._cleanup_all_spmds = AsyncMock(side_effect=cleanup_gate.wait)
+    controller._reclaim_all_spmds = AsyncMock(side_effect=reclaim_gate.wait)
     controller.stop_checkpointer = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
 
@@ -689,7 +695,7 @@ async def test_driver_error_transitions_through_failing(controller):
     assert controller._state_machine.state == ControllerState.FAILING
     assert not transition_task.done()
 
-    cleanup_gate.set()
+    reclaim_gate.set()
 
     assert await transition_task is True
     assert controller._state_machine.state == ControllerState.FAILED
@@ -724,24 +730,28 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
         "driver_components": {},
     }
     controller._control_ledger = ControlLedger(1)
-    manifest = {
-        "op1": {
-            "spmd_state": spmd_state,
-            "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
-        },
-        "op2": {
-            "spmd_state": spmd_state,
-            "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
-        },
-        "__fluxway_control_plane__": {
+    topology = TopologySnapshot(1, (), (), "v1")
+    manifest = CheckpointManifest(
+        schema_version=4,
+        checkpoint_id="restore_10_0",
+        attempt_id="attempt",
+        coordinator_generation=1,
+        cut=CheckpointCut.for_step("restore-cut", 0),
+        checkpoint_sequence=1,
+        references=(),
+        framework_state={
             "control_ledger": controller._control_ledger.checkpoint_state(cuts={}),
             "components": {},
             "last_checkpointed_step": 0,
         },
-    }
+        spmds={
+            spmd_id: SpmdCheckpoint(topology, spmd_state, {})
+            for spmd_id in ("op1", "op2")
+        },
+    )
 
     restore_task = asyncio.create_task(
-        controller.restore_snapshot("restore_10_0", 10, manifest)
+        controller.restore_snapshot("restore_10_0", manifest, "/tmp/repository")
     )
     await asyncio.sleep(0)
 
@@ -749,19 +759,19 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
         timeout=600
     )
     controller.block_all_spmds.assert_not_called()
-    mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_not_called()
-    mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_not_called()
+    mock_spmd_manager.mock_driver1.restore_from_manifest.remote.assert_not_called()
+    mock_spmd_manager.mock_driver2.restore_from_manifest.remote.assert_not_called()
 
     ready_gate.set()
 
     await restore_task
 
     controller.block_all_spmds.assert_awaited_once_with()
-    mock_spmd_manager.mock_driver1.restore_from_disk.remote.assert_called_once_with(
-        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}, 10
+    mock_spmd_manager.mock_driver1.restore_from_manifest.remote.assert_called_once_with(
+        "restore_10_0", manifest.cut, manifest.spmds["op1"], "/tmp/repository"
     )
-    mock_spmd_manager.mock_driver2.restore_from_disk.remote.assert_called_once_with(
-        spmd_state, {0: {"ckpt_dir": "/tmp/ckpt"}}, 10
+    mock_spmd_manager.mock_driver2.restore_from_manifest.remote.assert_called_once_with(
+        "restore_10_0", manifest.cut, manifest.spmds["op2"], "/tmp/repository"
     )
 
 
@@ -803,20 +813,27 @@ async def test_terminal_checkpoint_restore_uses_existing_completion_path(
         "static_args": {},
         "driver_components": {},
     }
-    manifest: dict[str, Any] = {
-        spmd_id: {
-            "spmd_state": spmd_state,
-            "rank_storage": {"0": {"ckpt_dir": "/tmp/ckpt"}},
-        }
-        for spmd_id in ("op1", "op2")
-    }
-    manifest["__fluxway_control_plane__"] = {
-        "control_ledger": terminal_state,
-        "components": {},
-        "last_checkpointed_step": 3,
-    }
+    topology = TopologySnapshot(1, (), (), "v1")
+    manifest = CheckpointManifest(
+        schema_version=4,
+        checkpoint_id="restore_terminal",
+        attempt_id="attempt",
+        coordinator_generation=1,
+        cut=CheckpointCut("restore-cut", 3, {"op1:read": 3}, {"op1:read": 3}, 0),
+        checkpoint_sequence=1,
+        references=(),
+        framework_state={
+            "control_ledger": terminal_state,
+            "components": {},
+            "last_checkpointed_step": 3,
+        },
+        spmds={
+            spmd_id: SpmdCheckpoint(topology, spmd_state, {})
+            for spmd_id in ("op1", "op2")
+        },
+    )
 
-    await controller.restore_snapshot("restore_terminal", 3, manifest)
+    await controller.restore_snapshot("restore_terminal", manifest, "/tmp/repository")
 
     controller.unblock_all_spmds.assert_not_awaited()
     controller._resume_and_schedule_next_drain.assert_awaited_once_with()

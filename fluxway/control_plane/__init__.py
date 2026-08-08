@@ -22,19 +22,15 @@ from .components import (
 from .ledger_client import ControlLedgerClient, ControlRecord, StreamProgress
 from .execution import start, GraphExecution
 from .checkpointer import (
-    CheckpointArtifactCommitter,
-    CheckpointArtifactPreparer,
-    CheckpointContext,
-    CheckpointMetadata,
-    CheckpointParticipant,
-    CheckpointState,
-    CheckpointMetadataProvider,
-    CheckpointRestoreLayoutProvider,
+    CheckpointComponentRegistration,
+    CheckpointComponentRegistry,
+    SaveSession,
+    CheckpointCut,
     FluxwayCheckpointer,
-    WorkerCheckpointBackend,
-    SafeTensorsBackend,
-    PickleBackend,
-    OrbaxBackend,
+    StateCheckpointComponent,
+    SafeTensorsCheckpointComponent,
+    PickleCheckpointComponent,
+    OrbaxCheckpointComponent,
 )
 
 __all__ = [
@@ -58,18 +54,14 @@ __all__ = [
     "start",
     "GraphExecution",
     "FluxwayCheckpointer",
-    "CheckpointContext",
-    "CheckpointState",
-    "CheckpointMetadata",
-    "CheckpointParticipant",
-    "CheckpointArtifactPreparer",
-    "CheckpointRestoreLayoutProvider",
-    "CheckpointMetadataProvider",
-    "CheckpointArtifactCommitter",
-    "WorkerCheckpointBackend",
-    "SafeTensorsBackend",
-    "PickleBackend",
-    "OrbaxBackend",
+    "SaveSession",
+    "CheckpointComponentRegistration",
+    "CheckpointComponentRegistry",
+    "CheckpointCut",
+    "StateCheckpointComponent",
+    "SafeTensorsCheckpointComponent",
+    "PickleCheckpointComponent",
+    "OrbaxCheckpointComponent",
 ]
 
 ensure_logging_configured()

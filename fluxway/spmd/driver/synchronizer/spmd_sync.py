@@ -127,7 +127,7 @@ class SPMDSynchronizer:
         self._expected_ops: set = set()
 
         # Drain parameters
-        self._drain_target_count: int | None = None
+        self._drain_step_count: int | None = None
         self._drain_on_drained: Callable[[], None] | None = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
 
@@ -229,12 +229,12 @@ class SPMDSynchronizer:
                 should_report = completed_count > old_spmd_count
 
             # Drain ACK: All workers have fully completed the requested number of steps.
-            # They are now idle at the START of step index == _drain_target_count.
+            # They are now idle at the START of step index == _drain_step_count.
             if (
-                self._drain_target_count is not None
+                self._drain_step_count is not None
                 and op_name not in self._drain_acked_ops
                 and self._all_workers_reached_count_internal(
-                    op_name, self._drain_target_count
+                    op_name, self._drain_step_count
                 )
             ):
                 self._drain_acked_ops.add(op_name)
@@ -321,30 +321,30 @@ class SPMDSynchronizer:
     def is_draining(self) -> bool:
         """True if a drain ceiling is active."""
         with self._lock:
-            return self._drain_target_count is not None
+            return self._drain_step_count is not None
 
     def drain_to_step_count(
-        self, target_count: int, on_drained: Callable[[], None]
+        self, step_count: int, on_drained: Callable[[], None]
     ) -> None:
         """
-        Request the SPMD to drain until every worker has COMPLETED exactly 'target_count' steps.
+        Request the SPMD to drain until every worker has COMPLETED exactly 'step_count' steps.
         """
         drain_complete = False
         with self._lock:
-            if self._drain_target_count is not None:
+            if self._drain_step_count is not None:
                 raise RuntimeError(
                     f"SPMD {self.spmd_id} is already draining to count "
-                    f"{self._drain_target_count}; call clear_drain() first"
+                    f"{self._drain_step_count}; call clear_drain() first"
                 )
-            self._drain_target_count = target_count
+            self._drain_step_count = step_count
             self._drain_on_drained = on_drained
             self._drain_acked_ops = set()
-            logger.debug(f"Drain target set to {target_count} spmd_id={self.spmd_id}")
+            logger.debug(f"Drain target set to {step_count} spmd_id={self.spmd_id}")
 
             # Instantly check if we are ALREADY drained
             known_ops = self._active_ops_for_drain()
             for op_name in known_ops:
-                if self._all_workers_reached_count_internal(op_name, target_count):
+                if self._all_workers_reached_count_internal(op_name, step_count):
                     self._drain_acked_ops.add(op_name)
 
             # Require at least one op to have been registered before declaring
@@ -359,23 +359,23 @@ class SPMDSynchronizer:
         if drain_complete:
             on_drained()
 
-    def shorten_drain_to_step_count(self, target_count: int) -> None:
+    def shorten_drain_to_step_count(self, step_count: int) -> None:
         callback = None
         with self._lock:
-            current = self._drain_target_count
+            current = self._drain_step_count
             if current is None:
                 raise RuntimeError("cannot shorten an inactive SPMD drain")
-            if target_count > current:
+            if step_count > current:
                 raise ValueError(
                     f"drain target can only shrink: current={current} "
-                    f"requested={target_count}"
+                    f"requested={step_count}"
                 )
-            self._drain_target_count = target_count
+            self._drain_step_count = step_count
             known_ops = self._active_ops_for_drain()
             self._drain_acked_ops = {
                 op_name
                 for op_name in known_ops
-                if self._all_workers_reached_count_internal(op_name, target_count)
+                if self._all_workers_reached_count_internal(op_name, step_count)
             }
             if self._drain_acked_ops >= known_ops and known_ops:
                 callback = self._drain_on_drained
@@ -386,9 +386,9 @@ class SPMDSynchronizer:
     def clear_drain(self) -> None:
         """Remove the drain target and unblock workers so training resumes."""
         with self._lock:
-            if self._drain_target_count is None:
+            if self._drain_step_count is None:
                 return
-            self._drain_target_count = None
+            self._drain_step_count = None
             self._drain_on_drained = None
             self._drain_acked_ops = set()
             logger.debug(f"Drain cleared spmd_id={self.spmd_id}")

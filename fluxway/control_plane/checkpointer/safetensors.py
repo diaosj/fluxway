@@ -7,51 +7,75 @@ Tensors are stored in a ``.safetensors`` file; non-tensor metadata
 """
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import asyncio
 import numpy as np
 
-from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
+from fluxway.common.types.checkpoint import (
+    CheckpointObjectRecord,
+    SaveSession,
+    RestoreSession,
+    RestoreTopologyMode,
+    KeepPolicy,
+)
+from fluxway.control_plane.checkpointer._filesystem_backend import (
+    FilesystemCheckpointComponent,
+)
 
 _SEP = "\x00"  # Separator for composite keys; cannot appear in field names
 
 
-class SafeTensorsBackend(WorkerCheckpointBackend, backend_name="safetensors"):
+class SafeTensorsCheckpointComponent(FilesystemCheckpointComponent):
     """safetensors tensors + JSON sidecar."""
 
-    def __init__(self, force_write: bool = False):
-        self._force_write = force_write
-
-    async def save(self, state, ckpt_dir, spmd_id, rank, step):
-        base = Path(ckpt_dir) / str(step) / spmd_id / f"worker_{rank}"
-        tensors_path = str(base / "safetensors_state.safetensors")
-        meta_path = str(base / "safetensors_state.meta.json")
-
-        if not self._force_write:
-            if Path(tensors_path).exists() or Path(meta_path).exists():
-                raise FileExistsError(
-                    f"Checkpoint files already exist for spmd_id={spmd_id} step={step}. "
-                    f"Set force_write=True in CheckpointConfig to overwrite."
-                )
-
-        await asyncio.to_thread(save_worker_state, state, tensors_path, meta_path)
-        return {
-            "ckpt_dir": str(base),
-            "tensors_path": tensors_path,
-            "meta_path": meta_path,
-        }
-
-    async def load(
-        self, metadata: dict[str, Any], restore_layout: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        return await asyncio.to_thread(
-            load_worker_state, metadata["tensors_path"], metadata["meta_path"]
+    def __init__(
+        self,
+        component_id: str,
+        capture_state,
+        restore_state,
+        *,
+        keep: KeepPolicy = KeepPolicy(),
+    ) -> None:
+        super().__init__(
+            component_id,
+            capture_state,
+            restore_state,
+            keep=keep,
+            restore_topology=RestoreTopologyMode.EXACT_TOPOLOGY,
         )
 
-    def finalize(self) -> None:
-        pass  # SafeTensors writes are fully synchronous; nothing to drain.
+    async def _write_state(
+        self, state: Any, directory: Path, context: SaveSession
+    ) -> Mapping[str, Any]:
+        tensors_path = directory / "state.safetensors"
+        metadata_path = directory / "state.meta.json"
+        await asyncio.to_thread(
+            save_worker_state, state, str(tensors_path), str(metadata_path)
+        )
+        return {"tensors": "state.safetensors", "metadata": "state.meta.json"}
+
+    async def _read_state(
+        self, record: CheckpointObjectRecord, context: RestoreSession
+    ) -> Any:
+        if len(record.checkpoint_objects) != 1:
+            raise ValueError(
+                "SafeTensors record must contain exactly one checkpoint_object"
+            )
+        directory = self._file_path(record.checkpoint_objects[0].storage_locator)
+        return await asyncio.to_thread(
+            load_worker_state,
+            str(directory / "state.safetensors"),
+            str(directory / "state.meta.json"),
+        )
+
+    async def _finalize_io(self, context: SaveSession) -> None:
+        return None
+
+    async def _close_resources(self) -> None:
+        return None
 
 
 def _try_jax_flatten(value: Any) -> dict[str, np.ndarray] | None:
@@ -168,7 +192,7 @@ def load_worker_state(tensors_path: str, meta_path: str) -> dict[str, Any]:
         meta_path:    Absolute path to the ``.meta.json`` sidecar.
 
     Returns:
-        State dict suitable for ``Worker.load_state_from_disk()``.
+        State dict returned to the registered restore callback.
     """
     from safetensors.numpy import load_file
 

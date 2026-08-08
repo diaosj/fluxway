@@ -876,6 +876,7 @@ def spmd(
     driver_runtime_env: dict[str, Any] | None = None,
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
+    checkpoint_components: tuple[Any, ...] = (),
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -904,6 +905,27 @@ def spmd(
     ):
         raise TypeError("resource_profile must be a ResourceProfile")
 
+    if not isinstance(checkpoint_components, tuple):
+        raise TypeError("checkpoint_components must be a tuple")
+    from fluxway.control_plane.checkpointer.backend import (
+        CheckpointComponentRegistration,
+    )
+
+    invalid_backends = [
+        backend
+        for backend in checkpoint_components
+        if not isinstance(backend, CheckpointComponentRegistration)
+    ]
+    if invalid_backends:
+        raise TypeError(
+            "checkpoint_components must contain CheckpointComponentRegistration instances"
+        )
+    component_ids = [
+        backend.descriptor.component_id for backend in checkpoint_components
+    ]
+    if len(component_ids) != len(set(component_ids)):
+        raise ValueError("checkpoint_components must have unique component IDs")
+
     mesh = None
     if mesh_axis_names and mesh_axis_shapes:
         mesh = DeviceMesh(axis_names=mesh_axis_names, device_shape=mesh_axis_shapes)
@@ -913,6 +935,7 @@ def spmd(
         cls._mesh = mesh  # type: ignore
         cls._runtime_env = runtime_env  # type: ignore
         cls._driver_runtime_env = driver_runtime_env  # type: ignore
+        cls._checkpoint_components = checkpoint_components  # type: ignore
 
         cls.get_resource_profile = classmethod(lambda c: c._resource_profile)  # type: ignore
         cls.get_mesh = classmethod(lambda c: c._mesh)  # type: ignore
@@ -980,6 +1003,7 @@ def spmd(
                 operator_specs=operator_specs,
                 runtime_env=c._runtime_env,
                 driver_runtime_env=c._driver_runtime_env,
+                checkpoint_components=c._checkpoint_components,
             )
 
         cls.get_spmd_config = classmethod(get_spmd_config)  # type: ignore
@@ -996,6 +1020,7 @@ def spmd_source(
     interleave_unit_size: int = 1,
     runtime_env: dict[str, Any] | None = None,
     driver_runtime_env: dict[str, Any] | None = None,
+    checkpoint_components: tuple[Any, ...] = (),
 ):
     """
     Configure a class as an SPMD source.
@@ -1007,6 +1032,7 @@ def spmd_source(
         mesh_axis_shapes=mesh_axis_shapes,
         runtime_env=runtime_env,
         driver_runtime_env=driver_runtime_env,
+        checkpoint_components=checkpoint_components,
     )
 
     def decorator(cls):

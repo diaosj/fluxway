@@ -1,72 +1,191 @@
+"""Capability-composed checkpoint backend registrations."""
+
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass
 
-_BACKEND_REGISTRY: dict[str, type["WorkerCheckpointBackend"]] = {}
+from fluxway.common.types.checkpoint import (
+    CheckpointObjectRef,
+    CheckpointCapability,
+    ComponentCheckpoint,
+    CheckpointRuntime,
+    ComponentSpec,
+    CheckpointCommitPermit,
+    SaveSession,
+    CommitSaveSession,
+    RestoreSession,
+    WorkerSaveResult,
+    CheckpointHold,
+    CleanupReservation,
+    CleanupReservationRequest,
+)
 
 
-class WorkerCheckpointBackend(ABC):
-    """
-    Per-worker checkpoint serialization interface.
+class CheckpointComponent(ABC):
+    @property
+    @abstractmethod
+    def descriptor(self) -> ComponentSpec: ...
 
-    Each implementation persists a worker's in-memory state dict to a shared
-    filesystem and reconstructs it on demand.  Implementations must be
-    picklable (Ray actor constraint).
+    @abstractmethod
+    async def open(self, runtime: CheckpointRuntime) -> None: ...
 
-    Subclasses register themselves automatically via ``backend_name``:
+    @abstractmethod
+    async def start_save(self, session: SaveSession) -> None: ...
 
-        class MyBackend(WorkerCheckpointBackend, backend_name="myformat"):
-            ...
+    @abstractmethod
+    async def save(self, session: SaveSession) -> WorkerSaveResult: ...
 
-    After which ``WorkerCheckpointBackend.create("myformat")`` works without
-    any changes to the call site (open for extension, closed for modification).
-    """
+    @abstractmethod
+    async def finish_save(self, session: SaveSession) -> None: ...
 
-    def __init_subclass__(cls, backend_name: str = "", **kwargs) -> None:
-        super().__init_subclass__(**kwargs)
-        if backend_name:
-            _BACKEND_REGISTRY[backend_name] = cls
+    @abstractmethod
+    async def commit_save(self, session: CommitSaveSession) -> ComponentCheckpoint: ...
 
-    @classmethod
-    def create(cls, name: str, force_write: bool = False) -> "WorkerCheckpointBackend":
-        """Instantiate a registered backend by name."""
-        backend_cls = _BACKEND_REGISTRY.get(name)
-        if backend_cls is None:
+    @abstractmethod
+    async def rollback_save(self, session: SaveSession) -> None: ...
+
+    @abstractmethod
+    async def on_checkpoint_available(self, session: SaveSession) -> None: ...
+
+    @abstractmethod
+    async def restore(self, session: RestoreSession) -> None: ...
+
+    @abstractmethod
+    async def close(self) -> None: ...
+
+
+class CheckpointObjectLifecycle(ABC):
+    @abstractmethod
+    async def hold_checkpoint_object(
+        self,
+        checkpoint_object: CheckpointObjectRef,
+        owner_id: str,
+        ttl_seconds: float,
+        request_id: str,
+    ) -> CheckpointHold: ...
+
+    @abstractmethod
+    async def renew_checkpoint_hold(
+        self, lease: CheckpointHold, ttl_seconds: float
+    ) -> CheckpointHold: ...
+
+    @abstractmethod
+    async def release_checkpoint_hold(self, lease: CheckpointHold) -> None: ...
+
+    @abstractmethod
+    async def reserve_cleanup(
+        self, request: CleanupReservationRequest
+    ) -> CleanupReservation: ...
+
+    @abstractmethod
+    async def commit_cleanup(
+        self,
+        reservation: CleanupReservation,
+        permit: CheckpointCommitPermit,
+    ) -> None: ...
+
+    @abstractmethod
+    async def rollback_cleanup(
+        self,
+        reservation: CleanupReservation,
+        permit: CheckpointCommitPermit,
+    ) -> None: ...
+
+
+class CheckpointObjectCleaner(ABC):
+    @abstractmethod
+    async def cleanup(
+        self,
+        reservation: CleanupReservation,
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointComponentRegistration:
+    descriptor: ComponentSpec
+    component: CheckpointComponent
+    object_lifecycle: CheckpointObjectLifecycle | None = None
+    cleaner: CheckpointObjectCleaner | None = None
+
+    def __post_init__(self) -> None:
+        declared = self.descriptor.capabilities
+        actual = {CheckpointCapability.PERSISTENCE}
+        actual.add(CheckpointCapability.LIFECYCLE)
+        if self.object_lifecycle is not None:
+            actual.add(CheckpointCapability.RETENTION)
+        if self.cleaner is not None:
+            actual.add(CheckpointCapability.RECLAIMER)
+        if declared != actual:
             raise ValueError(
-                f"Unknown checkpoint backend: {name!r}. "
-                f"Registered backends: {sorted(_BACKEND_REGISTRY)}"
+                "checkpoint backend capability declaration does not match registration"
             )
-        return backend_cls(force_write=force_write)  # type: ignore
+        if any(
+            checkpoint_object.keep.keep_last is not None
+            for checkpoint_object in self.descriptor.checkpoint_objects
+        ) and (self.object_lifecycle is None or self.cleaner is None):
+            raise ValueError(
+                "finite checkpoint_object cleanup requires keep and cleaner capabilities"
+            )
 
-    @classmethod
-    def registered_names(cls) -> list:
-        return sorted(_BACKEND_REGISTRY)
 
-    @abstractmethod
-    async def save(
-        self, state: dict[str, Any], ckpt_dir: str, spmd_id: str, rank: int, step: int
-    ) -> dict[str, Any]:
-        """Persist ``state`` and return opaque metadata needed by :meth:`load`."""
+class CheckpointComponentRegistry:
+    """Immutable registrations with startup-validated, direct capability dispatch."""
 
-    @abstractmethod
-    async def load(
-        self, metadata: dict[str, Any], restore_layout: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Reconstruct state using the live restore layout when required."""
+    def __init__(
+        self, registrations: tuple[CheckpointComponentRegistration, ...]
+    ) -> None:
+        component_ids = [
+            registration.descriptor.component_id for registration in registrations
+        ]
+        if len(component_ids) != len(set(component_ids)):
+            raise ValueError("checkpoint component IDs must be unique; duplicate found")
+        self._registrations = registrations
+        self._by_id = {
+            registration.descriptor.component_id: registration
+            for registration in registrations
+        }
 
-    @abstractmethod
-    def finalize(self) -> None:
-        """
-        Wait for any outstanding background I/O operations to complete.
-        Default implementation is a no-op for synchronous backends.
+    def __iter__(self):
+        return iter(self._registrations)
 
-        Called by workers after each checkpoint to ensure durability before the
-        Controller writes the manifest.  The checkpointer may be reused afterwards.
-        """
+    def __len__(self) -> int:
+        return len(self._registrations)
 
-    def close(self) -> None:
-        """Flush outstanding I/O and release all resources (called on actor teardown).
+    def require(self, component_id: str) -> CheckpointComponentRegistration:
+        registration = self._by_id.get(component_id)
+        if registration is None:
+            raise KeyError(f"checkpoint component is not registered: {component_id!r}")
+        return registration
 
-        Default implementation delegates to finalize(); backends that manage
-        persistent resources (e.g. file handles, thread pools) should override.
-        """
-        self.finalize()
+    async def open_all(self, runtime: CheckpointRuntime) -> None:
+        opened: list[CheckpointComponent] = []
+        try:
+            for registration in self._registrations:
+                await registration.component.open(runtime)
+                opened.append(registration.component)
+        except BaseException as primary_error:
+            cleanup_errors: list[BaseException] = []
+            for lifecycle in reversed(opened):
+                try:
+                    await lifecycle.close()
+                except BaseException as close_error:
+                    cleanup_errors.append(close_error)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "checkpoint backend open and cleanup failed",
+                    [primary_error, *cleanup_errors],
+                ) from None
+            raise
+
+    async def close_all(self) -> None:
+        errors: list[BaseException] = []
+        for registration in reversed(self._registrations):
+            try:
+                await registration.component.close()
+            except BaseException as error:
+                errors.append(error)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("checkpoint backend close failed", errors)

@@ -49,7 +49,7 @@ def meta_for(phase, policy):
     )
 
 
-def test_default_phase_graph_keeps_step_major_priority():
+def test_default_phase_graph_retentions_step_major_priority():
     metas = {phase: meta_for(phase, policy_for(phase)) for phase in PHASES}
     worker = worker_with(metas)
 

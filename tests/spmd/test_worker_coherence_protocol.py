@@ -892,7 +892,7 @@ async def test_cancelled_batch_delegation_rolls_back_prior_child_grants(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery_fails", (False, True))
-async def test_delivery_failure_rolls_back_but_success_keeps_child_grant(
+async def test_delivery_failure_rolls_back_but_success_retentions_child_grant(
     delivery_fails,
 ) -> None:
     directory = CoherenceDirectory()

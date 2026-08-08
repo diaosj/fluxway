@@ -151,7 +151,7 @@ class ControllerStateMachine:
             if event == ControllerEvent.DRIVER_ERROR:
                 self._record_driver_failure(kwargs)
             elif event == ControllerEvent.CLEANUP_FAILED:
-                self._record_cleanup_failure(kwargs)
+                self._record_reclaim_failure(kwargs)
 
             # Perform state transition
             old_state = self._state
@@ -210,7 +210,7 @@ class ControllerStateMachine:
                 ):
                     await self.trigger_event(
                         ControllerEvent.CLEANUP_FAILED,
-                        failure=self._cleanup_failure(e),
+                        failure=self._reclaim_failure(e),
                     )
                     return
                 raise
@@ -258,7 +258,7 @@ class ControllerStateMachine:
         self._failures[spmd_id] = failure
         logger.error(f"Controller error: {failure}")
 
-    def _record_cleanup_failure(self, event_data: dict) -> None:
+    def _record_reclaim_failure(self, event_data: dict) -> None:
         failure = event_data.get("failure")
         if not isinstance(failure, ExecutionFailure):
             raise TypeError("CLEANUP_FAILED requires an ExecutionFailure.")
@@ -270,10 +270,10 @@ class ControllerStateMachine:
                 "CLEANUP_FAILED requires controller/CONTROLLER_CLEANUP identity."
             )
         self._failures[failure.spmd_id] = failure
-        logger.error(f"Controller cleanup error: {failure}")
+        logger.error(f"Controller reclaim error: {failure}")
 
     @staticmethod
-    def _cleanup_failure(error: BaseException) -> ExecutionFailure:
+    def _reclaim_failure(error: BaseException) -> ExecutionFailure:
         return ExecutionFailure.from_exception(
             spmd_id=_CONTROLLER_FAILURE_ID,
             rank=None,
@@ -342,7 +342,7 @@ class ControllerStateMachine:
         # active, the drain→checkpoint→resume pipeline will detect max_steps and
         # trigger ALL_DRIVERS_COMPLETED itself after the final checkpoint is
         # persisted.  Firing the event here would race with that pipeline —
-        # cleanup would release placement groups while saves are in-flight.
+        # reclaim would release placement groups while saves are in-flight.
         if self._controller._async_step_manager.is_all_completed():
             has_drain = self._controller._drain_strategy is not None
             if has_drain:
@@ -362,22 +362,22 @@ class ControllerStateMachine:
         """
         Called when entering COMPLETING state.
 
-        Reclaims all SPMD resources and performs cleanup.
+        Reclaims all SPMD resources and performs reclaim.
         """
         logger.debug("Controller entering COMPLETING state")
 
-        cleanup_error = None
+        reclaim_error = None
         try:
             await self._controller._finalize_runtime(
                 export_profiler_trace=True,
             )
         except Exception as e:
-            logger.error(f"Failed to cleanup SPMDs: {e}")
-            cleanup_error = e
-        if cleanup_error is not None:
+            logger.error(f"Failed to reclaim SPMDs: {e}")
+            reclaim_error = e
+        if reclaim_error is not None:
             await self.trigger_event(
                 ControllerEvent.CLEANUP_FAILED,
-                failure=self._cleanup_failure(cleanup_error),
+                failure=self._reclaim_failure(reclaim_error),
             )
             return
         await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
@@ -393,19 +393,19 @@ class ControllerStateMachine:
         failures = dict(self._failures)
         logger.error(f"Execution failures: {failures}")
 
-        # Attempt to cleanup resources even on failure
-        cleanup_error = None
+        # Attempt to reclaim resources even on failure
+        reclaim_error = None
         try:
             await self._controller._finalize_runtime(
                 export_profiler_trace=False,
             )
         except Exception as e:
-            logger.error(f"Failed to cleanup SPMDs during failure handling: {e}")
-            cleanup_error = e
-        if cleanup_error is not None:
+            logger.error(f"Failed to reclaim SPMDs during failure handling: {e}")
+            reclaim_error = e
+        if reclaim_error is not None:
             await self.trigger_event(
                 ControllerEvent.CLEANUP_FAILED,
-                failure=self._cleanup_failure(cleanup_error),
+                failure=self._reclaim_failure(reclaim_error),
             )
             return
         await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)

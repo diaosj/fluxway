@@ -341,13 +341,13 @@ def test_ragged_slice_multilevel():
 
     tensor = TransportTensor(values, [l0_splits, l1_splits])
 
-    # Slice [0:1] -> Should keep Row 0 only.
+    # Slice [0:1] -> Should retention Row 0 only.
     sliced = tensor.slice(0, 1)
 
     lists = sliced.to_lists()
     assert lists == [[[1, 2], [3]]]
 
-    # Slice [1:2] -> Keep Row 1
+    # Slice [1:2] -> Retention Row 1
     sliced_2 = tensor.slice(1, 2)
     assert sliced_2.to_lists() == [[[4]]]
 
@@ -518,7 +518,7 @@ def test_gather_propagates_explicit_indices():
 
 
 def test_no_indices_stays_none():
-    """Operations on tensor without indices keep routing_indices as None."""
+    """Operations on tensor without indices retention routing_indices as None."""
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
     tensor = TransportTensor(data)

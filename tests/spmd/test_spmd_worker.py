@@ -11,7 +11,6 @@ Covers:
 import sys
 import os
 import asyncio
-from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
@@ -116,17 +115,8 @@ async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
         (),
         {"is_source_operator": lambda _self, name: name == "Reader"},
     )()
-    worker._checkpoint_context = lambda root, step: (root, step)
-    restored = []
-    worker._trigger_restored_source_steps = restored.extend
-
-    await worker.load_state_from_disk(
-        {
-            "completed_step_count": {"Reader": 1, "Dense": 1},
-            "checkpoint_root": "/tmp/prove",
-        },
-        rank_storage=None,
-        step=1,
+    restored = worker._restore_checkpoint_runtime_state(
+        {"completed_step_count": {"Reader": 1, "Dense": 1}}
     )
 
     assert worker._scheduled_step_count == {"Reader": 1, "Dense": 1}
@@ -269,7 +259,6 @@ def test_worker_phase_one_does_not_start_runtime(monkeypatch):
         rank=0,
         spmd_id="spmd-a",
         driver_handle=object(),
-        checkpoint_backend=MagicMock(),
     )
 
     assert started == {"heartbeat": 0, "run_loop": 0}
@@ -348,7 +337,6 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
         rank=2,
         spmd_id="spmd-a",
         driver_handle=object(),
-        checkpoint_backend=MagicMock(),
     )
     worker.setup_and_start(local_rank=1, local_world_size=3, node_rank=0, num_nodes=2)
 
@@ -379,7 +367,6 @@ async def test_worker_stop_clears_driver_handle_and_waits_for_tasks():
         rank=0,
         spmd_id="spmd-a",
         driver_handle=object(),
-        checkpoint_backend=MagicMock(),
     )
 
     async def run_forever():
@@ -441,7 +428,6 @@ def test_worker_setup_and_start_logs_phase_markers(monkeypatch, capsys):
         rank=0,
         spmd_id="spmd-log",
         driver_handle=object(),
-        checkpoint_backend=MagicMock(),
     )
 
     worker.setup_and_start(local_rank=0, local_world_size=1, node_rank=0, num_nodes=1)
@@ -1070,121 +1056,3 @@ async def test_send_output_uses_compiled_mesh():
     assert call["compiled_plan"].op_name == "compute"
     assert call["exec_step"] == 0
     assert call["successor_handlers"] == ({0: worker._successor_handlers["target"][0]},)
-
-
-@pytest.mark.asyncio
-async def test_trigger_snapshot_hooks():
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    worker_cls = cls.modified_class if cls else SPMDWorker
-
-    mock_cls1 = type("MockClass1", (), {})
-    mock_cls2 = type("MockClass2", (), {})
-
-    op_meta1 = OperatorSpec(
-        name="op1",
-        owner=mock_cls1,
-        method_name="op1",
-    )
-
-    op_meta2 = OperatorSpec(
-        name="op2",
-        owner=mock_cls2,
-        method_name="op2",
-    )
-
-    config = single_spmd_config(
-        name="snapshot-hooks",
-        spmd_id="test_spmd",
-        mesh=DeviceMesh(("data",), (1,)),
-        operators={"op1": op_meta1, "op2": op_meta2},
-    )
-
-    worker = worker_cls(
-        config=config,
-        rank=0,
-        spmd_id="test_spmd",
-        driver_handle=MagicMock(),
-        checkpoint_backend=MagicMock(),
-    )
-
-    # Mock operator manager and operators
-    mock_op1 = MagicMock(
-        spec=["prepare_checkpoint_artifacts", "commit_checkpoint_artifacts"]
-    )
-    mock_op2 = MagicMock(spec=[])
-
-    worker._op_manager = MagicMock()
-
-    # Operator state lives in worker-process instance storage.
-    from unittest.mock import patch
-    import fluxway.spmd.worker.worker as worker_module
-
-    with patch.object(worker_module, "get_instance_storage") as mock_storage:
-        storage_dict = {id(mock_cls1): mock_op1, id(mock_cls2): mock_op2}
-        mock_lock = MagicMock()
-        mock_lock.__enter__ = MagicMock(return_value=None)
-        mock_lock.__exit__ = MagicMock(return_value=None)
-        mock_storage.return_value = (storage_dict, mock_lock)
-
-        ckpt_dir = "/tmp/ckpt"
-        step = 42
-
-        await worker.prepare_checkpoint_artifacts(ckpt_dir, step)
-
-        from fluxway.common.types import CheckpointContext
-
-        expected_context = CheckpointContext(ckpt_dir, step, "test_spmd", 0, 1)
-        mock_op1.prepare_checkpoint_artifacts.assert_called_once_with(expected_context)
-
-        gathered_states = {"op1": {0: {"state": 1}}, "op2": {0: {"state": 2}}}
-        await worker.commit_checkpoint_artifacts(ckpt_dir, step, gathered_states)
-
-        mock_op1.commit_checkpoint_artifacts.assert_called_once_with(
-            {0: {"state": 1}}, expected_context
-        )
-
-
-@pytest.mark.asyncio
-async def test_prepare_checkpoint_aborts_prepared_local_participants():
-    worker_cls = _worker_cls()
-    owner1 = type("PrepareOwner1", (), {})
-    owner2 = type("PrepareOwner2", (), {})
-    config = single_spmd_config(
-        name="snapshot-prepare-abort",
-        spmd_id="test_spmd",
-        mesh=DeviceMesh(("data",), (1,)),
-        operators={
-            "op1": OperatorSpec(name="op1", owner=owner1, method_name="op1"),
-            "op2": OperatorSpec(name="op2", owner=owner2, method_name="op2"),
-        },
-    )
-    worker = worker_cls(
-        config=config,
-        rank=0,
-        spmd_id="test_spmd",
-        driver_handle=MagicMock(),
-        checkpoint_backend=MagicMock(),
-    )
-    worker._op_manager = MagicMock()
-    prepared = MagicMock(
-        spec=["prepare_checkpoint_artifacts", "abort_checkpoint_artifacts"]
-    )
-    failing = MagicMock(
-        spec=["prepare_checkpoint_artifacts", "abort_checkpoint_artifacts"]
-    )
-    failing.prepare_checkpoint_artifacts.side_effect = RuntimeError("prepare failed")
-
-    from unittest.mock import patch
-    import fluxway.spmd.worker.worker as worker_module
-
-    with patch.object(worker_module, "get_instance_storage") as storage:
-        lock = MagicMock()
-        lock.__enter__ = MagicMock(return_value=None)
-        lock.__exit__ = MagicMock(return_value=None)
-        storage.return_value = ({id(owner1): prepared, id(owner2): failing}, lock)
-
-        with pytest.raises(RuntimeError, match="prepare failed"):
-            await worker.prepare_checkpoint_artifacts("/tmp/ckpt", 42)
-
-    prepared.abort_checkpoint_artifacts.assert_called_once()
-    failing.abort_checkpoint_artifacts.assert_called_once()

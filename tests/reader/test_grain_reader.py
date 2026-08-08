@@ -139,13 +139,43 @@ class TestGrainReaderSharding:
         ds = MockDataSource(10)
         reader = _make_reader(ds, rank=0, world_size=2)
         assert [int(reader.next_item().features[0]) for _ in range(2)] == [0, 2]
-        from fluxway.common.types import CheckpointContext
+        from fluxway.common.types import (
+            SaveSession,
+            RestoreSession,
+            CheckpointCommitPermit,
+            CheckpointCut,
+            TopologySnapshot,
+        )
 
-        context = CheckpointContext("/tmp/checkpoint", 1, "reader", 0, 2)
-        state = reader.save_state(context)
+        topology = TopologySnapshot(2, ("data",), (2,), "v1")
+        save_session = SaveSession(
+            instance=reader,
+            attempt_id="tx",
+            checkpoint_id="checkpoint",
+            commit_permit=CheckpointCommitPermit("tx", 1, b"permit"),
+            cut=CheckpointCut.for_step("cut", 1),
+            spmd_id="reader",
+            rank=0,
+            source_topology=topology,
+            component_id="reader",
+        )
+        state = reader.capture_state(save_session)
 
         restored = _make_reader(ds, rank=0, world_size=2)
-        restored.restore_state(state, context)
+        restored.restore_checkpoint_state(
+            state,
+            RestoreSession(
+                instance=restored,
+                checkpoint_id=save_session.checkpoint_id,
+                cut=save_session.cut,
+                spmd_id=save_session.spmd_id,
+                rank=save_session.rank,
+                saved_topology=topology,
+                restore_topology=topology,
+                component_id=save_session.component_id,
+                component_checkpoint=None,
+            ),
+        )
         batch = restored.next_item()
 
         assert batch is not None

@@ -2,8 +2,8 @@
 Unit tests for SPMDSynchronizer drain-to-count barrier and Worker drain target.
 
 Design:
-- Workers are self-blocked at drain_target_count by Worker._drain_resume_event (set_drain_target_count RPC).
-- Workers therefore only ever REPORT completion up to target_count.
+- Workers are self-blocked at drain_step_count by Worker._drain_resume_event (set_drain_step_count RPC).
+- Workers therefore only ever REPORT completion up to step_count.
 - The Synchronizer's job is to count those ACKs and fire the on_drained callback.
 - Synchronizer no longer manages blocking for drain (that's the Worker's responsibility).
 
@@ -11,7 +11,7 @@ Tests are split into:
 - TestDrainSetup: setup/teardown invariants
 - TestDrainAckCallback: ACK counting and callback triggering
 - TestDrainAndAllowedStepIndependence: drain ACK must not be affected by allowed_step
-- TestWorkerDrainTarget: Worker.set/clear_drain_target_count state correctness
+- TestWorkerDrainTarget: Worker.set/clear_drain_step_count state correctness
 """
 
 import asyncio
@@ -42,17 +42,17 @@ class TestDrainSetup:
         """Calling drain_to_step_count while already draining must raise RuntimeError."""
         sync = _make_sync()
         _register_op(sync, "op_a", step=0)
-        sync.drain_to_step_count(target_count=5, on_drained=lambda: None)
+        sync.drain_to_step_count(step_count=5, on_drained=lambda: None)
 
         with pytest.raises(RuntimeError, match="already draining"):
-            sync.drain_to_step_count(target_count=10, on_drained=lambda: None)
+            sync.drain_to_step_count(step_count=10, on_drained=lambda: None)
 
     def test_is_draining_property(self):
         sync = _make_sync()
         _register_op(sync, "op_a", step=0)
 
         assert not sync.is_draining
-        sync.drain_to_step_count(target_count=5, on_drained=lambda: None)
+        sync.drain_to_step_count(step_count=5, on_drained=lambda: None)
         assert sync.is_draining
         sync.clear_drain()
         assert not sync.is_draining
@@ -66,7 +66,7 @@ class TestDrainSetup:
         fired = threading.Event()
         sync = _make_sync(num_workers=2)
         _register_op(sync, "op_a", step=3)
-        sync.drain_to_step_count(target_count=5, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=5, on_drained=fired.set)
 
         sync.shorten_drain_to_step_count(3)
 
@@ -75,7 +75,7 @@ class TestDrainSetup:
     def test_shorten_drain_rejects_target_extension(self):
         sync = _make_sync(num_workers=1)
         _register_op(sync, "op_a", step=0)
-        sync.drain_to_step_count(target_count=3, on_drained=lambda: None)
+        sync.drain_to_step_count(step_count=3, on_drained=lambda: None)
 
         with pytest.raises(ValueError, match="only shrink"):
             sync.shorten_drain_to_step_count(4)
@@ -84,30 +84,30 @@ class TestDrainSetup:
 
 class TestDrainAckCallback:
     """
-    Workers are self-blocked at target_count, so they report exactly target_count.
-    The callback fires when all workers have reported target_count.
+    Workers are self-blocked at step_count, so they report exactly step_count.
+    The callback fires when all workers have reported step_count.
     """
 
-    def test_callback_fires_at_target_count_single_op(self):
+    def test_callback_fires_at_step_count_single_op(self):
         fired = threading.Event()
         sync = _make_sync(num_workers=2)
         _register_op(sync, "op_a", step=0)
         fired.clear()
-        sync.drain_to_step_count(target_count=5, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=5, on_drained=fired.set)
 
         sync.report_worker_op_completed(0, "op_a", 5)
         assert not fired.is_set(), "Callback should not fire until all workers ACK"
         sync.report_worker_op_completed(1, "op_a", 5)
-        assert fired.is_set(), "Callback must fire when all workers reach target_count"
+        assert fired.is_set(), "Callback must fire when all workers reach step_count"
 
     def test_callback_fires_with_multiple_ops(self):
-        """All ops must be ACKed (at target_count) before on_drained fires."""
+        """All ops must be ACKed (at step_count) before on_drained fires."""
         fired = threading.Event()
         sync = _make_sync(num_workers=2)
         _register_op(sync, "op_a", step=0)
         _register_op(sync, "op_b", step=0)
         fired.clear()
-        sync.drain_to_step_count(target_count=3, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=3, on_drained=fired.set)
 
         sync.report_worker_op_completed(0, "op_a", 3)
         sync.report_worker_op_completed(1, "op_a", 3)
@@ -123,7 +123,7 @@ class TestDrainAckCallback:
         sync.report_worker_op_completed(0, "lookup", 2)
 
         fired = threading.Event()
-        sync.drain_to_step_count(target_count=2, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=2, on_drained=fired.set)
         assert not fired.is_set()
 
         sync.report_worker_op_completed(0, "update", 1)
@@ -137,9 +137,9 @@ class TestDrainAckCallback:
         sync = _make_sync(num_workers=3)
         _register_op(sync, "op_a", step=0)
         fired.clear()
-        sync.drain_to_step_count(target_count=2, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=2, on_drained=fired.set)
 
-        # target_count = 2; only 2 of 3 workers reported
+        # step_count = 2; only 2 of 3 workers reported
         sync.report_worker_op_completed(0, "op_a", 2)
         sync.report_worker_op_completed(1, "op_a", 2)
         assert not fired.is_set()
@@ -150,7 +150,7 @@ class TestDrainAckCallback:
 
 class TestDrainAndAllowedStepIndependence:
     """
-    drain_target_count (ACK fence) and update_allowed_step (flow-control ceiling)
+    drain_step_count (ACK fence) and update_allowed_step (flow-control ceiling)
     must not interfere with each other.
     """
 
@@ -164,9 +164,9 @@ class TestDrainAndAllowedStepIndependence:
         )
         _register_op(sync, "op_a", step=0)
         sync.update_allowed_step("op_a", 3)
-        sync.drain_to_step_count(target_count=5, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=5, on_drained=fired.set)
 
-        # Workers reach target_count=5; drain ACK must fire regardless of allowed_step=3
+        # Workers reach step_count=5; drain ACK must fire regardless of allowed_step=3
         sync.report_worker_op_completed(0, "op_a", 5)
         sync.report_worker_op_completed(1, "op_a", 5)
         assert fired.is_set(), "drain ACK must fire even when allowed_step is set"
@@ -176,7 +176,7 @@ class TestDrainAndAllowedStepIndependence:
         sync = _make_sync(num_workers=2)
         _register_op(sync, "op_a", step=0)
         sync.update_allowed_step("op_a", 10)
-        sync.drain_to_step_count(target_count=5, on_drained=lambda: None)
+        sync.drain_to_step_count(step_count=5, on_drained=lambda: None)
         sync.clear_drain()
         assert sync._allowed_steps.get("op_a") == 10
 
@@ -205,7 +205,7 @@ class TestDrainAndAllowedStepIndependence:
 
 class TestWorkerDrainTarget:
     """
-    Verify SPMDWorker.set_drain_target_count / clear_drain_target_count state correctness.
+    Verify SPMDWorker.set_drain_step_count / clear_drain_step_count state correctness.
     """
 
     def _make_stub(self):
@@ -214,7 +214,7 @@ class TestWorkerDrainTarget:
 
         raw_cls: typing.Any = getattr(_ActorCls, "__ray_actor_class__", _ActorCls)
         stub = types.SimpleNamespace(
-            _drain_target_count=None,
+            _drain_step_count=None,
             _drain_cond=asyncio.Condition(),
             _running_plan_steps={},
             _background_tasks=set(),
@@ -226,39 +226,37 @@ class TestWorkerDrainTarget:
             on_task_done=lambda _task: None,
             schedule_key=lambda op_name, step: (0, 0, step, op_name),
         )
-        stub.set_drain_target_count = types.MethodType(
-            raw_cls.set_drain_target_count, stub
-        )
-        stub.clear_drain_target_count = types.MethodType(
-            raw_cls.clear_drain_target_count, stub
+        stub.set_drain_step_count = types.MethodType(raw_cls.set_drain_step_count, stub)
+        stub.clear_drain_step_count = types.MethodType(
+            raw_cls.clear_drain_step_count, stub
         )
         return stub
 
     @pytest.mark.asyncio
     async def test_set_drain_target_updates_state(self):
         w = self._make_stub()
-        await w.set_drain_target_count(42)
-        assert w._drain_target_count == 42
+        await w.set_drain_step_count(42)
+        assert w._drain_step_count == 42
 
     @pytest.mark.asyncio
     async def test_clear_drain_resets_state(self):
         w = self._make_stub()
-        await w.set_drain_target_count(42)
-        await w.clear_drain_target_count()
-        assert w._drain_target_count is None
+        await w.set_drain_step_count(42)
+        await w.clear_drain_step_count()
+        assert w._drain_step_count is None
 
     @pytest.mark.asyncio
     async def test_set_overrides_previous_target(self):
         w = self._make_stub()
-        await w.set_drain_target_count(10)
-        await w.set_drain_target_count(20)
-        assert w._drain_target_count == 20
+        await w.set_drain_step_count(10)
+        await w.set_drain_step_count(20)
+        assert w._drain_step_count == 20
 
     @pytest.mark.asyncio
     async def test_clear_is_idempotent(self):
         w = self._make_stub()
-        await w.clear_drain_target_count()
-        assert w._drain_target_count is None
+        await w.clear_drain_step_count()
+        assert w._drain_step_count is None
 
 
 class TestDrainEdgeCases:
@@ -275,7 +273,7 @@ class TestDrainEdgeCases:
         sync = _make_sync(num_workers=2)
         fired = threading.Event()
         # No _register_op call — known_ops is empty
-        sync.drain_to_step_count(target_count=0, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=0, on_drained=fired.set)
         assert not fired.is_set(), (
             "drain must not fire when no ops have been registered: "
             "an empty snapshot would be produced with no actual state"
@@ -286,17 +284,17 @@ class TestDrainEdgeCases:
         sync = _make_sync(num_workers=2)
         _register_op(sync, "op_a", step=5)  # both workers at count=5
         fired = threading.Event()
-        sync.drain_to_step_count(target_count=3, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=3, on_drained=fired.set)
         assert fired.is_set(), (
-            "drain must fire immediately when workers already exceed target_count"
+            "drain must fire immediately when workers already exceed step_count"
         )
 
     def test_drain_does_not_fire_when_workers_below_target(self):
-        """drain_to_step_count must NOT fire if workers are below target_count."""
+        """drain_to_step_count must NOT fire if workers are below step_count."""
         sync = _make_sync(num_workers=2)
         _register_op(sync, "op_a", step=2)  # both workers at count=2
         fired = threading.Event()
-        sync.drain_to_step_count(target_count=5, on_drained=fired.set)
+        sync.drain_to_step_count(step_count=5, on_drained=fired.set)
         assert not fired.is_set(), (
-            "drain must not fire when workers have not reached target_count"
+            "drain must not fire when workers have not reached step_count"
         )

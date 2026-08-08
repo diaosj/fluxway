@@ -146,7 +146,7 @@ Recipe 不是立即执行的 Python 条件。每个函数先创建一个不可�
 | `incident_spmds(R)` | `kind="incident_spmds"` | `relations=R` |
 | `isolated_spmds(R)` | `kind="isolated_spmds"` | `relations=R` |
 | `occupancy(A)` | `kind="occupancy"` | `workers=A` |
-| `target_occupancy(R)` | `kind="target_occupancy"` | `relations=R` |
+| `artifact_occupancy(R)` | `kind="artifact_occupancy"` | `relations=R` |
 | `weighted_dominant_share(A)` | `kind="weighted_dominant_share"` | `workers=A` |
 | `support(A)` | `kind="support"` | `workers=A` |
 | node `union(A,...)` | `kind="node_union"` | `items`：node set 名单 |
@@ -204,7 +204,7 @@ Recipe 不是立即执行的 Python 条件。每个函数先创建一个不可�
 |---|---|---|
 | `occupancy(A)` | vector | 记录每台机器上有多少个 A worker |
 | `support(A)` | node set | 记录至少承载一个 A worker 的机器 |
-| `target_occupancy(R)` | vector | 取亲和关系中被参考一方的 occupancy，用于集中度优化 |
+| `artifact_occupancy(R)` | vector | 取亲和关系中被参考一方的 occupancy，用于集中度优化 |
 | `weighted_dominant_share(A)` | vector | 为 A 中每个可伸缩 SPMD 计算加权资源占比 |
 
 `affinity_constraints()` 返回当前 Recipe 中 Fluxway 能确认“一定成立”的亲和关系集合：

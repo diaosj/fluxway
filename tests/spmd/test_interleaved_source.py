@@ -253,7 +253,7 @@ async def test_inactive_interleaved_rank_does_not_send():
         get_dispatcher=lambda _name: InterleavedDispatcher(2)
     )
     worker._drain_cond = asyncio.Condition()
-    worker._drain_target_count = None
+    worker._drain_step_count = None
     worker._barriers_declared = {("loader", 0): True}
     worker._operator_send_context = lambda _name: (_ for _ in ()).throw(
         AssertionError("inactive rank must not access a send plan")

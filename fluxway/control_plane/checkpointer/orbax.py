@@ -1,15 +1,14 @@
-"""
-Per-Worker Orbax serialization utilities.
+"""Orbax checkpoint backend with shared global and partition-local records."""
 
-OrbaxBackend persists the user's pytree treedef alongside arrays via
-CompositeCheckpointHandler(state=StandardSave, pytree_meta=JsonSave).
-On restore, the treedef reconstructs the EXACT same pytree structure
-(including nnx.State / nnx.Variable wrappers), so users get back
-exactly what they returned from save_state() — zero framework leakage.
-"""
+from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import os
+import shutil
+import msgpack
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,52 +16,48 @@ import numpy as np
 from etils import epath
 from ray import cloudpickle
 
-from fluxway.control_plane.checkpointer.backend import WorkerCheckpointBackend
+from fluxway.common.types.checkpoint import (
+    CheckpointObjectRef,
+    ComponentCheckpoint,
+    CheckpointObjectRecord,
+    CheckpointRuntime,
+    CheckpointRuntimeRole,
+    SaveSession,
+    CommitSaveSession,
+    RestoreSession,
+    PartitionRecord,
+    WorkerSaveResult,
+    RestoreTopologyMode,
+    KeepPolicy,
+    TopologyMismatchError,
+)
+from fluxway.control_plane.checkpointer._filesystem_backend import (
+    FilesystemCheckpointComponent,
+    _as_async,
+)
 
 
-def _escape(s: str) -> str:
-    """
-    Escape special characters in path strings to ensure safe directory names.
-
-    This is critical to prevent Key Collision. If a user defines a dict with a key
-    that contains a slash (e.g., {"a/b": 1}), leaving it unescaped would cause it to
-    collide with a nested dict (e.g., {"a": {"b": 1}}). By URL-encoding "/" into "%2F"
-    and "%" into "%25", we mathematically guarantee that every unique tree topology
-    maps to a unique, collision-free flat string path.
-    """
-    return s.replace("%", "%25").replace("/", "%2F")
+def _escape(value: str) -> str:
+    return value.replace("%", "%25").replace("/", "%2F")
 
 
 def _get_path_str(path: tuple) -> str:
-    """
-    Convert a JAX KeyPath into a clean, collision-free string for flat dict keys.
-
-    Why not use JAX's built-in `jax.tree_util.keystr(path, simple=True, separator='/')`?
-    Because the official JAX function is unsafe for filesystem paths: it does NOT escape
-    dictionary keys. It will incorrectly format both {"a/b": 1} and {"a": {"b": 1}} into
-    the exact same string "a/b", causing catastrophic data overwriting during checkpointing.
-
-    This function implements a safe serializer that enumerates standard JAX Keys (which is
-    the standard JAX paradigm) and enforces our `_escape` protection on all node names,
-    ensuring 100% data safety while maintaining human-readable folder structures in Orbax.
-    """
     import jax.tree_util as jtu
 
     parts = []
-    for p in path:
-        if isinstance(p, jtu.DictKey):
-            parts.append(_escape(str(p.key)))
-        elif isinstance(p, jtu.SequenceKey):
-            parts.append(str(p.idx))
-        elif hasattr(p, "name"):
-            parts.append(_escape(p.name))
+    for item in path:
+        if isinstance(item, jtu.DictKey):
+            parts.append(_escape(str(item.key)))
+        elif isinstance(item, jtu.SequenceKey):
+            parts.append(str(item.idx))
+        elif hasattr(item, "name"):
+            parts.append(_escape(item.name))
         else:
-            parts.append(_escape(str(p)))
+            parts.append(_escape(str(item)))
     return "/".join(parts)
 
 
 def _is_global_leaf(leaf: Any) -> bool:
-    """Determine if a pytree leaf should be saved via Orbax StandardSave (global)."""
     import jax
 
     if not isinstance(leaf, jax.Array | jax.ShapeDtypeStruct):
@@ -74,14 +69,46 @@ def _is_global_leaf(leaf: Any) -> bool:
     return True
 
 
-class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
-    def __init__(self, force_write: bool = False):
-        self._handler = None
-        self._force_write = force_write
+def _barrier_sync_key(context: SaveSession | RestoreSession, operation: str) -> str:
+    if not operation:
+        raise ValueError("Orbax barrier operation must be non-empty")
+    identity = "\x00".join(
+        (
+            context.spmd_id,
+            context.checkpoint_id,
+            context.attempt_id,
+            context.component_id,
+            operation,
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"fluxway_{operation}_{digest}"
 
-    def __setstate__(self, state):
-        self.__dict__.update(state)  # type: ignore
+
+class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
+    def __init__(
+        self,
+        component_id: str,
+        capture_state,
+        restore_state,
+        restore_layout,
+        *,
+        keep: KeepPolicy = KeepPolicy(),
+    ) -> None:
+        super().__init__(
+            component_id,
+            capture_state,
+            restore_state,
+            keep=keep,
+            restore_topology=RestoreTopologyMode.GLOBAL_RESHARD,
+        )
+        self._restore_layout = _as_async(restore_layout, "restore_layout")
         self._handler = None
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_handler"] = None
+        return state
 
     def _get_handler(self):
         if self._handler is None:
@@ -90,221 +117,413 @@ class OrbaxBackend(WorkerCheckpointBackend, backend_name="orbax"):
             self._handler = ocp.StandardCheckpointHandler()
         return self._handler
 
-    async def save(
-        self, state: dict[str, Any], ckpt_dir: str, spmd_id: str, rank: int, step: int
-    ) -> dict[str, Any]:
-        import orbax.checkpoint as ocp
+    async def _open_resources(self, runtime: CheckpointRuntime) -> None:
+        if runtime.role is CheckpointRuntimeRole.WORKER:
+            self._get_handler()
+
+    async def save(self, session: SaveSession) -> WorkerSaveResult:
+        self._require_permit(session, session.commit_permit)
+        self._require_worker(session)
         import jax
         import jax.tree_util as jtu
+        import orbax.checkpoint as ocp
 
+        state = await self._capture_state(session.instance, session)
         leaves_with_path, treedef = jtu.tree_flatten_with_path(state)
-
-        global_dict = {}
-        local_dict = {}
+        global_dict: dict[str, Any] = {}
+        local_dict: dict[str, Any] = {}
         for path, leaf in leaves_with_path:
-            path_str = _get_path_str(path)
-            if _is_global_leaf(leaf):
-                global_dict[path_str] = leaf
-            else:
-                local_dict[path_str] = leaf
+            path_string = _get_path_str(path)
+            checkpoint_object = global_dict if _is_global_leaf(leaf) else local_dict
+            checkpoint_object[path_string] = leaf
 
-        pytree_meta_encoded = base64.b64encode(cloudpickle.dumps(treedef)).decode(
-            "ascii"
-        )
-
-        # The canonical SPMD-level checkpoint directory for this step.  All
-        # artifact sub-paths are derived from it.  Setting ckpt_dir here
-        # unconditionally ensures load_state_from_disk can locate the checkpoint
-        # even when the checkpoint contains only local_state (no global arrays).
-        spmd_step_dir = Path(ckpt_dir) / str(step) / spmd_id
-        metadata: dict[str, Any] = {
-            "pytree_meta": pytree_meta_encoded,
-            "ckpt_dir": str(spmd_step_dir),
-        }
-
-        handler = self._get_handler()
-
-        if local_dict:
-            local_state_np = jax.tree_util.tree_map(
-                lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, local_dict
-            )
-
-            local_final_path = spmd_step_dir / f"worker_{rank}_local_state"
-
-            def _write_local():
-                # Bypass Orbax Checkpointer entirely for per-rank local state.
-                # Orbax's Checkpointer always coordinates across all JAX
-                # distributed processes via barriers, and for non-sharded numpy
-                # arrays only one process actually writes data regardless of
-                # primary_host / active_processes settings.  Direct numpy
-                # serialization lets each rank write independently without any
-                # cross-process coordination.
-                import shutil
-
-                tmp_path = local_final_path.with_suffix(".tmp")
-                # Clean up any leftover tmp dir from a previous interrupted write.
-                if tmp_path.exists():
-                    shutil.rmtree(tmp_path)
-                tmp_path.mkdir(parents=True, exist_ok=True)
-
-                leaves, local_treedef = jtu.tree_flatten(local_state_np)
-                for i, leaf in enumerate(leaves):
-                    leaf_path = tmp_path / f"leaf_{i}.npy"
-                    if isinstance(leaf, np.ndarray):
-                        np.save(str(leaf_path), leaf)
-                    else:
-                        # Non-array leaves (scalars, strings, etc.)
-                        with open(str(leaf_path.with_suffix(".pkl")), "wb") as f:
-                            cloudpickle.dump(leaf, f)
-
-                # Save the pytree structure so we can reconstruct on load.
-                with open(str(tmp_path / "_local_treedef.pkl"), "wb") as f:
-                    cloudpickle.dump(local_treedef, f)
-
-                # Atomic rename: tmp → final.
-                if local_final_path.exists():
-                    if not self._force_write:
-                        raise FileExistsError(
-                            f"Local checkpoint already exists at {local_final_path}. "
-                            "Set force_write=True in CheckpointConfig to overwrite."
-                        )
-                    shutil.rmtree(local_final_path)
-                # Use shutil.move instead of Path.rename to handle the case
-                # where tmp and final paths reside on different filesystems.
-                shutil.move(str(tmp_path), str(local_final_path))
-
-            await asyncio.to_thread(_write_local)
-            metadata["local_state_dir"] = str(local_final_path)
+        pytree_meta = base64.b64encode(cloudpickle.dumps(treedef)).decode("ascii")
+        shared_staging = self._staging_root(session) / "shared"
+        shared_final = self._final_backend_root(session) / "state" / "shared"
+        partition_key = f"rank/{session.rank}"
+        local_staging = self._staging_path(session, partition_key)
+        local_final = self._final_path(session, partition_key)
 
         if global_dict:
-            final_path = spmd_step_dir / "orbax_state"
-            await asyncio.to_thread(
-                final_path.parent.mkdir, parents=True, exist_ok=True
+            shared_staging.parent.mkdir(parents=True, exist_ok=True)
+
+            def write_global() -> None:
+                options = ocp.options.MultiprocessingOptions(
+                    barrier_sync_key_prefix=_barrier_sync_key(session, "save")
+                )
+                checkpointer = ocp.Checkpointer(
+                    self._get_handler(), multiprocessing_options=options
+                )
+                try:
+                    checkpointer.save(
+                        epath.Path(shared_staging),
+                        force=False,
+                        args=ocp.args.StandardSave(global_dict),
+                    )
+                finally:
+                    checkpointer.close()
+
+            await asyncio.to_thread(write_global)
+
+        if local_dict:
+            if local_staging.exists():
+                raise FileExistsError(
+                    f"Orbax local staging directory exists: {local_staging}"
+                )
+            local_staging.mkdir(parents=True, exist_ok=False)
+            local_state = jtu.tree_map(
+                lambda value: np.asarray(value)
+                if isinstance(value, jax.Array)
+                else value,
+                local_dict,
             )
+            await asyncio.to_thread(self._write_local, local_staging, local_state)
 
-            def _write_global():
-                # The global phase uses its own step-scoped prefix so it does
-                # not collide with either another checkpoint step or the local
-                # save phase above.
-                mp_options = ocp.options.MultiprocessingOptions(
-                    barrier_sync_key_prefix=f"{spmd_id}_{step}_global"
+        checkpoint_objects: list[CheckpointObjectRef] = []
+        if global_dict:
+            checkpoint_objects.append(
+                CheckpointObjectRef(
+                    component_id=self.descriptor.component_id,
+                    checkpoint_object_id="state",
+                    version_id=session.checkpoint_id,
+                    storage_locator=shared_final.as_uri().encode("utf-8"),
+                    format_version=self.descriptor.format_version,
                 )
-                ckptr = ocp.Checkpointer(handler, multiprocessing_options=mp_options)
-                ckptr.save(
-                    epath.Path(final_path),
-                    force=self._force_write,
-                    args=ocp.args.StandardSave(global_dict),
+            )
+        if local_dict:
+            checkpoint_objects.append(
+                CheckpointObjectRef(
+                    component_id=self.descriptor.component_id,
+                    checkpoint_object_id="state",
+                    version_id=session.checkpoint_id,
+                    storage_locator=local_final.as_uri().encode("utf-8"),
+                    format_version=self.descriptor.format_version,
+                    partition_key=partition_key,
+                )
+            )
+        return WorkerSaveResult(
+            record=CheckpointObjectRecord(
+                payload=msgpack.packb(
+                    {
+                        "pytree_meta": pytree_meta,
+                        "has_global_state": bool(global_dict),
+                        "has_local_state": bool(local_dict),
+                    },
+                    use_bin_type=True,
+                ),
+                checkpoint_objects=tuple(checkpoint_objects),
+            ),
+            commit_metadata=msgpack.packb(
+                {
+                    "shared_staging_uri": shared_staging.as_uri()
+                    if global_dict
+                    else None,
+                    "local_staging_uri": local_staging.as_uri() if local_dict else None,
+                },
+                use_bin_type=True,
+            ),
+        )
+
+    async def commit_save(self, session: CommitSaveSession) -> ComponentCheckpoint:
+        self._require_permit(session, session.commit_permit)
+        self._require_worker(session)
+        if not session.worker_results:
+            raise ValueError("Orbax commit_save requires rank records")
+        prepared_values = tuple(session.worker_results.values())
+        records = [prepared.record for prepared in prepared_values]
+        if any(record is None for record in records):
+            raise ValueError("Orbax commit_save received an empty rank record")
+        typed_records = [record for record in records if record is not None]
+        payloads = [
+            msgpack.unpackb(record.payload, raw=False) for record in typed_records
+        ]
+        pytree_values = {payload["pytree_meta"] for payload in payloads}
+        if len(pytree_values) != 1:
+            raise ValueError("Orbax ranks produced different pytree structures")
+
+        moved: list[tuple[Path, Path]] = []
+        shared_record: CheckpointObjectRecord | None = None
+        partitions: list[PartitionRecord] = []
+        try:
+            first_record = typed_records[0]
+            global_checkpoint_objects = [
+                checkpoint_object
+                for checkpoint_object in first_record.checkpoint_objects
+                if checkpoint_object.partition_key is None
+            ]
+            if global_checkpoint_objects:
+                if len(global_checkpoint_objects) != 1:
+                    raise ValueError(
+                        "Orbax rank record has multiple shared checkpoint_objects"
+                    )
+                first_metadata = msgpack.unpackb(
+                    prepared_values[0].commit_metadata, raw=False
+                )
+                if not isinstance(first_metadata, Mapping):
+                    raise TypeError("Orbax rank record has no commit_save metadata")
+                shared_staging_value = first_metadata["shared_staging_uri"]
+                if not isinstance(shared_staging_value, str):
+                    raise TypeError("Orbax shared staging URI is missing")
+                shared_staging = self._file_path(shared_staging_value.encode("utf-8"))
+                shared_final = self._file_path(
+                    global_checkpoint_objects[0].storage_locator
+                )
+                if not shared_staging.is_dir():
+                    raise FileNotFoundError(
+                        f"Orbax shared staging checkpoint_object is missing: {shared_staging}"
+                    )
+                if shared_final.exists():
+                    raise FileExistsError(
+                        f"Orbax shared final checkpoint_object exists: {shared_final}"
+                    )
+                shared_final.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(shared_staging, shared_final)
+                moved.append((shared_staging, shared_final))
+                shared_record = CheckpointObjectRecord(
+                    payload=msgpack.packb(
+                        {
+                            "pytree_meta": msgpack.unpackb(
+                                first_record.payload, raw=False
+                            )["pytree_meta"],
+                            "has_global_state": True,
+                        },
+                        use_bin_type=True,
+                    ),
+                    checkpoint_objects=(global_checkpoint_objects[0],),
                 )
 
-            await asyncio.to_thread(_write_global)
-            metadata["orbax_final_path"] = str(final_path)
-
-        return metadata
-
-    async def load(
-        self, metadata: dict[str, Any], restore_layout: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        import jax.tree_util as jtu
-
-        handler = self._get_handler()
-
-        global_dict = {}
-        if "orbax_final_path" in metadata:
-            import orbax.checkpoint as ocp
-
-            ckpt_path = epath.Path(metadata["orbax_final_path"])
-
-            # If a restore layout is provided, extract its global leaves for `item`.
-            target_global_dict = None
-            if restore_layout is not None:
-                target_global_dict = {}
-                leaves_with_path, _ = jtu.tree_flatten_with_path(restore_layout)
-                for path, leaf in leaves_with_path:
-                    path_str = _get_path_str(path)
-                    if _is_global_leaf(leaf):
-                        target_global_dict[path_str] = leaf
-
-            def _read_global():
-                ckptr = ocp.Checkpointer(handler)
-                if target_global_dict is not None and target_global_dict:
-                    # Pass the target_global_dict as `item` to support resharding automatically.
-                    return ckptr.restore(
-                        ckpt_path,
-                        args=ocp.args.StandardRestore(
-                            item=target_global_dict,
+            for rank, prepared in sorted(session.worker_results.items()):
+                record = prepared.record
+                if record is None:
+                    raise ValueError(f"Orbax rank {rank} has no record")
+                local_checkpoint_objects = [
+                    checkpoint_object
+                    for checkpoint_object in record.checkpoint_objects
+                    if checkpoint_object.partition_key is not None
+                ]
+                if not local_checkpoint_objects:
+                    continue
+                if len(local_checkpoint_objects) != 1:
+                    raise ValueError(
+                        f"Orbax rank {rank} has multiple local checkpoint_objects"
+                    )
+                metadata = msgpack.unpackb(prepared.commit_metadata, raw=False)
+                if not isinstance(metadata, Mapping):
+                    raise TypeError(f"Orbax rank {rank} has no commit_save metadata")
+                local_staging_value = metadata["local_staging_uri"]
+                if not isinstance(local_staging_value, str):
+                    raise TypeError(f"Orbax rank {rank} local staging URI is missing")
+                local_staging = self._file_path(local_staging_value.encode("utf-8"))
+                local_final = self._file_path(
+                    local_checkpoint_objects[0].storage_locator
+                )
+                if not local_staging.is_dir():
+                    raise FileNotFoundError(
+                        f"Orbax rank {rank} local staging checkpoint_object is missing"
+                    )
+                if local_final.exists():
+                    raise FileExistsError(
+                        f"Orbax rank {rank} local final checkpoint_object exists"
+                    )
+                local_final.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(local_staging, local_final)
+                moved.append((local_staging, local_final))
+                partitions.append(
+                    PartitionRecord(
+                        partition_key=local_checkpoint_objects[0].partition_key or "",
+                        source_rank=rank,
+                        record=CheckpointObjectRecord(
+                            payload=msgpack.packb(
+                                {
+                                    "pytree_meta": msgpack.unpackb(
+                                        record.payload, raw=False
+                                    )["pytree_meta"],
+                                    "has_local_state": True,
+                                },
+                                use_bin_type=True,
+                            ),
+                            checkpoint_objects=(local_checkpoint_objects[0],),
                         ),
                     )
-                elif target_global_dict is not None and not target_global_dict:
-                    # restore_layout was provided but contains no globally-sharded
-                    # leaves. This means the operator's model params are on
-                    # SingleDeviceSharding which is a design error: all model
-                    # arrays must be placed on the distributed mesh before
-                    # checkpoint restore is called.
-                    raise ValueError(
-                        "orbax restore: restore_layout was provided but yielded an "
-                        "empty target_global_dict (no globally-sharded JAX arrays "
-                        "found). This indicates model params are still on "
-                        "SingleDeviceSharding at restore time. Ensure model arrays "
-                        "are placed on the distributed mesh in __init__ via "
-                        "jax.device_put(param, NamedSharding(mesh, ...))."
-                    )
-                else:
-                    # No target state at all — cannot determine target sharding.
-                    raise ValueError(
-                        f"orbax restore: no restore_layout provided for checkpoint "
-                        f"at {ckpt_path}. Cannot restore without knowing the "
-                        f"expected pytree structure and sharding."
-                    )
+                )
+        except BaseException:
+            for staging, final in reversed(moved):
+                if final.exists():
+                    os.replace(final, staging)
+            raise
+        return ComponentCheckpoint(
+            component_id=self.descriptor.component_id,
+            format_version=self.descriptor.format_version,
+            shared_records=(shared_record,) if shared_record is not None else (),
+            partitions=tuple(partitions),
+        )
 
-            global_dict = await asyncio.to_thread(_read_global)
+    async def restore(self, session: RestoreSession) -> None:
+        self._require_worker(session)
+        publication = session.component_checkpoint
+        current = session.current_topology or session.source_topology
+        if publication.partitions and current != session.source_topology:
+            raise TopologyMismatchError(
+                "Orbax publication contains rank-local state and requires exact topology"
+            )
+        layout = await self._restore_layout(session.instance, session)
+        global_values: dict[str, Any] = {}
+        local_values: dict[str, Any] = {}
+        pytree_meta: str | None = None
 
-        local_dict = {}
-        if "local_state_dir" in metadata:
+        if publication.shared_records:
+            if len(publication.shared_records) != 1:
+                raise ValueError("Orbax publication has multiple shared records")
+            shared = publication.shared_records[0]
+            pytree_meta = msgpack.unpackb(shared.payload, raw=False)["pytree_meta"]
+            global_values = await self._read_global(shared, layout, session)
 
-            def _read_local():
-                local_dir = Path(metadata["local_state_dir"])
-                with open(str(local_dir / "_local_treedef.pkl"), "rb") as f:
-                    local_treedef = cloudpickle.load(f)
-                leaves = []
-                for i in range(local_treedef.num_leaves):
-                    npy_path = local_dir / f"leaf_{i}.npy"
-                    pkl_path = local_dir / f"leaf_{i}.pkl"
-                    if npy_path.exists():
-                        leaves.append(np.load(str(npy_path)))
-                    elif pkl_path.exists():
-                        with open(str(pkl_path), "rb") as f:
-                            leaves.append(cloudpickle.load(f))
-                    else:
-                        raise FileNotFoundError(f"Missing leaf {i} in {local_dir}")
-                return local_treedef.unflatten(leaves)
+        partition_key = f"rank/{session.rank}"
+        local_matches = [
+            partition.record
+            for partition in publication.partitions
+            if partition.partition_key == partition_key
+        ]
+        if local_matches:
+            if len(local_matches) != 1:
+                raise ValueError("Orbax publication has duplicate local partitions")
+            local = local_matches[0]
+            pytree_meta = msgpack.unpackb(local.payload, raw=False)["pytree_meta"]
+            local_values = await self._read_local(local)
+        elif publication.partitions:
+            raise KeyError(f"Orbax local partition not found: {partition_key!r}")
 
-            local_dict = await asyncio.to_thread(_read_local)
+        if pytree_meta is None:
+            raise ValueError("Orbax publication contains no state records")
+        state = self._reconstruct_state(pytree_meta, {**global_values, **local_values})
+        await self._restore_state(session.instance, state, session)
 
-        # Merge the two flat dictionaries.
-        # Since keys are unique paths, there are no conflicts or mixed keys.
-        all_dict = {**global_dict, **local_dict}
+    async def rollback_save(self, session: SaveSession) -> None:
+        self._require_permit(session, session.commit_permit)
+        self._require_worker(session)
+        partition_key = f"rank/{session.rank}"
+        paths = [
+            self._staging_path(session, partition_key),
+            self._final_path(session, partition_key),
+        ]
+        if session.rank == 0:
+            paths.extend(
+                (
+                    self._staging_root(session) / "shared",
+                    self._final_backend_root(session) / "state" / "shared",
+                )
+            )
+        for path in paths:
+            if path.exists():
+                await asyncio.to_thread(shutil.rmtree, path)
 
-        if "pytree_meta" in metadata:
-            saved_treedef = cloudpickle.loads(base64.b64decode(metadata["pytree_meta"]))
+    async def _write_state(
+        self, state: Any, directory: Path, context: SaveSession
+    ) -> Mapping[str, Any]:
+        raise RuntimeError("Orbax uses its collective save implementation")
 
-            # Reconstruct the original path sequence using a dummy unflatten
-            dummy_leaves = list(range(saved_treedef.num_leaves))
-            dummy_tree = jtu.tree_unflatten(saved_treedef, dummy_leaves)
-            paths_and_indices, _ = jtu.tree_flatten_with_path(dummy_tree)
+    async def _read_state(
+        self, record: CheckpointObjectRecord, context: RestoreSession
+    ) -> Any:
+        raise RuntimeError("Orbax uses shared and partition restore records")
 
-            restored_leaves = []
-            for path, _ in paths_and_indices:
-                path_str = _get_path_str(path)
-                restored_leaves.append(all_dict[path_str])
+    async def _finalize_io(self, context: SaveSession) -> None:
+        return None
 
-            return jtu.tree_unflatten(saved_treedef, restored_leaves)
-
-        return all_dict
-
-    def finalize(self) -> None:
-        pass
-
-    def close(self) -> None:
-        if self._handler:
+    async def _close_resources(self) -> None:
+        if self._handler is not None:
             self._handler.close()
             self._handler = None
+
+    @staticmethod
+    def _write_local(directory: Path, local_state: Any) -> None:
+        import jax.tree_util as jtu
+
+        leaves, treedef = jtu.tree_flatten(local_state)
+        for index, leaf in enumerate(leaves):
+            numpy_path = directory / f"leaf_{index}.npy"
+            if isinstance(leaf, np.ndarray):
+                np.save(str(numpy_path), leaf)
+            else:
+                with (directory / f"leaf_{index}.pkl").open("xb") as stream:
+                    cloudpickle.dump(leaf, stream)
+        with (directory / "treedef.pkl").open("xb") as stream:
+            cloudpickle.dump(treedef, stream)
+
+    async def _read_global(
+        self,
+        record: CheckpointObjectRecord,
+        restore_layout: Any,
+        context: RestoreSession,
+    ) -> dict[str, Any]:
+        import jax.tree_util as jtu
+        import orbax.checkpoint as ocp
+
+        if len(record.checkpoint_objects) != 1:
+            raise ValueError("Orbax shared record must contain one checkpoint_object")
+        checkpoint_object: dict[str, Any] = {}
+        for path, leaf in jtu.tree_flatten_with_path(restore_layout)[0]:
+            if _is_global_leaf(leaf):
+                checkpoint_object[_get_path_str(path)] = leaf
+        if not checkpoint_object:
+            raise ValueError("Orbax restore layout contains no globally sharded arrays")
+        checkpoint_path = epath.Path(
+            self._file_path(record.checkpoint_objects[0].storage_locator)
+        )
+
+        def read() -> dict[str, Any]:
+            options = ocp.options.MultiprocessingOptions(
+                barrier_sync_key_prefix=_barrier_sync_key(context, "restore")
+            )
+            checkpointer = ocp.Checkpointer(
+                self._get_handler(), multiprocessing_options=options
+            )
+            try:
+                return checkpointer.restore(
+                    checkpoint_path,
+                    args=ocp.args.StandardRestore(item=checkpoint_object),
+                )
+            finally:
+                checkpointer.close()
+
+        return await asyncio.to_thread(read)
+
+    async def _read_local(self, record: CheckpointObjectRecord) -> dict[str, Any]:
+        if len(record.checkpoint_objects) != 1:
+            raise ValueError("Orbax local record must contain one checkpoint_object")
+        directory = self._file_path(record.checkpoint_objects[0].storage_locator)
+
+        def read() -> dict[str, Any]:
+            with (directory / "treedef.pkl").open("rb") as stream:
+                treedef = cloudpickle.load(stream)
+            leaves = []
+            for index in range(treedef.num_leaves):
+                numpy_path = directory / f"leaf_{index}.npy"
+                pickle_path = directory / f"leaf_{index}.pkl"
+                if numpy_path.exists():
+                    leaves.append(np.load(str(numpy_path)))
+                elif pickle_path.exists():
+                    with pickle_path.open("rb") as stream:
+                        leaves.append(cloudpickle.load(stream))
+                else:
+                    raise FileNotFoundError(
+                        f"Orbax local leaf {index} is missing in {directory}"
+                    )
+            return treedef.unflatten(leaves)
+
+        return await asyncio.to_thread(read)
+
+    @staticmethod
+    def _reconstruct_state(pytree_meta: str, values: dict[str, Any]) -> Any:
+        import jax.tree_util as jtu
+
+        treedef = cloudpickle.loads(base64.b64decode(pytree_meta))
+        dummy_tree = jtu.tree_unflatten(treedef, list(range(treedef.num_leaves)))
+        paths, _ = jtu.tree_flatten_with_path(dummy_tree)
+        leaves = []
+        for path, _ in paths:
+            path_string = _get_path_str(path)
+            if path_string not in values:
+                raise KeyError(f"Orbax restored state is missing path {path_string!r}")
+            leaves.append(values[path_string])
+        return jtu.tree_unflatten(treedef, leaves)

@@ -1161,7 +1161,7 @@ class BaseDataDistributor:
 
         # Set capacity bucket. Bucketing is *only* needed when the active
         # backend requires static shapes (jax.jit / torch.compile). Pure
-        # eager paths (HybridBackend default, TorchBackend eager) keep
+        # eager paths (HybridBackend default, TorchBackend eager) retention
         # capacity == actual_req so all padding branches below are no-ops.
         bk_static = backend.requires_static_shapes()
         if isinstance(capacity, list | tuple):
@@ -2817,7 +2817,7 @@ def _ragged_project_rows_to_flat(
       splits0: [0, 2, 3]      row 0 owns child lists [0, 2)
       splits1: [0, 2, 3, 6]   those child lists own flat values [0, 3)
 
-    The planner only sorts outer rows. This helper keeps transport open to
+    The planner only sorts outer rows. This helper retentions transport open to
     deeper ragged topologies by repeatedly expanding sorted parent ids into
     child ids until the last level describes flat value segments.
     """

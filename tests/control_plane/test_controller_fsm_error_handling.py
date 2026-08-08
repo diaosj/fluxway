@@ -14,7 +14,7 @@ from fluxway.control_plane.state_machine.controller_fsm import ControllerStateMa
 
 def _make_controller() -> MagicMock:
     controller = MagicMock()
-    controller._cleanup_all_spmds = AsyncMock()
+    controller._reclaim_all_spmds = AsyncMock()
     controller._release_stopped_spmd_handles = MagicMock()
     controller.stop_checkpointer = AsyncMock()
 
@@ -22,7 +22,7 @@ def _make_controller() -> MagicMock:
         assert export_profiler_trace is False
         await controller.stop_checkpointer()
         try:
-            await controller._cleanup_all_spmds()
+            await controller._reclaim_all_spmds()
         finally:
             controller._release_stopped_spmd_handles()
 
@@ -75,14 +75,14 @@ async def test_driver_error_fails_job_without_partial_restart(
     assert not any(
         "Invalid state transition" in record.getMessage() for record in caplog.records
     )
-    controller._cleanup_all_spmds.assert_awaited_once_with()
+    controller._reclaim_all_spmds.assert_awaited_once_with()
     controller._release_stopped_spmd_handles.assert_called_once_with()
 
 
 @pytest.mark.asyncio
-async def test_failure_cleanup_exception_still_reaches_failed() -> None:
+async def test_failure_reclaim_exception_still_reaches_failed() -> None:
     controller = _make_controller()
-    controller._cleanup_all_spmds.side_effect = RuntimeError("cleanup failed")
+    controller._reclaim_all_spmds.side_effect = RuntimeError("reclaim failed")
     fsm = ControllerStateMachine(controller)
     fsm._state = ControllerState.RUNNING
 
@@ -93,7 +93,7 @@ async def test_failure_cleanup_exception_still_reaches_failed() -> None:
     )
 
     assert fsm.state == ControllerState.FAILED
-    controller._cleanup_all_spmds.assert_awaited_once_with()
+    controller._reclaim_all_spmds.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -128,7 +128,7 @@ async def test_driver_error_rejects_mismatched_failure_identity() -> None:
 
     assert fsm.state == ControllerState.RUNNING
     assert fsm.get_failures() == {}
-    controller._cleanup_all_spmds.assert_not_awaited()
+    controller._reclaim_all_spmds.assert_not_awaited()
 
 
 def test_controller_has_no_partial_spmd_restart_api() -> None:

@@ -87,6 +87,7 @@ def bind_spmd(
     is_source: bool = False,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
+    checkpoint_components: tuple[Any, ...] = (),
     **operator_configs: dict[str, Any],
 ) -> type:
     dynamic_cls = type(
@@ -128,6 +129,7 @@ def bind_spmd(
             interleave_unit_size=interleave_unit_size,
             runtime_env=runtime_env,
             driver_runtime_env=driver_runtime_env,
+            checkpoint_components=checkpoint_components,
         )
     else:
         spmd_dec = spmd(
@@ -136,6 +138,7 @@ def bind_spmd(
             mesh_axis_shapes=mesh_axis_shapes,
             runtime_env=runtime_env,
             driver_runtime_env=driver_runtime_env,
+            checkpoint_components=checkpoint_components,
         )
 
     return spmd_dec(dynamic_cls)

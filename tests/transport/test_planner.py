@@ -175,7 +175,7 @@ def test_dynamic_to_static():
     assert counts == [2, 1]
 
 
-def test_hash_literal_indices_keep_negative_bit_patterns_valid():
+def test_hash_literal_indices_retention_negative_bit_patterns_valid():
     dst_mesh = DeviceMesh(device_shape=(1,), axis_names=("x",))
     dst_layout = ShardingSpec.hash(P("x")).bind(dst_mesh)
 
@@ -463,7 +463,7 @@ def test_range_indices_planner_path_does_not_call_materialize(monkeypatch):
 
 
 def test_zip_mode_const_axis_does_not_inflate_sort_indices():
-    """Multi-axis zip + ConstantIndices keeps sort_indices.len == primary length.
+    """Multi-axis zip + ConstantIndices retentions sort_indices.len == primary length.
 
     Locks in the Patch L fix: under transport's row-binding
     (``backend.take(data, sort_indices, axes=(0,))``), an auxiliary

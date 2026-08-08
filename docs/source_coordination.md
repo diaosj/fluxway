@@ -162,9 +162,9 @@ request_drain
   -> workers drain
   -> Driver DRAINED
   -> component checkpoint_state
-  -> worker checkpoint participants
+  -> worker registered persistence capability capture/finalize/commit
   -> Controller ControlLedger snapshot at cut C
-  -> atomic checkpoint envelope publish
+  -> retention reservation and atomic Manifest publish
   -> finalize in-memory durable cut
 ```
 
@@ -173,14 +173,15 @@ Driver component checkpoint 只包含 source cursor、builder tail、至多一�
 source-domain lineage 和 terminal。Arrow、NumPy、`TransportTensor`、Ray handle 与 local prefetch
 payload 不进入 checkpoint。
 
-恢复时 Controller 先恢复 `ControlLedger`，Driver 再恢复 component metadata，最后恢复
-worker/operator state。Dense/Orbax、sparse distributed prepare/commit、source metadata 和用户
-per-worker pickle 都使用同一个 `CheckpointContext` 与现有 snapshot barrier。
+恢复时 Controller 先恢复 `ControlLedger`，Driver 再恢复 component metadata，最后通过各 backend
+恢复 worker state。Dense/Orbax、sparse/Lance、reader cursor 和自定义格式都使用同一个
+`CheckpointContext` 与 capability-composed `CheckpointComponentRegistration` ABI。
 
-artifact transaction 按三层组合：Worker 回滚本进程内所有已尝试 prepare 的 participant；Driver
-在 prepare 或 rank save 失败时执行 worker artifact abort；全局 checkpointer 在任一 Driver、payload
-prepare、distributed commit 或 publish 失败时 abort 所有 Driver。cleanup 自身失败使用异常组同时
-保留主错误与 rollback 错误。只有完整 envelope publish 后才 finalize control ledger cut。
+artifact transaction 按三层组合：Worker coordinator 回滚本进程已尝试的 backend；Driver 在 capture、
+finalize 或 commit 失败时调用 worker abort；全局 checkpointer 在 Manifest publish 前失败时 abort
+所有 Driver 与 retention reservation。backend 的 `abort`、`reclaim`、`close` 语义互不替代；reclaim
+自身失败使用异常组同时保留主错误与 rollback 错误。只有完整 Manifest publish 后才 finalize control
+ledger cut。
 
 ## 同步与异步 Source
 

@@ -211,7 +211,7 @@ async def run_training(args):
             unique_ids=h_proc.unique_user_ids  # type: ignore
         ).sparse_features
         h_emb2 = table2.lookup(
-            unique_ids=h_proc.unique_item_ids  # type: ignore
+            unique_ids=h_proc.unique_checkpoint_object_ids  # type: ignore
         ).sparse_features
 
         h_prepare = dense.prepare_dense_inputs(
@@ -259,9 +259,7 @@ async def run_training(args):
 
     async_step_config = AsyncStepConfig(max_steps=args.max_steps)
     checkpoint_config = CheckpointConfig(
-        force_write=True,
-        backend="orbax",
-        ckpt_dir=args.checkpoint_dir,
+        repository_dir=args.checkpoint_dir,
         interval_steps=args.checkpoint_interval,
     )
     profiler_config = _build_profiler_config(args)
@@ -287,7 +285,7 @@ async def run_training(args):
     await execution.wait()
 
     await execution.cancel()
-    print("[Fluxway] Training completed up to target steps.")
+    print("[Fluxway] Training completed up to checkpoint_object steps.")
 
 
 def main():

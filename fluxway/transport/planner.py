@@ -309,7 +309,7 @@ class TransportPlanner:
         #     ``primary axis length``.  Required by L1 transport's
         #     ``backend.take(data, sort_indices, axes=(0,))`` row-binding,
         #     so ``sort_indices.len == row count`` and never the inflated
-        #     Cartesian product.  ConstantIndices keeps a ``(1,)`` rank
+        #     Cartesian product.  ConstantIndices retentions a ``(1,)`` rank
         #     tensor and broadcasts via ``coordinate_to_device`` — zero
         #     materialisation cost for the constant axis.
         zip_mode = domain.combine == "zip"
@@ -383,7 +383,7 @@ class TransportPlanner:
             #   - cartesian: reshape this axis's rank/valid tensors into
             #     their own broadcast dimension so the final shape is
             #     ``∏ effective_lengths`` after coordinate_to_device.
-            #   - zip: keep 1-D shapes; constant axes carry shape (1,) and
+            #   - zip: retention 1-D shapes; constant axes carry shape (1,) and
             #     non-constant axes must already share the same length
             #     (validated below).  XLA broadcast at
             #     ``coordinate_to_device`` time aligns shapes element-wise.

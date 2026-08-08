@@ -53,7 +53,6 @@ async def test_driver_stop_waits_for_worker_shutdown():
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a", "node-a"],
-        checkpoint_backend=None,
     )
 
     worker0 = MagicMock()
@@ -88,7 +87,6 @@ async def test_driver_stop_propagates_worker_shutdown_failure_after_detach():
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a"],
-        checkpoint_backend=None,
     )
     worker = MagicMock()
     worker.stop.remote = AsyncMock(side_effect=RuntimeError("drain failed"))
@@ -116,7 +114,6 @@ async def test_driver_stop_reports_submission_and_detach_failures():
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a", "node-b"],
-        checkpoint_backend=None,
     )
     failed = MagicMock()
     failed.stop.remote = MagicMock(side_effect=RuntimeError("submit failed"))
@@ -153,7 +150,6 @@ async def test_driver_stop_shuts_down_workers_when_heartbeat_stop_fails():
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a"],
-        checkpoint_backend=None,
     )
     worker = MagicMock()
     worker.stop.remote = AsyncMock(return_value=None)
@@ -184,7 +180,6 @@ async def test_stop_heartbeat_joins_background_thread():
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a"],
-        checkpoint_backend=None,
     )
 
     join_mock = MagicMock()
@@ -212,7 +207,6 @@ def test_driver_ignores_worker_callbacks_while_stopping():
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a"],
-        checkpoint_backend=None,
     )
 
     heartbeat = MagicMock()

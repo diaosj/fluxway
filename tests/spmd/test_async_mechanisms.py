@@ -406,7 +406,6 @@ def _make_driver(spmd_id: str, controller_handle=None):
         graph_topology={},
         worker_resource={"CPU": 0},
         expected_node_ids=["node-a"],
-        checkpoint_backend=None,
     )
 
 

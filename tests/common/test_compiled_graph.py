@@ -265,7 +265,7 @@ def test_transfer_codes_are_plan_wide_canonical_wire_identities():
         plan.spmd("source").transfer(4)
 
 
-def test_compiler_keeps_exact_operator_dependencies_for_one_target_spmd():
+def test_compiler_retentions_exact_operator_dependencies_for_one_target_spmd():
     before = OperatorSpec(name="before")
     after_a = OperatorSpec(name="after_a")
     after_b = OperatorSpec(name="after_b")

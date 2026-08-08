@@ -16,6 +16,7 @@ from fluxway.common.schema import FluxwayBaseSchema
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types.failure import ExecutionFailure
 from fluxway.resources import ResourceProfile
+from fluxway.common.types.checkpoint import CheckpointCaptureMode
 
 
 from enum import StrEnum
@@ -91,6 +92,7 @@ class SPMDConfig(FluxwayBaseSchema):
     mesh: Any = None  # DeviceMesh (use Any to avoid circular import)
 
     operator_specs: dict[str, OperatorSpec] = Field(default_factory=dict)
+    checkpoint_components: tuple[Any, ...] = ()
 
     # Static arguments for operators: {arg_name: arg_value}
     static_args: dict[str, Any] = Field(default_factory=dict)
@@ -101,7 +103,7 @@ class SPMDConfig(FluxwayBaseSchema):
     # Global step limit for the SPMD. If set, source operators will self-terminate
     max_steps: int | None = None
 
-    # If true, worker will block identically at step=0 until a drain target is provided.
+    # If true, worker will block identically at step=0 until a drain checkpoint_object is provided.
     requires_drain_at_startup: bool = False
 
     # If true, workers enqueue source operators immediately after topology startup.
@@ -426,8 +428,8 @@ class DriverState(StrEnum):
     READY = "ready"  # Ready, waiting for Controller command
     RUNNING = "running"  # Running
     BLOCKED = "blocked"  # Blocked
-    DRAINING = "draining"  # Draining to target step
-    DRAINED = "drained"  # Reached the drain target step
+    DRAINING = "draining"  # Draining to checkpoint_object step
+    DRAINED = "drained"  # Reached the drain checkpoint_object step
     SNAPSHOTTING = "snapshotting"  # Extracting operator states via save_state
     ERROR = "error"  # Error state
     COMPLETED = "completed"  # Completed
@@ -505,10 +507,17 @@ class HeartbeatConfig(FluxwayBaseSchema):
 class CheckpointConfig(FluxwayBaseSchema):
     """Configuration for checkpoint manager."""
 
-    backend: str  # Validated at runtime by WorkerCheckpointBackend.create()
-    ckpt_dir: str
+    repository_dir: str
     interval_steps: int
-    force_write: bool = False  # Force write even if directory already exists
+    capture_mode: CheckpointCaptureMode = CheckpointCaptureMode.FENCED
+
+    @model_validator(mode="after")
+    def _validate_checkpoint_config(self):
+        if not self.repository_dir:
+            raise ValueError("repository_dir must be non-empty")
+        if self.interval_steps < 1:
+            raise ValueError("interval_steps must be positive")
+        return self
 
 
 class AsyncStepConfig(FluxwayBaseSchema):
