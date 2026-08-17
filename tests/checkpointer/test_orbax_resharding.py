@@ -1,5 +1,5 @@
 from fluxway.common.types.checkpoint import RestoreTopologyMode
-from fluxway.control_plane.checkpointer.orbax import OrbaxCheckpointComponent
+from fluxway.control_plane.checkpointer.orbax_component import OrbaxCheckpointComponent
 
 
 def test_orbax_declares_global_reshard_and_requires_restore_layout():
@@ -12,5 +12,5 @@ def test_orbax_declares_global_reshard_and_requires_restore_layout():
     async def layout(module, context):
         return {}
 
-    backend = OrbaxCheckpointComponent("dense", save, restore, layout)
-    assert backend.descriptor.restore_topology is RestoreTopologyMode.GLOBAL_RESHARD
+    component = OrbaxCheckpointComponent("dense", save, restore, layout)
+    assert component.descriptor.restore.topology is RestoreTopologyMode.GLOBAL_RESHARD

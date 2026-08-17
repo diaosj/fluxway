@@ -1,6 +1,6 @@
 from fluxway.checkpoint import (
     CommitSaveSession,
-    ComponentSpec,
+    CheckpointComponentSpec,
     SaveSession,
     register_checkpoint_component,
     state_checkpoint_component,
@@ -13,11 +13,8 @@ from fluxway.common.types.checkpoint import (
 
 
 def test_public_component_api_defaults_to_one_state_object() -> None:
-    spec = ComponentSpec("reader")
-    assert tuple(
-        checkpoint_object.checkpoint_object_id
-        for checkpoint_object in spec.checkpoint_objects
-    ) == ("state",)
+    spec = CheckpointComponentSpec("reader")
+    assert spec.checkpoint_objects == ()
 
 
 def test_save_session_builds_opaque_checkpoint_objects() -> None:
@@ -71,7 +68,12 @@ def test_public_registration_uses_the_component_descriptor() -> None:
         lambda instance, state, session: None,
     )
 
-    registration = register_checkpoint_component(component)
+    registration = register_checkpoint_component(
+        component,
+        component_lifecycle=component,
+        save=component,
+        restore=component,
+    )
 
     assert registration.component is component
     assert registration.descriptor is component.descriptor

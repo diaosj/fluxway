@@ -13,6 +13,7 @@ stack. These tests pin its three structural responsibilities:
 import pytest
 
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.coherence import CoherenceInstance, CoherenceSubject
 from fluxway.common.tensor_backend import set_backend
 from fluxway.common.types.sharding import (
     IdentityIndices,
@@ -265,7 +266,9 @@ def _build_chunked_tensor(local_shape, global_shape):
     from fluxway.common.types.tensor import TransportTensor
 
     flat = jnp.zeros(local_shape, dtype=jnp.float32)
-    return TransportTensor(flat, global_shape=global_shape, source_step=0)
+    tensor = TransportTensor(flat, global_shape=global_shape, source_step=0)
+    tensor._bind_coherence_instances((CoherenceInstance(CoherenceSubject(1, 0, 1), 0),))
+    return tensor
 
 
 def test_distributor_last_src_view_populated_after_plan():
@@ -359,6 +362,7 @@ def test_distributor_expected_n_for_dst_data_driven_falls_back():
 
     keys = jnp.arange(0, 6, dtype=jnp.int32)
     tt = TransportTensor(keys, global_shape=(12,), source_step=0)
+    tt._bind_coherence_instances((CoherenceInstance(CoherenceSubject(1, 0, 3), 0),))
     dist = AsyncDataDistributor(local_rank=0)
     dist.plan_and_shard(
         local_data=tt,

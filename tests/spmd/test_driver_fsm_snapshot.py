@@ -59,15 +59,41 @@ class TestSnapshotHappyPath:
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
         fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
-        fsm.trigger(DriverEvent.SNAPSHOT_COMPLETE)
+        fsm.trigger(DriverEvent.RESUME)
         assert fsm.state == DriverState.RUNNING
+
+    def test_snapshotting_can_reenter_draining_for_terminal_shorten(self):
+        fsm, _ = _make_fsm()
+        fsm.trigger(DriverEvent.DRAIN_REQUESTED)
+        fsm.trigger(DriverEvent.DRAIN_COMPLETE)
+        fsm.trigger(DriverEvent.SNAPSHOT_REQUESTED)
+        fsm.trigger(DriverEvent.DRAIN_REQUESTED)
+        assert fsm.state == DriverState.DRAINING
 
     def test_drained_to_running_no_snapshot(self):
         fsm, _ = _make_fsm()
         fsm.trigger(DriverEvent.DRAIN_REQUESTED)
         fsm.trigger(DriverEvent.DRAIN_COMPLETE)
-        fsm.trigger(DriverEvent.SNAPSHOT_COMPLETE)
+        fsm.trigger(DriverEvent.RESUME)
         assert fsm.state == DriverState.RUNNING
+
+    def test_restore_round_trip_requires_ready_before_start(self):
+        fsm = DriverStateMachine(MagicMock(spmd_id="test_spmd"))
+        fsm.require_transition(DriverEvent.INIT_COMPLETE)
+        fsm.require_transition(DriverEvent.RESTORE_REQUESTED)
+        assert fsm.state is DriverState.RESTORING
+        assert not fsm.trigger(DriverEvent.START)
+        fsm.require_transition(DriverEvent.RESTORE_COMPLETE)
+        assert fsm.state is DriverState.READY
+        fsm.require_transition(DriverEvent.START)
+        assert fsm.state is DriverState.RUNNING
+
+    def test_repeated_drain_admission_is_state_owned(self):
+        fsm, _ = _make_fsm()
+        assert fsm.admit_drain() is True
+        assert fsm.admit_drain() is False
+        fsm.require_transition(DriverEvent.DRAIN_COMPLETE)
+        assert fsm.admit_drain() is False
 
 
 class TestSnapshotErrorPaths:

@@ -1412,7 +1412,7 @@ class TraceRecorder:
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(CONTROLLER_COMPLETION, payload=(spmd_count,))
 
-    def controller_reclaim(
+    def controller_cleanup(
         self, *, spmd_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(CONTROLLER_CLEANUP, payload=(spmd_count,))

@@ -88,6 +88,8 @@ def bind_spmd(
     interleaved: bool = False,
     interleave_unit_size: int = 1,
     checkpoint_components: tuple[Any, ...] = (),
+    heartbeat_interval_s: float = 5.0,
+    heartbeat_timeout_s: float = 90.0,
     **operator_configs: dict[str, Any],
 ) -> type:
     dynamic_cls = type(
@@ -130,6 +132,8 @@ def bind_spmd(
             runtime_env=runtime_env,
             driver_runtime_env=driver_runtime_env,
             checkpoint_components=checkpoint_components,
+            heartbeat_interval_s=heartbeat_interval_s,
+            heartbeat_timeout_s=heartbeat_timeout_s,
         )
     else:
         spmd_dec = spmd(
@@ -139,6 +143,8 @@ def bind_spmd(
             runtime_env=runtime_env,
             driver_runtime_env=driver_runtime_env,
             checkpoint_components=checkpoint_components,
+            heartbeat_interval_s=heartbeat_interval_s,
+            heartbeat_timeout_s=heartbeat_timeout_s,
         )
 
     return spmd_dec(dynamic_cls)

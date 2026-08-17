@@ -12,9 +12,9 @@ from fluxway.common.types.checkpoint import (
     CheckpointRuntime,
     CommitAuthority,
     CommitSaveSession,
-    ComponentCheckpoint,
-    ComponentSpec,
-    KeepPolicy,
+    CheckpointComponentPublication,
+    CheckpointComponentSpec,
+    CheckpointRetentionPolicy,
     NameReference,
     RestoreSession,
     SaveCheckpointRequest,
@@ -22,12 +22,15 @@ from fluxway.common.types.checkpoint import (
     StepReference,
     WorkerSaveResult,
 )
-from fluxway.control_plane.checkpointer.backend import (
+from fluxway.control_plane.checkpointer.component import (
     CheckpointComponent,
+    CheckpointComponentLifecycle,
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
-    CheckpointObjectCleaner,
+    CheckpointObjectCleanup,
     CheckpointObjectLifecycle,
+    CheckpointComponentRestore,
+    CheckpointComponentSave,
 )
 from fluxway.control_plane.checkpointer.inline import StateCheckpointComponent
 
@@ -46,24 +49,32 @@ def state_checkpoint_component(
 def register_checkpoint_component(
     component: CheckpointComponent,
     *,
+    component_lifecycle: CheckpointComponentLifecycle | None = None,
+    save: CheckpointComponentSave | None = None,
+    restore: CheckpointComponentRestore | None = None,
     object_lifecycle: CheckpointObjectLifecycle | None = None,
-    cleaner: CheckpointObjectCleaner | None = None,
+    object_cleanup: CheckpointObjectCleanup | None = None,
 ) -> CheckpointComponentRegistration:
     return CheckpointComponentRegistration(
-        descriptor=component.descriptor,
         component=component,
+        component_lifecycle=component_lifecycle,
+        save=save,
+        restore=restore,
         object_lifecycle=object_lifecycle,
-        cleaner=cleaner,
+        object_cleanup=object_cleanup,
     )
 
 
 __all__ = [
     "CheckpointComponent",
+    "CheckpointComponentLifecycle",
     "CheckpointComponentRegistration",
     "CheckpointComponentRegistry",
     "CheckpointHold",
-    "CheckpointObjectCleaner",
+    "CheckpointObjectCleanup",
     "CheckpointObjectLifecycle",
+    "CheckpointComponentRestore",
+    "CheckpointComponentSave",
     "CheckpointIdReference",
     "CheckpointManifest",
     "CheckpointObjectRef",
@@ -71,9 +82,9 @@ __all__ = [
     "CheckpointRuntime",
     "CommitAuthority",
     "CommitSaveSession",
-    "ComponentCheckpoint",
-    "ComponentSpec",
-    "KeepPolicy",
+    "CheckpointComponentPublication",
+    "CheckpointComponentSpec",
+    "CheckpointRetentionPolicy",
     "NameReference",
     "RestoreSession",
     "SaveCheckpointRequest",

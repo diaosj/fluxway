@@ -17,7 +17,11 @@ from fluxway.common.compiled_graph import (
     CompiledTensorTransfer,
     SPMDGraphView,
 )
-from fluxway.common.coherence import CoherenceAction
+from fluxway.common.coherence import (
+    CoherenceAction,
+    CoherenceSubject,
+    CoherenceInstance,
+)
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_policy import ArgumentType
 from fluxway.common.types.sharding import (
@@ -375,6 +379,24 @@ class CompiledSendPlan:
 
     def coherence_logical_tuuid(self, transfer_code: int) -> int:
         return self.tensor_route(transfer_code).logical_tuuid
+
+    def coherence_instance(
+        self,
+        transfer_code: int,
+        epoch: int,
+    ) -> CoherenceInstance:
+        if type(epoch) is not int or epoch < 0:
+            raise ValueError(
+                f"coherence epoch must be a non-negative int, got {epoch!r}."
+            )
+        return CoherenceInstance(
+            CoherenceSubject(
+                self.sender_spmd_code,
+                self.rank,
+                self.coherence_logical_tuuid(transfer_code),
+            ),
+            epoch,
+        )
 
     def coherence_child_slot(self, transfer_code: int, target_rank: int) -> int:
         route = self.tensor_route(transfer_code)
@@ -1076,7 +1098,11 @@ def build_completed_without_tensor_step_frame_groups(
                     expected_count=expected_count,
                     transfer_code=route.transfer_code,
                     payload=empty_values,
-                    source_step=exec_step,
+                    coherence_instance=_output_coherence_instance(
+                        compiled_plan,
+                        route.logical_tuuid,
+                        exec_step,
+                    ),
                 )
         for frame_arg in distributor.build_transport_frame_args(
             step=exec_step,
@@ -1167,8 +1193,7 @@ def _build_dependency_decision_frame_groups(
             routes_by_target[target_rank].append(route)
 
     frame_groups: list[StepFrameGroup] = []
-    for target_rank in sorted(routes_by_target):
-        routes = routes_by_target[target_rank]
+    for target_rank, routes in routes_by_target.items():
         builder = TransportFrameBuilder(
             step=exec_step,
             sender_spmd_code=compiled_plan.sender_spmd_code,
@@ -1211,8 +1236,7 @@ def _build_ordering_frame_groups(
             routes_by_target[target_rank].append(route)
 
     frame_groups: list[StepFrameGroup] = []
-    for target_rank in sorted(routes_by_target):
-        routes = routes_by_target[target_rank]
+    for target_rank, routes in routes_by_target.items():
         builder = TransportFrameBuilder(
             step=exec_step,
             sender_spmd_code=compiled_plan.sender_spmd_code,
@@ -1338,6 +1362,17 @@ def prepare_route_tensor(
             tensor=leaf_tensor,
             exec_step=exec_step,
         )
+    instance = _output_coherence_instance(
+        compiled_plan,
+        route.logical_tuuid,
+        exec_step,
+    )
+    bound_instances = leaf_tensor._coherence_instances
+    if bound_instances:
+        if instance not in bound_instances:
+            leaf_tensor._extend_coherence_instances((instance,))
+    else:
+        leaf_tensor._bind_coherence_instances((instance,))
     if route.target_spec.is_content_addressable and (
         leaf_tensor.routing_indices is None
         and leaf_tensor.receipt is None
@@ -1350,6 +1385,21 @@ def prepare_route_tensor(
             "TransportTensor lacks routing_indices, receipt, and flat_values."
         )
     return leaf_tensor
+
+
+def _output_coherence_instance(
+    compiled_plan: CompiledSendPlan,
+    logical_tuuid: int,
+    epoch: int,
+) -> CoherenceInstance:
+    return CoherenceInstance(
+        CoherenceSubject(
+            compiled_plan.sender_spmd_code,
+            compiled_plan.rank,
+            logical_tuuid,
+        ),
+        epoch,
+    )
 
 
 def ensure_transport_source_step(

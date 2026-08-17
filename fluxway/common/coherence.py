@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
-import typing
-from typing import NewType
+from types import MappingProxyType
+from typing import ClassVar, NewType
 
 
 class CoherenceError(RuntimeError):
@@ -59,6 +59,11 @@ class ParentAuthority(IntEnum):
     OWNERSHIP = 2
 
 
+class InvalidationResult(IntEnum):
+    STARTED = 1
+    SATISFIED_BY_PARENT_RETURN = 2
+
+
 class ExecutionFenceState(IntEnum):
     OPEN = 0
     CLOSING = 1
@@ -91,17 +96,50 @@ class CoherenceEvent(IntEnum):
     AckSnoopInval = 11
 
 
-@dataclass(slots=True)
-class TransitionResult:
-    status: str
-    message: str = ""
-    action: typing.Callable[[CoherenceEntryState], None] | None = None
+class TransitionStatus(StrEnum):
+    READY = "ready"
+    PENDING = "pending"
+    ERROR = "error"
+    ERROR_BACKPRESSURE = "error_backpressure"
+
+
+class PendingDisposition(IntEnum):
+    BLOCKED = 1
+    GRANTED = 2
+    REJECTED = 3
 
 
 ExecutionToken = NewType("ExecutionToken", int)
 
 
 @dataclass(frozen=True, slots=True)
+class CoherenceTransitionContext:
+    execution: ExecutionToken | None = None
+    child_id: int | None = None
+    publishes_local_payload: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionResult:
+    status: TransitionStatus
+    message: str = ""
+    action: Callable[[CoherenceEntryState, CoherenceTransitionContext], None] | None = (
+        None
+    )
+
+    def commit(
+        self,
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext = CoherenceTransitionContext(),
+    ) -> None:
+        if self.status is not TransitionStatus.READY or self.action is None:
+            raise CoherenceStateTransitionError(
+                f"cannot commit transition status={self.status}."
+            )
+        self.action(entry, context)
+
+
+@dataclass(frozen=True, slots=True, order=True)
 class CoherenceSubject:
     owner_spmd_code: int
     owner_rank: int
@@ -128,16 +166,16 @@ class CoherenceSubject:
             raise ValueError("logical_tuuid must be positive.")
 
 
-@dataclass(frozen=True, slots=True)
-class TensorInstance:
+@dataclass(frozen=True, slots=True, order=True)
+class CoherenceInstance:
     subject: CoherenceSubject
     epoch: int
 
     def __post_init__(self) -> None:
         if type(self.epoch) is not int:
-            raise TypeError("TensorInstance.epoch must be an int.")
+            raise TypeError("CoherenceInstance.epoch must be an int.")
         if self.epoch < 0:
-            raise ValueError("TensorInstance.epoch must be non-negative.")
+            raise ValueError("CoherenceInstance.epoch must be non-negative.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +195,7 @@ class GrantReady:
 
 @dataclass(frozen=True, slots=True)
 class GrantPending:
-    ready: asyncio.Future[GrantToken]
+    request_id: int
     reason: str
     requires_parent_ownership: bool = False
     invalidate_children: int = 0
@@ -171,19 +209,74 @@ class GrantRejected:
 GrantResult = GrantReady | GrantPending | GrantRejected
 
 
+@dataclass(frozen=True, slots=True)
+class ParentReturnToken:
+    key: CoherenceSubject
+    epoch: int
+    transaction_id: int
+
+
+@dataclass(slots=True)
+class ParentGrantState:
+    authority: ParentAuthority = ParentAuthority.NONE
+    return_transaction: ParentReturnToken | None = None
+    return_tombstone_epoch: int | None = None
+
+    def begin_return(self, token: ParentReturnToken) -> None:
+        if self.return_transaction is not None:
+            raise CoherenceStateTransitionError(
+                "parent return transaction is already active."
+            )
+        if self.authority not in (
+            ParentAuthority.SHARED,
+            ParentAuthority.OWNERSHIP,
+        ):
+            raise CoherenceStateTransitionError("parent grant is not returnable.")
+        self.authority = ParentAuthority.NONE
+        self.return_transaction = token
+        self.return_tombstone_epoch = token.epoch
+
+    def observe_return(self, key: CoherenceSubject) -> None:
+        if self.return_transaction is None:
+            raise CoherenceStateTransitionError(
+                f"coherence key={key} has no active parent return transaction."
+            )
+        self.return_transaction = None
+
+    def complete_return(self, token: ParentReturnToken) -> None:
+        if self.return_transaction != token:
+            raise CoherenceStateTransitionError(
+                f"parent return id={token.transaction_id} is not bound to entry."
+            )
+        self.return_transaction = None
+
+    def accept_shared(self, epoch: int) -> None:
+        if self.authority is not ParentAuthority.NONE:
+            raise CoherenceStateTransitionError("parent authority is already active.")
+        if self.return_transaction is not None:
+            raise CoherenceStateTransitionError(
+                "parent return transaction is still active."
+            )
+        self.authority = ParentAuthority.SHARED
+        if self.return_tombstone_epoch == epoch:
+            self.return_tombstone_epoch = None
+
+    def coalesces_invalidation(self, epoch: int) -> bool:
+        return self.return_tombstone_epoch == epoch
+
+    @property
+    def return_in_flight(self) -> bool:
+        return self.return_transaction is not None
+
+
 @dataclass(slots=True)
 class _PendingRequest:
+    request_id: int
     epoch: int
     kind: GrantKind
     execution: ExecutionToken
-    future: asyncio.Future[GrantToken]
     publishes_local_payload: bool = False
-
-
-@dataclass(slots=True)
-class _PendingDeliveryWaiter:
-    child_bitmap: int
-    future: asyncio.Future[None]
+    result: GrantReady | GrantRejected | None = None
 
 
 @dataclass(slots=True)
@@ -199,328 +292,634 @@ class CoherenceEntryState:
     local_writer: ExecutionToken | None = None
     local_writer_grant_id: int | None = None
     ownership_child_id: int | None = None
-    parent_authority: ParentAuthority = ParentAuthority.NONE
+    parent_grant: ParentGrantState = field(default_factory=ParentGrantState)
     revoking: bool = False
     pending_readers: deque[_PendingRequest] = field(default_factory=deque)
     pending_writers: deque[_PendingRequest] = field(default_factory=deque)
-    pending_quiescence: deque[asyncio.Future[None]] = field(default_factory=deque)
-    pending_delivery_waiters: deque[_PendingDeliveryWaiter] = field(
-        default_factory=deque
-    )
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionGuard:
+    predicate: Callable[[CoherenceEntryState, CoherenceTransitionContext], bool]
+    result: TransitionResult
+
+
+@dataclass(frozen=True, slots=True)
+class TransitionSpec:
+    guards: tuple[TransitionGuard, ...]
+    ready: TransitionResult
+    validate: Callable[[CoherenceTransitionContext], None] | None = None
 
 
 class CoherenceDirectory:
     """Endpoint-local, event-loop-owned directory for direct coherence edges."""
 
-    def _evaluate_transition(
-        self, event: CoherenceEvent, entry: CoherenceEntryState, **kwargs
-    ) -> TransitionResult:
-        if event == CoherenceEvent.PrRd:
-            execution = kwargs.get("execution")
-            if entry.ownership_child_id is not None:
-                return TransitionResult("PENDING", "child owns data")
-            if entry.state is CoherenceState.INVALID:
-                return TransitionResult("ERROR", "cannot read invalid data.")
-            if entry.revoking:
-                return TransitionResult(
-                    "ERROR", "cannot read while invalidation is active."
-                )
-            if entry.local_writer is not None:
-                if execution == entry.local_writer:
-                    return TransitionResult(
-                        "ERROR", "active writer cannot acquire a separate read grant."
-                    )
-                return TransitionResult("PENDING", "writer active")
-            if self._has_pending_writer(entry):
-                return TransitionResult("PENDING", "ownership request pending")
-
-            return TransitionResult(
-                "READY",
-                action=lambda e: setattr(e, "state", CoherenceState.SHARED)
-                if e.state == CoherenceState.EXCLUSIVE
-                else None,
-            )
-
-        elif event == CoherenceEvent.PrWr:
-            if entry.state is CoherenceState.INVALID:
-                return TransitionResult("ERROR", "cannot write invalid data.")
-            if (
-                entry.local_writer is not None
-                or entry.ownership_child_id is not None
-                or entry.local_reader_count
-                or entry.child_share_bitmap
-                or entry.child_delivery_inflight
-            ):
-                return TransitionResult("PENDING", "read grants active")
-            if entry.parent_authority is ParentAuthority.SHARED:
-                return TransitionResult("PENDING", "parent ownership required")
-
-            return TransitionResult(
-                "READY", action=lambda e: setattr(e, "state", CoherenceState.MODIFIED)
-            )
-
-        elif event == CoherenceEvent.TxBusRd:
-            child_id = kwargs.get("child_id")
-            assert child_id is not None, "child_id is required"
-            publishes_local_payload = kwargs.get("publishes_local_payload", False)
-            if self._try_tx_bus_rd_ready(
-                entry,
-                child_id,
-                publishes_local_payload=publishes_local_payload,
-            ):
-                return TransitionResult("READY")
-            return self._tx_bus_rd_blocker(
-                entry,
-                publishes_local_payload=publishes_local_payload,
-            )
-
-        elif event == CoherenceEvent.RxBusRd:
-            if (
-                entry.local_writer is not None
-                or entry.ownership_child_id is not None
-                or entry.state is CoherenceState.MODIFIED
-            ):
-                return TransitionResult(
-                    "ERROR_BACKPRESSURE",
-                    "cannot accept parent read grant while ownership is active.",
-                )
-            if entry.parent_authority is not ParentAuthority.NONE:
-                return TransitionResult("ERROR", "parent authority is already active.")
-            if entry.state is not CoherenceState.INVALID:
-                return TransitionResult(
-                    "ERROR", "BUS_RD requires an invalid destination entry."
-                )
-
-            def action(e):
-                e.parent_authority = ParentAuthority.SHARED
-                e.state = CoherenceState.SHARED
-
-            return TransitionResult("READY", action=action)
-
-        elif event == CoherenceEvent.PublishLocal:
-            if entry.parent_authority is not ParentAuthority.NONE:
-                return TransitionResult(
-                    "ERROR", "local payload publication cannot replace a parent grant."
-                )
-            if entry.state is not CoherenceState.INVALID:
-                return TransitionResult(
-                    "ERROR", "local payload publication requires an invalid entry."
-                )
-            if not self._is_locally_quiescent(entry):
-                return TransitionResult(
-                    "ERROR_BACKPRESSURE",
-                    "local payload publication requires a quiescent entry.",
-                )
-
-            return TransitionResult(
-                "READY", action=lambda e: setattr(e, "state", CoherenceState.EXCLUSIVE)
-            )
-
-        elif event == CoherenceEvent.TxGrantReturn:
-            if entry.parent_authority is ParentAuthority.NONE:
-                return TransitionResult("ERROR", "has no parent grant to return.")
-            if not self._is_locally_quiescent(entry):
-                return TransitionResult(
-                    "ERROR_BACKPRESSURE", "still has active local or child grants."
-                )
-
-            def action(e):
-                e.parent_authority = ParentAuthority.NONE
-                e.revoking = False
-                e.state = CoherenceState.INVALID
-
-            return TransitionResult("READY", action=action)
-
-        elif event == CoherenceEvent.TxOwnershipGrant:
-            child_id = kwargs.get("child_id")
-            assert child_id is not None, "child_id is required"
-            if (
-                entry.local_reader_count
-                or entry.child_share_bitmap
-                or entry.child_delivery_inflight
-            ):
-                return TransitionResult(
-                    "ERROR_BACKPRESSURE", "shared grants are still active."
-                )
-            if entry.ownership_child_id is not None:
-                return TransitionResult("ERROR", "ownership is already delegated.")
-
-            def action(e):
-                e.local_writer = None
-                e.local_writer_grant_id = None
-                e.ownership_child_id = child_id
-                e.state = CoherenceState.INVALID
-
-            return TransitionResult("READY", action=action)
-
-        elif event == CoherenceEvent.RxOwnershipGrant:
-            if entry.parent_authority is not ParentAuthority.SHARED:
-                return TransitionResult(
-                    "ERROR", "ownership requires shared parent authority."
-                )
-            if (
-                entry.local_reader_count
-                or entry.child_share_bitmap
-                or entry.ownership_child_id is not None
-            ):
-                return TransitionResult(
-                    "ERROR_BACKPRESSURE", "local or child grants are still active."
-                )
-
-            return TransitionResult(
-                "READY",
-                action=lambda e: setattr(
-                    e, "parent_authority", ParentAuthority.OWNERSHIP
-                ),
-            )
-
-        elif event == CoherenceEvent.TxOwnershipCancel:
-            if entry.parent_authority is not ParentAuthority.OWNERSHIP:
-                return TransitionResult("ERROR", "no parent ownership to cancel.")
-            if entry.local_writer is not None:
-                return TransitionResult(
-                    "ERROR", "ownership cannot be cancelled after write access starts."
-                )
-
-            def action(e):
-                e.parent_authority = ParentAuthority.NONE
-                e.state = CoherenceState.INVALID
-
-            return TransitionResult("READY", action=action)
-
-        elif event == CoherenceEvent.RxSnoopInval:
-            if entry.revoking:
-                return TransitionResult("ERROR", "invalidation is already active.")
-            if (
-                entry.parent_authority is ParentAuthority.OWNERSHIP
-                or entry.state is CoherenceState.MODIFIED
-                or entry.local_writer is not None
-                or entry.ownership_child_id is not None
-            ):
-                return TransitionResult(
-                    "ERROR",
-                    "modified ownership cannot be invalidated without writeback.",
-                )
-
-            return TransitionResult(
-                "READY", action=lambda e: setattr(e, "revoking", True)
-            )
-
-        elif event == CoherenceEvent.AckSnoopInval:
-            if not entry.revoking:
-                return TransitionResult("ERROR", "invalidation was not started.")
-            if (
-                entry.local_reader_count
-                or entry.local_writer is not None
-                or entry.ownership_child_id is not None
-                or entry.child_share_bitmap
-                or entry.child_delivery_inflight
-            ):
-                return TransitionResult(
-                    "ERROR_BACKPRESSURE", "local or child grants are still active."
-                )
-
-            return TransitionResult(
-                "READY", action=lambda e: setattr(e, "state", CoherenceState.INVALID)
-            )
-
-        return TransitionResult("ERROR", f"Unknown event {event}")
+    _transition_specs_cache: ClassVar[
+        Mapping[CoherenceEvent, TransitionSpec] | None
+    ] = None
 
     def __init__(self) -> None:
         self._entries: dict[CoherenceSubject, CoherenceEntryState] = {}
         self._next_grant_id = 1
+        self._next_request_id = 1
+        self._pending_requests: dict[int, _PendingRequest] = {}
+        self._progress_listeners: list[Callable[[], None]] = []
+        self._next_parent_return_transaction_id = 1
+        self._parent_return_transactions: dict[int, ParentReturnToken] = {}
         self._active_delivery_receipts: dict[
             int, tuple[CoherenceSubject, int, int]
         ] = {}
-
-    def register(self, key: CoherenceSubject, epoch: int) -> CoherenceEntryState:
-        self._require_subject(key)
-        self._require_epoch(epoch)
-        entry = self._entries.get(key)
-        if entry is None:
-            entry = CoherenceEntryState(epoch=epoch)
-            self._entries[key] = entry
-            return entry
-        if epoch < entry.epoch:
-            raise StaleEpochError(
-                f"coherence key={key} received stale epoch={epoch}; current={entry.epoch}."
+        transition_specs = type(self)._transition_specs_cache
+        if transition_specs is None:
+            transition_specs = self._create_transition_specs()
+            type(self)._transition_specs_cache = transition_specs
+        self._transition_specs = transition_specs
+        self._pending_events = {
+            GrantKind.READ: CoherenceEvent.PrRd,
+            GrantKind.WRITE: CoherenceEvent.PrWr,
+            GrantKind.DELEGATED_READ: CoherenceEvent.TxBusRd,
+        }
+        self._pending_grant_factories: dict[
+            GrantKind,
+            Callable[
+                [CoherenceEntryState, CoherenceSubject, _PendingRequest], GrantToken
+            ],
+        ] = {
+            GrantKind.READ: self._complete_pending_read,
+            GrantKind.WRITE: self._complete_pending_write,
+            GrantKind.DELEGATED_READ: self._complete_pending_delegated_read,
+        }
+        registered_grant_kinds = frozenset(self._pending_events)
+        if registered_grant_kinds != frozenset(GrantKind):
+            missing = frozenset(GrantKind) - registered_grant_kinds
+            raise CoherenceStateTransitionError(
+                f"incomplete pending event mapping: missing={missing}."
             )
-        if epoch > entry.epoch:
+        if frozenset(self._pending_grant_factories) != registered_grant_kinds:
+            raise CoherenceStateTransitionError(
+                "pending event and grant factory mappings do not cover the same kinds."
+            )
+
+    def _evaluate_transition(
+        self,
+        event: CoherenceEvent,
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext = CoherenceTransitionContext(),
+    ) -> TransitionResult:
+        try:
+            spec = self._transition_specs[event]
+        except KeyError as exc:
+            raise CoherenceStateTransitionError(
+                f"unregistered coherence event={event!r}."
+            ) from exc
+        if spec.validate is not None:
+            spec.validate(context)
+        for guard in spec.guards:
+            if guard.predicate(entry, context):
+                return guard.result
+        return spec.ready
+
+    @classmethod
+    def _create_transition_specs(cls) -> Mapping[CoherenceEvent, TransitionSpec]:
+        def guard(
+            predicate: Callable[
+                [CoherenceEntryState, CoherenceTransitionContext], bool
+            ],
+            status: TransitionStatus,
+            message: str,
+        ) -> TransitionGuard:
+            return TransitionGuard(predicate, TransitionResult(status, message))
+
+        def ready(
+            action: Callable[[CoherenceEntryState, CoherenceTransitionContext], None],
+        ) -> TransitionResult:
+            return TransitionResult(TransitionStatus.READY, action=action)
+
+        set_modified = cls._set_state_action(CoherenceState.MODIFIED)
+        set_exclusive = cls._set_state_action(CoherenceState.EXCLUSIVE)
+        set_invalid = cls._set_state_action(CoherenceState.INVALID)
+        specs = {
+            CoherenceEvent.PrRd: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.ownership_child_id is not None,
+                        TransitionStatus.PENDING,
+                        "child owns data",
+                    ),
+                    guard(
+                        lambda entry, _: entry.state is CoherenceState.INVALID,
+                        TransitionStatus.ERROR,
+                        "cannot read invalid data.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.revoking,
+                        TransitionStatus.ERROR,
+                        "cannot read while invalidation is active.",
+                    ),
+                    guard(
+                        lambda entry, context: entry.local_writer is not None
+                        and context.execution == entry.local_writer,
+                        TransitionStatus.ERROR,
+                        "active writer cannot acquire a separate read grant.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.local_writer is not None,
+                        TransitionStatus.PENDING,
+                        "writer active",
+                    ),
+                    guard(
+                        lambda entry, _: cls._has_pending_writer(entry),
+                        TransitionStatus.PENDING,
+                        "ownership request pending",
+                    ),
+                ),
+                ready(cls._share_if_exclusive),
+            ),
+            CoherenceEvent.PrWr: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.state is CoherenceState.INVALID,
+                        TransitionStatus.ERROR,
+                        "cannot write invalid data.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.local_writer is not None
+                        or entry.ownership_child_id is not None
+                        or bool(entry.local_reader_count)
+                        or bool(entry.child_share_bitmap)
+                        or bool(entry.child_delivery_inflight),
+                        TransitionStatus.PENDING,
+                        "read grants active",
+                    ),
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        is ParentAuthority.SHARED,
+                        TransitionStatus.PENDING,
+                        "parent ownership required",
+                    ),
+                ),
+                ready(set_modified),
+            ),
+            CoherenceEvent.TxBusRd: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.revoking,
+                        TransitionStatus.ERROR,
+                        "cannot delegate while invalidation is active.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.local_writer is not None,
+                        TransitionStatus.PENDING,
+                        "local writer active",
+                    ),
+                    guard(
+                        lambda entry, _: entry.ownership_child_id is not None,
+                        TransitionStatus.PENDING,
+                        "child owns data",
+                    ),
+                    guard(
+                        lambda entry, _: cls._has_pending_writer(entry),
+                        TransitionStatus.PENDING,
+                        "ownership request pending",
+                    ),
+                    guard(
+                        lambda entry, context: context.publishes_local_payload
+                        and entry.parent_grant.authority is not ParentAuthority.NONE,
+                        TransitionStatus.ERROR,
+                        "local payload publication cannot replace a parent grant.",
+                    ),
+                    guard(
+                        lambda entry, context: not context.publishes_local_payload
+                        and entry.state is CoherenceState.INVALID,
+                        TransitionStatus.ERROR,
+                        "cannot delegate invalid data.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.state is CoherenceState.MODIFIED,
+                        TransitionStatus.ERROR,
+                        "cannot delegate modified ownership as shared data.",
+                    ),
+                ),
+                ready(cls._delegate_shared_read),
+                cls._require_child_context,
+            ),
+            CoherenceEvent.RxBusRd: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.local_writer is not None
+                        or entry.ownership_child_id is not None
+                        or entry.state is CoherenceState.MODIFIED,
+                        TransitionStatus.ERROR_BACKPRESSURE,
+                        "cannot accept parent read grant while ownership is active.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        is not ParentAuthority.NONE
+                        or entry.parent_grant.return_in_flight,
+                        TransitionStatus.ERROR,
+                        "parent authority is already active.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.state is not CoherenceState.INVALID,
+                        TransitionStatus.ERROR,
+                        "BUS_RD requires an invalid destination entry.",
+                    ),
+                ),
+                ready(cls._accept_shared_parent_grant),
+            ),
+            CoherenceEvent.PublishLocal: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        is not ParentAuthority.NONE,
+                        TransitionStatus.ERROR,
+                        "local payload publication cannot replace a parent grant.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.state is not CoherenceState.INVALID,
+                        TransitionStatus.ERROR,
+                        "local payload publication requires an invalid entry.",
+                    ),
+                    guard(
+                        lambda entry, _: not cls._is_locally_quiescent(entry),
+                        TransitionStatus.ERROR_BACKPRESSURE,
+                        "local payload publication requires a quiescent entry.",
+                    ),
+                ),
+                ready(set_exclusive),
+            ),
+            CoherenceEvent.TxGrantReturn: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        not in (ParentAuthority.SHARED, ParentAuthority.OWNERSHIP),
+                        TransitionStatus.ERROR,
+                        "has no parent grant to return.",
+                    ),
+                    guard(
+                        lambda entry, _: not cls._is_locally_quiescent(entry),
+                        TransitionStatus.ERROR_BACKPRESSURE,
+                        "still has active local or child grants.",
+                    ),
+                ),
+                ready(set_invalid),
+            ),
+            CoherenceEvent.TxOwnershipGrant: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: bool(entry.local_reader_count)
+                        or bool(entry.child_share_bitmap)
+                        or bool(entry.child_delivery_inflight),
+                        TransitionStatus.ERROR_BACKPRESSURE,
+                        "shared grants are still active.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.ownership_child_id is not None,
+                        TransitionStatus.ERROR,
+                        "ownership is already delegated.",
+                    ),
+                ),
+                ready(cls._delegate_ownership),
+                cls._require_child_context,
+            ),
+            CoherenceEvent.RxOwnershipGrant: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        is not ParentAuthority.SHARED,
+                        TransitionStatus.ERROR,
+                        "ownership requires shared parent authority.",
+                    ),
+                    guard(
+                        lambda entry, _: bool(entry.local_reader_count)
+                        or bool(entry.child_share_bitmap)
+                        or entry.ownership_child_id is not None,
+                        TransitionStatus.ERROR_BACKPRESSURE,
+                        "local or child grants are still active.",
+                    ),
+                ),
+                ready(cls._accept_parent_ownership),
+            ),
+            CoherenceEvent.TxOwnershipCancel: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        is not ParentAuthority.OWNERSHIP,
+                        TransitionStatus.ERROR,
+                        "no parent ownership to cancel.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.local_writer is not None,
+                        TransitionStatus.ERROR,
+                        "ownership cannot be cancelled after write access starts.",
+                    ),
+                ),
+                ready(cls._cancel_parent_ownership),
+            ),
+            CoherenceEvent.RxSnoopInval: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: entry.revoking,
+                        TransitionStatus.ERROR,
+                        "invalidation is already active.",
+                    ),
+                    guard(
+                        lambda entry, _: entry.parent_grant.authority
+                        is ParentAuthority.OWNERSHIP
+                        or entry.state is CoherenceState.MODIFIED
+                        or entry.local_writer is not None
+                        or entry.ownership_child_id is not None,
+                        TransitionStatus.ERROR,
+                        "modified ownership cannot be invalidated without writeback.",
+                    ),
+                ),
+                ready(cls._start_invalidation),
+            ),
+            CoherenceEvent.AckSnoopInval: TransitionSpec(
+                (
+                    guard(
+                        lambda entry, _: not entry.revoking,
+                        TransitionStatus.ERROR,
+                        "invalidation was not started.",
+                    ),
+                    guard(
+                        lambda entry, _: bool(entry.local_reader_count)
+                        or entry.local_writer is not None
+                        or entry.ownership_child_id is not None
+                        or bool(entry.child_share_bitmap)
+                        or bool(entry.child_delivery_inflight),
+                        TransitionStatus.ERROR_BACKPRESSURE,
+                        "local or child grants are still active.",
+                    ),
+                ),
+                ready(set_invalid),
+            ),
+        }
+        registered_events = frozenset(specs)
+        protocol_events = frozenset(CoherenceEvent)
+        if registered_events != protocol_events:
+            missing = protocol_events - registered_events
+            extra = registered_events - protocol_events
+            raise CoherenceStateTransitionError(
+                f"incomplete coherence state machine: missing={missing}, extra={extra}."
+            )
+        return MappingProxyType(specs)
+
+    @staticmethod
+    def _set_state_action(
+        state: CoherenceState,
+    ) -> Callable[[CoherenceEntryState, CoherenceTransitionContext], None]:
+        def set_state(
+            entry: CoherenceEntryState,
+            context: CoherenceTransitionContext,
+        ) -> None:
+            entry.state = state
+
+        return set_state
+
+    @staticmethod
+    def _share_if_exclusive(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        if entry.state is CoherenceState.EXCLUSIVE:
+            entry.state = CoherenceState.SHARED
+
+    @staticmethod
+    def _delegate_shared_read(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        child_id = context.child_id
+        if child_id is None:
+            raise CoherenceStateTransitionError("TxBusRd requires child_id.")
+        if entry.state is CoherenceState.INVALID:
+            entry.state = CoherenceState.EXCLUSIVE
+        child_mask = 1 << child_id
+        if not entry.child_share_bitmap & child_mask:
+            entry.child_share_bitmap |= child_mask
+            if entry.state is CoherenceState.EXCLUSIVE:
+                entry.state = CoherenceState.SHARED
+
+    @staticmethod
+    def _accept_shared_parent_grant(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        entry.parent_grant.accept_shared(entry.epoch)
+        entry.state = CoherenceState.SHARED
+
+    @staticmethod
+    def _delegate_ownership(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        child_id = context.child_id
+        if child_id is None:
+            raise CoherenceStateTransitionError("TxOwnershipGrant requires child_id.")
+        entry.local_writer = None
+        entry.local_writer_grant_id = None
+        entry.ownership_child_id = child_id
+        entry.state = CoherenceState.INVALID
+
+    @staticmethod
+    def _accept_parent_ownership(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        entry.parent_grant.authority = ParentAuthority.OWNERSHIP
+
+    @staticmethod
+    def _cancel_parent_ownership(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        entry.parent_grant.authority = ParentAuthority.NONE
+        entry.state = CoherenceState.INVALID
+
+    @staticmethod
+    def _start_invalidation(
+        entry: CoherenceEntryState,
+        context: CoherenceTransitionContext,
+    ) -> None:
+        entry.revoking = True
+
+    @staticmethod
+    def _require_child_context(context: CoherenceTransitionContext) -> None:
+        if context.child_id is None:
+            raise CoherenceStateTransitionError(
+                "coherence transition requires child_id."
+            )
+
+    def admit(self, instance: CoherenceInstance) -> CoherenceEntryState:
+        """Synchronously admit one canonical coherence instance."""
+        self._require_subject(instance.subject)
+        self._require_epoch(instance.epoch)
+        entry = self._entries.get(instance.subject)
+        if entry is None:
+            entry = CoherenceEntryState(epoch=instance.epoch)
+            self._entries[instance.subject] = entry
+            return entry
+        if instance.epoch < entry.epoch:
+            raise StaleEpochError(
+                f"coherence key={instance.subject} received stale epoch={instance.epoch}; "
+                f"current={entry.epoch}."
+            )
+        if instance.epoch > entry.epoch:
             if not self._can_advance_epoch(entry):
                 raise CoherenceBackpressureError(
-                    f"coherence key={key} cannot advance epoch while grants are active."
+                    f"coherence key={instance.subject} cannot advance epoch while "
+                    "grants are active."
                 )
-            self._advance_epoch(entry, epoch)
+            self._advance_epoch(entry, instance.epoch)
         return entry
 
-    def fence(self) -> None:
+    def _admit_request(
+        self, instance: CoherenceInstance
+    ) -> tuple[CoherenceEntryState, bool]:
+        try:
+            return self.admit(instance), True
+        except CoherenceBackpressureError:
+            entry = self._entries.get(instance.subject)
+            if entry is None:
+                raise
+            return entry, False
+
+    def add_progress_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        if listener in self._progress_listeners:
+            raise CoherenceStateTransitionError(
+                "progress listener is already registered."
+            )
+        self._progress_listeners.append(listener)
+
+        def remove() -> None:
+            if listener in self._progress_listeners:
+                self._progress_listeners.remove(listener)
+
+        return remove
+
+    def _signal_progress(self) -> None:
+        for listener in tuple(self._progress_listeners):
+            listener()
+
+    def can_admit(self, instance: CoherenceInstance) -> bool:
+        self._require_subject(instance.subject)
+        self._require_epoch(instance.epoch)
+        entry = self._entries.get(instance.subject)
+        if entry is None:
+            return True
+        if instance.epoch < entry.epoch:
+            raise StaleEpochError(
+                f"coherence key={instance.subject} received stale epoch={instance.epoch}; "
+                f"current={entry.epoch}."
+            )
+        return instance.epoch == entry.epoch or self._can_advance_epoch(entry)
+
+    def take_pending_result(self, request_id: int) -> GrantReady | GrantRejected | None:
+        request = self._pending_requests.get(request_id)
+        if request is None:
+            raise CoherenceStateTransitionError(
+                f"unknown coherence pending request id={request_id}."
+            )
+        if request.result is None:
+            return None
+        result = request.result
+        del self._pending_requests[request_id]
+        return result
+
+    def pending_result(self, request_id: int) -> GrantReady | GrantRejected | None:
+        request = self._pending_requests.get(request_id)
+        if request is None:
+            raise CoherenceStateTransitionError(
+                f"unknown coherence pending request id={request_id}."
+            )
+        return request.result
+
+    def cancel_pending_request(self, request_id: int) -> None:
+        request = self._pending_requests.pop(request_id, None)
+        if request is None:
+            raise CoherenceStateTransitionError(
+                f"unknown coherence pending request id={request_id}."
+            )
+        request.result = GrantRejected(
+            CoherenceStateTransitionError(
+                f"coherence pending request id={request_id} was cancelled."
+            )
+        )
         for entry in self._entries.values():
-            for request in (*entry.pending_readers, *entry.pending_writers):
-                if not request.future.done():
-                    request.future.cancel()
-            for future in entry.pending_quiescence:
-                if not future.done():
-                    future.cancel()
-            for waiter in entry.pending_delivery_waiters:
-                if not waiter.future.done():
-                    waiter.future.cancel()
+            for queue in (entry.pending_readers, entry.pending_writers):
+                try:
+                    queue.remove(request)
+                except ValueError:
+                    pass
+        self._signal_progress()
+
+    def is_quiescent(self, instance: CoherenceInstance) -> bool:
+        entry = self._require_current(instance.subject, instance.epoch)
+        return self._is_locally_quiescent(entry)
+
+    def deliveries_complete(
+        self,
+        instance: CoherenceInstance,
+        child_bitmap: int,
+    ) -> bool:
+        if child_bitmap < 0:
+            raise ValueError("child_bitmap must be non-negative.")
+        entry = self._require_current(instance.subject, instance.epoch)
+        return not self._delivery_receipts_overlap(entry, child_bitmap)
+
+    def fence(self) -> None:
+        self._pending_requests.clear()
         self._active_delivery_receipts.clear()
+        self._parent_return_transactions.clear()
         self._entries.clear()
+        self._signal_progress()
 
     def request_read(
         self, key: CoherenceSubject, epoch: int, execution: ExecutionToken
     ) -> GrantResult:
-        entry = self.register(key, epoch)
+        entry = self.admit(CoherenceInstance(key, epoch))
+        context = CoherenceTransitionContext(execution=execution)
         result = self._evaluate_transition(
-            CoherenceEvent.PrRd, entry, execution=execution
+            CoherenceEvent.PrRd,
+            entry,
+            context,
         )
-        if result.status == "PENDING":
+        if result.status is TransitionStatus.PENDING:
             return self._pending(
                 entry, epoch, GrantKind.READ, execution, result.message
             )
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             return GrantRejected(CoherenceStateTransitionError(result.message))
 
-        if result.action:
-            result.action(entry)
+        result.commit(entry, context)
         token = self._acquire_read(entry, key, epoch, execution)
         return GrantReady(token)
 
     def request_write(
         self, key: CoherenceSubject, epoch: int, execution: ExecutionToken
     ) -> GrantResult:
-        self._require_subject(key)
-        self._require_epoch(epoch)
-        entry = self._entries.get(key)
-        if entry is None:
-            entry = CoherenceEntryState(epoch=epoch)
-            self._entries[key] = entry
-        elif epoch < entry.epoch:
-            raise StaleEpochError(
-                f"coherence key={key} received stale epoch={epoch}; current={entry.epoch}."
+        entry, ready = self._admit_request(CoherenceInstance(key, epoch))
+        if not ready:
+            return self._pending(
+                entry,
+                epoch,
+                GrantKind.WRITE,
+                execution,
+                "current epoch grants active",
             )
-        elif epoch > entry.epoch:
-            if not self._can_advance_epoch(entry):
-                return self._pending(
-                    entry,
-                    epoch,
-                    GrantKind.WRITE,
-                    execution,
-                    "current epoch grants active",
-                )
-            self._advance_epoch(entry, epoch)
 
         result = self._evaluate_transition(CoherenceEvent.PrWr, entry)
-        if result.status == "PENDING":
+        if result.status is TransitionStatus.PENDING:
             return self._pending(
                 entry, epoch, GrantKind.WRITE, execution, result.message
             )
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             return GrantRejected(CoherenceStateTransitionError(result.message))
 
-        if result.action:
-            result.action(entry)
-        return GrantReady(self._acquire_write(entry, key, epoch, execution))
+        result.commit(entry)
+        token = self._acquire_write(entry, key, epoch, execution)
+        return GrantReady(token)
 
     def delegate_read(
         self, key: CoherenceSubject, epoch: int, child_id: int
@@ -556,48 +955,29 @@ class CoherenceDirectory:
         self._require_subject(key)
         if child_id < 0:
             raise ValueError(f"child_id must be non-negative, got {child_id}.")
-        self._require_epoch(epoch)
-        entry = self._entries.get(key)
-        if entry is None:
-            entry = CoherenceEntryState(epoch=epoch)
-            self._entries[key] = entry
-        elif epoch < entry.epoch:
-            raise StaleEpochError(
-                f"coherence key={key} received stale epoch={epoch}; current={entry.epoch}."
+        entry, ready = self._admit_request(CoherenceInstance(key, epoch))
+        if not ready:
+            return self._pending(
+                entry,
+                epoch,
+                GrantKind.DELEGATED_READ,
+                ExecutionToken(child_id),
+                "current epoch grants active",
+                publishes_local_payload=publishes_local_payload,
             )
-        elif epoch > entry.epoch:
-            if not self._can_advance_epoch(entry):
-                return self._pending(
-                    entry,
-                    epoch,
-                    GrantKind.DELEGATED_READ,
-                    ExecutionToken(child_id),
-                    "current epoch grants active",
-                    publishes_local_payload=publishes_local_payload,
-                )
-            self._advance_epoch(entry, epoch)
 
         mask = 1 << child_id
         new_grant = not bool(entry.child_share_bitmap & mask)
-        if self._try_tx_bus_rd_ready(
-            entry,
-            child_id,
-            publishes_local_payload=publishes_local_payload,
-        ):
-            return GrantReady(
-                GrantToken(
-                    key,
-                    epoch,
-                    GrantKind.DELEGATED_READ,
-                    ExecutionToken(child_id),
-                    new_grant=new_grant,
-                )
-            )
-        result = self._tx_bus_rd_blocker(
-            entry,
+        context = CoherenceTransitionContext(
+            child_id=child_id,
             publishes_local_payload=publishes_local_payload,
         )
-        if result.status == "PENDING":
+        result = self._evaluate_transition(
+            CoherenceEvent.TxBusRd,
+            entry,
+            context,
+        )
+        if result.status is TransitionStatus.PENDING:
             return self._pending(
                 entry,
                 epoch,
@@ -606,135 +986,135 @@ class CoherenceDirectory:
                 result.message,
                 publishes_local_payload=publishes_local_payload,
             )
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             return GrantRejected(CoherenceStateTransitionError(result.message))
-
-        raise CoherenceStateTransitionError(
-            f"unexpected BUS_RD transition status={result.status}."
+        if result.status is not TransitionStatus.READY:
+            raise CoherenceStateTransitionError(
+                f"unexpected BUS_RD transition status={result.status}."
+            )
+        result.commit(entry, context)
+        token = GrantToken(
+            key,
+            epoch,
+            GrantKind.DELEGATED_READ,
+            ExecutionToken(child_id),
+            new_grant=new_grant,
         )
-
-    @classmethod
-    def _try_tx_bus_rd_ready(
-        cls,
-        entry: CoherenceEntryState,
-        child_id: int,
-        *,
-        publishes_local_payload: bool,
-    ) -> bool:
-        if (
-            entry.revoking
-            or entry.local_writer is not None
-            or entry.ownership_child_id is not None
-            or cls._has_pending_writer(entry)
-            or (
-                publishes_local_payload
-                and entry.parent_authority is not ParentAuthority.NONE
-            )
-            or (not publishes_local_payload and entry.state is CoherenceState.INVALID)
-            or entry.state is CoherenceState.MODIFIED
-        ):
-            return False
-        if entry.state is CoherenceState.INVALID:
-            entry.state = CoherenceState.EXCLUSIVE
-        mask = 1 << child_id
-        if not entry.child_share_bitmap & mask:
-            entry.child_share_bitmap |= mask
-            if entry.state is CoherenceState.EXCLUSIVE:
-                entry.state = CoherenceState.SHARED
-        return True
-
-    @classmethod
-    def _tx_bus_rd_blocker(
-        cls,
-        entry: CoherenceEntryState,
-        *,
-        publishes_local_payload: bool,
-    ) -> TransitionResult:
-        if entry.revoking:
-            return TransitionResult(
-                "ERROR", "cannot delegate while invalidation is active."
-            )
-        if entry.local_writer is not None:
-            return TransitionResult("PENDING", "local writer active")
-        if entry.ownership_child_id is not None:
-            return TransitionResult("PENDING", "child owns data")
-        if cls._has_pending_writer(entry):
-            return TransitionResult("PENDING", "ownership request pending")
-        if (
-            publishes_local_payload
-            and entry.parent_authority is not ParentAuthority.NONE
-        ):
-            return TransitionResult(
-                "ERROR",
-                "local payload publication cannot replace a parent grant.",
-            )
-        if entry.state is CoherenceState.INVALID:
-            return TransitionResult("ERROR", "cannot delegate invalid data.")
-        if entry.state is CoherenceState.MODIFIED:
-            return TransitionResult(
-                "ERROR", "cannot delegate modified ownership as shared data."
-            )
-        raise CoherenceStateTransitionError("BUS_RD blocker is not blocking.")
+        return GrantReady(token)
 
     def accept_parent_read(self, key: CoherenceSubject, epoch: int) -> None:
-        entry = self.register(key, epoch)
+        entry = self._entries.get(key)
+        if entry is not None and epoch > entry.epoch:
+            if entry.parent_grant.return_in_flight:
+                entry.parent_grant.observe_return(key)
+                self.admit(CoherenceInstance(key, epoch))
+            else:
+                entry = self.admit(CoherenceInstance(key, epoch))
+        else:
+            entry = self.admit(CoherenceInstance(key, epoch))
         result = self._evaluate_transition(CoherenceEvent.RxBusRd, entry)
-        if result.status == "ERROR_BACKPRESSURE":
+        if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(result.message)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
-        if result.action:
-            result.action(entry)
+        result.commit(entry)
 
     def publish_local_payload(
         self,
         key: CoherenceSubject,
         epoch: int,
     ) -> CoherenceEntryState:
-        entry = self.register(key, epoch)
+        entry = self.admit(CoherenceInstance(key, epoch))
         result = self._evaluate_transition(CoherenceEvent.PublishLocal, entry)
-        if result.status == "ERROR_BACKPRESSURE":
+        if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(result.message)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
-        if result.action:
-            result.action(entry)
+        result.commit(entry)
         return entry
 
-    def return_parent(self, key: CoherenceSubject, epoch: int) -> None:
+    def begin_parent_return(
+        self, key: CoherenceSubject, epoch: int
+    ) -> ParentReturnToken:
         entry = self._require_current(key, epoch)
         result = self._evaluate_transition(CoherenceEvent.TxGrantReturn, entry)
-        if result.status == "ERROR_BACKPRESSURE":
+        if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(f"coherence key={key} {result.message}")
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(f"coherence key={key} {result.message}")
-        if result.action:
-            result.action(entry)
-        self._wake_pending(entry, key)
+        result.commit(entry)
+        transaction_id = self._next_parent_return_transaction_id
+        self._next_parent_return_transaction_id += 1
+        token = ParentReturnToken(key, epoch, transaction_id)
+        entry.parent_grant.begin_return(token)
+        self._parent_return_transactions[transaction_id] = token
+        return token
+
+    def complete_parent_return(self, token: ParentReturnToken) -> None:
+        active = self._parent_return_transactions.pop(token.transaction_id, None)
+        if active != token:
+            raise CoherenceStateTransitionError(
+                "parent return transaction "
+                f"id={token.transaction_id} is already completed or inactive."
+            )
+        entry = self._entries.get(token.key)
+        if entry is None:
+            raise CoherenceStateTransitionError(
+                f"parent return id={token.transaction_id} has no directory entry."
+            )
+        if entry.epoch > token.epoch:
+            return
+        if entry.epoch < token.epoch:
+            raise StaleEpochError(
+                f"coherence key={token.key} completed future epoch={token.epoch}; "
+                f"current={entry.epoch}."
+            )
+        entry.parent_grant.complete_return(token)
+        entry.revoking = False
+        self._wake_pending(entry, token.key)
 
     def parent_return_ready(self, key: CoherenceSubject, epoch: int) -> bool:
         entry = self._require_current(key, epoch)
-        return (
-            entry.parent_authority is not ParentAuthority.NONE
-            and self._is_locally_quiescent(entry)
-        )
+        return entry.parent_grant.authority in (
+            ParentAuthority.SHARED,
+            ParentAuthority.OWNERSHIP,
+        ) and self._is_locally_quiescent(entry)
 
     def has_parent_ownership(self, key: CoherenceSubject, epoch: int) -> bool:
         return (
-            self._require_current(key, epoch).parent_authority
+            self._require_current(key, epoch).parent_grant.authority
             is ParentAuthority.OWNERSHIP
         )
 
-    def require_retirement_quiescence(self, instance: TensorInstance) -> None:
-        entry = self._require_current(instance.subject, instance.epoch)
+    def require_current_entry_retirement(self, instance: CoherenceInstance) -> None:
+        entry = self._entries.get(instance.subject)
+        if entry is None:
+            raise RetirementInvariantError(
+                f"tensor instance has no current coherence entry: {instance}."
+            )
+        if instance.epoch != entry.epoch:
+            raise RetirementInvariantError(
+                f"tensor instance is not the current coherence epoch: {instance}; "
+                f"current={entry.epoch}."
+            )
         if not self._can_advance_epoch(entry):
             raise RetirementInvariantError(
                 f"tensor instance is not retirement-quiescent: {instance}."
             )
 
+    @staticmethod
+    def require_returned_instance(
+        instance: CoherenceInstance,
+        returned_instances: frozenset[CoherenceInstance],
+    ) -> None:
+        if instance not in returned_instances:
+            raise RetirementInvariantError(
+                f"tensor instance lacks a completed parent-return proof: {instance}."
+            )
+
     def require_local_write(
         self,
-        instance: TensorInstance,
+        instance: CoherenceInstance,
         execution: ExecutionToken,
     ) -> GrantToken:
         entry = self._require_current(instance.subject, instance.epoch)
@@ -756,12 +1136,12 @@ class CoherenceDirectory:
 
     def handoff_local_write(
         self,
-        old: TensorInstance,
-        new: TensorInstance,
+        old: CoherenceInstance,
+        new: CoherenceInstance,
         execution: ExecutionToken,
     ) -> None:
         self.require_local_handoff(old, new, execution)
-        new_entry = self.register(new.subject, new.epoch)
+        new_entry = self.admit(new)
         old_entry = self._require_current(old.subject, old.epoch)
         old_entry.local_writer = None
         old_entry.local_writer_grant_id = None
@@ -771,8 +1151,8 @@ class CoherenceDirectory:
 
     def require_local_handoff(
         self,
-        old: TensorInstance,
-        new: TensorInstance,
+        old: CoherenceInstance,
+        new: CoherenceInstance,
         execution: ExecutionToken,
     ) -> None:
         self.require_local_write(old, execution)
@@ -803,24 +1183,6 @@ class CoherenceDirectory:
             f"unsupported local grant kind={token.kind}."
         )
 
-    async def wait_until_quiescent(
-        self,
-        key: CoherenceSubject,
-        epoch: int,
-    ) -> None:
-        entry = self.register(key, epoch)
-        if self._is_locally_quiescent(entry):
-            return
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        entry.pending_quiescence.append(future)
-        try:
-            await future
-        finally:
-            if not future.done():
-                future.cancel()
-            if future in entry.pending_quiescence:
-                entry.pending_quiescence.remove(future)
-
     def return_child(self, key: CoherenceSubject, epoch: int, child_id: int) -> None:
         entry = self._require_current(key, epoch)
         mask = 1 << child_id
@@ -834,12 +1196,15 @@ class CoherenceDirectory:
             )
         if entry.child_delivery_inflight.get(child_id, 0):
             entry.child_return_pending_bitmap |= mask
+            self._signal_progress()
             return
         entry.child_share_bitmap &= ~mask
         entry.child_delivery_committed_bitmap &= ~mask
         self._settle_shared_state(entry)
-        if entry.pending_readers or entry.pending_writers or entry.pending_quiescence:
+        if entry.pending_readers or entry.pending_writers:
             self._wake_pending(entry, key)
+        else:
+            self._signal_progress()
 
     def register_child_delivery(self, token: GrantToken) -> GrantToken:
         entry = self._require_current(token.key, token.epoch)
@@ -915,33 +1280,11 @@ class CoherenceDirectory:
             ):
                 entry.child_share_bitmap &= ~mask
                 sharing_changed = True
-        if entry.pending_delivery_waiters:
-            self._wake_delivery_waiters(entry)
         if sharing_changed:
             self._settle_shared_state(entry)
             self._wake_pending(entry, token.key)
-
-    async def wait_until_deliveries_complete(
-        self,
-        key: CoherenceSubject,
-        epoch: int,
-        child_bitmap: int,
-    ) -> None:
-        entry = self._require_current(key, epoch)
-        if child_bitmap < 0:
-            raise ValueError("child_bitmap must be non-negative.")
-        if not self._delivery_receipts_overlap(entry, child_bitmap):
-            return
-        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
-        waiter = _PendingDeliveryWaiter(child_bitmap, future)
-        entry.pending_delivery_waiters.append(waiter)
-        try:
-            await future
-        finally:
-            if not future.done():
-                future.cancel()
-            if waiter in entry.pending_delivery_waiters:
-                entry.pending_delivery_waiters.remove(waiter)
+        else:
+            self._signal_progress()
 
     def delegate_ownership(self, token: GrantToken, child_id: int) -> None:
         entry = self._require_current(token.key, token.epoch)
@@ -953,35 +1296,35 @@ class CoherenceDirectory:
         ):
             raise CoherenceStateTransitionError("write grant is not active.")
 
+        context = CoherenceTransitionContext(child_id=child_id)
         result = self._evaluate_transition(
-            CoherenceEvent.TxOwnershipGrant, entry, child_id=child_id
+            CoherenceEvent.TxOwnershipGrant,
+            entry,
+            context,
         )
-        if result.status == "ERROR_BACKPRESSURE":
+        if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(result.message)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
 
-        if result.action:
-            result.action(entry)
+        result.commit(entry, context)
 
     def accept_parent_ownership(self, key: CoherenceSubject, epoch: int) -> None:
         entry = self._require_current(key, epoch)
         result = self._evaluate_transition(CoherenceEvent.RxOwnershipGrant, entry)
-        if result.status == "ERROR_BACKPRESSURE":
+        if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(result.message)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
-        if result.action:
-            result.action(entry)
+        result.commit(entry)
         self._wake_pending(entry, key)
 
     def cancel_parent_ownership(self, key: CoherenceSubject, epoch: int) -> None:
         entry = self._require_current(key, epoch)
         result = self._evaluate_transition(CoherenceEvent.TxOwnershipCancel, entry)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
-        if result.action:
-            result.action(entry)
+        result.commit(entry)
         self._wake_pending(entry, key)
 
     def return_ownership_child(
@@ -1001,29 +1344,35 @@ class CoherenceDirectory:
         entry.state = CoherenceState.EXCLUSIVE if data_valid else CoherenceState.INVALID
         self._wake_pending(entry, key)
 
-    def invalidate(self, key: CoherenceSubject, epoch: int) -> None:
-        self.begin_invalidation(key, epoch)
-        self.finish_invalidation(key, epoch)
+    def invalidate(self, key: CoherenceSubject, epoch: int) -> InvalidationResult:
+        result = self.begin_invalidation(key, epoch)
+        if result is InvalidationResult.STARTED:
+            self.finish_invalidation(key, epoch)
+        return result
 
-    def begin_invalidation(self, key: CoherenceSubject, epoch: int) -> None:
+    def begin_invalidation(
+        self, key: CoherenceSubject, epoch: int
+    ) -> InvalidationResult:
+        entry = self._entries.get(key)
+        if entry is not None and entry.parent_grant.coalesces_invalidation(epoch):
+            return InvalidationResult.SATISFIED_BY_PARENT_RETURN
         entry = self._require_current(key, epoch)
         result = self._evaluate_transition(CoherenceEvent.RxSnoopInval, entry)
-        if result.status == "ERROR" and "writeback" in result.message:
+        if result.status is TransitionStatus.ERROR and "writeback" in result.message:
             raise UnsupportedRemoteWritebackError(result.message)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
-        if result.action:
-            result.action(entry)
+        result.commit(entry)
+        return InvalidationResult.STARTED
 
     def finish_invalidation(self, key: CoherenceSubject, epoch: int) -> None:
         entry = self._require_current(key, epoch)
         result = self._evaluate_transition(CoherenceEvent.AckSnoopInval, entry)
-        if result.status == "ERROR_BACKPRESSURE":
+        if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(result.message)
-        if result.status == "ERROR":
+        if result.status is TransitionStatus.ERROR:
             raise CoherenceStateTransitionError(result.message)
-        if result.action:
-            result.action(entry)
+        result.commit(entry)
 
     def release(self, token: GrantToken) -> None:
         entry = self._require_current(token.key, token.epoch)
@@ -1043,7 +1392,7 @@ class CoherenceDirectory:
                 )
             entry.local_writer = None
             entry.local_writer_grant_id = None
-            if entry.parent_authority is ParentAuthority.OWNERSHIP:
+            if entry.parent_grant.authority is ParentAuthority.OWNERSHIP:
                 entry.state = CoherenceState.MODIFIED
             elif entry.child_share_bitmap:
                 entry.state = CoherenceState.SHARED
@@ -1063,24 +1412,26 @@ class CoherenceDirectory:
         *,
         publishes_local_payload: bool = False,
     ) -> GrantPending:
-        future: asyncio.Future[GrantToken] = asyncio.get_running_loop().create_future()
+        request_id = self._next_request_id
+        self._next_request_id += 1
         request = _PendingRequest(
+            request_id,
             epoch,
             kind,
             execution,
-            future,
             publishes_local_payload,
         )
+        self._pending_requests[request_id] = request
         if kind in (GrantKind.READ, GrantKind.DELEGATED_READ):
             entry.pending_readers.append(request)
         else:
             entry.pending_writers.append(request)
         return GrantPending(
-            future,
+            request_id,
             reason,
             requires_parent_ownership=(
                 kind is GrantKind.WRITE
-                and entry.parent_authority is ParentAuthority.SHARED
+                and entry.parent_grant.authority is ParentAuthority.SHARED
             ),
             invalidate_children=(
                 entry.child_share_bitmap if kind is GrantKind.WRITE else 0
@@ -1088,6 +1439,7 @@ class CoherenceDirectory:
         )
 
     def _wake_pending(self, entry: CoherenceEntryState, key: CoherenceSubject) -> None:
+        self._signal_progress()
         if entry.local_writer is not None or entry.ownership_child_id is not None:
             return
         if (
@@ -1097,13 +1449,12 @@ class CoherenceDirectory:
         ):
             while entry.pending_writers:
                 request = entry.pending_writers.popleft()
-                if request.future.done():
+                if request.result is not None:
                     continue
                 if request.epoch < entry.epoch:
-                    request.future.set_exception(
+                    request.result = GrantRejected(
                         StaleEpochError(
-                            f"coherence key={key} pending epoch={request.epoch}; "
-                            f"current={entry.epoch}."
+                            f"coherence key={key} pending epoch={request.epoch}; current={entry.epoch}."
                         )
                     )
                     continue
@@ -1111,48 +1462,21 @@ class CoherenceDirectory:
                     if not self._can_advance_epoch(entry):
                         entry.pending_writers.appendleft(request)
                         return
-                    self._advance_epoch(entry, request.epoch)
-                if (
-                    request.kind is GrantKind.DELEGATED_READ
-                    and request.publishes_local_payload
-                    and entry.state is CoherenceState.INVALID
-                ):
-                    if entry.parent_authority is not ParentAuthority.NONE:
-                        request.future.set_exception(
-                            CoherenceStateTransitionError(
-                                "local payload publication cannot replace a parent grant."
-                            )
-                        )
-                        continue
-                    entry.state = CoherenceState.EXCLUSIVE
-                if entry.state is CoherenceState.INVALID:
-                    request.future.set_exception(
-                        CoherenceStateTransitionError(
-                            "pending write grant became invalid before acquisition."
-                        )
-                    )
-                    continue
-                if entry.parent_authority is ParentAuthority.SHARED:
+                    self.admit(CoherenceInstance(key, request.epoch))
+                disposition = self._resume_pending_request(entry, key, request)
+                if disposition is PendingDisposition.BLOCKED:
                     entry.pending_writers.appendleft(request)
                     return
-                request.future.set_result(
-                    self._acquire_write(
-                        entry,
-                        key,
-                        request.epoch,
-                        request.execution,
-                    )
-                )
-                return
+                if disposition is PendingDisposition.GRANTED:
+                    return
         while entry.pending_readers and entry.local_writer is None:
             request = entry.pending_readers.popleft()
-            if request.future.done():
+            if request.result is not None:
                 continue
             if request.epoch < entry.epoch:
-                request.future.set_exception(
+                request.result = GrantRejected(
                     StaleEpochError(
-                        f"coherence key={key} pending epoch={request.epoch}; "
-                        f"current={entry.epoch}."
+                        f"coherence key={key} pending epoch={request.epoch}; current={entry.epoch}."
                     )
                 )
                 continue
@@ -1160,76 +1484,88 @@ class CoherenceDirectory:
                 if not self._can_advance_epoch(entry):
                     entry.pending_readers.appendleft(request)
                     return
-                self._advance_epoch(entry, request.epoch)
-            if (
-                request.kind is GrantKind.DELEGATED_READ
-                and request.publishes_local_payload
-                and entry.state is CoherenceState.INVALID
-            ):
-                if entry.parent_authority is not ParentAuthority.NONE:
-                    request.future.set_exception(
-                        CoherenceStateTransitionError(
-                            "local payload publication cannot replace parent authority."
-                        )
-                    )
-                    continue
-                entry.state = CoherenceState.EXCLUSIVE
-            if entry.state is CoherenceState.INVALID:
-                request.future.set_exception(
+                self.admit(CoherenceInstance(key, request.epoch))
+            disposition = self._resume_pending_request(entry, key, request)
+            if disposition is PendingDisposition.BLOCKED:
+                entry.pending_readers.appendleft(request)
+                return
+        self._signal_progress()
+
+    def _resume_pending_request(
+        self,
+        entry: CoherenceEntryState,
+        key: CoherenceSubject,
+        request: _PendingRequest,
+    ) -> PendingDisposition:
+        event = self._pending_events[request.kind]
+        context = CoherenceTransitionContext(
+            execution=request.execution,
+            child_id=int(request.execution),
+            publishes_local_payload=request.publishes_local_payload,
+        )
+        result = self._evaluate_transition(
+            event,
+            entry,
+            context,
+        )
+        match result.status:
+            case TransitionStatus.PENDING:
+                return PendingDisposition.BLOCKED
+            case TransitionStatus.ERROR:
+                request.result = GrantRejected(
                     CoherenceStateTransitionError(
-                        "pending read grant became invalid before acquisition."
+                        f"pending {request.kind.name.lower()} grant became invalid before acquisition: {result.message}"
                     )
                 )
-                continue
-            if request.kind is GrantKind.READ:
-                token = self._acquire_read(
-                    entry,
-                    key,
-                    request.epoch,
-                    request.execution,
+                return PendingDisposition.REJECTED
+            case TransitionStatus.ERROR_BACKPRESSURE:
+                request.result = GrantRejected(
+                    CoherenceBackpressureError(result.message)
                 )
-            elif request.kind is GrantKind.DELEGATED_READ:
-                entry.child_share_bitmap |= 1 << int(request.execution)
-                token = GrantToken(
-                    key,
-                    request.epoch,
-                    request.kind,
-                    request.execution,
-                )
-            else:
-                request.future.set_exception(
-                    CoherenceStateTransitionError(
-                        f"unsupported pending reader kind={request.kind}."
-                    )
-                )
-                continue
-            entry.state = CoherenceState.SHARED
-            request.future.set_result(token)
-        if self._is_locally_quiescent(entry):
-            while entry.pending_quiescence:
-                future = entry.pending_quiescence.popleft()
-                if not future.done():
-                    future.set_result(None)
+                return PendingDisposition.REJECTED
+            case TransitionStatus.READY:
+                result.commit(entry, context)
+                token = self._pending_grant_factories[request.kind](entry, key, request)
+                request.result = GrantReady(token)
+                return PendingDisposition.GRANTED
+        raise CoherenceStateTransitionError(
+            f"unhandled transition status={result.status}."
+        )
+
+    def _complete_pending_read(
+        self,
+        entry: CoherenceEntryState,
+        key: CoherenceSubject,
+        request: _PendingRequest,
+    ) -> GrantToken:
+        return self._acquire_read(entry, key, request.epoch, request.execution)
+
+    def _complete_pending_write(
+        self,
+        entry: CoherenceEntryState,
+        key: CoherenceSubject,
+        request: _PendingRequest,
+    ) -> GrantToken:
+        return self._acquire_write(entry, key, request.epoch, request.execution)
+
+    @staticmethod
+    def _complete_pending_delegated_read(
+        entry: CoherenceEntryState,
+        key: CoherenceSubject,
+        request: _PendingRequest,
+    ) -> GrantToken:
+        return GrantToken(
+            key,
+            request.epoch,
+            request.kind,
+            request.execution,
+        )
 
     @staticmethod
     def _has_pending_writer(entry: CoherenceEntryState) -> bool:
-        while entry.pending_writers and entry.pending_writers[0].future.done():
+        while entry.pending_writers and entry.pending_writers[0].result is not None:
             entry.pending_writers.popleft()
         return bool(entry.pending_writers)
-
-    @classmethod
-    def _wake_delivery_waiters(cls, entry: CoherenceEntryState) -> None:
-        if not entry.pending_delivery_waiters:
-            return
-        remaining = deque()
-        for waiter in entry.pending_delivery_waiters:
-            if waiter.future.done():
-                continue
-            if cls._delivery_receipts_overlap(entry, waiter.child_bitmap):
-                remaining.append(waiter)
-                continue
-            waiter.future.set_result(None)
-        entry.pending_delivery_waiters = remaining
 
     @staticmethod
     def _delivery_receipts_overlap(
@@ -1267,11 +1603,16 @@ class CoherenceDirectory:
     def _can_advance_epoch(cls, entry: CoherenceEntryState) -> bool:
         return (
             cls._is_locally_quiescent(entry)
-            and entry.parent_authority is ParentAuthority.NONE
+            and entry.parent_grant.authority is ParentAuthority.NONE
+            and not entry.parent_grant.return_in_flight
         )
 
     @staticmethod
     def _advance_epoch(entry: CoherenceEntryState, epoch: int) -> None:
+        if entry.parent_grant.return_in_flight:
+            raise CoherenceBackpressureError(
+                "cannot advance epoch while a parent return transaction is active."
+            )
         entry.epoch = epoch
         entry.state = CoherenceState.INVALID
         entry.revoking = False
@@ -1325,10 +1666,10 @@ class CoherenceDirectory:
         ):
             entry.state = (
                 CoherenceState.SHARED
-                if entry.parent_authority is ParentAuthority.SHARED
+                if entry.parent_grant.authority is ParentAuthority.SHARED
                 else (
                     CoherenceState.MODIFIED
-                    if entry.parent_authority is ParentAuthority.OWNERSHIP
+                    if entry.parent_grant.authority is ParentAuthority.OWNERSHIP
                     else CoherenceState.EXCLUSIVE
                 )
             )
@@ -1336,7 +1677,7 @@ class CoherenceDirectory:
     @staticmethod
     def _has_live_pending(entry: CoherenceEntryState) -> bool:
         for queue in (entry.pending_writers, entry.pending_readers):
-            while queue and queue[0].future.done():
+            while queue and queue[0].result is not None:
                 queue.popleft()
             if queue:
                 return True

@@ -34,16 +34,17 @@ This document is the normative Fluxway coherence specification.
 
 ```text
 Subject        = (owner_spmd_code, owner_rank, logical_tuuid)
-TensorInstance = (Subject, Epoch)
+CoherenceInstance = (Subject, Epoch)
 tensor_of      : ENTRY_ROUTE_CODE -> logical_tuuid
 slot_t         : direct-child endpoint <-> compact bitmap index
 ```
 
 `logical_tuuid` and `tensor_of` come only from `CompiledTensorTransfer`. A route code
-selects a compiled direct edge; it is not a tensor identity. `TransportTensor.source_step`
-is lowered to the entry epoch. `FRAME_STEP` remains scheduler/delivery metadata for tensor
-frames; homogeneous coherence frames use it as their common epoch. No mutable second epoch
-counter, global directory, sibling holder list or cross-level broadcast exists.
+selects a compiled direct edge; it is not a tensor identity. `TransportTensor` must carry
+an already-bound `CoherenceInstance`; `source_step` is provenance metadata and never creates
+or advances a directory epoch. `ENTRY_AUX` is only the wire projection of that instance's
+epoch. `FRAME_STEP` remains scheduler/delivery metadata. No mutable second epoch counter,
+global directory, sibling holder list or cross-level broadcast exists.
 
 For each logical tensor, child slots are assigned by sorting its finite set of
 `(artifact_spmd_id, artifact_rank)` endpoints. The mapping is bijective and projections never
@@ -54,12 +55,13 @@ renumber an existing slot.
 One endpoint-local entry is:
 
 ```text
-D = (epoch, mesi, parent_authority, read_grants, write_grant,
+D = (epoch, mesi, parent_grant, read_grants, write_grant,
      ownership_child, child_bitmap, delivery_inflight,
      delivery_committed, return_pending, pending, allocation_binding)
 
-parent_authority in {NONE, SHARED, OWNERSHIP}
-mesi             in {
+parent_grant = (authority, return_transaction, return_tombstone_epoch)
+authority    in {NONE, SHARED, OWNERSHIP}
+mesi         in {
     I = Invalid,
     S = Shared,
     E = Exclusive,
@@ -79,14 +81,14 @@ I1 writer != NONE
 I2 ownership_child != NONE
    => writer = NONE and readers = 0 and child_bitmap = 0 and mesi = I
 
-I3 parent_authority = OWNERSHIP
+I3 parent_grant.authority = OWNERSHIP
    => mesi in {M, I} and the direct parent is I
 
 I4 mesi = I => PrRd, PrWr and BusRd delegation cannot become GrantReady
 
 I5 epoch advance
    => no reader, writer, ownership child, child bit, delivery receipt,
-      parent authority or pending continuation
+      parent authority, outbound parent return or pending continuation
 
 I6 incoming_epoch < epoch => StaleEpochError and D is unchanged
 
@@ -94,8 +96,51 @@ I7 delivery_committed subset child_bitmap
    and return_pending subset child_bitmap
    and delivery_inflight(child) > 0 => child is in child_bitmap
 
-I8 each read/write/delivery token is consumed exactly once
+I8 each read/write/delivery/parent-return token is consumed exactly once
 ```
+
+Epoch admission has one canonical synchronous implementation: `CoherenceDirectory.admit(instance)`
+validates the canonical `CoherenceInstance`, re-reads the current entry, and either advances a
+fully quiescent entry or raises a protocol error. `CoherenceSequencer` is the only asynchronous
+reorder buffer. Its runtime admission adapter awaits entry-local quiescence when the directory
+reports backpressure; it never retries stale epochs. A request that reaches `admit()` after a newer
+instance has advanced the directory fails with `StaleEpochError`; it cannot move the directory
+backwards.
+
+The epoch gate is exactly I5: local readers and writer, ownership child, child-share bitmap,
+delivery receipts, live pending continuations, parent authority, and an outbound parent-return
+transaction must all be absent. The directory evaluates this predicate synchronously. The
+event-loop wait is owned by `coherence_runtime.py`, which observes directory progress and suspends
+only the requesting coroutine; the ready path performs bounded entry-local operations without a
+directory lock or polling loop.
+
+`CoherenceSequencer.commit_payload()` records its ROB ticket synchronously and returns an awaitable.
+When a sealed ticket is already at every lane head, admission and retirement run inline in the
+caller coroutine; a completion Future is allocated only for predecessor-blocked tickets or failure
+propagation. The common path therefore stays below the asynchronous scheduling boundary while
+conflicts still suspend without blocking the event loop.
+
+The worker closes an intent only after every frame-build result and local-only payload for that
+epoch has synchronously registered a ROB ticket. Closing is the admission cut, not delivery
+completion: once all tickets are registered, `close_intent()` releases the ordered retire path;
+admission, delegation, enqueue, send, and delivery then complete the tickets. This ordering avoids
+the cycle in which a worker waits for delivery before closing the intent while delivery waits for
+the intent to close.
+
+Cross-subject tickets are checked for a wait-for cycle only at the sealed drain boundary. The ready
+path never rebuilds a global dependency graph; if all active intents are sealed and no lane-head ticket
+can retire, a detected cycle fences the sequencer and fails every waiting ticket exactly once. An
+unsealed predecessor is ordinary frame-build backpressure, not a deadlock diagnosis.
+
+`return_transaction` is the explicit transient state, not a fourth stable
+parent authority and not a fifth MESI state. Beginning a return moves stable
+authority to NONE and local MESI to I while retaining the exact transaction
+token. The token remains independently active when a newer BusRd proves that
+the parent observed the return before the return RPC completes locally.
+Successful token completion yields an epoch-scoped returned-instance set. Allocation
+retirement consumes that proof instead of querying the single current entry, which may
+already describe a newer epoch. Instances absent from the set still require the current
+entry to satisfy the full retirement invariant.
 
 An unseen entry starts in I. Epoch advance always initializes the new epoch to I; version
 change alone never makes bytes valid. Only `PublishLocalPayload`, payload-bearing `BusRd`,
@@ -127,20 +172,22 @@ in the transition table below.
 |---|---|---|
 | `PublishLocal` | I, no parent authority, quiescent | I -> E |
 | `PrRd` | Not I, not revoking, no owner child, no active/pending writer | issue read token; E -> S, or S/M -> S/M |
-| `PrWr` | Not I, no active local/child shares/deliveries, parent_authority != SHARED | issue write token; E/S -> M, or M -> M |
+| `PrWr` | Not I, no active local/child shares/deliveries, parent_grant.authority != SHARED | issue write token; E/S -> M, or M -> M |
 | `TxBusRd` | E or S (or publishes_local_payload and I->E), not revoking, no writer, no owner child, no pending writer | set child bit; E -> S or S -> S |
-| `RxBusRd` (Receive Bus Read) | I, no parent authority, no writer, no owner child | parent_authority = SHARED; I -> S |
-| `TxGrantReturn` (Transmit Grant Return) | parent_authority != NONE, quiescent | parent_authority = NONE, revoking = False; Any -> I |
+| `RxBusRd` (Receive Bus Read) | I, no parent authority, no writer, no owner child; or a newer epoch observes an active return transaction | authority = SHARED; I -> S |
+| `BeginGrantReturn` | authority in {SHARED, OWNERSHIP}, quiescent | issue return token; authority = NONE; return_transaction = token; Any -> I |
+| `CompleteGrantReturn` | matching active return token | clear return_transaction if the entry has not advanced; consume token |
 | `TxOwnershipGrant` (Transmit Ownership Grant) | no owner child, no local readers, no child shares/deliveries | ownership_child = child; Any -> I |
-| `RxOwnershipGrant` (Receive Ownership Grant) | parent_authority == SHARED, no local/child shares, no owner child | parent_authority = OWNERSHIP |
-| `TxOwnershipCancel` (Transmit Ownership Cancel) | parent_authority == OWNERSHIP, local_writer is None | parent_authority = NONE; Any -> I |
-| `RxSnoopInval` (Receive Snoop Invalidate) | not revoking, parent_authority != OWNERSHIP, not M, no writer, no owner child | revoking = True |
+| `RxOwnershipGrant` (Receive Ownership Grant) | parent_grant.authority == SHARED, no local/child shares, no owner child | parent_grant.authority = OWNERSHIP |
+| `TxOwnershipCancel` (Transmit Ownership Cancel) | parent_grant.authority == OWNERSHIP, local_writer is None | parent_grant.authority = NONE; Any -> I |
+| `RxSnoopInval` (Receive Snoop Invalidate) | not revoking, parent_grant.authority != OWNERSHIP, not M, no writer, no owner child | revoking = True |
 | `AckSnoopInval` (Acknowledge Snoop Invalidate) | revoking = True, no local/child shares, no writer, no owner child | Any -> I |
 | `EPOCH_ADVANCE` | I5 | Any -> I at the new epoch |
 
-Pending writers have priority over later readers. Ready operations do not allocate a Future;
-conflicts return an entry-local Future and suspend only the affected coroutine. Cancellation
-removes the request before the next wakeup.
+Pending writers have priority over later readers. The directory owns only synchronous protocol
+facts and returns explicit pending grant state (`request_id`); `coherence_runtime.py` owns asynchronous waiter
+continuations and converts progress notifications into awaitable operations. Cancellation removes
+the request before the next wakeup and never holds a directory lock.
 
 Invalid transitions fail immediately. In particular, M cannot respond to shared invalidation,
 an I child cannot obtain missing bytes through header-only RFO, duplicate current-epoch return
@@ -198,7 +245,8 @@ same-worker delivery deliberately avoids wire encode/decode while preserving com
 route, logical TUUID (Tensor Universally Unique Identifier), epoch and grant semantics.
 
 The directory has one event-loop owner. Coroutines on that loop use the ready path
-without a shared lock; conflicts suspend through an entry-local Future. Operating-system
+without a shared lock; conflicts return explicit pending state and the async runtime
+waits on Directory progress signals. Operating-system
 threads must marshal intents through the host event loop's thread-safe submission
 boundary and must not mutate entries directly. The current directory API (Application Programming Interface) remains
 event-loop-only; Fluxway does not expose a second thread-mutating API. The GIL (Global Interpreter Lock) is not a
@@ -215,6 +263,9 @@ multiple dependent fields.
 6. Delivery failure rolls back only the delegation created by that delivery.
 7. Delivery success does not return the grant. The child returns after its local operator,
    allocation aliases and descendants are quiescent.
+8. The child installs `return_transaction`, clears stable authority and invalidates local access before publishing GrantReturn.
+9. A newer BusRd may observe that transaction and advance the entry before the return RPC completes;
+   the exact-once return token completes independently.
 
 If a return overtakes an in-flight delivery, the parent marks return-pending. A failed delivery
 then clears the grant. A successful delivery cancels the early return because the child must
@@ -238,6 +289,43 @@ return the successfully delivered authority again.
 SnoopInval first marks the child revoking so no new reader or delegation can enter. Existing
 controlled readers finish normally; the child recursively drains only its direct descendants.
 It then invalidates wrapper access, enters I, and sends exactly one GrantReturn.
+
+If SnoopInval crosses an outbound GrantReturn for the same epoch, the child
+coalesces it into that active return transaction and does not emit a second
+GrantReturn. A same-epoch BusRd regrant clears the old return tombstone before
+new authority becomes invalidatable.
+
+### Input grant release lifecycle
+
+Worker input cleanup is one explicit lifecycle, represented by an immutable
+`InputCoherenceReleasePlan` and executed by `InputCoherenceRelease.complete()`.
+`InputCoherenceRelease` is a lifecycle release, not a general rollback transaction; the operation is not a
+transaction with commit/rollback semantics. At the worker scheduling level, Step commit is decoupled
+from input quiescence return: when an operator finishes a step, `_commit_finished_steps` schedules
+`InputCoherenceRelease.complete()` on a tracked worker background task (`_spawn_background_task`) and
+advances the step watermark without awaiting that cleanup coroutine. The coroutine takes ownership of
+the step's release resources before its first potentially suspending quiescence await. This avoids DAG
+scheduling waits with downstream alias consumers while Directory quiescence guarantees zero-copy safety.
+Worker shutdown and failure fences track and await all active background release tasks; scheduling the
+task does not mean that the input lifecycle has already completed.
+
+For both remote grants and local-only grants, the phases are fixed:
+
+1. release each local access token exactly once;
+2. wait for every grant subject and allocation-alias `CoherenceInstance` to become quiescent,
+   including direct descendants and delivery receipts;
+3. invalidate tensor runtime access;
+4. begin, send, and complete grouped `GRANT_RETURN` routes when a direct parent exists;
+5. release tensor payloads;
+6. consume the epoch-scoped returned-instance proof, or require the current-entry retirement
+   proof, before retiring the allocation and advancing its watermark.
+
+`InputCoherenceReleasePlan` derives parent routes from grant metadata and validates the direct
+parent handler before any transport action. A revoked grant has no second return route. Missing
+entries, old epochs, absent returned-instance proof, and live retirement state are protocol
+errors and raise; they are never treated as successful cleanup. Local-only input uses the same
+phases with an empty parent-route set, so releasing a local read token does not bypass alias or
+descendant quiescence.
 
 GrantReturn clears either a share bit or a dirty ownership child according to the parent's
 authoritative entry. A share return may leave the parent's valid bytes E. A dirty ownership
@@ -281,7 +369,7 @@ Epoch safety follows from I5-I6. Direct-edge authority conservation composes the
 proofs over the tree without a global coordinator.
 
 Progress is conditional on controlled readers releasing and direct children responding. Waiting
-uses entry-local Futures; there is no polling, global lock or global scan. A pending writer prevents
+uses runtime-owned progress events; there is no polling, global lock or global scan. A pending writer prevents
 new read traffic from starving it.
 
 On an invariant violation, transport failure or execution error, Fluxway fences the entire run:

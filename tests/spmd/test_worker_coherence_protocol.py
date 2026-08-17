@@ -3,7 +3,6 @@ import types
 
 import pytest
 import numpy as np
-from fluxway.spmd.worker import data_plane_executor
 from fluxway.common.allocation import AllocationRegistry
 
 from fluxway.common.coherence import (
@@ -16,19 +15,33 @@ from fluxway.common.coherence import (
     GrantKind,
     GrantReady,
     TensorAccessIntent,
-    TensorInstance,
+    CoherenceInstance,
 )
 from fluxway.common.tensor_backend import set_backend
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.spmd.worker.worker import LocalSendToken, SPMDWorker, _InputCoherenceGrant
+from fluxway.spmd.worker.coherence_runtime import (
+    CoherenceAdmissionRuntime,
+    CoherenceBatchRetireRuntime,
+    ParentGrantReturnRuntime,
+    _delegated_reads,
+)
 from fluxway.spmd.worker.data_plane import build_coherence_frame
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionResult,
     ExecutionStatus,
 )
+from fluxway.transport.communication import (
+    TransportDelegationDescriptor,
+    TransportFrameBatch,
+)
 
 
-raw_cls = SPMDWorker.__ray_actor_class__
+def _entry(directory: CoherenceDirectory, key: CoherenceSubject, epoch: int):
+    return directory.admit(CoherenceInstance(key, epoch))
+
+
+raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
 
 
 class _Handler:
@@ -40,6 +53,12 @@ class _Handler:
 
 
 def _bind(worker, *names):
+    if hasattr(worker, "_coherence_directory") and not hasattr(
+        worker, "_coherence_admission_runtime"
+    ):
+        worker._coherence_admission_runtime = CoherenceAdmissionRuntime(
+            worker._coherence_directory
+        )
     for name in names:
         value = getattr(raw_cls, name)
         if name == "_bitmap_indices":
@@ -50,6 +69,19 @@ def _bind(worker, *names):
 
 def _grant_map(*grants):
     return {grant.identity: grant for grant in grants}
+
+
+def _attach_parent_return_runtime(worker):
+    _bind(
+        worker,
+        "_send_parent_return_group",
+        "_send_coherence_frame",
+        "_require_local_spmd_code",
+    )
+    worker._parent_grant_return_runtime = ParentGrantReturnRuntime(
+        worker._coherence_directory,
+        worker._send_parent_return_group,
+    )
 
 
 @pytest.mark.asyncio
@@ -132,7 +164,7 @@ async def test_rfo_invalidates_sibling_and_delegates_ownership() -> None:
 
     assert actions[1] == [CoherenceAction.OWNERSHIP_GRANT]
     assert actions[2] == [CoherenceAction.SNOOP_INVALIDATE]
-    entry = parent._coherence_directory.register(subject, epoch)
+    entry = _entry(parent._coherence_directory, subject, epoch)
     assert entry.ownership_child_id == 0
     assert entry.state is CoherenceState.INVALID
 
@@ -344,13 +376,33 @@ async def test_share_return_resolves_route_to_logical_subject_and_child_slot():
         frame=header.to_frame(()),
     )
 
-    assert (
-        worker._coherence_directory.register(
-            subject,
-            epoch,
-        ).child_share_bitmap
-        == 0
+    assert _entry(worker._coherence_directory, subject, epoch).child_share_bitmap == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_coalesces_invalidation_during_parent_return() -> None:
+    subject = CoherenceSubject(3, 0, 19)
+    epoch = 7
+    directory = CoherenceDirectory()
+    directory.accept_parent_read(subject, epoch)
+    local = directory.request_read(subject, epoch, ExecutionToken(epoch))
+    assert isinstance(local, GrantReady)
+    directory.release(local.token)
+    returning = directory.begin_parent_return(subject, epoch)
+    worker = types.SimpleNamespace(
+        _coherence_directory=directory,
+        _coherence_revocations=set(),
     )
+    _bind(worker, "_invalidate_parent_grant")
+
+    await worker._invalidate_parent_grant(
+        subject,
+        route_code=11,
+        epoch=epoch,
+        sender_rank=0,
+    )
+
+    directory.complete_parent_return(returning)
 
 
 def test_reserved_flush_code_is_rejected_before_dispatch() -> None:
@@ -478,7 +530,7 @@ async def test_write_intent_suspends_for_rfo_and_retires_dirty_parent_copy(
     donated_grant = next(iter(child._coherence_input_grants[("op", epoch)].values()))
     assert donated_grant.local_access_token.kind is GrantKind.WRITE
     assert tensor._runtime_access_intent.name == intent
-    assert child_directory.register(subject, epoch).state is CoherenceState.MODIFIED
+    assert _entry(child_directory, subject, epoch).state is CoherenceState.MODIFIED
 
     async def receive_return(_frames):
         parent_directory.return_ownership_child(
@@ -490,10 +542,11 @@ async def test_write_intent_suspends_for_rfo_and_retires_dirty_parent_copy(
         return (0,)
 
     child._predecessor_handlers = {"parent": {0: _Handler(receive_return)}}
+    _attach_parent_return_runtime(child)
     await child._return_input_coherence("op", epoch)
 
-    assert child_directory.register(subject, epoch).state is CoherenceState.INVALID
-    assert parent_directory.register(subject, epoch).state is CoherenceState.INVALID
+    assert _entry(child_directory, subject, epoch).state is CoherenceState.INVALID
+    assert _entry(parent_directory, subject, epoch).state is CoherenceState.INVALID
 
 
 @pytest.mark.asyncio
@@ -549,7 +602,7 @@ async def test_failed_rfo_fences_without_speculative_remote_rollback() -> None:
     assert grants
     assert len(failures) == 1
     assert failures[0][1]["phase"] == "COHERENCE_RFO"
-    assert parent_directory.register(subject, epoch).state is CoherenceState.SHARED
+    assert _entry(parent_directory, subject, epoch).state is CoherenceState.SHARED
 
 
 @pytest.mark.asyncio
@@ -600,6 +653,20 @@ async def test_multi_subject_reservation_failure_rolls_back_earlier_writer() -> 
         actions.append(action)
 
     worker._send_coherence_to_parent = send_to_parent
+
+    async def send_parent_group(routes):
+        for route in routes:
+            await send_to_parent(
+                route.subject,
+                route.route_code,
+                route.epoch,
+                CoherenceAction.GRANT_RETURN,
+            )
+
+    worker._parent_grant_return_runtime = ParentGrantReturnRuntime(
+        inner,
+        send_parent_group,
+    )
     _bind(worker, "_acquire_owned_inputs", "_rollback_ownership_reservations")
 
     with pytest.raises(RuntimeError, match="second reservation failed"):
@@ -608,7 +675,7 @@ async def test_multi_subject_reservation_failure_rolls_back_earlier_writer() -> 
     assert not grants
     assert actions == [CoherenceAction.GRANT_RETURN, CoherenceAction.GRANT_RETURN]
     assert all(
-        inner.register(subject, epoch).state is CoherenceState.INVALID
+        _entry(inner, subject, epoch).state is CoherenceState.INVALID
         for subject in subjects
     )
 
@@ -647,9 +714,12 @@ async def test_alias_lineage_delays_parent_return_until_downstream_quiescence() 
         _coherence_input_grants={("op", epoch): _grant_map(grant)},
         _coherence_input_bindings={},
         _coherence_input_intents={},
-        _coherence_alias_dependencies={("op", epoch): {(output_subject, epoch)}},
+        _coherence_alias_dependencies={
+            ("op", epoch): {CoherenceInstance(output_subject, epoch)}
+        },
         _allocation_registry=AllocationRegistry(),
         _coherence_input_tensors={("op", epoch): {tensor}},
+        _local_input_origins={},
         _coherence_revocations=set(),
         _predecessor_handlers={"parent": {0: _Handler(receive_return)}},
         _local_spmd_code=4,
@@ -657,6 +727,7 @@ async def test_alias_lineage_delays_parent_return_until_downstream_quiescence() 
         _world_size=1,
     )
     _bind(worker, "_return_input_coherence", "_require_local_spmd_code")
+    _attach_parent_return_runtime(worker)
 
     returning = asyncio.create_task(worker._return_input_coherence("op", epoch))
     await asyncio.sleep(0)
@@ -667,7 +738,60 @@ async def test_alias_lineage_delays_parent_return_until_downstream_quiescence() 
     directory.return_child(output_subject, epoch, child_id=0)
     await asyncio.wait_for(returning, timeout=0.1)
 
-    with pytest.raises(CoherenceStateTransitionError, match="invalidated"):
+    with pytest.raises(CoherenceStateTransitionError, match="released"):
+        _ = tensor.flat_values
+
+
+@pytest.mark.asyncio
+async def test_input_retirement_accepts_reentrant_next_epoch_after_return() -> None:
+    set_backend("numba_cpu")
+    epoch = 7
+    subject = CoherenceSubject(3, 0, 19)
+    instance = CoherenceInstance(subject, epoch)
+    directory = CoherenceDirectory()
+    directory.accept_parent_read(subject, epoch)
+    local_read = directory.request_read(subject, epoch, ExecutionToken(epoch))
+    assert isinstance(local_read, GrantReady)
+    tensor = TransportTensor(np.arange(4, dtype=np.int64))
+    tensor._bind_coherence_instances((instance,))
+    registry = AllocationRegistry()
+    registry.bind(instance, tensor._runtime_allocation_descriptor())
+    grant = _InputCoherenceGrant(
+        parent_spmd_id="parent",
+        parent_rank=0,
+        subject=subject,
+        route_code=11,
+        epoch=epoch,
+        local_access_token=local_read.token,
+    )
+
+    async def receive_return(_frames):
+        directory.accept_parent_read(subject, epoch + 1)
+        return (0,)
+
+    worker = types.SimpleNamespace(
+        _coherence_directory=directory,
+        _coherence_input_grants={("op", epoch): _grant_map(grant)},
+        _coherence_input_bindings={},
+        _coherence_input_intents={},
+        _coherence_alias_dependencies={},
+        _allocation_registry=registry,
+        _coherence_input_tensors={("op", epoch): {tensor}},
+        _local_input_origins={},
+        _coherence_revocations=set(),
+        _predecessor_handlers={"parent": {0: _Handler(receive_return)}},
+        _local_spmd_code=4,
+        rank=0,
+        _world_size=1,
+    )
+    _bind(worker, "_return_input_coherence", "_require_local_spmd_code")
+    _attach_parent_return_runtime(worker)
+
+    await worker._return_input_coherence("op", epoch)
+
+    assert not registry.is_bound(instance)
+    assert _entry(directory, subject, epoch + 1).epoch == epoch + 1
+    with pytest.raises(CoherenceStateTransitionError, match="released"):
         _ = tensor.flat_values
 
 
@@ -715,15 +839,15 @@ def test_alias_dependency_is_derived_from_runtime_allocation_identity() -> None:
     worker._register_coherence_alias_dependencies("op", 7, tensor)
 
     assert worker._coherence_alias_dependencies[("op", 7)] == {
-        (CoherenceSubject(4, 0, 23), 7)
+        CoherenceInstance(CoherenceSubject(4, 0, 23), 7)
     }
 
 
 def test_strict_donate_handoffs_exact_allocation_to_new_ssa_instance() -> None:
     set_backend("numba_cpu")
     step = 7
-    old = TensorInstance(CoherenceSubject(3, 0, 19), step)
-    new = TensorInstance(CoherenceSubject(4, 0, 23), step)
+    old = CoherenceInstance(CoherenceSubject(3, 0, 19), step)
+    new = CoherenceInstance(CoherenceSubject(4, 0, 23), step)
     tensor = TransportTensor(np.arange(4, dtype=np.int64))
     tensor._bind_coherence_instances((old,))
     directory = CoherenceDirectory()
@@ -838,7 +962,7 @@ def test_alias_dependency_rejects_noncanonical_output_epoch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_alias_barrier_waits_for_registration_not_delivery() -> None:
+async def test_send_barrier_waits_for_registration_not_delivery() -> None:
     delivery_gate = asyncio.Event()
     delivery = asyncio.create_task(delivery_gate.wait())
     result = ExecutionResult(ExecutionStatus.SUCCESS, data=object())
@@ -850,13 +974,13 @@ async def test_alias_barrier_waits_for_registration_not_delivery() -> None:
         return (delivery,)
 
     worker._send_output = send_output
-    _bind(worker, "_send_local_plan_result", "_await_alias_send_registration")
+    _bind(worker, "_send_local_plan_result", "_await_send_registration")
     registration = asyncio.create_task(
         worker._send_local_plan_result("op", 7, result, {})
     )
     token = LocalSendToken("op", 7, result, registration)
 
-    await worker._await_alias_send_registration(token)
+    await worker._await_send_registration(token)
 
     assert registration.done()
     assert not delivery.done()
@@ -865,29 +989,40 @@ async def test_alias_barrier_waits_for_registration_not_delivery() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancelled_batch_delegation_rolls_back_prior_child_grants(
-    monkeypatch,
-) -> None:
+async def test_cancelled_batch_delegation_rolls_back_prior_child_grants() -> None:
     directory = CoherenceDirectory()
     first = CoherenceSubject(1, 0, 10)
     blocked = CoherenceSubject(1, 0, 11)
     directory.publish_local_payload(blocked, 7)
     blocker = directory.request_write(blocked, 7, ExecutionToken(9))
     assert isinstance(blocker, GrantReady)
-    monkeypatch.setattr(
-        data_plane_executor,
-        "_delegated_reads",
-        lambda _plan, _batch: ((first, 7, 0), (blocked, 7, 0)),
+    runtime = CoherenceBatchRetireRuntime(
+        directory,
+        types.SimpleNamespace(commit_payload=lambda _instances, payload: payload()),
     )
-    task = asyncio.create_task(
-        data_plane_executor._delegate_batch_reads(directory, None, None)
+    plan = types.SimpleNamespace(
+        sender_spmd_code=1,
+        rank=0,
+        coherence_logical_tuuid=lambda code: 10 if code == 1 else 11,
+        coherence_child_slot=lambda _code, _rank: 0,
     )
+    batch = TransportFrameBatch(
+        context_index=0,
+        target_rank=0,
+        batch_seq=0,
+        frames=(),
+        delegations=(
+            TransportDelegationDescriptor(1, 7),
+            TransportDelegationDescriptor(2, 7),
+        ),
+    )
+    task = asyncio.create_task(runtime._delegate_batch_reads(plan, batch))
     await asyncio.sleep(0)
 
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
-    assert directory.register(first, 7).child_share_bitmap == 0
+    assert _entry(directory, first, 7).child_share_bitmap == 0
 
 
 @pytest.mark.asyncio
@@ -901,25 +1036,57 @@ async def test_delivery_failure_rolls_back_but_success_retentions_child_grant(
     grant = directory.delegate_read(subject, 7, child_id=0)
     assert isinstance(grant, GrantReady)
     receipt = directory.register_child_delivery(grant.token)
+    runtime = CoherenceBatchRetireRuntime(
+        directory,
+        types.SimpleNamespace(commit_payload=lambda _instances, payload: payload()),
+    )
 
     async def delivery():
         if delivery_fails:
             raise RuntimeError("delivery failed")
 
-    async def submit_delivery(awaitable):
-        return asyncio.create_task(awaitable)
+    async def retire() -> None:
+        result = await delivery()
+        assert result is None
 
-    task = await data_plane_executor._submit_delegated_batch(
-        directory=directory,
-        delegated_tokens=(receipt,),
-        delivery=delivery(),
-        submit_delivery=submit_delivery,
-    )
+    task = asyncio.create_task(runtime._complete_delivery((receipt,), retire()))
     await asyncio.gather(task, return_exceptions=True)
     await asyncio.sleep(0)
 
     expected = 0 if delivery_fails else 1
-    assert directory.register(subject, 7).child_share_bitmap == expected
+    assert _entry(directory, subject, 7).child_share_bitmap == expected
+
+
+def test_delegated_reads_preserve_batch_order_and_drop_duplicates() -> None:
+    plan = types.SimpleNamespace(
+        sender_spmd_code=7,
+        rank=1,
+        coherence_logical_tuuid=lambda transfer_code: transfer_code + 100,
+        coherence_instance=lambda transfer_code, epoch: CoherenceInstance(
+            CoherenceSubject(7, 1, transfer_code + 100), epoch
+        ),
+        coherence_child_slot=lambda transfer_code, target_rank: target_rank
+        + transfer_code,
+    )
+    batch = TransportFrameBatch(
+        context_index=0,
+        target_rank=2,
+        batch_seq=0,
+        frames=(),
+        delegations=(
+            TransportDelegationDescriptor(1, 1),
+            TransportDelegationDescriptor(1, 0),
+            TransportDelegationDescriptor(1, 1),
+        ),
+    )
+
+    delegated_reads = _delegated_reads(plan, batch)  # type: ignore[arg-type]
+
+    assert [(epoch, slot) for _subject, epoch, slot in delegated_reads] == [
+        (1, 3),
+        (0, 3),
+    ]
+    assert len(delegated_reads) == 2
 
 
 @pytest.mark.asyncio
@@ -933,6 +1100,10 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
     assert isinstance(second, GrantReady)
     first_receipt = directory.register_child_delivery(first.token)
     second_receipt = directory.register_child_delivery(second.token)
+    runtime = CoherenceBatchRetireRuntime(
+        directory,
+        types.SimpleNamespace(commit_payload=lambda _instances, payload: payload()),
+    )
     fail_first = asyncio.Event()
 
     async def first_delivery():
@@ -942,20 +1113,11 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
     async def second_delivery():
         return None
 
-    async def submit_delivery(awaitable):
-        return asyncio.create_task(awaitable)
-
-    first_task = await data_plane_executor._submit_delegated_batch(
-        directory=directory,
-        delegated_tokens=(first_receipt,),
-        delivery=first_delivery(),
-        submit_delivery=submit_delivery,
+    first_task = asyncio.create_task(
+        runtime._complete_delivery((first_receipt,), first_delivery())
     )
-    second_task = await data_plane_executor._submit_delegated_batch(
-        directory=directory,
-        delegated_tokens=(second_receipt,),
-        delivery=second_delivery(),
-        submit_delivery=submit_delivery,
+    second_task = asyncio.create_task(
+        runtime._complete_delivery((second_receipt,), second_delivery())
     )
     await second_task
     await asyncio.sleep(0)
@@ -963,5 +1125,5 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
     await asyncio.gather(first_task, return_exceptions=True)
     await asyncio.sleep(0)
 
-    assert directory.register(subject, 7).child_share_bitmap == 1
+    assert _entry(directory, subject, 7).child_share_bitmap == 1
     directory.return_child(subject, 7, child_id=0)

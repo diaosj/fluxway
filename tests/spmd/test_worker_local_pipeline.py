@@ -8,6 +8,7 @@ import pytest
 
 from fluxway.common.operator_policy import AsyncPolicy, SchedulePolicy
 from fluxway.common.schedule_semantics import compile_phase_schedule
+from fluxway.common.types import DrainBoundary
 from fluxway import OperatorSpec
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.spmd.worker.operator_manager.dispatcher import (
@@ -115,7 +116,9 @@ def _make_pipeline_stub_with_profiler(
         _coherence_alias_dependencies={},
         _background_tasks=set(),
         _plan_tasks=set(),
-        _send_tasks=set(),
+        _send_tasks={},
+        _drain_boundary=DrainBoundary(),
+        _source_operator_names=("op",),
     )
     stub._mailbox.clear_step = AsyncMock()
     stub._operator_pipeline_depth = types.MethodType(
@@ -171,8 +174,8 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._commit_allocation_handoffs,
         stub,
     )
-    stub._await_alias_send_registration = types.MethodType(
-        raw_cls._await_alias_send_registration,
+    stub._await_send_registration = types.MethodType(
+        raw_cls._await_send_registration,
         stub,
     )
     stub._on_background_task_done = types.MethodType(
@@ -195,6 +198,7 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._prepare_inputs_if_policy_allows,
         stub,
     )
+    stub._drain_blocks_step = types.MethodType(raw_cls._drain_blocks_step, stub)
     stub._start_prepare_and_enqueue_token = types.MethodType(
         raw_cls._start_prepare_and_enqueue_token,
         stub,
@@ -248,10 +252,16 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._release_phase_order_steps,
         stub,
     )
-    stub.set_drain_step_count = types.MethodType(
-        raw_cls.set_drain_step_count,
+    stub.set_drain_boundary = types.MethodType(
+        raw_cls.set_drain_boundary,
         stub,
     )
+    stub._set_drain_boundary = types.MethodType(
+        raw_cls._set_drain_boundary,
+        stub,
+    )
+    stub._source_is_exhausted = types.MethodType(raw_cls._source_is_exhausted, stub)
+    stub._source_blocks_step = types.MethodType(raw_cls._source_blocks_step, stub)
     stub._advance_step = types.MethodType(raw_cls._advance_step, stub)
     stub._trigger_source_operators = types.MethodType(
         raw_cls._trigger_source_operators,
@@ -1028,7 +1038,7 @@ async def test_setting_drain_target_cancels_speculative_prepare_past_target():
     await started.wait()
     assert ("op", 3) in stub._input_prepare_runtime._tasks
 
-    await stub.set_drain_step_count(2)
+    await stub.set_drain_boundary(2)
     assert ("op", 3) not in stub._input_prepare_runtime._tasks
 
 
@@ -1060,7 +1070,7 @@ async def test_checkpoint_outbound_fence_ignores_parked_future_plans():
 
 
 @pytest.mark.asyncio
-async def test_local_barrier_does_not_wait_frame_build_task():
+async def test_local_barrier_waits_for_frame_build_task():
     stub = _make_pipeline_stub(
         OperatorSpec(
             name="op",
@@ -1085,10 +1095,8 @@ async def test_local_barrier_does_not_wait_frame_build_task():
     await stub._local_plan_commit("op", 0, send_token)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
-    assert elapsed_ms < 20.0
+    assert elapsed_ms >= 50.0
     assert send_token.send_task is not None
-    assert not frame_build_done.is_set()
-    await send_token.send_task
     assert frame_build_done.is_set()
 
 
@@ -1144,7 +1152,7 @@ async def test_local_barrier_observes_immediate_send_registration_failure():
 
 
 @pytest.mark.asyncio
-async def test_local_barrier_poisoned_by_late_send_failure_at_drain():
+async def test_local_barrier_propagates_late_send_failure():
     stub = _make_pipeline_stub(
         OperatorSpec(
             name="op",
@@ -1159,10 +1167,8 @@ async def test_local_barrier_poisoned_by_late_send_failure_at_drain():
     stub._send_output = failing_send_output
 
     send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
-    await stub._local_plan_commit("op", 0, send_token)
-    failure_before_sleep = stub._failure
-    assert failure_before_sleep is None
-    await asyncio.sleep(0.02)
+    with pytest.raises(RuntimeError, match="late frame build failed"):
+        await stub._local_plan_commit("op", 0, send_token)
     assert stub._failure is not None
     assert stub._failure.phase == "SEND"
     assert stub._failure.message == "late frame build failed"

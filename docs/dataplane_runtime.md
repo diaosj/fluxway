@@ -23,18 +23,29 @@ receiver 完成 route/action/epoch 校验并登记 parent shared authority 后�
 send completion 只结束 delivery receipt，不归还 ShareGrant；只有 downstream operator、alias
 lineage 和 descendants 全部静止后才发送 `GRANT_RETURN`。
 
+输入归还由 worker-local `InputCoherenceRelease` 统一完成。它先释放 local access token，
+再等待 grant subject、allocation alias 和 direct descendants 的 quiescence，随后才失效
+tensor runtime access、发送 `GRANT_RETURN`、释放 payload，并执行 returned-instance 或
+current-entry retirement proof。remote grant 与 local-only grant 走同一条 awaited lifecycle；
+local-only 只是没有 parent route。在 Worker 调度层，`_commit_finished_steps` 在 step 完成时
+把 `InputCoherenceRelease.complete()` 放入受监管的后台生命周期任务并推进 Step 调度水印；
+后台协程取得 release 资源所有权后才执行可能挂起的 quiescence await，调度水印推进不代表
+输入归还已经完成。Directory 状态机继续严格保障零拷贝物理内存安全。
+
 RFO 的顺序是：writer intent 先阻止新 reader，释放当前 read token，等待 local subtree；child
 发送 RFO 后，parent 等待 delivery、并发 invalidate siblings、清空 sharing set，再进入 I 并发送
-`OWNERSHIP_GRANT`。child 收到 grant 后才进入 M、解析 pending future 并恢复 CALL。
+`OWNERSHIP_GRANT`。child 收到 grant 后才进入 M、解析 pending request result 并恢复 CALL。
 
 `SNOOP_INVALIDATE` 只能撤销 S。receiver 设置 revoking、等待 controlled readers 和 direct
 children，随后 wrapper fail-fast、进入 I 并发送一次 `GRANT_RETURN`。M holder 无法在没有
 writeback 的情况下响应 invalidation，直接触发 execution failure。`OWNERSHIP_CANCEL` 仅允许
 CALL 开始前使用；CALL 开始后的 dirty authority 只能退休，parent 保持 I。
 
-当前 Python allocation policy 的 epoch 唯一来源是 tensor instance 的 immutable
-`TransportTensor.source_step`；raw output 在 frame build 前绑定当前 execution step。该值被
-lower 到 `ENTRY_AUX`，而 `FRAME_STEP` 继续承担 delivery barrier 的 exact-step 语义。
+coherence epoch 的唯一事实来源是 coherence-owned `CoherenceInstance(subject, epoch)`。
+`TransportTensor` 只携带已绑定的 instance；`source_step` 是调度/来源元数据，不能推导
+directory epoch。raw output 必须在进入 data-plane 前由 worker 绑定 canonical instance，
+随后该 instance 的 epoch 才被 lower 到 `ENTRY_AUX`，而 `FRAME_STEP` 继续承担 delivery
+barrier 的 exact-step 语义。
 
 ### Compressed Flat ABI Entry Row
 
@@ -63,16 +74,18 @@ Protocol version 1 (`PROTOCOL_VERSION = 1`) 使用固定 9 列、36 bytes 的
 | 20:23 | `CoherenceAction` |
 | 24:31 | reserved，必须为 0 |
 
-`ENTRY_AUX` 在 `TENSOR_TRANSFER` 和 `COHERENCE` frame 中是 coherence epoch，
-在 `DEPENDENCY_DECISION` frame 中是 decision enum，在 `ORDERING_COMPLETION` 中必须为 0。
-`ENTRY_ROUTE_CODE` 只做协议分派。receiver 必须通过 canonical compiled graph 的
-`transfer_code -> logical_tuuid` 映射取得 coherence identity，禁止把 route code 直接写入
-directory key。
+`ENTRY_AUX` 在 `TENSOR_TRANSFER` 和 `COHERENCE` frame 中是 canonical
+`CoherenceInstance.epoch` 的 wire projection，在 `DEPENDENCY_DECISION` frame 中是
+decision enum，在 `ORDERING_COMPLETION` 中必须为 0。`ENTRY_ROUTE_CODE` 只做协议分派。
+receiver 必须通过 canonical compiled graph 的 `transfer_code -> logical_tuuid` 映射取得
+coherence subject，并使用 frame 中携带的 coherence epoch；禁止把 route code、
+`FRAME_STEP` 或 `source_step` 直接当作 directory identity。
 
 coherence action code：`0=NONE`、`1=BUS_RD`、`2=RFO`、`4=SNOOP_INVALIDATE`、
 `5=GRANT_RETURN`、`7=OWNERSHIP_GRANT`、`8=OWNERSHIP_CANCEL`。code 3、6、9-15
 为 reserved，validator 直接抛异常。一个 coherence frame 内所有 entry 必须具有相同 action
-和 epoch，且 epoch 等于 `FRAME_STEP`；sender 按 `(artifact, action, epoch)` 聚合 route codes。
+和 epoch；sender 按 `(artifact, action, epoch)` 聚合 route codes。正常路径中 epoch 与
+`FRAME_STEP` 可能数值相同，但二者语义独立，任何一方都不能推导另一方。
 
 ### Coherence Identity And Child Slots
 
@@ -314,8 +327,31 @@ logical TUUID, epoch and directory authority remain the single sources of truth.
 `CoherenceDirectory` is owned by one worker event loop. Multiple coroutines on that loop
 may share a tensor through the ready path: one dictionary lookup and bounded entry-local
 counter/bitmap updates, with no Future allocation, polling or operating-system thread
-block. A conflict creates an entry-local Future and suspends only the requesting
-coroutine.
+block. A conflict returns explicit pending state; `coherence_runtime.py` registers a
+progress listener and suspends only the requesting coroutine.
+
+The data plane does not perform coherence admission or delegation. `CoherenceSequencer` orders
+canonical `CoherenceInstance` tickets; the coherence runtime adapter awaits quiescence and invokes
+`CoherenceDirectory.admit()` before the pure queue is given a frame batch. `source_step` and
+`FRAME_STEP` remain scheduling metadata, never directory epoch sources.
+
+```mermaid
+flowchart LR
+  I["issue intent"] --> B["concurrent frame build"]
+  B --> C["ROB commit_payload"]
+  C --> K["all payload tickets registered"]
+  K --> X["close_intent admission cut"]
+  X --> R["runtime admission adapter"]
+  R --> A["ordered Directory.admit"]
+  A --> Q["pure target queue"]
+  Q --> S["send / RPC"]
+  S --> E["delivery completion"]
+  E --> Z["ticket completion"]
+```
+
+`commit_payload()` performs ticket registration synchronously. A sealed head ticket uses the
+inline retire path; blocked predecessors allocate a Future and suspend only their coroutine.
+Frame and payload objects remain borrowed zero-copy references throughout this handoff.
 
 Operating-system threads must not mutate the directory directly. They must marshal an
 intent through the host event loop's thread-safe submission primitive; the owner loop
@@ -338,6 +374,12 @@ WAIT -> CALL -> SEND -> BARRIER
 - `SEND` registers `LocalSendToken` and starts background delivery.
 - `BARRIER` observes token registration, clears exact-step mailbox data, and
   advances committed watermark when previous steps are committed.
+
+Drain boundaries and source refill are separate responsibilities. A boundary update only
+changes admission, cancels or discards speculative source work at or beyond the cut, and wakes
+the drain condition; it never refills the source pipeline. `_fill_source_pipeline()` is the
+sole source-admission loop and checks running state, terminal observation, pipeline depth, and
+the finite `max_steps` target before enqueueing another step.
 
 Local DAG does not encode forward/backward/update algorithm ordering. Cross
 operator scheduling lives in `SchedulePolicy`, worker priority keys, and

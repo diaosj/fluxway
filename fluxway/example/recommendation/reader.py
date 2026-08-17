@@ -41,7 +41,7 @@ def _row_partitioned_int_tensor(
     checkpoint_components=(
         StateCheckpointComponent(
             "reader",
-            lambda owner, context: owner.capture_checkpoint_state(context),
+            lambda owner, context: owner.save_checkpoint_state(context),
             lambda owner, state, context: owner.restore_checkpoint_state(
                 state, context
             ),
@@ -96,7 +96,7 @@ class RecommendationReader(GrainReader):
             seq_len_probs /= seq_len_probs.sum()
 
             user_ids = rng.choice(vocab_size_user, size=num_samples, p=user_probs)
-            checkpoint_object_checkpoint_object_ids = rng.choice(
+            target_target_ids = rng.choice(
                 vocab_size_item, size=num_samples, p=item_probs
             )
             seq_lens = rng.choice(seq_len_choices, size=num_samples, p=seq_len_probs)
@@ -113,11 +113,9 @@ class RecommendationReader(GrainReader):
                         "request_hour": [int(rng.integers(0, 24))],
                         "hist_click_item_seq": [int(x) for x in hist_seq],
                         "hist_seq_length": [sl],
-                        "checkpoint_object_checkpoint_object_id": [
-                            int(checkpoint_object_checkpoint_object_ids[i])
-                        ],
-                        "checkpoint_object_item_category": [int(rng.integers(0, 10))],
-                        "checkpoint_object_item_stats": [
+                        "target_target_id": [int(target_target_ids[i])],
+                        "target_item_category": [int(rng.integers(0, 10))],
+                        "target_item_stats": [
                             rng.random(),
                             (rng.random() * 20),
                         ],
@@ -206,24 +204,24 @@ class RecommendationReader(GrainReader):
             "request_hour",
             "hist_click_item_seq",
             "hist_seq_length",
-            "checkpoint_object_checkpoint_object_id",
-            "checkpoint_object_item_category",
-            "checkpoint_object_item_stats",
+            "target_target_id",
+            "target_item_category",
+            "target_item_stats",
             "is_click",
         )
         for k in required_keys:
             assert k in samples[0], f"[Reader] sample missing required key '{k}'"
 
         # Determine feature dimensions from first sample
-        stats_dim = len(samples[0]["checkpoint_object_item_stats"])
+        stats_dim = len(samples[0]["target_item_stats"])
         assert stats_dim > 0, (
-            f"[Reader] checkpoint_object_item_stats must be non-empty, got dim={stats_dim}"
+            f"[Reader] target_item_stats must be non-empty, got dim={stats_dim}"
         )
         # All samples must agree on stats dimensionality.
         for i, s in enumerate(samples):
-            assert len(s["checkpoint_object_item_stats"]) == stats_dim, (
-                f"[Reader] sample {i} checkpoint_object_item_stats dim "
-                f"{len(s['checkpoint_object_item_stats'])} != expected {stats_dim}"
+            assert len(s["target_item_stats"]) == stats_dim, (
+                f"[Reader] sample {i} target_item_stats dim "
+                f"{len(s['target_item_stats'])} != expected {stats_dim}"
             )
             assert s["is_click"][0] in (0, 1), (
                 f"[Reader] sample {i} is_click must be 0 or 1, got {s['is_click'][0]}"
@@ -263,10 +261,10 @@ class RecommendationReader(GrainReader):
         )
 
         passive = PassiveFeatures(
-            checkpoint_object_checkpoint_object_id=_row_partitioned_int_tensor(
+            target_target_id=_row_partitioned_int_tensor(
                 [
                     [
-                        s["checkpoint_object_checkpoint_object_id"][0],
+                        s["target_target_id"][0],
                         *s["hist_click_item_seq"],
                     ]
                     for s in samples
@@ -274,14 +272,14 @@ class RecommendationReader(GrainReader):
                 global_shape=g_shape_item_sparse,
                 origin_indices=origins,
             ),
-            checkpoint_object_item_category=TransportTensor.from_lists(
-                [s["checkpoint_object_item_category"][0] for s in samples],
+            target_item_category=TransportTensor.from_lists(
+                [s["target_item_category"][0] for s in samples],
                 dtype=np.int32,
                 global_shape=g_shape,
                 origin_indices=origins,
             ),
-            checkpoint_object_item_stats=TransportTensor.from_lists(
-                [s["checkpoint_object_item_stats"] for s in samples],
+            target_item_stats=TransportTensor.from_lists(
+                [s["target_item_stats"] for s in samples],
                 dtype=np.float32,
                 global_shape=g_shape_stats,
                 origin_indices=origins,
@@ -299,14 +297,14 @@ class RecommendationReader(GrainReader):
 
         return UserBatch(active=active, passive=passive, labels=labels)
 
-    def capture_checkpoint_state(self, context: SaveSession) -> dict[str, Any]:
+    def save_checkpoint_state(self, context: SaveSession) -> dict[str, Any]:
         static_args = self.static_args
         state: dict[str, Any] = {
             "completed_steps": self._completed_steps,
             "batch_size": int(static_args["batch_size"]),
         }
         state["mode"] = "iterator"
-        state["grain_state"] = super().capture_state(context)
+        state["grain_state"] = super().save_state(context)
         return state
 
     def restore_checkpoint_state(

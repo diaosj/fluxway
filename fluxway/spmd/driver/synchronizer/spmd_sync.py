@@ -14,6 +14,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
 from typing import Any
 
+from fluxway.common.types import (
+    DrainBoundary,
+    DrainEvent,
+    DrainEventKind,
+    reduce_drain_boundary,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -106,6 +113,12 @@ class SPMDSynchronizer:
         # SPMD-level completed count (minimum count reached by all workers)
         self._spmd_completed_count: dict[str, int] = {}
 
+        # Durable/terminal-facing logical view.  The execution counters above
+        # are raw cursors and must never be rewritten when a terminal boundary
+        # arrives; this derived view is the only value exposed to checkpoint
+        # and controller callbacks after a terminal cut is observed.
+        self._committed_spmd_count: dict[str, int] = {}
+
         # Op lock states (controller-requested)
         self._op_locked: dict[str, bool] = {}
 
@@ -130,6 +143,7 @@ class SPMDSynchronizer:
         self._drain_step_count: int | None = None
         self._drain_on_drained: Callable[[], None] | None = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
+        self._drain_boundary = DrainBoundary()
 
     def load_spmd_state(self, spmd_state: dict[str, Any]) -> None:
         """Load step counts for all workers uniformly from SPMD-level logical state.
@@ -139,10 +153,22 @@ class SPMDSynchronizer:
         counts to every rank slot, ensuring no rank starts at step 0 after restore.
         """
         with self._lock:
+            boundary_state = spmd_state.get("drain_boundary")
+            if boundary_state is not None:
+                if not isinstance(boundary_state, dict):
+                    raise TypeError("SPMD drain_boundary state must be a dictionary")
+                self._drain_boundary = DrainBoundary.from_mapping(boundary_state)
+            for worker_counts in self._worker_completed_count.values():
+                worker_counts.clear()
+            self._spmd_completed_count.clear()
+            self._committed_spmd_count.clear()
             for op_name, count in spmd_state.get("completed_step_count", {}).items():
                 for rank in range(self.num_workers):
                     self._worker_completed_count[rank][op_name] = count
                 self._spmd_completed_count[op_name] = count
+                self._committed_spmd_count[op_name] = self._effective_count_internal(
+                    count
+                )
                 if (
                     op_name in self._allowed_steps
                     and self._allowed_steps[op_name] < count
@@ -222,11 +248,25 @@ class SPMDSynchronizer:
 
             if self._all_workers_reached_count_internal(op_name, completed_count):
                 old_spmd_count = self._spmd_completed_count.get(op_name, 0)
-                self._spmd_completed_count[op_name] = completed_count
+                self._spmd_completed_count[op_name] = max(
+                    old_spmd_count, completed_count
+                )
+                effective_count = reduce_drain_boundary(
+                    self._drain_boundary,
+                    DrainEvent(
+                        DrainEventKind.LATE_COMPLETION,
+                        self._spmd_completed_count[op_name],
+                    ),
+                ).clamped_completion
+                if effective_count is None:
+                    raise RuntimeError("late completion reducer returned no count")
+                old_committed_count = self._committed_spmd_count.get(op_name, 0)
+                self._committed_spmd_count[op_name] = effective_count
                 logger.debug(
                     f"SPMD {self.spmd_id} reached {op_name} total_count {completed_count}"
                 )
-                should_report = completed_count > old_spmd_count
+                should_report = effective_count > old_committed_count
+                completed_count = effective_count
 
             # Drain ACK: All workers have fully completed the requested number of steps.
             # They are now idle at the START of step index == _drain_step_count.
@@ -252,6 +292,47 @@ class SPMDSynchronizer:
                 logger.error(f"Error reporting op completion: {e}")
 
         if drain_complete and callback:
+            callback()
+
+    @property
+    def drain_step_count(self) -> int | None:
+        with self._lock:
+            return self._drain_step_count
+
+    @property
+    def drain_boundary(self) -> DrainBoundary:
+        with self._lock:
+            return self._drain_boundary
+
+    def apply_boundary_event(self, event: DrainEvent) -> None:
+        """Apply one shared boundary event without changing execution cursors."""
+        callback = None
+        with self._lock:
+            transition = reduce_drain_boundary(self._drain_boundary, event)
+            self._drain_boundary = transition.boundary
+            if event.kind is not DrainEventKind.TERMINAL_OBSERVATION:
+                return
+            cut = self._drain_boundary.observed_cut
+            if cut is None:
+                raise RuntimeError("terminal reducer did not produce a cut")
+            for op_name, count in tuple(self._spmd_completed_count.items()):
+                self._committed_spmd_count[op_name] = min(count, cut)
+            for op_name in self._active_ops_for_drain():
+                if self._all_workers_reached_count_internal(op_name, cut):
+                    self._committed_spmd_count[op_name] = cut
+            if self._drain_step_count is not None:
+                known_ops = self._active_ops_for_drain()
+                self._drain_acked_ops = {
+                    op_name
+                    for op_name in known_ops
+                    if self._all_workers_reached_count_internal(
+                        op_name, self._drain_step_count
+                    )
+                }
+                if self._drain_acked_ops >= known_ops and known_ops:
+                    callback = self._drain_on_drained
+                    self._drain_on_drained = None
+        if callback:
             callback()
 
     def _check_worker_skew_internal(self, op_name: str) -> None:
@@ -313,6 +394,10 @@ class SPMDSynchronizer:
             for r in range(self.num_workers)
         )
 
+    def _effective_count_internal(self, count: int) -> int:
+        terminal_cut = self._drain_boundary.observed_cut
+        return count if terminal_cut is None else min(count, terminal_cut)
+
     # =========================================================================
     # Drain-to-Step Control
     # =========================================================================
@@ -359,7 +444,11 @@ class SPMDSynchronizer:
         if drain_complete:
             on_drained()
 
-    def shorten_drain_to_step_count(self, step_count: int) -> None:
+    def shorten_drain_to_step_count(
+        self,
+        step_count: int,
+        on_drained: Callable[[], None] | None = None,
+    ) -> None:
         callback = None
         with self._lock:
             current = self._drain_step_count
@@ -371,6 +460,8 @@ class SPMDSynchronizer:
                     f"requested={step_count}"
                 )
             self._drain_step_count = step_count
+            if on_drained is not None:
+                self._drain_on_drained = on_drained
             known_ops = self._active_ops_for_drain()
             self._drain_acked_ops = {
                 op_name
@@ -460,11 +551,11 @@ class SPMDSynchronizer:
 
     def get_spmd_steps(self) -> dict[str, int]:
         with self._lock:
-            return dict(self._spmd_completed_count)
+            return dict(self._committed_spmd_count)
 
     def get_spmd_step(self, op_name: str) -> int:
         with self._lock:
-            return self._spmd_completed_count.get(op_name, 0)
+            return self._committed_spmd_count.get(op_name, 0)
 
     def get_worker_step(self, rank: int, op_name: str) -> int:
         with self._lock:
@@ -491,4 +582,5 @@ class SPMDSynchronizer:
                 self._worker_op_locked[rank].clear()
                 self._op_runnable_epoch_issuer.clear_worker(rank)
             self._spmd_completed_count.clear()
+            self._committed_spmd_count.clear()
             self._op_locked.clear()

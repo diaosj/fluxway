@@ -3,13 +3,16 @@ from fluxway.common.types.checkpoint import (
     CheckpointObjectKey,
     CheckpointObjectRef,
     CheckpointObjectSpec,
-    CheckpointCapability,
-    ComponentCheckpoint,
+    CheckpointComponentCapability,
+    CheckpointComponentPublication,
     CheckpointObjectRecord,
-    ComponentSpec,
+    CheckpointComponentSpec,
     CheckpointCommitPermit,
     CommitAuthority,
-    CheckpointCaptureMode,
+    CheckpointSaveState,
+    CheckpointRestoreSpec,
+    CheckpointSaveScope,
+    CheckpointSaveSpec,
     SaveSession,
     CommitSaveSession,
     RestoreSession,
@@ -19,7 +22,7 @@ from fluxway.common.types.checkpoint import (
     RestoreRequest,
     RestoreTopologyMode,
     CheckpointHold,
-    KeepPolicy,
+    CheckpointRetentionPolicy,
     CheckpointManifest,
     CheckpointAssembly,
     CheckpointIdReference,
@@ -29,12 +32,15 @@ from fluxway.common.types.checkpoint import (
     TopologySnapshot,
 )
 
-from .backend import (
+from .component import (
     CheckpointComponentRegistry,
     CheckpointComponentRegistration,
     CheckpointComponent,
-    CheckpointObjectCleaner,
+    CheckpointComponentLifecycle,
+    CheckpointObjectCleanup,
     CheckpointObjectLifecycle,
+    CheckpointComponentRestore,
+    CheckpointComponentSave,
 )
 from .checkpoint import FluxwayCheckpointer
 from .directory import (
@@ -43,31 +49,37 @@ from .directory import (
     CheckpointDirectoryOwnershipError,
 )
 from .inline import StateCheckpointComponent
-from .orbax import OrbaxCheckpointComponent
-from .pickle_backend import PickleCheckpointComponent
+from .orbax_component import OrbaxCheckpointComponent
+from .pickle_component import PickleCheckpointComponent
 from .repository import CheckpointRepository
-from .keep import CheckpointCleanupCoordinator
-from .safetensors import SafeTensorsCheckpointComponent
+from .retention import CheckpointRetentionCoordinator
+from .safetensors_component import SafeTensorsCheckpointComponent
 
 __all__ = [
     "CheckpointObjectKey",
     "CheckpointObjectCleanedUpError",
     "CheckpointObjectRef",
-    "CheckpointCleanupCoordinator",
+    "CheckpointRetentionCoordinator",
     "CheckpointObjectSpec",
-    "ComponentCheckpoint",
+    "CheckpointComponentPublication",
     "CheckpointObjectRecord",
     "CHECKPOINT_ROOT_MARKER",
-    "CheckpointCapability",
-    "ComponentSpec",
+    "CheckpointComponentCapability",
+    "CheckpointComponentSpec",
     "CheckpointComponentRegistry",
     "CheckpointComponentRegistration",
     "CheckpointComponent",
-    "CheckpointObjectCleaner",
+    "CheckpointComponentLifecycle",
+    "CheckpointObjectCleanup",
     "CheckpointObjectLifecycle",
     "CheckpointCommitPermit",
     "CommitAuthority",
-    "CheckpointCaptureMode",
+    "CheckpointSaveState",
+    "CheckpointRestoreSpec",
+    "CheckpointSaveScope",
+    "CheckpointSaveSpec",
+    "CheckpointComponentRestore",
+    "CheckpointComponentSave",
     "SaveSession",
     "CommitSaveSession",
     "RestoreSession",
@@ -84,7 +96,7 @@ __all__ = [
     "RestoreRequest",
     "RestoreTopologyMode",
     "CheckpointHold",
-    "KeepPolicy",
+    "CheckpointRetentionPolicy",
     "SafeTensorsCheckpointComponent",
     "CheckpointManifest",
     "CheckpointAssembly",

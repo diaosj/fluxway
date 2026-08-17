@@ -16,6 +16,7 @@ class ExecutionStatus(Enum):
     INACTIVE = auto()
     STALE_AFTER_RESTORE = auto()
     COMPLETED_WITHOUT_TENSOR = auto()
+    SOURCE_EXHAUSTED = auto()
 
 
 @dataclass

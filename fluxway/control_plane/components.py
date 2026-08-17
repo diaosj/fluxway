@@ -50,7 +50,7 @@ class ControlPlaneComponent(Protocol):
        invokes `await component.on_state(state)` for each registered component.
        `ComponentState` represents the host FSM's current state:
        - `ControllerState` (e.g., INITIALIZING, PENDING, TOPOLOGY_REGISTERING, READY, RUNNING, COMPLETING, FAILING, COMPLETED, FAILED)
-       - `DriverState` (e.g., INITIALIZING, READY, RUNNING, BLOCKED, DRAINING, DRAINED, SNAPSHOTTING, ERROR, COMPLETED)
+       - `DriverState` (e.g., INITIALIZING, READY, RESTORING, RUNNING, BLOCKED, DRAINING, DRAINED, SNAPSHOTTING, ERROR, COMPLETED)
 
     3. State Checkpointing & Recovery:
        During checkpointing or fault recovery operations, the host calls `registry.checkpoint_state()`

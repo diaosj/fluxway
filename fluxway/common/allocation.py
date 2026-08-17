@@ -8,7 +8,7 @@ from typing import Any
 from fluxway.common.coherence import (
     CoherenceSubject,
     RetirementInvariantError,
-    TensorInstance,
+    CoherenceInstance,
     UnsupportedAllocationHandoffError,
 )
 
@@ -53,21 +53,21 @@ class AllocationDescriptor:
 
 @dataclass(frozen=True, slots=True)
 class AllocationBinding:
-    instance: TensorInstance
+    instance: CoherenceInstance
     descriptor: AllocationDescriptor
 
 
 class AllocationRegistry:
     def __init__(self) -> None:
-        self._bindings: dict[TensorInstance, AllocationBinding] = {}
-        self._retired: dict[CoherenceSubject, deque[TensorInstance]] = defaultdict(
+        self._bindings: dict[CoherenceInstance, AllocationBinding] = {}
+        self._retired: dict[CoherenceSubject, deque[CoherenceInstance]] = defaultdict(
             deque
         )
         self._watermarks: dict[CoherenceSubject, int] = {}
 
     def bind(
         self,
-        instance: TensorInstance,
+        instance: CoherenceInstance,
         descriptor: AllocationDescriptor,
     ) -> AllocationBinding:
         if instance in self._bindings:
@@ -80,8 +80,8 @@ class AllocationRegistry:
 
     def handoff(
         self,
-        old: TensorInstance,
-        new: TensorInstance,
+        old: CoherenceInstance,
+        new: CoherenceInstance,
         descriptor: AllocationDescriptor,
     ) -> AllocationBinding:
         self.require_handoff(old, new, descriptor)
@@ -93,8 +93,8 @@ class AllocationRegistry:
 
     def require_handoff(
         self,
-        old: TensorInstance,
-        new: TensorInstance,
+        old: CoherenceInstance,
+        new: CoherenceInstance,
         descriptor: AllocationDescriptor,
     ) -> None:
         old_binding = self._bindings.get(old)
@@ -114,7 +114,7 @@ class AllocationRegistry:
                 "allocation handoff requires an exact allocation and byte span."
             )
 
-    def retire(self, instance: TensorInstance) -> None:
+    def retire(self, instance: CoherenceInstance) -> None:
         if instance not in self._bindings:
             raise RetirementInvariantError(
                 f"cannot retire an unbound tensor instance: {instance}."
@@ -145,7 +145,7 @@ class AllocationRegistry:
             del self._retired[subject]
         return removed
 
-    def binding(self, instance: TensorInstance) -> AllocationBinding:
+    def binding(self, instance: CoherenceInstance) -> AllocationBinding:
         try:
             return self._bindings[instance]
         except KeyError as exc:
@@ -153,7 +153,7 @@ class AllocationRegistry:
                 f"tensor instance has no allocation binding: {instance}."
             ) from exc
 
-    def is_bound(self, instance: TensorInstance) -> bool:
+    def is_bound(self, instance: CoherenceInstance) -> bool:
         return instance in self._bindings
 
     def fence(self) -> None:

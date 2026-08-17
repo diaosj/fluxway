@@ -1,4 +1,4 @@
-"""Keep policy calculation over opaque backend-owned checkpoint_objects."""
+"""Retention policy calculation over opaque component-owned checkpoint_objects."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from fluxway.common.types.checkpoint import (
     CleanupReservationRequest,
     CheckpointManifest,
 )
-from fluxway.control_plane.checkpointer.backend import (
+from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
 )
@@ -21,7 +21,7 @@ from fluxway.control_plane.checkpointer.repository import CheckpointRepository
 
 
 @dataclass(frozen=True, slots=True)
-class BackendCleanupReservation:
+class CheckpointCleanupReservation:
     spmd_id: str
     component_id: str
     reservation: CleanupReservation
@@ -35,8 +35,8 @@ class _PublishedTargetVersion:
     protected: bool
 
 
-class CheckpointCleanupCoordinator:
-    """Calculates pressure and delegates all atomic state to checkpoint_object backends."""
+class CheckpointRetentionCoordinator:
+    """Calculates pressure and delegates all atomic state to checkpoint_object components."""
 
     def __init__(
         self,
@@ -51,21 +51,21 @@ class CheckpointCleanupCoordinator:
         permit: CheckpointCommitPermit,
         new_manifest: CheckpointManifest,
         existing_manifests: tuple[CheckpointManifest, ...],
-    ) -> tuple[BackendCleanupReservation, ...]:
+    ) -> tuple[CheckpointCleanupReservation, ...]:
         if not permit.attempt_id:
             raise ValueError("cleanup reservation requires commit_save permit")
         existing = self._group_checkpoint_objects(existing_manifests)
         added = self._group_checkpoint_objects((new_manifest,))
-        reservations: list[BackendCleanupReservation] = []
+        reservations: list[CheckpointCleanupReservation] = []
         try:
             for key, new_versions in added.items():
                 spmd_id, component_id, checkpoint_object_id = key
-                registration = self._require_backend(spmd_id, component_id)
+                registration = self._require_component(spmd_id, component_id)
                 checkpoint_object = self._require_checkpoint_object(
                     registration, checkpoint_object_id
                 )
-                maximum = checkpoint_object.keep.keep_last
-                if maximum is None or checkpoint_object.keep.keep_forever:
+                maximum = checkpoint_object.retention.retain_last
+                if maximum is None or checkpoint_object.retention.retain_forever:
                     continue
                 previous = existing.get(key, ())
                 previous_by_version = self._unique_versions(previous)
@@ -88,12 +88,12 @@ class CheckpointCleanupCoordinator:
                     for item in previous_by_version.values()
                     if item.protected
                 )
-                keep = registration.object_lifecycle
-                if keep is None:
+                lifecycle = registration.object_lifecycle
+                if lifecycle is None:
                     raise RuntimeError(
                         "checkpoint object lifecycle capability is not registered"
                     )
-                reservation = await keep.reserve_cleanup(
+                reservation = await lifecycle.reserve_cleanup(
                     CleanupReservationRequest(
                         permit=permit,
                         checkpoint_object_id=checkpoint_object_id,
@@ -107,8 +107,8 @@ class CheckpointCleanupCoordinator:
                 )
                 if len(claimed_by_version) != required:
                     raise RuntimeError(
-                        "checkpoint backend returned an incomplete cleanup reservation "
-                        f"backend={component_id!r} checkpoint_object={checkpoint_object_id!r} "
+                        "checkpoint component returned an incomplete cleanup reservation "
+                        f"component={component_id!r} checkpoint_object={checkpoint_object_id!r} "
                         f"required_versions={required} "
                         f"claimed_versions={len(claimed_by_version)}"
                     )
@@ -118,19 +118,21 @@ class CheckpointCleanupCoordinator:
                         candidate.checkpoint_objects
                     ):
                         raise RuntimeError(
-                            "checkpoint backend returned a partial checkpoint_object-version "
-                            f"reservation backend={component_id!r} "
+                            "checkpoint component returned a partial checkpoint_object-version "
+                            f"reservation component={component_id!r} "
                             f"checkpoint_object={checkpoint_object_id!r} version={version_id!r}"
                         )
                 reservations.append(
-                    BackendCleanupReservation(
+                    CheckpointCleanupReservation(
                         spmd_id=spmd_id,
                         component_id=component_id,
                         reservation=reservation,
                     )
                 )
         except BaseException as primary_error:
-            cleanup_errors = await self._abort_all(tuple(reservations), permit)
+            cleanup_errors = await self._rollback_reservations(
+                tuple(reservations), permit
+            )
             if cleanup_errors:
                 raise BaseExceptionGroup(
                     "cleanup reservation and cleanup failed",
@@ -141,36 +143,36 @@ class CheckpointCleanupCoordinator:
 
     async def publish(
         self,
-        reservations: tuple[BackendCleanupReservation, ...],
+        reservations: tuple[CheckpointCleanupReservation, ...],
         permit: CheckpointCommitPermit,
     ) -> None:
         try:
             for binding in reservations:
-                registration = self._require_backend(
+                registration = self._require_component(
                     binding.spmd_id, binding.component_id
                 )
-                keep = registration.object_lifecycle
-                if keep is None:
+                lifecycle = registration.object_lifecycle
+                if lifecycle is None:
                     raise RuntimeError(
                         "checkpoint object lifecycle capability is not registered"
                     )
-                await keep.commit_cleanup(binding.reservation, permit)
+                await lifecycle.commit_cleanup(binding.reservation, permit)
         except BaseException as primary_error:
-            cleanup_errors = await self._abort_all(reservations, permit)
+            cleanup_errors = await self._rollback_reservations(reservations, permit)
             if cleanup_errors:
                 raise BaseExceptionGroup(
-                    "keep publication and cleanup failed",
+                    "retention publication and cleanup failed",
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
 
     async def rollback_save(
         self,
-        reservations: tuple[BackendCleanupReservation, ...],
+        reservations: tuple[CheckpointCleanupReservation, ...],
         permit: CheckpointCommitPermit,
     ) -> None:
-        errors = await self._abort_all(reservations, permit)
-        self._raise_errors("keep rollback_save failed", errors)
+        errors = await self._rollback_reservations(reservations, permit)
+        self._raise_errors("retention rollback failed", errors)
 
     async def cleanup(
         self,
@@ -178,12 +180,14 @@ class CheckpointCleanupCoordinator:
     ) -> None:
         errors: list[BaseException] = []
         for pending in pending_cleanups:
-            registration = self._require_backend(pending.spmd_id, pending.component_id)
-            cleaner = registration.cleaner
-            if cleaner is None:
-                raise RuntimeError("cleaner capability is not registered")
+            registration = self._require_component(
+                pending.spmd_id, pending.component_id
+            )
+            cleanup = registration.object_cleanup
+            if cleanup is None:
+                raise RuntimeError("object cleanup capability is not registered")
             try:
-                await cleaner.cleanup(pending.reservation)
+                await cleanup.cleanup(pending.reservation)
                 for checkpoint_object in pending.reservation.claimed:
                     self._repository.mark_checkpoint_object_cleaned_up(
                         pending.spmd_id, checkpoint_object
@@ -191,12 +195,12 @@ class CheckpointCleanupCoordinator:
                 self._repository.complete_pending_cleanup(pending)
             except BaseException as error:
                 errors.append(error)
-        self._raise_errors("keep cleanup failed", errors)
+        self._raise_errors("retention cleanup failed", errors)
 
     @staticmethod
     def pending_cleanups(
         checkpoint_id: str,
-        reservations: tuple[BackendCleanupReservation, ...],
+        reservations: tuple[CheckpointCleanupReservation, ...],
     ) -> tuple[PendingCleanup, ...]:
         return tuple(
             PendingCleanup(
@@ -208,31 +212,33 @@ class CheckpointCleanupCoordinator:
             for binding in reservations
         )
 
-    async def _abort_all(
+    async def _rollback_reservations(
         self,
-        reservations: tuple[BackendCleanupReservation, ...],
+        reservations: tuple[CheckpointCleanupReservation, ...],
         permit: CheckpointCommitPermit,
     ) -> list[BaseException]:
         errors: list[BaseException] = []
         for binding in reversed(reservations):
-            registration = self._require_backend(binding.spmd_id, binding.component_id)
-            keep = registration.object_lifecycle
-            if keep is None:
+            registration = self._require_component(
+                binding.spmd_id, binding.component_id
+            )
+            lifecycle = registration.object_lifecycle
+            if lifecycle is None:
                 raise RuntimeError(
                     "checkpoint object lifecycle capability is not registered"
                 )
             try:
-                await keep.rollback_cleanup(binding.reservation, permit)
+                await lifecycle.rollback_cleanup(binding.reservation, permit)
             except BaseException as error:
                 errors.append(error)
         return errors
 
-    def _require_backend(
+    def _require_component(
         self, spmd_id: str, component_id: str
     ) -> CheckpointComponentRegistration:
         registry = self._registries.get(spmd_id)
         if registry is None:
-            raise KeyError(f"checkpoint backend registry not found for {spmd_id!r}")
+            raise KeyError(f"checkpoint component registry not found for {spmd_id!r}")
         return registry.require(component_id)
 
     @staticmethod
@@ -247,14 +253,14 @@ class CheckpointCleanupCoordinator:
         if len(matches) != 1:
             raise KeyError(
                 f"checkpoint_object checkpoint_object {checkpoint_object_id!r} is not declared by "
-                f"backend {registration.descriptor.component_id!r}"
+                f"component {registration.descriptor.component_id!r}"
             )
         return matches[0]
 
     def _group_checkpoint_objects(
         self, manifests: tuple[CheckpointManifest, ...]
     ) -> dict[tuple[str, str, str], tuple[_PublishedTargetVersion, ...]]:
-        active_pins = self._active_keep_forever_checkpoint_ids(manifests)
+        active_pins = self._active_retain_forever_checkpoint_ids(manifests)
         grouped: dict[tuple[str, str, str], list[_PublishedTargetVersion]] = {}
         for manifest in manifests:
             protected = manifest.checkpoint_id in active_pins
@@ -306,7 +312,7 @@ class CheckpointCleanupCoordinator:
         return {key: tuple(values) for key, values in grouped.items()}
 
     @staticmethod
-    def _active_keep_forever_checkpoint_ids(
+    def _active_retain_forever_checkpoint_ids(
         manifests: tuple[CheckpointManifest, ...],
     ) -> frozenset[str]:
         latest_by_name: dict[str, CheckpointManifest] = {}
@@ -314,7 +320,7 @@ class CheckpointCleanupCoordinator:
             for reference in manifest.references:
                 if (
                     not isinstance(reference, NameReference)
-                    or not reference.keep_forever
+                    or not reference.retain_forever
                 ):
                     continue
                 previous = latest_by_name.get(reference.name)

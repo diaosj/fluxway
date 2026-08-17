@@ -111,7 +111,6 @@ def frame_metadata_nbytes(frame: TransportFrame) -> int:
 def build_current_frame(edge_count: int, rows: int, cols: int) -> TransportFrame:
     segment = np.zeros((rows, cols), dtype=np.float32)
     builder = TransportFrameBuilder(  # type: ignore
-
         step=7,
         sender_spmd_code=3,
         sender_rank=1,

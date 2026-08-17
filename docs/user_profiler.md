@@ -63,7 +63,7 @@ lanes required by the leaf's maximum concurrency; it does not create one track
 per step.
 
 Scheduler activity is grouped by responsibility under `scheduler/task`,
-`scheduler/queue`, `scheduler/step`, and `scheduler/loop`. Checkpoint backend
+`scheduler/queue`, `scheduler/step`, and `scheduler/loop`. Checkpoint component
 operations use `checkpoint/storage`, while snapshot coordination uses
 `checkpoint/hook`. A `worker` level is not repeated below `rank:<rank>`.
 

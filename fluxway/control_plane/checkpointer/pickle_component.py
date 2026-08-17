@@ -1,4 +1,4 @@
-"""Trusted Python state persisted by a backend-owned filesystem checkpoint_object."""
+"""Trusted Python state persisted by a component-owned filesystem checkpoint_object."""
 
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from fluxway.common.types.checkpoint import (
     SaveSession,
     RestoreSession,
     RestoreTopologyMode,
-    KeepPolicy,
+    CheckpointRetentionPolicy,
 )
-from fluxway.control_plane.checkpointer._filesystem_backend import (
+from fluxway.control_plane.checkpointer._filesystem_component import (
     FilesystemCheckpointComponent,
 )
 
@@ -25,16 +25,16 @@ class PickleCheckpointComponent(FilesystemCheckpointComponent):
     def __init__(
         self,
         component_id: str,
-        capture_state,
+        save_state,
         restore_state,
         *,
-        keep: KeepPolicy = KeepPolicy(),
+        retention: CheckpointRetentionPolicy = CheckpointRetentionPolicy(),
     ) -> None:
         super().__init__(
             component_id,
-            capture_state,
+            save_state,
             restore_state,
-            keep=keep,
+            retention=retention,
             restore_topology=RestoreTopologyMode.EXACT_TOPOLOGY,
         )
 
@@ -65,7 +65,7 @@ class PickleCheckpointComponent(FilesystemCheckpointComponent):
 
         return await asyncio.to_thread(read)
 
-    async def _finalize_io(self, context: SaveSession) -> None:
+    async def _finish_save_io(self, context: SaveSession) -> None:
         return None
 
     async def _close_resources(self) -> None:

@@ -3,37 +3,36 @@ from types import SimpleNamespace
 import pytest
 
 from fluxway.common.types.checkpoint import (
-    CheckpointCapability,
     CheckpointCut,
     CheckpointObjectRef,
     CheckpointObjectRecord,
     CheckpointObjectSpec,
     CheckpointCommitPermit,
     CheckpointManifest,
-    ComponentCheckpoint,
-    ComponentSpec,
+    CheckpointComponentPublication,
+    CheckpointComponentSpec,
     CleanupReservation,
-    KeepPolicy,
+    CheckpointRetentionPolicy,
     SpmdCheckpoint,
     TopologySnapshot,
 )
-from fluxway.control_plane.checkpointer.keep import (
-    CheckpointCleanupCoordinator,
-    BackendCleanupReservation,
+from fluxway.control_plane.checkpointer.retention import (
+    CheckpointRetentionCoordinator,
+    CheckpointCleanupReservation,
 )
 
 
-class _Keep:
+class _CleanupLifecycle:
     def __init__(self, *, publish_error: BaseException | None = None) -> None:
         self.publish_error = publish_error
-        self.aborted: list[CleanupReservation] = []
+        self.rolled_back: list[CleanupReservation] = []
 
     async def commit_cleanup(self, reservation, permit) -> None:
         if self.publish_error is not None:
             raise self.publish_error
 
     async def rollback_cleanup(self, reservation, permit) -> None:
-        self.aborted.append(reservation)
+        self.rolled_back.append(reservation)
 
 
 class _Registry:
@@ -89,7 +88,7 @@ def _multi_object_manifest(sequence: int) -> CheckpointManifest:
                 source_topology=TopologySnapshot(1, (), (), "v1"),
                 runtime_state={},
                 components={
-                    "dense": ComponentCheckpoint(
+                    "dense": CheckpointComponentPublication(
                         component_id="dense",
                         format_version=1,
                         shared_records=(
@@ -103,19 +102,21 @@ def _multi_object_manifest(sequence: int) -> CheckpointManifest:
 
 
 @pytest.mark.asyncio
-async def test_keep_publication_failure_aborts_every_reservation():
-    first = _Keep()
-    second = _Keep(publish_error=RuntimeError("injected publication failure"))
+async def test_retention_publication_failure_rolls_back_every_reservation():
+    first = _CleanupLifecycle()
+    second = _CleanupLifecycle(
+        publish_error=RuntimeError("injected publication failure")
+    )
     registry = _Registry(
         {
             "first": SimpleNamespace(object_lifecycle=first),
             "second": SimpleNamespace(object_lifecycle=second),
         }
     )
-    coordinator = CheckpointCleanupCoordinator({"train": registry}, SimpleNamespace())
+    coordinator = CheckpointRetentionCoordinator({"train": registry}, SimpleNamespace())
     permit = CheckpointCommitPermit("attempt", 1, b"token")
     reservations = tuple(
-        BackendCleanupReservation(
+        CheckpointCleanupReservation(
             "train",
             component_id,
             CleanupReservation(
@@ -139,26 +140,24 @@ async def test_keep_publication_failure_aborts_every_reservation():
     with pytest.raises(RuntimeError, match="injected publication failure"):
         await coordinator.publish(reservations, permit)
 
-    assert first.aborted == [reservations[0].reservation]
-    assert second.aborted == [reservations[1].reservation]
+    assert first.rolled_back == [reservations[0].reservation]
+    assert second.rolled_back == [reservations[1].reservation]
 
 
 @pytest.mark.asyncio
-async def test_keep_last_is_independent_for_each_checkpoint_object():
+async def test_retain_last_is_independent_for_each_checkpoint_object():
     lifecycle = _ReservingLifecycle()
-    descriptor = ComponentSpec(
+    descriptor = CheckpointComponentSpec(
         component_id="dense",
-        capabilities=frozenset(
-            {
-                CheckpointCapability.PERSISTENCE,
-                CheckpointCapability.LIFECYCLE,
-                CheckpointCapability.RETENTION,
-                CheckpointCapability.RECLAIMER,
-            }
-        ),
+        save=SimpleNamespace(),
+        restore=SimpleNamespace(),
         checkpoint_objects=(
-            CheckpointObjectSpec("model_state", KeepPolicy(keep_last=1)),
-            CheckpointObjectSpec("optimizer_state", KeepPolicy(keep_last=1)),
+            CheckpointObjectSpec(
+                "model_state", CheckpointRetentionPolicy(retain_last=1)
+            ),
+            CheckpointObjectSpec(
+                "optimizer_state", CheckpointRetentionPolicy(retain_last=1)
+            ),
         ),
     )
     registration = SimpleNamespace(
@@ -166,7 +165,7 @@ async def test_keep_last_is_independent_for_each_checkpoint_object():
         object_lifecycle=lifecycle,
     )
     repository = SimpleNamespace(is_checkpoint_object_cleaned_up=lambda *_: False)
-    coordinator = CheckpointCleanupCoordinator(
+    coordinator = CheckpointRetentionCoordinator(
         {"train": _Registry({"dense": registration})}, repository
     )
     permit = CheckpointCommitPermit("attempt-2", 1, b"token")

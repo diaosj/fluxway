@@ -35,36 +35,37 @@ class AbstractWorkerExecutor:
     ) -> None:
         raise NotImplementedError
 
-    async def set_drain_step_count(self, step_count: int) -> None:
+    async def set_drain_boundary(
+        self, step_count: int, terminal_cut: int | None = None
+    ) -> None:
         raise NotImplementedError
 
-    def clear_drain_step_count(self) -> None:
+    def clear_drain_boundary(self) -> None:
         raise NotImplementedError
 
-    async def checkpoint_prepare(
+    async def checkpoint_prepare_save(
         self,
         repository_root: str,
         checkpoint_id: str,
         attempt_id: str,
         permit: Any,
         cut: Any,
-        capture_mode: Any,
     ) -> None:
         raise NotImplementedError
 
-    async def checkpoint_capture(self) -> list[tuple[int, Any, Any]]:
+    async def checkpoint_save(self) -> list[tuple[int, Any, Any]]:
         raise NotImplementedError
 
-    async def checkpoint_finalize(self) -> None:
+    async def checkpoint_finish_save(self) -> None:
         raise NotImplementedError
 
-    async def checkpoint_commit(self, gathered_records: Any) -> Any:
+    async def checkpoint_commit_save(self, gathered_records: Any) -> Any:
         raise NotImplementedError
 
-    async def checkpoint_abort(self) -> None:
+    async def checkpoint_rollback_save(self) -> None:
         raise NotImplementedError
 
-    async def checkpoint_mark_published(self) -> None:
+    async def checkpoint_publish_save(self) -> None:
         raise NotImplementedError
 
     async def checkpoint_restore(self, *args, **kwargs) -> None:

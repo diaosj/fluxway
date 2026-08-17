@@ -11,7 +11,7 @@ from fluxway.common.types.checkpoint import (
     CheckpointCut,
     TopologySnapshot,
 )
-from fluxway.control_plane.checkpointer.safetensors import (
+from fluxway.control_plane.checkpointer.safetensors_component import (
     SafeTensorsCheckpointComponent,
     _flatten_worker_state,
     _unflatten_worker_state,
@@ -44,7 +44,7 @@ def test_safetensors_flatten_round_trips_small_pure_state():
 
 
 @pytest.mark.asyncio
-async def test_safetensors_backend_uses_transaction_context(tmp_path):
+async def test_safetensors_component_uses_transaction_context(tmp_path):
     restored: list[dict[str, object]] = []
 
     async def save(module, context):
@@ -66,14 +66,14 @@ async def test_safetensors_backend_uses_transaction_context(tmp_path):
         source_topology=topology,
         component_id="state",
     )
-    backend = SafeTensorsCheckpointComponent("state", save, restore)
-    await backend.open(
+    component = SafeTensorsCheckpointComponent("state", save, restore)
+    await component.open(
         CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
     )
-    await backend.start_save(save_session)
-    prepared = await backend.save(save_session)
-    await backend.finish_save(save_session)
-    publication = await backend.commit_save(
+    await component.prepare_save(save_session)
+    prepared = await component.save(save_session)
+    await component.finish_save(save_session)
+    publication = await component.commit_save(
         CommitSaveSession(
             instance=save_session.instance,
             attempt_id=save_session.attempt_id,
@@ -87,7 +87,7 @@ async def test_safetensors_backend_uses_transaction_context(tmp_path):
             worker_results={0: prepared},
         )
     )
-    await backend.restore(
+    await component.restore(
         RestoreSession(
             instance=None,
             checkpoint_id=save_session.checkpoint_id,
@@ -100,6 +100,6 @@ async def test_safetensors_backend_uses_transaction_context(tmp_path):
             component_checkpoint=publication,
         )
     )
-    await backend.close()
+    await component.close()
 
     np.testing.assert_array_equal(restored[0]["value"], np.array([5]))

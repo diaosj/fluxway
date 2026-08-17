@@ -3,11 +3,15 @@ from typing import Any
 from collections.abc import Mapping
 
 import ray
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+# pyrefly: ignore [missing-import]
+from ray.util.scheduling_strategies import (
+    PlacementGroupSchedulingStrategy,
+)
+
 
 from fluxway.common.types import (
-    ComponentCheckpoint,
-    CheckpointCaptureMode,
+    CheckpointComponentPublication,
     CheckpointCommitPermit,
     CheckpointCut,
     WorkerSaveResult,
@@ -281,86 +285,88 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
             for worker in self._worker_handles.values():
                 worker.register_successor_handlers.remote(spmd_id, handlers)
 
-    async def set_drain_step_count(self, step_count: int) -> None:
+    async def set_drain_boundary(
+        self, step_count: int, terminal_cut: int | None = None
+    ) -> None:
         await asyncio.gather(
             *[
-                worker.set_drain_step_count.remote(step_count)
+                worker.set_drain_boundary.remote(step_count, terminal_cut)
                 for worker in self._worker_handles.values()
             ]
         )
 
-    def clear_drain_step_count(self) -> None:
+    def clear_drain_boundary(self) -> None:
         for worker in self._worker_handles.values():
-            worker.clear_drain_step_count.remote()
+            worker.clear_drain_boundary.remote()
 
-    async def checkpoint_prepare(
+    async def checkpoint_prepare_save(
         self,
         repository_root: str,
         checkpoint_id: str,
         attempt_id: str,
         permit: CheckpointCommitPermit,
         cut: CheckpointCut,
-        capture_mode: CheckpointCaptureMode,
     ) -> None:
         await asyncio.gather(
             *(
-                worker.checkpoint_prepare.remote(
+                worker.checkpoint_prepare_save.remote(
                     repository_root,
                     checkpoint_id,
                     attempt_id,
                     permit,
                     cut,
-                    capture_mode,
                 )
                 for worker in self._worker_handles.values()
             )
         )
 
-    async def checkpoint_capture(
+    async def checkpoint_save(
         self,
     ) -> list[tuple[int, dict[str, Any], Mapping[str, WorkerSaveResult]]]:
         ranks = list(self._worker_handles.keys())
         results = await asyncio.gather(
-            *(self._worker_handles[rank].checkpoint_capture.remote() for rank in ranks)
+            *(self._worker_handles[rank].checkpoint_save.remote() for rank in ranks)
         )
         return [
             (rank, result[0], result[1])
             for rank, result in zip(ranks, results, strict=True)
         ]
 
-    async def checkpoint_finalize(self) -> None:
+    async def checkpoint_finish_save(self) -> None:
         await asyncio.gather(
             *(
-                worker.checkpoint_finalize.remote()
+                worker.checkpoint_finish_save.remote()
                 for worker in self._worker_handles.values()
             )
         )
 
-    async def checkpoint_commit(
+    async def checkpoint_commit_save(
         self,
         gathered_records: Mapping[str, Mapping[int, WorkerSaveResult]],
-    ) -> dict[int, Mapping[str, ComponentCheckpoint]]:
+    ) -> dict[int, Mapping[str, CheckpointComponentPublication]]:
         ranks = list(self._worker_handles)
         results = await asyncio.gather(
             *(
-                self._worker_handles[rank].checkpoint_commit.remote(gathered_records)
+                self._worker_handles[rank].checkpoint_commit_save.remote(
+                    gathered_records
+                )
                 for rank in ranks
             )
         )
         return dict(zip(ranks, results, strict=True))
 
-    async def checkpoint_abort(self) -> None:
+    async def checkpoint_rollback_save(self) -> None:
         await asyncio.gather(
             *(
-                worker.checkpoint_abort.remote()
+                worker.checkpoint_rollback_save.remote()
                 for worker in self._worker_handles.values()
             )
         )
 
-    async def checkpoint_mark_published(self) -> None:
+    async def checkpoint_publish_save(self) -> None:
         await asyncio.gather(
             *(
-                worker.checkpoint_mark_published.remote()
+                worker.checkpoint_publish_save.remote()
                 for worker in self._worker_handles.values()
             )
         )
@@ -373,7 +379,7 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
         source_topology: TopologySnapshot,
         current_topology: TopologySnapshot,
         runtime_state: Mapping[str, Any],
-        publications: Mapping[str, ComponentCheckpoint],
+        publications: Mapping[str, CheckpointComponentPublication],
     ) -> None:
         tasks = [
             worker.checkpoint_restore.remote(

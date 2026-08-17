@@ -159,7 +159,7 @@ class TestGrainReaderSharding:
             source_topology=topology,
             component_id="reader",
         )
-        state = reader.capture_state(save_session)
+        state = reader.save_state(save_session)
 
         restored = _make_reader(ds, rank=0, world_size=2)
         restored.restore_checkpoint_state(

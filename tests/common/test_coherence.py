@@ -6,19 +6,33 @@ import pytest
 from fluxway.common.coherence import (
     CoherenceBackpressureError,
     CoherenceDirectory,
+    CoherenceEvent,
+    InvalidationResult,
+    ParentReturnToken,
     CoherenceStateTransitionError,
     CoherenceSubject,
+    CoherenceInstance,
     CoherenceState,
     ExecutionToken,
     GrantPending,
     GrantReady,
     GrantRejected,
     StaleEpochError,
+    TransitionStatus,
 )
+from fluxway.spmd.worker.coherence_runtime import CoherenceAdmissionRuntime
+
+
+def _entry(directory: CoherenceDirectory, key: CoherenceSubject, epoch: int):
+    return directory.admit(CoherenceInstance(key, epoch))
 
 
 def _subject() -> CoherenceSubject:
     return CoherenceSubject(1, 2, 3)
+
+
+def _runtime(directory: CoherenceDirectory) -> CoherenceAdmissionRuntime:
+    return CoherenceAdmissionRuntime(directory)
 
 
 def _publish(
@@ -27,11 +41,23 @@ def _publish(
     directory.publish_local_payload(key, epoch)
 
 
+def test_transition_specs_are_complete_and_reused() -> None:
+    first = CoherenceDirectory()
+    second = CoherenceDirectory()
+
+    assert set(first._transition_specs) == set(CoherenceEvent)
+    assert first._transition_specs is second._transition_specs
+    assert all(
+        spec.ready.status is TransitionStatus.READY
+        for spec in first._transition_specs.values()
+    )
+
+
 def test_directory_rejects_route_shaped_tuple_subject() -> None:
     directory = CoherenceDirectory()
 
     with pytest.raises(TypeError, match="CoherenceSubject"):
-        directory.register(cast(CoherenceSubject, (1, 2, 3)), 7)
+        _entry(directory, cast(CoherenceSubject, (1, 2, 3)), 7)
 
 
 @pytest.mark.parametrize("operation", ("write", "delegate"))
@@ -54,12 +80,12 @@ def test_local_read_grant_releases_to_exclusive() -> None:
     result = directory.request_read(key, 7, ExecutionToken(11))
 
     assert isinstance(result, GrantReady)
-    assert directory.register(key, 7).state is CoherenceState.SHARED
+    assert _entry(directory, key, 7).state is CoherenceState.SHARED
 
     directory.release(result.token)
 
-    assert directory.register(key, 7).local_reader_count == 0
-    assert directory.register(key, 7).state is CoherenceState.EXCLUSIVE
+    assert _entry(directory, key, 7).local_reader_count == 0
+    assert _entry(directory, key, 7).state is CoherenceState.EXCLUSIVE
 
 
 def test_duplicate_read_release_cannot_consume_another_reader() -> None:
@@ -75,7 +101,7 @@ def test_duplicate_read_release_cannot_consume_another_reader() -> None:
     with pytest.raises(CoherenceStateTransitionError, match="already released"):
         directory.release(first.token)
 
-    assert directory.register(key, 7).local_reader_count == 1
+    assert _entry(directory, key, 7).local_reader_count == 1
     directory.release(second.token)
 
 
@@ -86,10 +112,10 @@ def test_child_bitmap_blocks_epoch_advance() -> None:
     directory.delegate_read(key, 7, child_id=4)
 
     with pytest.raises(CoherenceBackpressureError):
-        directory.register(key, 8)
+        _entry(directory, key, 8)
 
     directory.return_child(key, 7, child_id=4)
-    advanced = directory.register(key, 8)
+    advanced = _entry(directory, key, 8)
 
     assert advanced.epoch == 8
     assert advanced.child_share_bitmap == 0
@@ -98,19 +124,19 @@ def test_child_bitmap_blocks_epoch_advance() -> None:
 def test_stale_epoch_is_rejected() -> None:
     directory = CoherenceDirectory()
     key = _subject()
-    directory.register(key, 7)
+    _entry(directory, key, 7)
 
     with pytest.raises(StaleEpochError):
-        directory.register(key, 6)
+        _entry(directory, key, 6)
 
 
 def test_epoch_advance_does_not_restore_invalid_data() -> None:
     directory = CoherenceDirectory()
     key = _subject()
-    directory.register(key, 7)
+    _entry(directory, key, 7)
     directory.invalidate(key, 7)
 
-    advanced = directory.register(key, 8)
+    advanced = _entry(directory, key, 8)
 
     assert advanced.state is CoherenceState.INVALID
     assert isinstance(
@@ -122,20 +148,20 @@ def test_epoch_advance_does_not_restore_invalid_data() -> None:
 def test_new_parent_payload_restores_validity_after_epoch_advance() -> None:
     directory = CoherenceDirectory()
     key = _subject()
-    directory.register(key, 7)
+    _entry(directory, key, 7)
     directory.invalidate(key, 7)
 
     directory.accept_parent_read(key, 8)
 
-    assert directory.register(key, 8).state is CoherenceState.SHARED
+    assert _entry(directory, key, 8).state is CoherenceState.SHARED
 
 
 def test_local_payload_publication_restores_validity_explicitly() -> None:
     directory = CoherenceDirectory()
     key = _subject()
-    directory.register(key, 7)
+    _entry(directory, key, 7)
     directory.invalidate(key, 7)
-    assert directory.register(key, 8).state is CoherenceState.INVALID
+    assert _entry(directory, key, 8).state is CoherenceState.INVALID
 
     published = directory.publish_local_payload(key, 8)
 
@@ -165,9 +191,9 @@ async def test_future_local_payload_delegation_suspends_until_prior_epoch_return
 
     assert isinstance(future, GrantPending)
     directory.return_child(key, 7, child_id=0)
-    token = await future.ready
+    token = await _runtime(directory).await_grant(future)
     assert token.epoch == 8
-    assert directory.register(key, 8).state is CoherenceState.SHARED
+    assert _entry(directory, key, 8).state is CoherenceState.SHARED
 
 
 @pytest.mark.asyncio
@@ -180,13 +206,13 @@ async def test_pending_writer_resumes_without_blocking_thread() -> None:
 
     writer = directory.request_write(key, 7, ExecutionToken(12))
     assert isinstance(writer, GrantPending)
-    assert not writer.ready.done()
+    assert directory.pending_result(writer.request_id) is None
 
     directory.release(reader.token)
-    token = await asyncio.wait_for(writer.ready, timeout=0.1)
+    token = await asyncio.wait_for(_runtime(directory).await_grant(writer), timeout=0.1)
 
     assert token.execution == ExecutionToken(12)
-    assert directory.register(key, 7).state is CoherenceState.MODIFIED
+    assert _entry(directory, key, 7).state is CoherenceState.MODIFIED
 
 
 def test_modified_parent_ownership_cannot_be_delegated_as_shared() -> None:
@@ -202,7 +228,7 @@ def test_modified_parent_ownership_cannot_be_delegated_as_shared() -> None:
 
     assert isinstance(result, GrantRejected)
     assert "modified ownership" in str(result.error)
-    entry = directory.register(key, 7)
+    entry = _entry(directory, key, 7)
     assert entry.state is CoherenceState.MODIFIED
     assert entry.child_share_bitmap == 0
 
@@ -221,10 +247,10 @@ async def test_pending_writer_backpressures_later_readers() -> None:
 
     assert isinstance(later_reader, GrantPending)
     directory.release(first_reader.token)
-    write_token = await writer.ready
-    assert not later_reader.ready.done()
+    write_token = await _runtime(directory).await_grant(writer)
+    assert directory.pending_result(later_reader.request_id) is None
     directory.release(write_token)
-    assert later_reader.ready.done()
+    assert directory.pending_result(later_reader.request_id) is not None
 
 
 @pytest.mark.asyncio
@@ -244,12 +270,12 @@ async def test_inflight_delivery_invalidates_early_child_return() -> None:
     writer = directory.request_write(key, 7, ExecutionToken(1))
 
     assert isinstance(writer, GrantPending)
-    assert directory.register(key, 7).child_share_bitmap == 1
+    assert _entry(directory, key, 7).child_share_bitmap == 1
     directory.complete_child_delivery(second_receipt, delivered=True)
-    assert directory.register(key, 7).child_share_bitmap == 1
-    assert not writer.ready.done()
+    assert _entry(directory, key, 7).child_share_bitmap == 1
+    assert directory.pending_result(writer.request_id) is None
     directory.return_child(key, 7, child_id=0)
-    assert writer.ready.done()
+    assert directory.pending_result(writer.request_id) is not None
 
 
 @pytest.mark.asyncio
@@ -266,8 +292,8 @@ async def test_failed_inflight_delivery_applies_pending_child_return() -> None:
 
     directory.complete_child_delivery(receipt, delivered=False)
 
-    assert directory.register(key, 7).child_share_bitmap == 0
-    assert writer.ready.done()
+    assert _entry(directory, key, 7).child_share_bitmap == 0
+    assert directory.pending_result(writer.request_id) is not None
 
 
 @pytest.mark.asyncio
@@ -281,13 +307,73 @@ async def test_future_epoch_delegation_requires_new_payload_publication() -> Non
     future = directory.delegate_read(key, 8, child_id=4)
 
     assert isinstance(future, GrantPending)
-    assert not future.ready.done()
+    assert directory.pending_result(future.request_id) is None
 
     directory.return_child(key, 7, child_id=4)
     with pytest.raises(CoherenceStateTransitionError, match="became invalid"):
-        await asyncio.wait_for(future.ready, timeout=0.1)
+        await asyncio.wait_for(_runtime(directory).await_grant(future), timeout=0.1)
 
-    assert directory.register(key, 8).state is CoherenceState.INVALID
+    assert _entry(directory, key, 8).state is CoherenceState.INVALID
+
+
+@pytest.mark.asyncio
+async def test_parent_return_transaction_allows_reentrant_next_epoch() -> None:
+    parent = CoherenceDirectory()
+    child = CoherenceDirectory()
+    key = _subject()
+    parent.publish_local_payload(key, 7)
+    delegated = parent.delegate_read(key, 7, child_id=4)
+    assert isinstance(delegated, GrantReady)
+    child.accept_parent_read(key, 7)
+    local = child.request_read(key, 7, ExecutionToken(11))
+    assert isinstance(local, GrantReady)
+    child.release(local.token)
+
+    pending = parent.delegate_local_payload(key, 8, child_id=4)
+    assert isinstance(pending, GrantPending)
+    returning = child.begin_parent_return(key, 7)
+    assert isinstance(returning, ParentReturnToken)
+    assert _entry(child, key, 7).parent_grant.return_transaction == returning
+
+    parent.return_child(key, 7, child_id=4)
+    child.accept_parent_read(key, 8)
+    child.complete_parent_return(returning)
+
+    token = await _runtime(parent).await_grant(pending)
+    assert token.epoch == 8
+    assert _entry(child, key, 8).parent_grant.authority.name == "SHARED"
+    with pytest.raises(CoherenceStateTransitionError, match="already completed"):
+        child.complete_parent_return(returning)
+
+
+@pytest.mark.asyncio
+async def test_crossing_invalidation_is_coalesced_by_parent_return() -> None:
+    directory = CoherenceDirectory()
+    key = _subject()
+    directory.accept_parent_read(key, 7)
+    local = directory.request_read(key, 7, ExecutionToken(11))
+    assert isinstance(local, GrantReady)
+    directory.release(local.token)
+    returning = directory.begin_parent_return(key, 7)
+
+    assert (
+        directory.begin_invalidation(key, 7)
+        is InvalidationResult.SATISFIED_BY_PARENT_RETURN
+    )
+    directory.complete_parent_return(returning)
+    assert _entry(directory, key, 7).parent_grant.authority.name == "NONE"
+
+
+def test_same_epoch_regrant_clears_parent_return_tombstone() -> None:
+    directory = CoherenceDirectory()
+    key = _subject()
+    directory.accept_parent_read(key, 7)
+    returning = directory.begin_parent_return(key, 7)
+    directory.complete_parent_return(returning)
+
+    directory.accept_parent_read(key, 7)
+
+    assert directory.begin_invalidation(key, 7) is InvalidationResult.STARTED
 
 
 def test_duplicate_child_delegation_is_idempotent_and_not_new() -> None:
@@ -313,7 +399,7 @@ def test_invalidation_never_discards_active_child_bitmap() -> None:
     with pytest.raises(CoherenceBackpressureError):
         directory.invalidate(key, 7)
 
-    assert directory.register(key, 7).child_share_bitmap == 1 << 4
+    assert _entry(directory, key, 7).child_share_bitmap == 1 << 4
 
 
 def test_parent_return_requires_all_local_consumers() -> None:
@@ -340,15 +426,15 @@ async def test_quiescence_future_resolves_without_polling() -> None:
     key = _subject()
     _publish(directory, key)
     directory.delegate_read(key, 7, child_id=4)
-    waiter = asyncio.create_task(directory.wait_until_quiescent(key, 7))
+    waiter = asyncio.create_task(
+        _runtime(directory).await_quiescent(CoherenceInstance(key, 7))
+    )
     await asyncio.sleep(0)
 
     assert not waiter.done()
 
     directory.return_child(key, 7, child_id=4)
     await asyncio.wait_for(waiter, timeout=0.1)
-
-    assert not directory.register(key, 7).pending_quiescence
 
 
 @pytest.mark.asyncio
@@ -364,17 +450,19 @@ async def test_remote_ownership_waits_for_other_direct_children() -> None:
 
     assert isinstance(ownership, GrantPending)
     directory.return_child(key, 7, child_id=5)
-    token = await asyncio.wait_for(ownership.ready, timeout=0.1)
+    token = await asyncio.wait_for(
+        _runtime(directory).await_grant(ownership), timeout=0.1
+    )
     directory.delegate_ownership(token, child_id=4)
 
-    entry = directory.register(key, 7)
+    entry = _entry(directory, key, 7)
     assert entry.ownership_child_id == 4
     assert entry.local_writer is None
     assert entry.state is CoherenceState.INVALID
 
     directory.return_ownership_child(key, 7, child_id=4)
 
-    entry = directory.register(key, 7)
+    entry = _entry(directory, key, 7)
     assert entry.ownership_child_id is None
     assert entry.state is CoherenceState.INVALID
 
@@ -394,7 +482,7 @@ def test_clean_ownership_return_restores_exclusive_state() -> None:
         data_valid=True,
     )
 
-    assert directory.register(key, 7).state is CoherenceState.EXCLUSIVE
+    assert _entry(directory, key, 7).state is CoherenceState.EXCLUSIVE
 
 
 def test_parent_read_is_rejected_while_child_owns_data() -> None:
@@ -423,7 +511,7 @@ async def test_dirty_ownership_return_rejects_queued_reader() -> None:
     directory.return_ownership_child(key, 7, child_id=4, data_valid=False)
 
     with pytest.raises(CoherenceStateTransitionError, match="became invalid"):
-        await reader.ready
+        await _runtime(directory).await_grant(reader)
 
 
 @pytest.mark.asyncio
@@ -440,7 +528,7 @@ async def test_dirty_ownership_return_rejects_queued_writer() -> None:
     directory.return_ownership_child(key, 7, child_id=4, data_valid=False)
 
     with pytest.raises(CoherenceStateTransitionError, match="became invalid"):
-        await pending.ready
+        await _runtime(directory).await_grant(pending)
 
 
 @pytest.mark.asyncio
@@ -454,24 +542,24 @@ async def test_cancelled_pending_writer_does_not_block_successor() -> None:
     successor = directory.request_write(key, 7, ExecutionToken(3))
     assert isinstance(cancelled, GrantPending)
     assert isinstance(successor, GrantPending)
-    cancelled.ready.cancel()
+    directory.cancel_pending_request(cancelled.request_id)
 
     directory.release(reader.token)
 
-    token = await successor.ready
+    token = await _runtime(directory).await_grant(successor)
     assert token.execution == ExecutionToken(3)
 
 
 def test_invalid_entry_rejects_same_epoch_child_delegation() -> None:
     directory = CoherenceDirectory()
     key = _subject()
-    directory.register(key, 7)
+    _entry(directory, key, 7)
     directory.invalidate(key, 7)
 
     result = directory.delegate_read(key, 7, child_id=4)
 
     assert isinstance(result, GrantRejected)
-    assert directory.register(key, 7).child_share_bitmap == 0
+    assert _entry(directory, key, 7).child_share_bitmap == 0
 
 
 def test_active_writer_cannot_acquire_read_grant_with_same_execution() -> None:
@@ -484,7 +572,7 @@ def test_active_writer_cannot_acquire_read_grant_with_same_execution() -> None:
     result = directory.request_read(key, 7, ExecutionToken(4))
 
     assert isinstance(result, GrantRejected)
-    entry = directory.register(key, 7)
+    entry = _entry(directory, key, 7)
     assert entry.local_writer == ExecutionToken(4)
     assert entry.local_reader_count == 0
 
@@ -501,10 +589,10 @@ async def test_active_writer_cannot_be_reacquired_by_equal_numeric_token() -> No
 
     assert isinstance(colliding, GrantPending)
     directory.release(writer.token)
-    successor = await colliding.ready
+    successor = await _runtime(directory).await_grant(colliding)
 
     with pytest.raises(CoherenceStateTransitionError, match="does not belong"):
         directory.release(writer.token)
 
-    assert directory.register(key, 7).local_writer_grant_id == successor.grant_id
+    assert _entry(directory, key, 7).local_writer_grant_id == successor.grant_id
     directory.release(successor)

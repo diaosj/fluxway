@@ -12,22 +12,27 @@ Uses lightweight stubs (no Ray actors) matching the pattern in test_drain_barrie
 import asyncio
 import threading
 import types
-import typing
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from fluxway.common.allocation import AllocationRegistry
 from fluxway.common.coherence import CoherenceDirectory, ExecutionFenceState
+from fluxway.spmd.worker.coherence_sequencer import CoherenceSequencer
 from fluxway.spmd.worker.worker import LocalInputPrepareRuntime, SPMDWorker as _ActorCls
+
+
+async def _async_admit(directory: CoherenceDirectory, instance) -> None:
+    directory.admit(instance)
 
 
 def _make_worker_stub():
     raw_cls = _ActorCls.__ray_actor_class__  # type: ignore[reportAttributeAccessIssue]
+    directory = CoherenceDirectory()
     stub = types.SimpleNamespace(
         _running=True,
         _driver_handle=None,
-        _drain_step_count=typing.cast(int | None, 5),
+        _drain_step_count=5,
         _drain_cond=asyncio.Condition(),
         _execution_queue=asyncio.PriorityQueue(),
         _execution_queues={},
@@ -36,8 +41,9 @@ def _make_worker_stub():
         _heartbeat_task=None,
         _background_tasks=set(),
         _outbound_tasks=set(),
-        _send_tasks=set(),
+        _send_tasks={},
         _plan_tasks=set(),
+        _plan_task_steps={},
         spmd_id="test_spmd",
         rank=0,
         config=types.SimpleNamespace(operator_specs={}),
@@ -45,7 +51,12 @@ def _make_worker_stub():
         _op_manager=object(),
         _fence_state=ExecutionFenceState.OPEN,
         _coherence_input_tensors={},
-        _coherence_directory=CoherenceDirectory(),
+        _coherence_output_intents={},
+        _coherence_directory=directory,
+        _coherence_sequencer=CoherenceSequencer(
+            lambda _instances, payload: payload(),
+            lambda instance: _async_admit(directory, instance),
+        ),
         _allocation_registry=AllocationRegistry(),
         _checkpoint_coordinator=None,
         _checkpoint_repository_root=None,
@@ -88,7 +99,7 @@ class TestStopWakesDrainCondition:
 
         async def blocked_on_drain():
             async with stub._drain_cond:
-                while stub._drain_step_count is not None:  # type: ignore[reportUnnecessaryComparison]
+                while stub._drain_step_count is not None:
                     await stub._drain_cond.wait()
             woke_up.set()
 
@@ -100,7 +111,7 @@ class TestStopWakesDrainCondition:
 
         await asyncio.sleep(0.02)
         assert woke_up.is_set()
-        assert stub._drain_step_count is None  # type: ignore[reportUnnecessaryComparison]
+        assert stub._drain_step_count is None
 
         if not task.done():
             task.cancel()
@@ -116,7 +127,7 @@ class TestStopWakesDrainCondition:
 
         await stub.stop()
 
-        assert stub._drain_step_count is None  # type: ignore[reportUnnecessaryComparison]
+        assert stub._drain_step_count is None
 
     @pytest.mark.asyncio
     async def test_stop_sets_running_false(self):
@@ -140,7 +151,7 @@ class TestStopWakesDrainCondition:
     async def test_stop_cancels_owned_send_tasks(self):
         stub = _make_worker_stub()
         send_task = asyncio.create_task(asyncio.Event().wait())
-        stub._send_tasks.add(send_task)
+        stub._send_tasks[send_task] = ("op", 0)
 
         await stub.stop()
 
@@ -157,7 +168,7 @@ class TestStopWakesDrainCondition:
                 raise RuntimeError("send cancellation cleanup failed") from error
 
         send_task = asyncio.create_task(fail_during_cancellation())
-        stub._send_tasks.add(send_task)
+        stub._send_tasks[send_task] = ("op", 0)
 
         with pytest.raises(RuntimeError, match="send cancellation cleanup failed"):
             await stub.stop()

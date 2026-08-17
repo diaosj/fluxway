@@ -24,7 +24,12 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
 )
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker, _compile_transport_send_context
-from fluxway.common.coherence import CoherenceDirectory
+from fluxway.common.coherence import (
+    CoherenceDirectory,
+    CoherenceSubject,
+    CoherenceInstance,
+)
+from fluxway.spmd.worker.coherence_sequencer import CoherenceSequencer
 from fluxway.transport.communication import TransportFrameBatch
 from fluxway.transport.manifest import DependencyDecision
 
@@ -43,6 +48,25 @@ class _LocalOnlyTransportSPMD:
 
     @operator(name="consume", input_sharding={"x": _LOCAL_SPEC})
     def consume(self, x: Any):
+        return x
+
+
+@spmd(
+    resource_profile=ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("dp",),
+    mesh_axis_shapes=(1,),
+)
+class _LocalFanoutTransportSPMD:
+    @operator(name="produce", output_sharding={"x": _LOCAL_SPEC})
+    def produce(self) -> dict:
+        return {"x": 1}
+
+    @operator(name="consume_a", input_sharding={"x": _LOCAL_SPEC})
+    def consume_a(self, x: Any):
+        return x
+
+    @operator(name="consume_b", input_sharding={"x": _LOCAL_SPEC})
+    def consume_b(self, x: Any):
         return x
 
 
@@ -70,6 +94,22 @@ def _local_only_config(*, condition_fn=None):
     return builder.build("local_only_transport").nodes["A"].spmd_config
 
 
+def _local_fanout_config():
+    builder = Builder()
+    builder.add_node("A", _LocalFanoutTransportSPMD)
+    for consumer in ("consume_a", "consume_b"):
+        builder.add_func_edge(
+            "A",
+            "produce",
+            "A",
+            consumer,
+            source_output="x",
+            target_input="x",
+            local_only=True,
+        )
+    return builder.build("local_fanout_transport").nodes["A"].spmd_config
+
+
 def _only_expected_transfer_code(op_manager, op_name):
     expected = op_manager.get_expected_transfer_shards(op_name)
     assert len(expected) == 1
@@ -88,6 +128,42 @@ def _bind_direct_local_fast_path(stub, raw_cls):
         "_deposit_direct_local_input",
         "_deposit_local_only_orderings",
         "_deposit_local_only_dependency_decisions",
+        "_prepare_local_only_outputs",
+        "_prepare_local_only_outputs_impl",
+    ):
+        setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
+    stub._coherence_output_intents = {}
+
+    async def admit(instance):
+        stub._coherence_directory.admit(instance)
+
+    stub._coherence_sequencer = CoherenceSequencer(
+        lambda _instances, payload: payload(),
+        admit,
+    )
+    send_context = stub._operator_send_context("produce")
+    instances = tuple(
+        sorted(
+            {
+                CoherenceInstance(
+                    CoherenceSubject(
+                        stub._local_spmd_code,
+                        stub.rank,
+                        route.logical_tuuid,
+                    ),
+                    0,
+                )
+                for successor in send_context.compiled_plan.successor_routes
+                for route in successor.tensor_routes
+            }
+        )
+    )
+    for instance in instances:
+        stub._coherence_sequencer.issue_intent(instance)
+    stub._coherence_output_intents[("produce", 0)] = instances
+    for name in (
+        "_close_step_coherence_intents",
+        "_abort_step_coherence_intents",
     ):
         setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
 
@@ -265,6 +341,72 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
 
 
 @pytest.mark.asyncio
+async def test_local_only_fanout_uses_distinct_zero_copy_aliases():
+    raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
+    config = _local_fanout_config()
+    op_manager = OperatorManager(config, rank=0, spmd_id="A", static_args={})
+    mailbox = WorkerMailbox()
+    stub = types.SimpleNamespace(
+        spmd_id="A",
+        rank=0,
+        config=config,
+        _graph_view=config.require_graph_view(),
+        _world_size=config.num_workers,
+        _mesh=config.mesh,
+        _local_spmd_code=3,
+        _successor_handlers={},
+        _operator_send_context_cache={},
+        _profiler_runtime=ProfilerRuntimeFactory.from_config(
+            None,
+            process_name="worker/test/fanout/rank:0",
+        ),
+        _mailbox=mailbox,
+        _barriers_declared={},
+        _op_manager=op_manager,
+        op_manager=op_manager,
+        receive_transport_frames=_receive_transport_frames,
+        receive_control=_receive_control,
+        _coherence_directory=CoherenceDirectory(),
+    )
+    for name in (
+        "_require_local_spmd_code",
+        "_local_only_successor_handlers",
+        "_operator_send_context",
+        "_ensure_step_declared",
+        "_deposit_local_only_outputs",
+        "_prepare_local_only_outputs",
+        "_prepare_local_only_outputs_impl",
+        "_deposit_direct_local_input",
+    ):
+        setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
+    stub._coherence_subject = types.MethodType(raw_cls._coherence_subject, stub)
+    _bind_direct_local_fast_path(stub, raw_cls)
+
+    original = TransportTensor(np.arange(4, dtype=np.float32), source_step=0)
+    send_context = stub._operator_send_context("produce")
+    await stub._deposit_local_only_outputs(
+        [original], send_context, {}, 0, dependency_decisions=None
+    )
+
+    transfer_codes = {
+        consumer: _only_expected_transfer_code(op_manager, consumer)
+        for consumer in ("consume_a", "consume_b")
+    }
+    first = stub._direct_local_input_slots["consume_a"][0][
+        transfer_codes["consume_a"]
+    ].tensor
+    second = stub._direct_local_input_slots["consume_b"][0][
+        transfer_codes["consume_b"]
+    ].tensor
+    assert first is not second
+    assert (
+        first.flat_values.__array_interface__["data"][0]
+        == second.flat_values.__array_interface__["data"][0]
+        == original.flat_values.__array_interface__["data"][0]
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_output_all_local_only_returns_no_background_tasks_with_profiler():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
@@ -308,6 +450,8 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
         "_send_output",
         "_send_step_data_plane_frames_background",
         "_deposit_local_only_outputs",
+        "_prepare_local_only_outputs",
+        "_prepare_local_only_outputs_impl",
         "_ensure_step_declared",
         "_send_control_arguments",
     ):

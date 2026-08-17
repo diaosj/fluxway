@@ -3,19 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 import heapq
 from typing import Any
 
-from fluxway.common.coherence import (
-    CoherenceDirectory,
-    CoherenceSubject,
-    GrantPending,
-    GrantReady,
-    GrantRejected,
-    GrantToken,
-)
 from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
@@ -30,10 +22,15 @@ from fluxway.profiler.recorder import TraceRecorder
 from fluxway.spmd.worker.runtime import ScheduleKey
 
 SubmitDelivery = Callable[[Awaitable[Any]], Awaitable[asyncio.Task[Any]]]
+BatchSubmit = Callable[
+    [TransportFrameBatch, Callable[[], Awaitable[Any]]],
+    Awaitable[Any],
+]
 
 
 @dataclass(slots=True)
 class _QueuedBatch:
+    handler: DataPlaneCallable
     frames: tuple[TransportFrameEnvelope, ...]
     future: asyncio.Future[Any]
     compiled_plan: CompiledSendPlan
@@ -77,6 +74,7 @@ class _TargetBatchQueue:
         future: asyncio.Future[Any] = loop.create_future()
         async with self._lock:
             item = _QueuedBatch(
+                handler=handler,
                 frames=frames,
                 future=future,
                 compiled_plan=compiled_plan,
@@ -93,40 +91,80 @@ class _TargetBatchQueue:
             )
             self._sequence += 1
             if self._flush_task is None or self._flush_task.done():
-                self._flush_task = asyncio.create_task(self._flush_later(handler))
-        return await future
-
-    async def _flush_later(self, handler: DataPlaneCallable) -> None:
-        if self._flush_s > 0:
-            await asyncio.sleep(self._flush_s)
-        while True:
+                self._flush_task = asyncio.create_task(self._flush_later())
+                self._flush_task.add_done_callback(self._on_flush_done)
+        try:
+            return await future
+        except asyncio.CancelledError:
             async with self._lock:
-                if not self._items:
-                    return
-                selected: list[_QueuedBatch] = []
-                frame_count = 0
-                while self._items:
-                    _next_schedule_key, _next_sequence, next_item = self._items[0]
-                    next_frame_count = len(next_item.frames)
-                    if selected and frame_count + next_frame_count > self._max_frames:
-                        break
-                    _schedule_key, _sequence, item = heapq.heappop(self._items)
-                    selected.append(item)
-                    frame_count += next_frame_count
-                    if frame_count >= self._max_frames:
-                        break
-            await self._flush_selected(handler, selected)
+                self._items = [
+                    item_record
+                    for item_record in self._items
+                    if item_record[2] is not item
+                ]
+                heapq.heapify(self._items)
+            if not future.done():
+                future.cancel()
+            raise
+
+    def _on_flush_done(self, task: asyncio.Task[Any]) -> None:
+        if not task.cancelled():
+            return
+        pending = [item for _key, _sequence, item in self._items]
+        self._items.clear()
+        for item in pending:
+            if not item.future.done():
+                item.future.cancel()
+
+    async def _flush_later(self) -> None:
+        selected: list[_QueuedBatch] = []
+        try:
+            if self._flush_s > 0:
+                await asyncio.sleep(self._flush_s)
+            while True:
+                async with self._lock:
+                    if not self._items:
+                        return
+                    selected = []
+                    frame_count = 0
+                    while self._items:
+                        _next_schedule_key, _next_sequence, next_item = self._items[0]
+                        next_frame_count = len(next_item.frames)
+                        if (
+                            selected
+                            and frame_count + next_frame_count > self._max_frames
+                        ):
+                            break
+                        if selected and next_item.handler is not selected[0].handler:
+                            break
+                        _schedule_key, _sequence, item = heapq.heappop(self._items)
+                        selected.append(item)
+                        frame_count += next_frame_count
+                        if frame_count >= self._max_frames:
+                            break
+                await self._flush_selected(selected)
+                selected = []
+        except BaseException as error:
+            pending = selected + [item for _key, _seq, item in self._items]
+            self._items.clear()
+            for item in pending:
+                if item.future.done():
+                    continue
+                if isinstance(error, asyncio.CancelledError):
+                    item.future.cancel()
+                else:
+                    item.future.set_exception(error)
+            raise
 
     async def _flush_selected(
         self,
-        handler: DataPlaneCallable,
         selected: list[_QueuedBatch],
     ) -> None:
         frames = tuple(frame for item in selected for frame in item.frames)
         first = selected[0]
         try:
             result = await _send_transport_frame_batch_to_handler(
-                handler,
+                first.handler,
                 frames,
                 compiled_plan=first.compiled_plan,
                 output_step=first.output_step,
@@ -188,10 +226,10 @@ async def _build_and_send_frame_groups(
     source_spmd_id: str,
     batch_max_frames: int,
     submit_delivery: SubmitDelivery,
-    batch_delivery_factory: Callable[..., Awaitable[Any]] | None = None,
+    batch_delivery_factory: Callable[..., Awaitable[Any]],
+    batch_submit: BatchSubmit,
     profiler_recorder: TraceRecorder | None = None,
     delivery_schedule_key: ScheduleKey,
-    coherence_directory: CoherenceDirectory,
 ) -> list[asyncio.Task[Any]]:
     if len(successor_handlers) != len(compiled_plan.successor_routes):
         raise ValueError(
@@ -222,201 +260,83 @@ async def _build_and_send_frame_groups(
         batch_max_frames=batch_max_frames,
     )
     delivery_tasks: list[asyncio.Task[Any]] = []
-    if profiler_recorder is None:
-        for batch in batches:
-            route = compiled_plan.successor_routes[batch.context_index]
-            target_spmd_id = route.spmd_id
-            _validate_local_only_batch(route, compiled_plan, batch)
-            handler = _handler_for_batch(
-                batch,
-                successor_handlers=successor_handlers,
-                source_spmd_id=source_spmd_id,
-                source_rank=compiled_plan.rank,
-                output_step=exec_step,
-            )
-            frames = _batch_envelopes(batch)
-            delegated_tokens = await _delegate_batch_reads(
-                coherence_directory,
-                compiled_plan,
-                batch,
-            )
-            delivery = (
-                batch_delivery_factory(
+
+    async def schedule_batch(batch: TransportFrameBatch) -> asyncio.Task[Any]:
+        route = compiled_plan.successor_routes[batch.context_index]
+        target_spmd_id = route.spmd_id
+        _validate_local_only_batch(route, compiled_plan, batch)
+        handler = _handler_for_batch(
+            batch,
+            successor_handlers=successor_handlers,
+            source_spmd_id=source_spmd_id,
+            source_rank=compiled_plan.rank,
+            output_step=exec_step,
+        )
+        frames = _batch_envelopes(batch)
+
+        async def enqueue() -> Any:
+            async def send() -> Any:
+                return await batch_delivery_factory(
                     handler=handler,
                     frames=frames,
                     compiled_plan=compiled_plan,
                     output_step=exec_step,
+                    context_index=batch.context_index,
                     target_spmd_id=target_spmd_id,
                     target_rank=batch.target_rank,
                     batch_seq=batch.batch_seq,
-                    profiler_recorder=None,
+                    profiler_recorder=profiler_recorder,
                     schedule_key=delivery_schedule_key,
                 )
-                if batch_delivery_factory is not None
-                else _send_transport_frame_batch_to_handler(
-                    handler,
-                    frames,
-                    compiled_plan=compiled_plan,
-                    output_step=exec_step,
+
+            task = await submit_delivery(send())
+            return await task
+
+        retirement = batch_submit(batch, enqueue)
+        return asyncio.ensure_future(retirement)
+
+    if profiler_recorder is None:
+        try:
+            for batch in batches:
+                delivery_tasks.append(await schedule_batch(batch))
+        except BaseException:
+            await _cancel_delivery_tasks(delivery_tasks)
+            raise
+        return delivery_tasks
+
+    try:
+        async with profiler_recorder.data_plane_frame_submit(
+            source_rank=compiled_plan.rank,
+            output_step=exec_step,
+            frame_count=len(frame_groups),
+        ):
+            for batch in batches:
+                route = compiled_plan.successor_routes[batch.context_index]
+                target_spmd_id = route.spmd_id
+                frames = _batch_envelopes(batch)
+                async with profiler_recorder.data_plane_enqueue_batch(
+                    op_name=compiled_plan.op_name,
+                    step=exec_step,
+                    source_spmd_code=compiled_plan.sender_spmd_code,
+                    source_rank=compiled_plan.rank,
                     target_spmd_id=target_spmd_id,
                     target_rank=batch.target_rank,
                     batch_seq=batch.batch_seq,
-                )
-            )
-            delivery_tasks.append(
-                await _submit_delegated_batch(
-                    directory=coherence_directory,
-                    delegated_tokens=delegated_tokens,
-                    delivery=delivery,
-                    submit_delivery=submit_delivery,
-                )
-            )
-        return delivery_tasks
-
-    async with profiler_recorder.data_plane_frame_submit(
-        source_rank=compiled_plan.rank,
-        output_step=exec_step,
-        frame_count=len(frame_groups),
-    ):
-        for batch in batches:
-            route = compiled_plan.successor_routes[batch.context_index]
-            target_spmd_id = route.spmd_id
-            _validate_local_only_batch(route, compiled_plan, batch)
-            handler = _handler_for_batch(
-                batch,
-                successor_handlers=successor_handlers,
-                source_spmd_id=source_spmd_id,
-                source_rank=compiled_plan.rank,
-                output_step=exec_step,
-            )
-            frames = _batch_envelopes(batch)
-            delegated_tokens = await _delegate_batch_reads(
-                coherence_directory,
-                compiled_plan,
-                batch,
-            )
-            async with profiler_recorder.data_plane_enqueue_batch(
-                op_name=compiled_plan.op_name,
-                step=exec_step,
-                source_spmd_code=compiled_plan.sender_spmd_code,
-                source_rank=compiled_plan.rank,
-                target_spmd_id=target_spmd_id,
-                target_rank=batch.target_rank,
-                batch_seq=batch.batch_seq,
-                frame_count=len(frames),
-            ):
-                delivery = (
-                    batch_delivery_factory(
-                        handler=handler,
-                        frames=frames,
-                        compiled_plan=compiled_plan,
-                        output_step=exec_step,
-                        target_spmd_id=target_spmd_id,
-                        target_rank=batch.target_rank,
-                        batch_seq=batch.batch_seq,
-                        profiler_recorder=profiler_recorder,
-                        schedule_key=delivery_schedule_key,
-                    )
-                    if batch_delivery_factory is not None
-                    else _send_transport_frame_batch_to_handler(
-                        handler,
-                        frames,
-                        compiled_plan=compiled_plan,
-                        output_step=exec_step,
-                        target_spmd_id=target_spmd_id,
-                        target_rank=batch.target_rank,
-                        batch_seq=batch.batch_seq,
-                        profiler_recorder=profiler_recorder,
-                    )
-                )
-                delivery_tasks.append(
-                    await _submit_delegated_batch(
-                        directory=coherence_directory,
-                        delegated_tokens=delegated_tokens,
-                        delivery=delivery,
-                        submit_delivery=submit_delivery,
-                    )
-                )
+                    frame_count=len(frames),
+                ):
+                    delivery_tasks.append(await schedule_batch(batch))
+    except BaseException:
+        await _cancel_delivery_tasks(delivery_tasks)
+        raise
     return delivery_tasks
 
 
-def _delegated_reads(
-    compiled_plan: CompiledSendPlan,
-    batch: TransportFrameBatch,
-) -> set[tuple[CoherenceSubject, int, int]]:
-    return {
-        (
-            CoherenceSubject(
-                compiled_plan.sender_spmd_code,
-                compiled_plan.rank,
-                compiled_plan.coherence_logical_tuuid(item.transfer_code),
-            ),
-            item.epoch,
-            compiled_plan.coherence_child_slot(
-                item.transfer_code,
-                batch.target_rank,
-            ),
-        )
-        for item in batch.delegations
-    }
-
-
-async def _delegate_batch_reads(
-    directory: CoherenceDirectory,
-    compiled_plan: CompiledSendPlan,
-    batch: TransportFrameBatch,
-) -> tuple[GrantToken, ...]:
-    tokens: list[GrantToken] = []
-    try:
-        for subject, epoch, child_slot in _delegated_reads(compiled_plan, batch):
-            result = directory.delegate_local_payload(subject, epoch, child_slot)
-            if isinstance(result, GrantReady):
-                tokens.append(directory.register_child_delivery(result.token))
-                continue
-            if isinstance(result, GrantPending):
-                token = await result.ready
-                tokens.append(directory.register_child_delivery(token))
-                continue
-            if isinstance(result, GrantRejected):
-                raise result.error
-            raise TypeError(f"unsupported grant result={type(result).__name__}.")
-    except BaseException:
-        _complete_delegations(directory, tokens, delivered=False)
-        raise
-    return tuple(tokens)
-
-
-def _complete_delegations(
-    directory: CoherenceDirectory,
-    tokens: list[GrantToken] | tuple[GrantToken, ...],
-    *,
-    delivered: bool,
-) -> None:
-    for token in reversed(tokens):
-        directory.complete_child_delivery(token, delivered=delivered)
-
-
-async def _submit_delegated_batch(
-    *,
-    directory: CoherenceDirectory,
-    delegated_tokens: tuple[GrantToken, ...],
-    delivery: Awaitable[Any],
-    submit_delivery: SubmitDelivery,
-) -> asyncio.Task[Any]:
-    async def deliver_and_complete() -> Any:
-        try:
-            result = await delivery
-        except BaseException:
-            _complete_delegations(directory, delegated_tokens, delivered=False)
-            raise
-        _complete_delegations(directory, delegated_tokens, delivered=True)
-        return result
-
-    try:
-        return await submit_delivery(deliver_and_complete())
-    except BaseException:
-        _complete_delegations(directory, delegated_tokens, delivered=False)
-        raise
+async def _cancel_delivery_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:
+    pending = tuple(task for task in tasks if not task.done())
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _handler_for_batch(
@@ -498,9 +418,8 @@ async def _send_transport_frame_batch_to_handler(
 
 
 class BatchingDataPlaneExecutor:
-    def __init__(self, coherence_directory: CoherenceDirectory) -> None:
-        self._queues: dict[tuple[int, int], _TargetBatchQueue] = {}
-        self._coherence_directory = coherence_directory
+    def __init__(self) -> None:
+        self._queues: dict[tuple[str, int, str, int, str, int], _TargetBatchQueue] = {}
 
     async def send_tensor_frames(
         self,
@@ -517,6 +436,7 @@ class BatchingDataPlaneExecutor:
         dependency_decisions: DependencyDecisions = None,
         profiler_recorder: TraceRecorder | None = None,
         delivery_schedule_key: ScheduleKey,
+        batch_submit: BatchSubmit,
     ) -> list[asyncio.Task[Any]]:
         def build_frame_groups(recorder: TraceRecorder | None) -> list[StepFrameGroup]:
             return build_step_frame_groups(
@@ -539,6 +459,7 @@ class BatchingDataPlaneExecutor:
             submit_delivery=submit_delivery,
             profiler_recorder=profiler_recorder,
             delivery_schedule_key=delivery_schedule_key,
+            batch_submit=batch_submit,
         )
 
     async def send_completed_without_tensor_frames(
@@ -555,6 +476,7 @@ class BatchingDataPlaneExecutor:
         dependency_decisions: DependencyDecisions = None,
         profiler_recorder: TraceRecorder | None = None,
         delivery_schedule_key: ScheduleKey,
+        batch_submit: BatchSubmit,
     ) -> list[asyncio.Task[Any]]:
         def build_frame_groups(_recorder: TraceRecorder | None) -> list[StepFrameGroup]:
             return build_completed_without_tensor_step_frame_groups(
@@ -575,6 +497,7 @@ class BatchingDataPlaneExecutor:
             submit_delivery=submit_delivery,
             profiler_recorder=profiler_recorder,
             delivery_schedule_key=delivery_schedule_key,
+            batch_submit=batch_submit,
         )
 
     async def send_dependency_decision_frames(
@@ -590,6 +513,7 @@ class BatchingDataPlaneExecutor:
         dependency_decisions: DependencyDecisions,
         profiler_recorder: TraceRecorder | None = None,
         delivery_schedule_key: ScheduleKey,
+        batch_submit: BatchSubmit,
     ) -> list[asyncio.Task[Any]]:
         def build_frame_groups(_recorder: TraceRecorder | None) -> list[StepFrameGroup]:
             assert dependency_decisions is not None
@@ -610,6 +534,7 @@ class BatchingDataPlaneExecutor:
             submit_delivery=submit_delivery,
             profiler_recorder=profiler_recorder,
             delivery_schedule_key=delivery_schedule_key,
+            batch_submit=batch_submit,
         )
 
     async def _send_frame_groups(
@@ -625,6 +550,7 @@ class BatchingDataPlaneExecutor:
         submit_delivery: SubmitDelivery,
         profiler_recorder: TraceRecorder | None,
         delivery_schedule_key: ScheduleKey,
+        batch_submit: BatchSubmit,
     ) -> list[asyncio.Task[Any]]:
         return await _build_and_send_frame_groups(
             compiled_plan=compiled_plan,
@@ -641,7 +567,7 @@ class BatchingDataPlaneExecutor:
             ),
             profiler_recorder=profiler_recorder,
             delivery_schedule_key=delivery_schedule_key,
-            coherence_directory=self._coherence_directory,
+            batch_submit=batch_submit,
         )
 
     async def _enqueue_batch_delivery(
@@ -651,6 +577,7 @@ class BatchingDataPlaneExecutor:
         frames: tuple[TransportFrameEnvelope, ...],
         compiled_plan: CompiledSendPlan,
         output_step: int,
+        context_index: int,
         target_spmd_id: str,
         target_rank: int,
         batch_seq: int,
@@ -659,7 +586,14 @@ class BatchingDataPlaneExecutor:
         batch_flush_us: int,
         schedule_key: ScheduleKey,
     ) -> Any:
-        key = (id(handler), target_rank)
+        key = (
+            compiled_plan.source_spmd_id,
+            compiled_plan.rank,
+            compiled_plan.op_name,
+            context_index,
+            target_spmd_id,
+            target_rank,
+        )
         queue = self._queues.get(key)
         if queue is None:
             queue = _TargetBatchQueue(

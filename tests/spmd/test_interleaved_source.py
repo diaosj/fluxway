@@ -1,6 +1,6 @@
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 import pytest
@@ -14,6 +14,7 @@ from fluxway.common.compiled_graph import (
 )
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.types import DrainBoundary
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.spmd.worker.data_plane import (
     SuccessorRouteContext,
@@ -22,11 +23,17 @@ from fluxway.spmd.worker.data_plane import (
 )
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.spmd.worker.operator_manager.dispatcher import (
+    ExecutionResult,
     ExecutionStatus,
     InterleavedDispatcher,
 )
 from fluxway.spmd.worker.worker import SPMDWorker
 from tests.compiled_graph_fixtures import compiled_spmd_spec
+
+
+class _SourceDescriptor:
+    def build_component(self, context):
+        raise AssertionError("descriptor is not built in this worker unit test")
 
 
 def _compile_interleaved_compiled_graph(
@@ -45,6 +52,7 @@ def _compile_interleaved_compiled_graph(
         output_arguments={"data": ("t1",)},
         output_sharding={"t1": source_sharding},
     )
+
     processor = OperatorSpec(
         name="processor",
         input_arguments={"data": ("t1",)},
@@ -64,6 +72,158 @@ def _compile_interleaved_compiled_graph(
             ),
         ),
     )
+
+
+def test_controlled_interleaved_source_eof_is_explicit_execution_status():
+    loader = OperatorSpec(
+        name="loader",
+        is_source=True,
+        source=_SourceDescriptor(),
+        is_interleaved=True,
+    )
+    graph = compile_graph(
+        name="controlled-eof",
+        spmds=(
+            compiled_spmd_spec(
+                "loader",
+                DeviceMesh(device_shape=(1,), axis_names=("dp",)),
+                {"loader": loader},
+            ),
+        ),
+        dependencies=(),
+    )
+    worker_class = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_class = worker_class.modified_class if worker_class else SPMDWorker
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "loader"
+    worker.config = SimpleNamespace(require_graph_view=lambda: graph.spmd("loader"))
+    worker._drain_boundary = DrainBoundary()
+    worker._driver_handle = SimpleNamespace(
+        report_boundary_event=SimpleNamespace(remote=Mock())
+    )
+    worker._pending_terminal_observation = None
+
+    result = worker._normalize_interleaved_source_result("loader", 3, None)
+
+    assert result.status is ExecutionStatus.SOURCE_EXHAUSTED
+    assert worker._drain_boundary.observed_cut == 3
+
+
+def test_uncontrolled_interleaved_source_eof_is_reported():
+    loader = OperatorSpec(name="loader", is_source=True, is_interleaved=True)
+    graph = compile_graph(
+        name="uncontrolled-eof",
+        spmds=(
+            compiled_spmd_spec(
+                "loader",
+                DeviceMesh(device_shape=(1,), axis_names=("dp",)),
+                {"loader": loader},
+            ),
+        ),
+        dependencies=(),
+    )
+    worker_class = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_class = worker_class.modified_class if worker_class else SPMDWorker
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "loader"
+    worker.config = SimpleNamespace(require_graph_view=lambda: graph.spmd("loader"))
+    worker._drain_boundary = DrainBoundary()
+    worker._pending_terminal_observation = None
+
+    result = worker._normalize_interleaved_source_result("loader", 3, None)
+
+    assert result.status is ExecutionStatus.SOURCE_EXHAUSTED
+    assert worker._drain_boundary.observed_cut == 3
+
+
+def test_source_exhaustion_is_not_sent_as_a_data_completion():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+
+    result = ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
+
+    assert not worker_class._result_requires_send(worker, result)
+
+
+def test_source_exhaustion_is_stable_for_already_prefetched_steps():
+    loader = OperatorSpec(
+        name="loader",
+        is_source=True,
+        source=_SourceDescriptor(),
+        is_interleaved=True,
+    )
+    graph = compile_graph(
+        name="stable-controlled-eof",
+        spmds=(
+            compiled_spmd_spec(
+                "loader",
+                DeviceMesh(device_shape=(1,), axis_names=("dp",)),
+                {"loader": loader},
+            ),
+        ),
+        dependencies=(),
+    )
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "loader"
+    worker.config = SimpleNamespace(require_graph_view=lambda: graph.spmd("loader"))
+    worker._drain_boundary = DrainBoundary()
+    worker._pending_terminal_observation = None
+
+    first = worker_class._normalize_interleaved_source_result(worker, "loader", 3, None)
+    already_prefetched = worker_class._normalize_interleaved_source_result(
+        worker, "loader", 4, {"late": "batch"}
+    )
+
+    assert first.status is ExecutionStatus.SOURCE_EXHAUSTED
+    assert already_prefetched.status is ExecutionStatus.SOURCE_EXHAUSTED
+
+
+@pytest.mark.asyncio
+async def test_source_exhaustion_does_not_advance_the_data_watermark():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker._completed_step_count = {"loader": 3}
+    worker._finished_plan_steps = {
+        "loader": {3: ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)}
+    }
+    worker._coherence_input_grants = {}
+    worker._coherence_alias_dependencies = {}
+    worker._coherence_input_tensors = {}
+    worker._coherence_input_bindings = {}
+    worker._coherence_output_intents = {}
+    worker._local_input_origins = {}
+    worker._barriers_declared = {("loader", 3): True}
+    worker._drain_boundary = DrainBoundary()
+    worker._driver_handle = SimpleNamespace(
+        report_boundary_event=SimpleNamespace(remote=Mock())
+    )
+    worker._pending_terminal_observation = None
+    worker._pending_blocked = {"loader": []}
+    worker._pending_future_steps = {"loader": []}
+    worker._ready_pending_pipeline_steps = {"loader": []}
+    worker._pending_async_lag_steps = {"loader": []}
+    worker._pending_phase_order_steps = {"loader": []}
+    worker._in_op_step_queue = set()
+    worker._running_plan_steps = {"loader": set()}
+    worker._mailbox_ready_steps = {"loader": set()}
+    worker._direct_local_ready_steps = {"loader": set()}
+    worker._plan_task_steps = {}
+    worker._send_tasks = {}
+    worker._delivery_runtime = SimpleNamespace(cancel_matching=lambda _predicate: None)
+    worker._spawn_background_task = Mock()
+    worker._mailbox = SimpleNamespace(clear_step=AsyncMock())
+    worker._return_input_coherence = AsyncMock()
+    worker._clear_direct_local_step = Mock()
+    worker._advance_step = AsyncMock(
+        side_effect=AssertionError("source exhaustion is not a data step")
+    )
+
+    await worker_class._commit_finished_steps(worker, "loader")
+
+    assert worker._completed_step_count["loader"] == 3
+    assert worker._drain_boundary.observed_cut == 3
+    worker._advance_step.assert_not_awaited()
 
 
 def _build_interleaved_frames(
@@ -254,9 +414,16 @@ async def test_inactive_interleaved_rank_does_not_send():
     )
     worker._drain_cond = asyncio.Condition()
     worker._drain_step_count = None
+    worker._drain_boundary = DrainBoundary()
+    worker._pending_terminal_observation = None
     worker._barriers_declared = {("loader", 0): True}
     worker._operator_send_context = lambda _name: (_ for _ in ()).throw(
         AssertionError("inactive rank must not access a send plan")
+    )
+    worker._op_manager.get_operator_spec = lambda _name: SimpleNamespace(
+        is_source=False,
+        is_interleaved=False,
+        has_source_descriptor=False,
     )
 
     result = await worker_class._execute_operator_prepare_input(worker, "loader", 0)

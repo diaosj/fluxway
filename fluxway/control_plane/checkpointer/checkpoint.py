@@ -11,9 +11,7 @@ from fluxway.common.types.checkpoint import (
     CheckpointObjectCleanedUpError,
     CheckpointRuntime,
     CheckpointRuntimeRole,
-    CheckpointCaptureMode,
     CheckpointCut,
-    CheckpointTransactionState,
     CheckpointManifest,
     SaveCheckpointRequest,
     CheckpointIdReference,
@@ -22,13 +20,13 @@ from fluxway.common.types.checkpoint import (
     StepReference,
     CheckpointHold,
 )
-from fluxway.control_plane.checkpointer.backend import (
+from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
 )
 from fluxway.control_plane.checkpointer.repository import CheckpointRepository
-from fluxway.control_plane.checkpointer.keep import (
-    CheckpointCleanupCoordinator,
+from fluxway.control_plane.checkpointer.retention import (
+    CheckpointRetentionCoordinator,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,7 +39,6 @@ class FluxwayCheckpointer:
         repository_dir: str,
         *,
         interval_steps: int,
-        capture_mode: CheckpointCaptureMode = CheckpointCaptureMode.FENCED,
         component_registries: Mapping[str, CheckpointComponentRegistry] | None = None,
     ) -> None:
         if interval_steps < 1:
@@ -51,19 +48,16 @@ class FluxwayCheckpointer:
         self._coordinator_generation = self._repository.claim_coordinator_generation()
         self._repository_dir = str(self._repository.root)
         self._interval_steps = interval_steps
-        self._capture_mode = capture_mode
         self._registries = dict(component_registries or {})
-        self._keep = CheckpointCleanupCoordinator(self._registries, self._repository)
+        self._retention = CheckpointRetentionCoordinator(
+            self._registries, self._repository
+        )
         self._control_open = False
         self._closed = False
 
     @property
     def interval_steps(self) -> int:
         return self._interval_steps
-
-    @property
-    def capture_mode(self) -> CheckpointCaptureMode:
-        return self._capture_mode
 
     @property
     def repository(self) -> CheckpointRepository:
@@ -74,14 +68,11 @@ class FluxwayCheckpointer:
             raise RuntimeError("FluxwayCheckpointer is closed")
         if not isinstance(request, SaveCheckpointRequest):
             raise TypeError("FluxwayCheckpointer.save requires SaveCheckpointRequest")
-        await self._ensure_control_backends()
+        await self._ensure_control_components()
         await self._repair_pending_cleanups()
         checkpoint_id = CheckpointId.generate()
         permit = self._repository.issue_commit_permit(
             request.attempt_id, self._coordinator_generation
-        )
-        self._repository.write_transaction_state(
-            checkpoint_id, CheckpointTransactionState.CUT_CREATED
         )
         published = False
         reservations = ()
@@ -92,7 +83,6 @@ class FluxwayCheckpointer:
                 permit,
                 request.cut,
                 self._repository_dir,
-                request.capture_mode,
             )
             self._validate_assembly_cut(request, assembly.cut)
             sequence = self._repository.next_checkpoint_sequence()
@@ -108,22 +98,19 @@ class FluxwayCheckpointer:
                 spmds=assembly.spmds,
             )
             self._validate_manifest_progress(manifest)
-            self._repository.write_transaction_state(
-                str(checkpoint_id), CheckpointTransactionState.COMMITTED
-            )
-            reservations = await self._keep.reserve(
+            reservations = await self._retention.reserve(
                 permit, manifest, self._repository.list()
             )
             self._repository.require_commit_permit(permit)
-            await self._keep.publish(reservations, permit)
-            pending_cleanups = self._keep.pending_cleanups(
+            await self._retention.publish(reservations, permit)
+            pending_cleanups = self._retention.pending_cleanups(
                 str(checkpoint_id), reservations
             )
             self._repository.publish(manifest, permit, pending_cleanups)
             published = True
-            await self._controller.mark_snapshot_published(str(checkpoint_id), permit)
-            await self._finalize_framework_state(manifest)
-            await self._keep.cleanup(pending_cleanups)
+            await self._controller.publish_snapshot(str(checkpoint_id), permit)
+            await self._commit_framework_state(manifest)
+            await self._retention.cleanup(pending_cleanups)
             logger.info(
                 "checkpoint published snapshot=%s logical_step=%s",
                 checkpoint_id,
@@ -134,13 +121,11 @@ class FluxwayCheckpointer:
             cleanup_errors: list[BaseException] = []
             if not published:
                 try:
-                    await self._keep.rollback_save(reservations, permit)
+                    await self._retention.rollback_save(reservations, permit)
                 except BaseException as error:
                     cleanup_errors.append(error)
                 try:
-                    await self._controller.abort_snapshot_checkpoint_objects(
-                        str(checkpoint_id), permit
-                    )
+                    await self._controller.rollback_snapshot(str(checkpoint_id), permit)
                 except BaseException as error:
                     cleanup_errors.append(error)
             if cleanup_errors:
@@ -152,11 +137,14 @@ class FluxwayCheckpointer:
 
     async def restore(
         self,
-        reference: StepReference | CheckpointIdReference | str = "latest",
+        reference: StepReference
+        | NameReference
+        | CheckpointIdReference
+        | str = "latest",
     ) -> int | None:
         if self._closed:
             raise RuntimeError("FluxwayCheckpointer is closed")
-        await self._ensure_control_backends()
+        await self._ensure_control_components()
         if reference == "latest":
             manifest = self._repository.latest()
             if manifest is None:
@@ -198,7 +186,7 @@ class FluxwayCheckpointer:
         self,
         spmd_id: str,
         checkpoint_object: CheckpointObjectRef,
-        owner_id: str,
+        lease_holder_id: str,
         ttl_seconds: float,
         request_id: str,
     ) -> CheckpointHold:
@@ -207,14 +195,14 @@ class FluxwayCheckpointer:
             raise KeyError(
                 "cannot lease an checkpoint_object that is not a live published reference"
             )
-        await self._ensure_control_backends()
-        registration = self._require_backend(spmd_id, checkpoint_object.component_id)
+        await self._ensure_control_components()
+        registration = self._require_component(spmd_id, checkpoint_object.component_id)
         if registration.object_lifecycle is None:
             raise RuntimeError(
-                "backend does not expose checkpoint object lifecycle capability"
+                "component does not expose checkpoint object lifecycle capability"
             )
         return await registration.object_lifecycle.hold_checkpoint_object(
-            checkpoint_object, owner_id, ttl_seconds, request_id
+            checkpoint_object, lease_holder_id, ttl_seconds, request_id
         )
 
     async def renew_checkpoint_hold(
@@ -224,13 +212,13 @@ class FluxwayCheckpointer:
         ttl_seconds: float,
     ) -> CheckpointHold:
         self._require_open()
-        await self._ensure_control_backends()
-        registration = self._require_backend(
+        await self._ensure_control_components()
+        registration = self._require_component(
             spmd_id, lease.checkpoint_object.component_id
         )
         if registration.object_lifecycle is None:
             raise RuntimeError(
-                "backend does not expose checkpoint object lifecycle capability"
+                "component does not expose checkpoint object lifecycle capability"
             )
         return await registration.object_lifecycle.renew_checkpoint_hold(
             lease, ttl_seconds
@@ -240,19 +228,19 @@ class FluxwayCheckpointer:
         self, spmd_id: str, lease: CheckpointHold
     ) -> None:
         self._require_open()
-        await self._ensure_control_backends()
-        registration = self._require_backend(
+        await self._ensure_control_components()
+        registration = self._require_component(
             spmd_id, lease.checkpoint_object.component_id
         )
         if registration.object_lifecycle is None:
             raise RuntimeError(
-                "backend does not expose checkpoint object lifecycle capability"
+                "component does not expose checkpoint object lifecycle capability"
             )
         await registration.object_lifecycle.release_checkpoint_hold(lease)
 
     async def repair_pending_cleanups(self) -> int:
         self._require_open()
-        await self._ensure_control_backends()
+        await self._ensure_control_components()
         return await self._repair_pending_cleanups()
 
     async def close(self) -> None:
@@ -269,11 +257,11 @@ class FluxwayCheckpointer:
                 if len(errors) == 1:
                     raise errors[0]
                 raise BaseExceptionGroup(
-                    "control checkpoint backend close failed", errors
+                    "control checkpoint component close failed", errors
                 )
         self._closed = True
 
-    async def _ensure_control_backends(self) -> None:
+    async def _ensure_control_components(self) -> None:
         if self._control_open:
             return
         opened: list[CheckpointComponentRegistry] = []
@@ -296,7 +284,7 @@ class FluxwayCheckpointer:
                     cleanup_errors.append(error)
             if cleanup_errors:
                 raise BaseExceptionGroup(
-                    "control backend open and cleanup failed",
+                    "control component open and cleanup failed",
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
@@ -306,16 +294,16 @@ class FluxwayCheckpointer:
         pending = self._repository.list_pending_cleanups()
         if not pending:
             return 0
-        await self._keep.cleanup(pending)
+        await self._retention.cleanup(pending)
         return len(pending)
 
-    def _require_backend(
+    def _require_component(
         self, spmd_id: str, component_id: str
     ) -> CheckpointComponentRegistration:
         registry = self._registries.get(spmd_id)
         if registry is None:
             raise KeyError(
-                f"checkpoint backend registry not found for SPMD {spmd_id!r}"
+                f"checkpoint component registry not found for SPMD {spmd_id!r}"
             )
         return registry.require(component_id)
 
@@ -328,13 +316,17 @@ class FluxwayCheckpointer:
             registry = self._registries.get(spmd_id)
             if registry is None:
                 raise KeyError(
-                    f"checkpoint backend registry not found for SPMD {spmd_id!r}"
+                    f"checkpoint component registry not found for SPMD {spmd_id!r}"
                 )
             for component_id, publication in snapshot.components.items():
-                backend = registry.require(component_id)
+                component = registry.require(component_id)
+                if component.restore is None:
+                    raise RuntimeError(
+                        f"checkpoint component does not expose restore capability: {component_id!r}"
+                    )
                 declared_objects = {
                     checkpoint_object.checkpoint_object_id: checkpoint_object
-                    for checkpoint_object in backend.descriptor.checkpoint_objects
+                    for checkpoint_object in component.descriptor.checkpoint_objects
                 }
                 records = (
                     *publication.shared_records,
@@ -348,7 +340,7 @@ class FluxwayCheckpointer:
                         if declared_object is None:
                             raise ValueError(
                                 f"manifest checkpoint object {object_ref.checkpoint_object_id!r} "
-                                f"is not declared by backend {component_id!r}"
+                                f"is not declared by component {component_id!r}"
                             )
                         if declared_object.required_for_restore and (
                             self._repository.is_checkpoint_object_cleaned_up(
@@ -357,7 +349,7 @@ class FluxwayCheckpointer:
                         ):
                             raise CheckpointObjectCleanedUpError(
                                 "checkpoint object was cleaned up: "
-                                f"spmd={spmd_id!r} backend={component_id!r} "
+                                f"spmd={spmd_id!r} component={component_id!r} "
                                 f"checkpoint_object={object_ref.checkpoint_object_id!r} "
                                 f"version={object_ref.version_id!r}"
                             )
@@ -397,11 +389,9 @@ class FluxwayCheckpointer:
                 "CheckpointCut sealed ends disagree with framework ledger state"
             )
 
-    async def _finalize_framework_state(self, manifest: CheckpointManifest) -> None:
+    async def _commit_framework_state(self, manifest: CheckpointManifest) -> None:
         if manifest.cut.logical_step is None:
-            raise RuntimeError(
-                "controller framework ledger finalization requires logical_step"
-            )
-        await self._controller.finalize_snapshot(
+            raise RuntimeError("checkpoint control ledger commit requires logical_step")
+        await self._controller.commit_checkpoint_state(
             manifest.cut.logical_step, manifest.framework_state
         )

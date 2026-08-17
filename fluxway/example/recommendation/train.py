@@ -211,7 +211,7 @@ async def run_training(args):
             unique_ids=h_proc.unique_user_ids  # type: ignore
         ).sparse_features
         h_emb2 = table2.lookup(
-            unique_ids=h_proc.unique_checkpoint_object_ids  # type: ignore
+            unique_ids=h_proc.unique_target_ids  # type: ignore
         ).sparse_features
 
         h_prepare = dense.prepare_dense_inputs(
@@ -285,7 +285,7 @@ async def run_training(args):
     await execution.wait()
 
     await execution.cancel()
-    print("[Fluxway] Training completed up to checkpoint_object steps.")
+    print("[Fluxway] Training completed up to max steps.")
 
 
 def main():

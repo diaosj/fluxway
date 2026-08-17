@@ -309,7 +309,7 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
     checkpoint_components=(
         OrbaxCheckpointComponent(
             "dense",
-            lambda owner, context: owner.capture_checkpoint_state(context),
+            lambda owner, context: owner.save_checkpoint_state(context),
             lambda owner, state, context: owner.restore_checkpoint_state(
                 state, context
             ),
@@ -406,7 +406,7 @@ class DenseSPMD:
     def _checkpoint_state(self) -> dict:
         return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
 
-    def capture_checkpoint_state(self, context: SaveSession) -> dict:
+    def save_checkpoint_state(self, context: SaveSession) -> dict:
         return self._checkpoint_state()
 
     def restore_checkpoint_layout(self, context: RestoreSession) -> dict:

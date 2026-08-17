@@ -19,7 +19,6 @@ from typing import Any
 
 import ray
 from fluxway.common.types import (
-    CheckpointCaptureMode,
     CheckpointCut,
     DriverEvent,
     DriverState,
@@ -29,6 +28,7 @@ from fluxway.common.types import (
     SPMDConfig,
     SpmdCheckpoint,
     WorkerHeartbeat,
+    DrainEvent,
 )
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.rpc.protocol import DataPlaneCallable
@@ -93,7 +93,6 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         self.spmd_synchronizer.register_expected_ops(
             config.require_graph_view().operator_ids
         )
-
         self.monitor = SPMDMonitor(spmd_id)
 
         # Worker ready/running tracking
@@ -138,8 +137,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             executor=self.executor,
             synchronizer=self.spmd_synchronizer,
             controller_handle=self.controller_handle,
-            get_driver_state=lambda: self.state_machine.state,
-            trigger_state_event=lambda e: self.state_machine.trigger(e),
+            state_machine=self.state_machine,
             profiler_runtime=self._profiler_runtime,
             component_registry=self._driver_components,
             notify_component_state=self._notify_driver_components,
@@ -148,7 +146,10 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         self.heartbeat_manager = HeartbeatManager(
             spmd_id=self.spmd_id,
             num_workers=self.config.num_workers,
-            heartbeat_config=HeartbeatConfig(),
+            heartbeat_config=HeartbeatConfig(
+                heartbeat_interval=self.config.heartbeat_interval_s,
+                heartbeat_timeout=self.config.heartbeat_timeout_s,
+            ),
             profile_heartbeat=self._profile_heartbeat,
             get_driver_state=lambda: self.state_machine.state,
             get_driver_failure=lambda: self.state_machine.failure,
@@ -338,11 +339,15 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
     # Snapshot Orchestration
     # =====================================================================
 
-    async def request_drain(self, target_count: int, reason: str = "") -> None:
-        await self.snapshot_orchestrator.request_drain(target_count, reason)
-
-    async def request_terminal_drain(self, target_count: int) -> None:
-        await self.snapshot_orchestrator.request_terminal_drain(target_count)
+    async def request_drain(
+        self,
+        target_count: int,
+        terminal_cut: int | None = None,
+        reason: str = "",
+    ) -> None:
+        await self.snapshot_orchestrator.request_drain(
+            target_count, terminal_cut, reason
+        )
 
     async def request_snapshot(
         self,
@@ -351,29 +356,22 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         permit: Any,
         cut: CheckpointCut,
         repository_root: str,
-        capture_mode: CheckpointCaptureMode,
     ) -> None:
         await self.snapshot_orchestrator.request_snapshot(
-            snapshot_id, attempt_id, permit, cut, repository_root, capture_mode
+            snapshot_id, attempt_id, permit, cut, repository_root
         )
 
     async def resume(self) -> None:
         await self.snapshot_orchestrator.resume()
 
-    async def mark_snapshot_published(self, snapshot_id: str, permit: Any) -> None:
-        await self.snapshot_orchestrator.mark_published(snapshot_id, permit)
+    async def publish_snapshot(self, snapshot_id: str, permit: Any) -> None:
+        await self.snapshot_orchestrator.publish_save(snapshot_id, permit)
 
-    async def abort_snapshot_targets(self, snapshot_id: str, permit: Any) -> None:
-        await self.snapshot_orchestrator.abort_targets(snapshot_id, permit)
+    async def rollback_snapshot(self, snapshot_id: str, permit: Any) -> None:
+        await self.snapshot_orchestrator.rollback_save(snapshot_id, permit)
 
     async def fail_snapshot(self, snapshot_id: str) -> None:
-        try:
-            permit = self.snapshot_orchestrator._pending_permit
-            if permit is None:
-                raise RuntimeError("failed snapshot has no commit permit")
-            await self.snapshot_orchestrator.abort_targets(snapshot_id, permit)
-        finally:
-            self.snapshot_orchestrator._clear_drain_and_fail()
+        await self.snapshot_orchestrator.fail_snapshot(snapshot_id)
 
     async def restore_from_manifest(
         self,
@@ -436,7 +434,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                 logger.heartbeat(
                     f"All workers running triggering START spmd_id={self.spmd_id}"
                 )
-                if self.state_machine.state == DriverState.READY:
+                if self.state_machine.state is DriverState.READY:
                     self.state_machine.trigger(DriverEvent.START)
 
     def receive_worker_failure(self, rank: int, failure: ExecutionFailure) -> None:
@@ -486,6 +484,23 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                 step=step,
             )
         self.spmd_synchronizer.report_worker_op_completed(rank, op_name, step)
+
+    def report_boundary_event(self, op_name: str, event: DrainEvent) -> None:
+        if not isinstance(event, DrainEvent):
+            raise TypeError("boundary event must be a DrainEvent")
+        if self.controller_handle is None:
+            raise RuntimeError(
+                f"Driver {self.spmd_id!r} cannot report a boundary event without "
+                "a controller handle."
+            )
+        previous = self.spmd_synchronizer.drain_boundary
+        self.spmd_synchronizer.apply_boundary_event(event)
+        boundary = self.spmd_synchronizer.drain_boundary
+        if boundary.revision == previous.revision:
+            return
+        self.controller_handle.report_boundary_event.remote(
+            self.spmd_id, op_name, event
+        )
 
     def _on_spmd_op_completed(self, spmd_id: str, op_name: str, step: int) -> None:
         if self.controller_handle is None:

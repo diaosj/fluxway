@@ -196,6 +196,10 @@ class OperatorSpec(BaseModel):
         return self
 
     @property
+    def has_source_descriptor(self) -> bool:
+        return self.source is not None
+
+    @property
     def runtime_policy(self) -> CompiledAsyncPolicy:
         return self._runtime_policy
 

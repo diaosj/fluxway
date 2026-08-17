@@ -6,7 +6,11 @@ import asyncio
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from fluxway.control_plane.ledger_client import ControlRecord, StreamProgress
+from fluxway.control_plane.ledger_client import (
+    ControlRecord,
+    ControlStreamExhausted,
+    StreamProgress,
+)
 
 
 ControlKey = tuple[str, int]
@@ -181,6 +185,13 @@ class ControlLedger:
                     self._received.add(key)
                     return record
                 published_end = self._published_end(stream_id)
+                sealed_end = self._sealed_ends.get(stream_id)
+                if sealed_end is not None and position >= sealed_end:
+                    raise ControlStreamExhausted(
+                        "control stream reached its sealed end: "
+                        f"stream_id={stream_id!r} position={position} "
+                        f"sealed_end={sealed_end}"
+                    )
                 if position < published_end:
                     raise RuntimeError(
                         "control ledger retained interval is not contiguous: "
@@ -204,6 +215,7 @@ class ControlLedger:
                 f"published={published_end}"
             )
         self._sealed_ends[stream_id] = published_end
+        self._condition.notify_all()
 
     async def progress(self, stream_id: str) -> StreamProgress:
         self._validate_stream_id(stream_id)

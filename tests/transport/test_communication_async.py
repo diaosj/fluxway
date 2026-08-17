@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.coherence import CoherenceSubject, CoherenceInstance
 from fluxway.common.ragged import ragged_level_count
 from fluxway.common.tensor_backend import set_backend
 from fluxway.common.types.sharding import P, ShardingSpec
@@ -38,6 +39,30 @@ def use_jax_backend():
 
 async def _capture_frame(distributor, **kwargs):
     captured = {}
+
+    transfer_codes = kwargs.get("transfer_codes")
+    codes = (
+        tuple(transfer_codes)
+        if isinstance(transfer_codes, list | tuple)
+        else (int(transfer_codes),)
+    )
+    local_data = kwargs.get("local_data")
+    tensors = [local_data] if isinstance(local_data, TransportTensor) else local_data
+    if tensors is not None:
+        for code, tensor in zip(codes, tensors, strict=True):
+            if not tensor._coherence_instances:
+                tensor._bind_coherence_instances(
+                    (
+                        CoherenceInstance(
+                            CoherenceSubject(
+                                int(kwargs["sender_spmd_code"]),
+                                int(kwargs["sender_rank"]),
+                                code,
+                            ),
+                            int(kwargs["step"]),
+                        ),
+                    )
+                )
 
     async def send_fn(
         target_id,
@@ -176,11 +201,17 @@ def test_late_aggregation_preserves_expected_count_per_transfer(order) -> None:
                 global_shape=(16,),
                 source_step=0,
             )
+            tensor._bind_coherence_instances(
+                (CoherenceInstance(CoherenceSubject(1, 0, transfer_code), 0),)
+            )
         else:
             source = ShardingSpec.chunk(P()).bind(source_mesh)
             target = ShardingSpec.chunk(P()).bind(target_mesh)
             tensor = TransportTensor(
                 np.asarray(16, dtype=np.int32), global_shape=(), source_step=0
+            )
+            tensor._bind_coherence_instances(
+                (CoherenceInstance(CoherenceSubject(1, 0, transfer_code), 0),)
             )
         asyncio.run(
             distributor.distribute(
@@ -421,7 +452,10 @@ def test_absent_tensor_planning_preserves_causal_kind(method_name, expected_kind
         expected_count=1,
         transfer_code=94,
         payload=np.empty((0,), dtype=np.int32),
-        source_step=10,
+        coherence_instance=CoherenceInstance(
+            CoherenceSubject(1, 0, 94),
+            10,
+        ),
     )
 
     target_rank, header, payloads = distributor.build_transport_frame_args(

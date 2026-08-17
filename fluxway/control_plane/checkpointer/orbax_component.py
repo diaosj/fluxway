@@ -1,4 +1,4 @@
-"""Orbax checkpoint backend with shared global and partition-local records."""
+"""Orbax checkpoint component with shared global and partition-local records."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from ray import cloudpickle
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
-    ComponentCheckpoint,
+    CheckpointComponentPublication,
     CheckpointObjectRecord,
     CheckpointRuntime,
     CheckpointRuntimeRole,
@@ -28,10 +28,10 @@ from fluxway.common.types.checkpoint import (
     PartitionRecord,
     WorkerSaveResult,
     RestoreTopologyMode,
-    KeepPolicy,
+    CheckpointRetentionPolicy,
     TopologyMismatchError,
 )
-from fluxway.control_plane.checkpointer._filesystem_backend import (
+from fluxway.control_plane.checkpointer._filesystem_component import (
     FilesystemCheckpointComponent,
     _as_async,
 )
@@ -89,17 +89,17 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
     def __init__(
         self,
         component_id: str,
-        capture_state,
+        save_state,
         restore_state,
         restore_layout,
         *,
-        keep: KeepPolicy = KeepPolicy(),
+        retention: CheckpointRetentionPolicy = CheckpointRetentionPolicy(),
     ) -> None:
         super().__init__(
             component_id,
-            capture_state,
+            save_state,
             restore_state,
-            keep=keep,
+            retention=retention,
             restore_topology=RestoreTopologyMode.GLOBAL_RESHARD,
         )
         self._restore_layout = _as_async(restore_layout, "restore_layout")
@@ -128,7 +128,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         import jax.tree_util as jtu
         import orbax.checkpoint as ocp
 
-        state = await self._capture_state(session.instance, session)
+        state = await self._save_state(session.instance, session)
         leaves_with_path, treedef = jtu.tree_flatten_with_path(state)
         global_dict: dict[str, Any] = {}
         local_dict: dict[str, Any] = {}
@@ -139,7 +139,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
 
         pytree_meta = base64.b64encode(cloudpickle.dumps(treedef)).decode("ascii")
         shared_staging = self._staging_root(session) / "shared"
-        shared_final = self._final_backend_root(session) / "state" / "shared"
+        shared_final = self._final_component_root(session) / "state" / "shared"
         partition_key = f"rank/{session.rank}"
         local_staging = self._staging_path(session, partition_key)
         local_final = self._final_path(session, partition_key)
@@ -224,7 +224,9 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
             ),
         )
 
-    async def commit_save(self, session: CommitSaveSession) -> ComponentCheckpoint:
+    async def commit_save(
+        self, session: CommitSaveSession
+    ) -> CheckpointComponentPublication:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
         if not session.worker_results:
@@ -351,7 +353,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
                 if final.exists():
                     os.replace(final, staging)
             raise
-        return ComponentCheckpoint(
+        return CheckpointComponentPublication(
             component_id=self.descriptor.component_id,
             format_version=self.descriptor.format_version,
             shared_records=(shared_record,) if shared_record is not None else (),
@@ -410,12 +412,14 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
             paths.extend(
                 (
                     self._staging_root(session) / "shared",
-                    self._final_backend_root(session) / "state" / "shared",
+                    self._final_component_root(session) / "state" / "shared",
                 )
             )
         for path in paths:
-            if path.exists():
+            try:
                 await asyncio.to_thread(shutil.rmtree, path)
+            except FileNotFoundError:
+                pass
 
     async def _write_state(
         self, state: Any, directory: Path, context: SaveSession
@@ -427,7 +431,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
     ) -> Any:
         raise RuntimeError("Orbax uses shared and partition restore records")
 
-    async def _finalize_io(self, context: SaveSession) -> None:
+    async def _finish_save_io(self, context: SaveSession) -> None:
         return None
 
     async def _close_resources(self) -> None:

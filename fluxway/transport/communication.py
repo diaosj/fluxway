@@ -12,6 +12,7 @@ import asyncio
 import numpy as np
 
 from fluxway.common.tensor_backend import get_backend
+from fluxway.common.coherence import CoherenceInstance
 from fluxway.transport.planner import DestinationAssignment, TransportPlanner
 from fluxway.common.types.sharding import (
     PhysicalLayout,
@@ -174,36 +175,37 @@ def build_transport_frame_batches(
         frames_by_target.setdefault(key, []).append((header, tuple(payload_segments)))
 
     batches: list[TransportFrameBatch] = []
-    for key in sorted(frames_by_target):
-        context_index, target_rank = key
-        frames = frames_by_target[key]
+    for (context_index, target_rank), frames in frames_by_target.items():
         batch_seq = 0
         for start in range(0, len(frames), batch_max_frames):
             batch_frames = tuple(frames[start : start + batch_max_frames])
-            delegations = {
-                TransportDelegationDescriptor(
-                    int(entry[ENTRY_ROUTE_CODE]),
-                    int(entry[ENTRY_AUX]),
-                )
-                for header, _payload_segments in batch_frames
-                for entry in header.entry_i32
-                if TensorEntryKind(entry_tensor_kind(int(entry[ENTRY_STATE_FLAGS])))
-                is TensorEntryKind.TENSOR
-                and entry_coherence_action(int(entry[ENTRY_STATE_FLAGS]))
-                is CoherenceAction.BUS_RD
-            }
+            delegations: list[TransportDelegationDescriptor] = []
+            seen_delegations: set[TransportDelegationDescriptor] = set()
+            for header, _payload_segments in batch_frames:
+                for entry in header.entry_i32:
+                    if (
+                        TensorEntryKind(
+                            entry_tensor_kind(int(entry[ENTRY_STATE_FLAGS]))
+                        )
+                        is not TensorEntryKind.TENSOR
+                        or entry_coherence_action(int(entry[ENTRY_STATE_FLAGS]))
+                        is not CoherenceAction.BUS_RD
+                    ):
+                        continue
+                    descriptor = TransportDelegationDescriptor(
+                        int(entry[ENTRY_ROUTE_CODE]),
+                        int(entry[ENTRY_AUX]),
+                    )
+                    if descriptor not in seen_delegations:
+                        seen_delegations.add(descriptor)
+                        delegations.append(descriptor)
             batches.append(
                 TransportFrameBatch(
                     context_index=context_index,
                     target_rank=target_rank,
                     batch_seq=batch_seq,
                     frames=batch_frames,
-                    delegations=tuple(
-                        sorted(
-                            delegations,
-                            key=lambda item: (item.transfer_code, item.epoch),
-                        )
-                    ),
+                    delegations=tuple(delegations),
                 )
             )
             batch_seq += 1
@@ -601,7 +603,10 @@ def _hit_dst_subranks_for_dim(
         width = src_end - src_start
         if width >= dst_sub_size:
             return list(range(dst_sub_size))
-        return sorted({idx % dst_sub_size for idx in range(src_start, src_end)})
+        seen = [False] * dst_sub_size
+        for idx in range(src_start, src_end):
+            seen[idx % dst_sub_size] = True
+        return [sub_rank for sub_rank, present in enumerate(seen) if present]
 
     if isinstance(src_strategy, CyclicPartition) and isinstance(
         dst_strategy, ChunkPartition
@@ -805,14 +810,14 @@ class BaseDataDistributor:
         expected_count: int,
         transfer_code: int,
         payload: Any,
-        source_step: int,
+        coherence_instance: CoherenceInstance,
     ) -> None:
         self._plan_absent_tensor_entry(
             target_rank=target_rank,
             expected_count=expected_count,
             transfer_code=transfer_code,
             payload=payload,
-            source_step=source_step,
+            coherence_instance=coherence_instance,
             tensor_kind=TensorEntryKind.ROUTING_MISS,
         )
 
@@ -823,14 +828,14 @@ class BaseDataDistributor:
         expected_count: int,
         transfer_code: int,
         payload: Any,
-        source_step: int,
+        coherence_instance: CoherenceInstance,
     ) -> None:
         self._plan_absent_tensor_entry(
             target_rank=target_rank,
             expected_count=expected_count,
             transfer_code=transfer_code,
             payload=payload,
-            source_step=source_step,
+            coherence_instance=coherence_instance,
             tensor_kind=TensorEntryKind.COMPLETED_WITHOUT_TENSOR,
         )
 
@@ -841,7 +846,7 @@ class BaseDataDistributor:
         expected_count: int,
         transfer_code: int,
         payload: Any,
-        source_step: int,
+        coherence_instance: CoherenceInstance,
         tensor_kind: TensorEntryKind,
     ) -> None:
         if tensor_kind not in (
@@ -857,6 +862,11 @@ class BaseDataDistributor:
             raise ValueError(f"target_rank must be non-negative, got {target_rank}.")
         if expected_count <= 0:
             raise ValueError(f"expected_count must be positive, got {expected_count}.")
+        if not isinstance(coherence_instance, CoherenceInstance):
+            raise TypeError(
+                "coherence_instance must be CoherenceInstance, "
+                f"got {type(coherence_instance).__name__}."
+            )
         target_world_size = target_rank + 1
         manifest = self._current_plan_manifest
         if manifest is not None:
@@ -889,7 +899,7 @@ class BaseDataDistributor:
                 layout_states=(0,),
                 compact_params=None,
                 tensor_kinds=(int(tensor_kind),),
-                coherence_epochs=(source_step,),
+                coherence_epochs=(coherence_instance.epoch,),
                 expected_count=expected_count,
             )
         )
@@ -933,16 +943,25 @@ class BaseDataDistributor:
             raise ValueError("Transport planning requires at least one tensor.")
         if target is None:
             raise ValueError("Transport planning requires a target PhysicalLayout.")
-        source_steps_list = []
+        coherence_epochs_list = []
         for tt_idx, tt in enumerate(tensors_to_pack):
-            if tt.source_step is None:
+            instances = tt._coherence_instances
+            if not instances:
                 raise ValueError(
-                    "[Fluxway Distributor Error] TransportTensor.source_step is "
-                    f"required before frame planning for transfer code(s)="
-                    f"{self._format_transfer_codes(transfer_codes, transfer_code_to_name)} "
-                    f"tt_idx={tt_idx}."
+                    "[Fluxway Distributor Error] each TransportTensor must carry "
+                    "at least one canonical coherence instance before frame planning: "
+                    f"transfer_codes={self._format_transfer_codes(transfer_codes, transfer_code_to_name)} "
+                    f"tt_idx={tt_idx} instances={instances!r}."
                 )
-            source_steps_list.append(tt.source_step)
+            epochs = {instance.epoch for instance in instances}
+            if len(epochs) != 1:
+                raise ValueError(
+                    "[Fluxway Distributor Error] one TransportTensor cannot carry "
+                    "coherence instances from multiple epochs: "
+                    f"transfer_codes={self._format_transfer_codes(transfer_codes, transfer_code_to_name)} "
+                    f"tt_idx={tt_idx} instances={instances!r}."
+                )
+            coherence_epochs_list.append(next(iter(epochs)))
 
         primary = tensors_to_pack[0]
         local_shape = primary.logical_shape
@@ -1166,10 +1185,11 @@ class BaseDataDistributor:
         bk_static = backend.requires_static_shapes()
         if isinstance(capacity, list | tuple):
             selected_capacity = None
-            for cap in sorted(capacity):
-                if cap >= actual_req:
+            for cap in capacity:
+                if cap >= actual_req and (
+                    selected_capacity is None or cap < selected_capacity
+                ):
                     selected_capacity = cap
-                    break
             if selected_capacity is None:
                 selected_capacity = actual_req
             capacity = selected_capacity
@@ -1236,7 +1256,7 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list,
                 [None] * len(has_meta_tensor_state_list),
                 [int(TensorEntryKind.TENSOR)] * len(has_meta_tensor_state_list),
-                source_steps_list,
+                coherence_epochs_list,
             )
             return
 
@@ -1271,7 +1291,7 @@ class BaseDataDistributor:
                 has_meta_tensor_state_list,
                 direct_compact_params,
                 [int(TensorEntryKind.TENSOR)] * len(has_meta_tensor_state_list),
-                source_steps_list,
+                coherence_epochs_list,
             )
             return
 
@@ -1647,7 +1667,7 @@ class BaseDataDistributor:
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
                     tensor_kind_list,
-                    source_steps_list,
+                    coherence_epochs_list,
                 )
         else:
             # Scatter-send
@@ -1678,7 +1698,7 @@ class BaseDataDistributor:
                     has_meta_tensor_state_list,
                     _get_slice_compact_desc_params(device_id),
                     tensor_kind_list,
-                    source_steps_list,
+                    coherence_epochs_list,
                 )
 
     def plan_and_shard(
@@ -1714,7 +1734,7 @@ class BaseDataDistributor:
             has_meta_tensor_state_list,
             slice_compact_desc_params,
             tensor_kind_list,
-            source_steps_list,
+            coherence_epochs_list,
         ) in self._plan_single_tensor_group(
             local_data,
             source,
@@ -1739,7 +1759,7 @@ class BaseDataDistributor:
                     has_meta_tensor_state_list,
                     slice_compact_desc_params,
                     tensor_kind_list,
-                    source_steps_list,
+                    coherence_epochs_list,
                 )
             if self._meta_sort_indices is None:
                 self._meta_sort_indices = sort_idx
@@ -1769,7 +1789,7 @@ class BaseDataDistributor:
                             )
                         ),
                         tensor_kinds=tuple(tensor_kind_list),
-                        coherence_epochs=tuple(source_steps_list),
+                        coherence_epochs=tuple(coherence_epochs_list),
                         expected_count=manifest.expected_count_for(target_id),
                     )
                 )
@@ -1788,10 +1808,10 @@ class AsyncDataDistributor(BaseDataDistributor):
         template_cache: TransportFrameTemplateCache | None = None,
     ) -> list[tuple[int, TransportFrameHeader, tuple[Any, ...]]]:
         frame_args = []
-        for target_id in sorted(self._dest_agg.keys()):
+        for target_id, groups in self._dest_agg.items():
             frame = self._build_transport_frame_for_target(
                 target_id=target_id,
-                groups=self._dest_agg[target_id],
+                groups=groups,
                 step=step,
                 sender_spmd_code=sender_spmd_code,
                 sender_rank=sender_rank,

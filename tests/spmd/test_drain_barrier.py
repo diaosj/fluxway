@@ -2,7 +2,7 @@
 Unit tests for SPMDSynchronizer drain-to-count barrier and Worker drain target.
 
 Design:
-- Workers are self-blocked at drain_step_count by Worker._drain_resume_event (set_drain_step_count RPC).
+- Workers are self-blocked at drain_step_count by Worker._drain_resume_event (set_drain_boundary RPC).
 - Workers therefore only ever REPORT completion up to step_count.
 - The Synchronizer's job is to count those ACKs and fire the on_drained callback.
 - Synchronizer no longer manages blocking for drain (that's the Worker's responsibility).
@@ -11,15 +11,23 @@ Tests are split into:
 - TestDrainSetup: setup/teardown invariants
 - TestDrainAckCallback: ACK counting and callback triggering
 - TestDrainAndAllowedStepIndependence: drain ACK must not be affected by allowed_step
-- TestWorkerDrainTarget: Worker.set/clear_drain_step_count state correctness
+- TestWorkerDrainTarget: Worker.set/clear_drain_boundary state correctness
 """
 
 import asyncio
+from itertools import permutations
 import threading
 import types
 import typing
 
 import pytest
+from fluxway.common.types import (
+    DrainBoundary,
+    DrainEvent,
+    DrainEventKind,
+    DrainPhase,
+    reduce_drain_boundary,
+)
 from fluxway.spmd.driver.synchronizer import SPMDSynchronizer, MaxSkewSyncPolicy
 
 
@@ -43,9 +51,72 @@ class TestDrainSetup:
         sync = _make_sync()
         _register_op(sync, "op_a", step=0)
         sync.drain_to_step_count(step_count=5, on_drained=lambda: None)
-
         with pytest.raises(RuntimeError, match="already draining"):
             sync.drain_to_step_count(step_count=10, on_drained=lambda: None)
+
+
+def _reduce_events(events):
+    boundary = DrainBoundary()
+    dispatches = []
+    for event in events:
+        transition = reduce_drain_boundary(boundary, event)
+        boundary = transition.boundary
+        if transition.dispatch_target is not None:
+            dispatches.append(transition.dispatch_target)
+    return boundary, dispatches
+
+
+def test_boundary_observation_order_is_idempotent_and_minimum_wins() -> None:
+    events = (
+        DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 14),
+        DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13),
+        DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 15),
+        DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13),
+    )
+    outcomes = {
+        _reduce_events(order)[0].observed_cut for order in permutations(events[:2])
+    }
+    assert outcomes == {13}
+    boundary, dispatches = _reduce_events(events)
+    assert boundary.observed_cut == 13
+    assert boundary.admitted_cut == 13
+    assert dispatches == [14, 13]
+
+
+def test_boundary_rejects_durable_rollback_after_commit() -> None:
+    boundary, _ = _reduce_events(
+        (
+            DrainEvent(DrainEventKind.PERIODIC_REQUEST, 20),
+            DrainEvent(DrainEventKind.DRAIN_COMPLETE, 20),
+            DrainEvent(DrainEventKind.SNAPSHOT_BEGIN, 20),
+            DrainEvent(DrainEventKind.CHECKPOINT_COMMITTED, 20),
+        )
+    )
+    assert boundary.committed_cut == 20
+    with pytest.raises(ValueError, match="published checkpoint"):
+        reduce_drain_boundary(
+            boundary, DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13)
+        )
+
+
+def test_boundary_restore_terminal_state_is_completed_and_clamps_late_report() -> None:
+    boundary = DrainBoundary(
+        phase=DrainPhase.COMPLETED,
+        observed_cut=13,
+        admitted_cut=13,
+        drained_cut=13,
+        committed_cut=13,
+        revision=7,
+    )
+    restored = DrainBoundary.from_mapping(boundary.to_dict())
+    assert restored.phase is DrainPhase.COMPLETED
+    assert restored.committed_cut == 13
+    assert (
+        reduce_drain_boundary(
+            boundary, DrainEvent(DrainEventKind.LATE_COMPLETION, 15)
+        ).clamped_completion
+        == 13
+    )
 
     def test_is_draining_property(self):
         sync = _make_sync()
@@ -180,6 +251,121 @@ class TestDrainAndAllowedStepIndependence:
         sync.clear_drain()
         assert sync._allowed_steps.get("op_a") == 10
 
+
+@pytest.mark.parametrize("observations", [(14, 13), (13, 14)])
+def test_terminal_cut_converges_physical_rank_observations(
+    observations: tuple[int, int],
+) -> None:
+    sync = _make_sync(num_workers=2)
+    sync.register_expected_ops(("read", "update"))
+    for rank, count in enumerate(observations):
+        sync.report_worker_op_completed(rank, "read", count)
+        sync.report_worker_op_completed(rank, "update", count)
+
+    sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13))
+
+    assert sync.get_spmd_steps() == {"read": 13, "update": 13}
+    assert sync._worker_completed_count == {
+        0: {"read": observations[0], "update": observations[0]},
+        1: {"read": observations[1], "update": observations[1]},
+    }
+
+
+def test_terminal_cut_shortens_active_drain_and_clamps_late_reports() -> None:
+    fired = threading.Event()
+    sync = _make_sync(num_workers=2)
+    sync.register_expected_ops(("read", "update"))
+    sync.report_worker_op_completed(0, "read", 14)
+    sync.report_worker_op_completed(1, "read", 13)
+    sync.report_worker_op_completed(0, "update", 14)
+    sync.report_worker_op_completed(1, "update", 13)
+    sync.drain_to_step_count(20, on_drained=fired.set)
+
+    sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13))
+    assert not fired.is_set()
+    sync.shorten_drain_to_step_count(13)
+    assert fired.is_set()
+
+    sync.report_worker_op_completed(0, "read", 15)
+    sync.report_worker_op_completed(0, "update", 15)
+    assert sync.get_spmd_steps() == {"read": 13, "update": 13}
+
+
+def test_late_completion_keeps_raw_cursor_and_clamps_report_view() -> None:
+    reports: list[int] = []
+    sync = _make_sync(num_workers=2)
+    sync.register_expected_op("read")
+    sync.set_callbacks(
+        on_spmd_op_completed=lambda _spmd, _op, count: reports.append(count)
+    )
+    sync.report_worker_op_completed(0, "read", 14)
+    sync.report_worker_op_completed(1, "read", 14)
+    sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13))
+    reports.clear()
+
+    sync.report_worker_op_completed(0, "read", 15)
+    sync.report_worker_op_completed(1, "read", 15)
+
+    assert sync.get_all_worker_steps() == {0: {"read": 15}, 1: {"read": 15}}
+    assert sync.get_spmd_steps() == {"read": 13}
+    assert reports == []
+
+
+def test_terminal_cut_after_completed_drain_is_monotone() -> None:
+    sync = _make_sync(num_workers=2)
+    sync.register_expected_ops(("read",))
+    _register_op(sync, "read", step=20)
+    fired = threading.Event()
+    sync.drain_to_step_count(20, on_drained=fired.set)
+    assert fired.is_set()
+    sync.clear_drain()
+
+    sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13))
+    sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 15))
+    assert sync.get_spmd_steps() == {"read": 13}
+
+
+def test_terminal_cut_after_drain_ack_rearms_shortened_completion() -> None:
+    callbacks: list[int] = []
+    sync = _make_sync(num_workers=2)
+    sync.register_expected_ops(("read",))
+    _register_op(sync, "read", step=0)
+    sync.drain_to_step_count(20, on_drained=lambda: callbacks.append(20))
+    sync.report_worker_op_completed(0, "read", 20)
+    sync.report_worker_op_completed(1, "read", 20)
+    assert callbacks == [20]
+
+    sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13))
+    sync.shorten_drain_to_step_count(13, on_drained=lambda: callbacks.append(13))
+    assert callbacks == [20, 13]
+
+
+def test_terminal_shrink_invalidates_old_drained_cut() -> None:
+    boundary, _ = _reduce_events(
+        (
+            DrainEvent(DrainEventKind.PERIODIC_REQUEST, 20),
+            DrainEvent(DrainEventKind.DRAIN_COMPLETE, 20),
+            DrainEvent(DrainEventKind.SNAPSHOT_BEGIN, 20),
+            DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13),
+        )
+    )
+    assert boundary.phase is DrainPhase.DRAINING
+    assert boundary.admitted_cut == 13
+    assert boundary.drained_cut is None
+
+
+def test_zero_terminal_cut_converges_all_virtual_source_lanes() -> None:
+    syncs = [
+        _make_sync(num_workers=2),
+        _make_sync(num_workers=2),
+    ]
+    for sync in syncs:
+        sync.register_expected_ops(("read", "update"))
+        _register_op(sync, "read", step=4)
+        _register_op(sync, "update", step=4)
+        sync.apply_boundary_event(DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 0))
+        assert sync.get_spmd_steps() == {"read": 0, "update": 0}
+
     def test_restore_does_not_create_credit_ceiling_for_uncontrolled_op(self):
         sync = _make_sync(num_workers=1)
         blocked = []
@@ -205,7 +391,7 @@ class TestDrainAndAllowedStepIndependence:
 
 class TestWorkerDrainTarget:
     """
-    Verify SPMDWorker.set_drain_step_count / clear_drain_step_count state correctness.
+    Verify SPMDWorker.set_drain_boundary / clear_drain_boundary state correctness.
     """
 
     def _make_stub(self):
@@ -220,42 +406,51 @@ class TestWorkerDrainTarget:
             _background_tasks=set(),
             spmd_id="test_spmd",
             rank=0,
+            _drain_boundary=DrainBoundary(),
+            _source_operator_names=(),
         )
         stub._input_prepare_runtime = LocalInputPrepareRuntime(
             background_tasks=stub._background_tasks,
             on_task_done=lambda _task: None,
             schedule_key=lambda op_name, step: (0, 0, step, op_name),
         )
-        stub.set_drain_step_count = types.MethodType(raw_cls.set_drain_step_count, stub)
-        stub.clear_drain_step_count = types.MethodType(
-            raw_cls.clear_drain_step_count, stub
+        stub.set_drain_boundary = types.MethodType(raw_cls.set_drain_boundary, stub)
+        stub._set_drain_boundary = types.MethodType(raw_cls._set_drain_boundary, stub)
+        stub._drain_blocks_step = types.MethodType(raw_cls._drain_blocks_step, stub)
+        stub.op_manager = types.SimpleNamespace(
+            get_operator_spec=lambda _op: types.SimpleNamespace(
+                is_source=False,
+                is_interleaved=False,
+                has_source_descriptor=False,
+            )
         )
+        stub.clear_drain_boundary = types.MethodType(raw_cls.clear_drain_boundary, stub)
         return stub
 
     @pytest.mark.asyncio
     async def test_set_drain_target_updates_state(self):
         w = self._make_stub()
-        await w.set_drain_step_count(42)
+        await w.set_drain_boundary(42)
         assert w._drain_step_count == 42
 
     @pytest.mark.asyncio
     async def test_clear_drain_resets_state(self):
         w = self._make_stub()
-        await w.set_drain_step_count(42)
-        await w.clear_drain_step_count()
+        await w.set_drain_boundary(42)
+        await w.clear_drain_boundary()
         assert w._drain_step_count is None
 
     @pytest.mark.asyncio
     async def test_set_overrides_previous_target(self):
         w = self._make_stub()
-        await w.set_drain_step_count(10)
-        await w.set_drain_step_count(20)
+        await w.set_drain_boundary(10)
+        await w.set_drain_boundary(20)
         assert w._drain_step_count == 20
 
     @pytest.mark.asyncio
     async def test_clear_is_idempotent(self):
         w = self._make_stub()
-        await w.clear_drain_step_count()
+        await w.clear_drain_boundary()
         assert w._drain_step_count is None
 
 

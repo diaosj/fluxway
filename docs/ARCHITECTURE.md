@@ -18,7 +18,7 @@ MESI（Modified, Exclusive, Shared, Invalid，修改、独占、共享、无效�
 instance 在 endpoint-local directory 中的访问权限，不描述 Python 对象类型。
 
 TUUID（Tensor Universally Unique Identifier，tensor 通用唯一标识）是 logical tensor
-identity。DLPack（Deep Learning Pack）是跨 backend tensor payload 接口。BusRd（Bus Read）
+identity。DLPack（Deep Learning Pack）是跨 component tensor payload 接口。BusRd（Bus Read）
 对应 wire action `BUS_RD`；Snoop Invalidate（嗅探无效化）对应
 `SNOOP_INVALIDATE`；Grant Return（授权归还）对应 `GRANT_RETURN`。
 
@@ -50,8 +50,41 @@ runtime 在 CALL 前把 intent 转为本地 grant 或 RFO（Request For Ownershi
 Ray/Axon data-plane 无法用 header-only frame 恢复 parent payload，因此一执行协议将其 action code
 保留为非法值，不实现 remote writeback。
 
+parent grant 归还由 worker-local `ParentGrantReturnRuntime` 统一管理。worker 只提交
+`ParentReturnRoute`；该 module 在发送 `GRANT_RETURN` 前原子安装显式 return transaction、
+清除 stable parent authority，按 direct parent 和 epoch 聚合 frame，并以 exact-once token 完成事务。交叉到达的同 epoch
+`SNOOP_INVALIDATE` 由 directory 合并到已有 return transaction，future epoch `BUS_RD`
+可以把该事务作为父端已观察归还的证明。该路径保持 event-loop 无锁和 O(1) directory
+操作，但不是形式化 lock-free，也不是零开销：每个 return 会分配一个小 token 并执行
+常数次表查找。runtime 仅在 send 和 token completion 全部成功后返回 epoch-scoped
+returned-instance 集合，allocation retirement 消费该集合，避免用已推进的新 epoch entry
+反查旧 instance；集合外的 instance 仍执行完整 quiescence 校验。
+
+输入生命周期由 `InputCoherenceReleasePlan` 和 `InputCoherenceRelease` 组成。plan 是
+不可变的执行数据，集中保存 grants、alias `CoherenceInstance`、tensor payload 和 retirement
+候选，并从 grant 元数据校验、派生 parent-return routes；release 只暴露一个
+`complete()` 入口。它按“释放 local token -> grant/alias/descendant quiescence -> tensor
+invalidation -> parent return -> payload release -> retirement proof”顺序完成，remote 与
+local-only 输入使用同一条路径。`InputCoherenceRelease` 是生命周期 release，不是可回滚
+transaction。在 Worker 调度边界，Step 提交与输入 Quiescence 归还解耦：算子计算完成时
+通过 `_spawn_background_task` 将 `InputCoherenceRelease.complete()` 交给受监管的后台任务，
+后台协程取得该 step 的 release 资源所有权后再执行第一个可能挂起的 quiescence await；
+控制面调度水印 `_advance_step` 不等待这条归还路径，以解除下游 Phase 依赖。Worker 退出或
+异常清理时统一追踪并 await 全部后台归还任务，确保零拷贝物理内存由 Directory 状态机严格
+保障。这个解耦边界不等于“归还已完成”：只有 `complete()` 返回才表示该输入生命周期结束。
+
+epoch 转换同样只有一个事实来源。`CoherenceInstance(subject, epoch)` 是唯一 coherence
+身份；`CoherenceDirectory.admit()` 是唯一同步 admission 入口。乱序 frame build 不进入
+directory，而由 `CoherenceSequencer` 的 per-subject ROB 收敛。Sequencer 只在队头 intent
+调用 `admit()`，同一 epoch 的 delivery 可并发，下一 epoch 必须等待前一 intent 的所有
+delivery 完成；Sequencer 延迟分配 completion Future，快速路径在队头就绪时直接内联退休，
+降低热路径进入 asyncio 的延迟；冲突 coroutine 由 `coherence_runtime.py` 的异步 adapter 通过
+Directory progress signal 挂起，不在 Directory 内创建 Future。
+Directory 只保留同步协议事实，不持有 worker task 或 transport queue；整个路径不轮询、不阻塞
+event loop。
+
 逻辑 identity 是 `(owner_spmd_code, owner_rank, logical_tuuid, epoch)`；physical allocation
-identity 由 backend 证明。`donate` 只允许 endpoint-local、exact byte-span 的 Allocation
+identity 由 component 证明。`donate` 只允许 endpoint-local、exact byte-span 的 Allocation
 Handoff：旧 SSA（Static Single Assignment，静态单赋值）instance 进入 I，新 SSA instance
 获得同一 storage owner 并进入 E。跨
 endpoint 仍是普通 tensor payload，不是 FLUSH，也没有 Parameter Server 特例。
@@ -75,6 +108,29 @@ flowchart TB
   Q --> L["LocalStepPlan WAIT/CALL/SEND/BARRIER"]
   L --> R["Worker-local runtimes"]
   R --> T["Transport/Data-plane"]
+```
+
+异步 coherence/data-plane 工作流如下：
+
+```mermaid
+sequenceDiagram
+  participant W as Worker scheduler
+  participant S as CoherenceSequencer ROB
+  participant B as Frame builder threads
+  participant R as Coherence runtime adapter
+  participant D as CoherenceDirectory
+  participant Q as Pure data-plane queue
+  participant X as Receiver/delivery runtime
+  W->>S: issue_intent(CoherenceInstance)
+  W->>B: build frame concurrently
+  B-->>S: commit_payload(instance, zero-copy payload)
+  W->>S: close_intent() after all tickets are registered
+  S->>R: await quiescent admission
+  R->>D: synchronous admit() at ordered lane head
+  R->>Q: enqueue after admission
+  Q->>X: send frame batch
+  X-->>S: delivery completion
+  S-->>W: ticket completion
 ```
 
 ## Control Plane
@@ -158,14 +214,58 @@ Controller 和每个 SPMD Driver 分别承载 `ControlPlaneComponentRegistry` �
 `DriverComponentRegistry`，两个宿主复用同一个内部 `ControlPlaneComponent` 协议。
 组件通过 `on_state(state)` 响应宿主的生命周期 FSM 转换（Controller 对应 `ControllerState`，
 Driver 对应 `DriverState`），并通过 `checkpoint_state()` 与 `restore_state()` 统一参与控制面状态快照与容错恢复。
+Driver 的冷路径生命周期由单一状态机管理：`READY → RESTORING → READY` 与
+`RUNNING → DRAINING → DRAINED → SNAPSHOTTING → RUNNING`；terminal drain 只是在该
+状态机上的目标步 admission，不建立第二套状态源。
 source descriptor 只存在于 compiled `OperatorSpec`；source coordinator 由对应 Driver 构造并复用
 `DriverState`、drain 和 snapshot，不建立第二套 source lifecycle 或 barrier。
 
-全局 `ControlLedger` 只实现 opaque ordered metadata keep、等待式共享读取、durable
+terminal source 收敛沿用同一条状态链：
+
+```text
+Worker 发现 virtual source 的 first-missing step T
+  -> Worker -> Driver -> Controller 提交通用 boundary event
+  -> DrainBoundary reducer 取所有 observation 的最小值 T
+  -> 与周期 drain 相同的 request_drain(T, terminal_cut=T)
+  -> Worker 丢弃 source pipeline 中 step >= T 的 speculative work
+  -> SPMDSynchronizer 将所有 physical rank 的 committed frontier 收敛到 T
+  -> Driver DRAINED -> SNAPSHOTTING -> Controller COMPLETING -> COMPLETED
+```
+
+Controller 只持有一个 `DrainBoundary` reducer 状态，字段为
+`observed_cut`、`admitted_cut`、`drained_cut`、`committed_cut` 和版本号。Driver 不再维护
+第二份 boundary；Synchronizer 与 Worker 只保存带版本的本地快照，用于本地 late-report
+clamp 和 restore 校验，不能独立改变 Controller 的 admission。`OPEN → OBSERVED →
+DRAINING → DRAINED → SNAPSHOTTING → COMPLETED` 是该 reducer 在既有宿主 FSM 上的投影，
+不是第三套生命周期。
+
+`OPEN` 表示没有 active boundary；`OBSERVED` 表示已记录 terminal 事实但尚未完成
+admission；`DRAINING` 等待所有 rank 到达目标；`DRAINED` 表示物理 drain 完成；
+`SNAPSHOTTING` 表示 checkpoint 正在进行；`COMPLETED` 表示 terminal checkpoint 已
+原子发布。周期请求、terminal observation、drain completion、snapshot begin、checkpoint
+commit、restore 和 late completion 都进入同一个 reducer；late completion 只产生 clamp
+后的报告视图，不改变 raw execution cursor。
+
+Worker 的 `execution cursor` 允许先到达 `T+1`，但它不是 checkpoint 进度；只有
+`committed cut` 才能进入 runtime snapshot、driver report 和 Controller checkpoint。
+因此一个 rank 执行到 14、另一个 rank 在 13 发现 EOF 时，terminal checkpoint 的统一边界仍是 13，
+不会通过回写 execution cursor 伪造收敛。
+
+Drain boundary 更新与 source refill 解耦：boundary 只收缩 admission、清理 cut 之后的
+speculative source pipeline 并唤醒等待者，不会在 boundary 内重新填充 source。source
+refill 只由 `_fill_source_pipeline()` 执行，并在 enqueue 前检查 terminal cut、pipeline
+depth、worker running 状态和有限 `max_steps`。
+
+全局 `ControlLedger` 只实现 opaque ordered metadata retention、等待式共享读取、durable
 checkpoint cut、sealed end 和 replay。持久 identity 只有
 `(stream_id, position)`；virtual owner 由当前 operator step 与 interleave topology 推导。
 ledger 本身不包含 virtual unit、source revision、文件 lineage 或 executor lane 语义。完整协议与 exactly-once 不变量见
 [Source Coordination](source_coordination.md)。
+
+ControlLedger 的 `durable_cut`、`published_end` 和 `sealed_end` 是内部 source-coordination
+事实，不通过 `GraphExecution` 暴露；它们不是 terminal FSM 的状态查询。interleaved source 的
+terminal progress 走 `Worker -> Driver -> Controller -> request_drain` boundary-event 链，不通过轮询 API
+参与 drain admission 或 committed-cut 收敛。
 
 ## Worker Scheduler
 
@@ -255,7 +355,7 @@ dependency 伪装成成功完成。condition 可以直接返回严格 `bool`，�
 
 static-to-static 只 patch step 和 payload refs。dynamic 路径只缓存稳定 schema/tuuid/role 骨架；shape/count/routing/origin/inverse/payload 每 step 输入。
 
-Ray 和 Axon 共享 batch-first ABI。缺失 batch ABI 或非法 backend state 直接抛错。
+Ray 和 Axon 共享 batch-first ABI。缺失 batch ABI 或非法 component state 直接抛错。
 
 local-only edge 只允许 `source_node == checkpoint_object_node`。scheduler 建立全局 SPMD
 topology 时跳过这类边，因此同 rank 内部 operator 不等待 self-loop remote
@@ -276,11 +376,12 @@ loop。Fluxway 不为 directory 增加跨线程共享锁，Python 的 GIL（Glob
 
 ## Commit, Fence, And Failure
 
-step commit 和 delivery completion 分离：
+step commit、delivery completion 与 input coherence quiescence return 三者正交分离：
 
 - `SEND` 返回 `LocalSendToken` 表示 delivery 已注册。
 - `BARRIER` 不等待 frame build、batch RPC 或 receiver deposit。
-- drain/checkpoint/export/stop 是唯一等待 registered delivery 的 fence。
+- `_commit_finished_steps` 在 step 计算完成时立即提交结果并推进 `_advance_step` 控制面调度水印，输入 Quiescence 归还作为受监控的后台生命周期任务并发执行，不阻塞控制面调度流水线。
+- drain/checkpoint/export/stop 是唯一等待 registered delivery 和 background input release 的 fence。
 
 `ExecutionFailure` 是运行时失败的唯一事实。first failure 在 Worker 中一次性锁存
 SPMD、rank、operator、step、phase、异常类型、消息和 traceback；user CALL、SEND、
@@ -296,13 +397,16 @@ SPMD。业务方等待成功时得到
 `TimeoutError`。异常绝不表示为 tensor entry，因此 graph 成功热路径不新增错误
 frame、mailbox polling 或逐 tensor 分支；future eager 复用同一控制面 ABI。
 
-checkpoint、heartbeat、driver report 只读取 contiguous committed watermark。
+Worker 的 execution cursor 可以先于 durable 边界推进；terminal drain 将所有 rank 的
+committed cut 单调收敛到同一个逻辑边界，并丢弃该边界之后的 source pipeline。checkpoint、
+heartbeat、driver report 只读取 contiguous committed watermark，不能把 speculative execution
+cursor 当成 checkpoint 进度。
 
-checkpoint checkpoint_object 使用一套 `CheckpointComponentRegistration` transaction：Worker coordinator 负责 backend
-的 `prepare/capture/finalize/commit/abort/restore/close` 调度，Driver 只聚合
-`WorkerSaveResult` 与 `ComponentCheckpoint`，Controller-side checkpointer 负责 cut、Manifest、
-reference 和 publication ordering。backend 独占物理 storage_locator、版本、lease 与 cleanup；Manifest 对 storage_locator
-保持 opaque。`finalize` 成功前禁止 commit 和 Manifest publish；publish 前失败执行 abort，已发布版本
+checkpoint object 使用一套 `CheckpointComponentRegistration` transaction：Worker coordinator 负责 component
+的 `prepare_save/save/finish_save/commit_save/rollback_save/publish_save/restore/close` 调度，Driver 只聚合
+`WorkerSaveResult` 与 `CheckpointComponentPublication`，Controller-side checkpointer 负责 cut、Manifest、
+reference 和 publication ordering。component 独占物理 storage_locator、版本、lease 与 cleanup；Manifest 对 storage_locator
+保持 opaque。`finish_save` 成功前禁止 commit_save 和 Manifest publish；publish 前失败执行 rollback_save，已发布版本
 的保留策略执行 cleanup。terminal checkpoint 恢复后复用现有 drain completion，不增加 source gate。
 
 ## Profiler Semantics

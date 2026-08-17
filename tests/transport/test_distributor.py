@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from fluxway.common.index_descriptor import ContinuousIndex
+from fluxway.common.coherence import CoherenceInstance, CoherenceSubject
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.tensor_backend import (
     HybridBackend,
@@ -35,6 +36,24 @@ def use_hybrid_backend():
 
 async def _capture(local_rank, local_data, source, target, **kwargs):
     captured = {}
+    codes = kwargs.get("transfer_codes")
+    codes = tuple(codes) if isinstance(codes, list | tuple) else (int(codes),)
+    tensors = [local_data] if isinstance(local_data, TransportTensor) else local_data
+    if tensors is not None:
+        for code, tensor in zip(codes, tensors, strict=True):
+            if not tensor._coherence_instances:
+                tensor._bind_coherence_instances(
+                    (
+                        CoherenceInstance(
+                            CoherenceSubject(
+                                int(kwargs["sender_spmd_code"]),
+                                int(kwargs["sender_rank"]),
+                                code,
+                            ),
+                            int(kwargs.get("step", tensor.source_step or 0)),
+                        ),
+                    )
+                )
 
     async def send_fn(
         target_rank,
@@ -425,6 +444,9 @@ def test_mirror_routing_builds_single_expected_frame():
     receipt = SymmetryReceipt(world_size=43, sender_rank_tags=jnp.array([42, 42, 42]))
     data = jnp.array([[1.0], [2.0], [3.0]])
     tensor = TransportTensor(data, receipt=receipt, source_step=1)
+    tensor._bind_coherence_instances(
+        (CoherenceInstance(CoherenceSubject(1, 0, 123), 1),)
+    )
     source = ShardingSpec.chunk(P()).bind(source_mesh)
     target = ShardingSpec.chunk(P("target")).bind(target_mesh)
 

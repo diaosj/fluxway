@@ -204,7 +204,7 @@ class GrainReader(BaseReader):
 
     _GRAIN_STATE_KEY = "__grain_iter_state__"
 
-    def capture_state(self, context: SaveSession) -> dict[str, Any]:
+    def save_state(self, context: SaveSession) -> dict[str, Any]:
         """
         Return the iterator position as a framework-compatible dict.
 

@@ -240,4 +240,10 @@ Thumbs.db
 .qoder/
 .history/
 
+# Docker
+docker/
+!docker/Dockerfile.jax
+
+# Chore
 tmp/
+/*.sh

@@ -35,7 +35,7 @@ def _worker():
             "communication": asyncio.PriorityQueue(),
         },
         _plan_tasks=set(),
-        _send_tasks=set(),
+        _send_tasks={},
         _background_tasks=set(),
         _heartbeat_task=None,
         _op_runnable={"op": asyncio.Event()},
@@ -90,7 +90,7 @@ async def test_failure_cancels_execution_tasks_but_preserves_heartbeat():
     background_task = asyncio.create_task(_pending_task())
     heartbeat_task = asyncio.create_task(_pending_task())
     worker._plan_tasks.add(plan_task)
-    worker._send_tasks.add(send_task)
+    worker._send_tasks[send_task] = ("op", 0)
     worker._background_tasks.add(background_task)
     worker._heartbeat_task = heartbeat_task
 

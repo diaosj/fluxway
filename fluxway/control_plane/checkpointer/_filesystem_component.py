@@ -1,4 +1,4 @@
-"""Private filesystem implementation shared by built-in state backends."""
+"""Private filesystem implementation shared by built-in state components."""
 
 from __future__ import annotations
 
@@ -12,45 +12,49 @@ import shutil
 import time
 import uuid
 from abc import abstractmethod
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+# pyrefly: ignore [missing-import]
 import msgpack
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
     CheckpointObjectSpec,
-    CheckpointCapability,
-    ComponentCheckpoint,
+    CheckpointComponentPublication,
     CheckpointObjectRecord,
     CheckpointRuntime,
     CheckpointRuntimeRole,
-    ComponentSpec,
+    CheckpointComponentSpec,
     CheckpointCommitPermit,
     SaveSession,
     CommitSaveSession,
     RestoreSession,
-    CommitScope,
+    CheckpointRestoreSpec,
+    CheckpointSaveScope,
+    CheckpointSaveSpec,
     LeaseConflictError,
     PartitionRecord,
-    PrepareScope,
     WorkerSaveResult,
     RestoreTopologyMode,
     CheckpointCleanupBlocked,
     CheckpointHold,
-    KeepPolicy,
+    CheckpointRetentionPolicy,
     CleanupReservation,
     CleanupReservationRequest,
     TopologyMismatchError,
 )
-from fluxway.control_plane.checkpointer.backend import (
+from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponent,
-    CheckpointObjectCleaner,
+    CheckpointComponentLifecycle,
+    CheckpointObjectCleanup,
     CheckpointObjectLifecycle,
+    CheckpointComponentRestore,
+    CheckpointComponentSave,
 )
 from fluxway.control_plane.checkpointer.repository import validate_checkpoint_value
 
@@ -72,59 +76,56 @@ def _as_async(function: Callable[..., Any], name: str) -> Callable[..., Awaitabl
 
 class FilesystemCheckpointComponent(
     CheckpointComponent,
+    CheckpointComponentLifecycle,
+    CheckpointComponentSave,
+    CheckpointComponentRestore,
     CheckpointObjectLifecycle,
-    CheckpointObjectCleaner,
+    CheckpointObjectCleanup,
 ):
     """Internal transaction and lifecycle implementation for one state format."""
 
     def __init__(
         self,
         component_id: str,
-        capture_state: Callable[[Any, SaveSession], Any],
+        save_state: Callable[[Any, SaveSession], Any],
         restore_state: Callable[[Any, Any, RestoreSession], Any],
         *,
-        keep: KeepPolicy,
+        retention: CheckpointRetentionPolicy,
         restore_topology: RestoreTopologyMode,
-        supports_eager_capture: bool = False,
     ) -> None:
-        self._descriptor = ComponentSpec(
+        self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
             format_version=1,
-            prepare_scope=PrepareScope.LEADER,
-            commit_scope=CommitScope.LEADER,
-            checkpoint_objects=(CheckpointObjectSpec("state", keep),),
-            restore_topology=restore_topology,
-            capabilities=frozenset(
-                {
-                    CheckpointCapability.PERSISTENCE,
-                    CheckpointCapability.LIFECYCLE,
-                    CheckpointCapability.RETENTION,
-                    CheckpointCapability.RECLAIMER,
-                }
+            checkpoint_objects=(CheckpointObjectSpec("state", retention),),
+            save=CheckpointSaveSpec(
+                prepare_scope=CheckpointSaveScope.LEADER,
+                commit_scope=CheckpointSaveScope.LEADER,
             ),
-            supports_eager_capture=supports_eager_capture,
+            restore=CheckpointRestoreSpec(topology=restore_topology),
         )
-        self._capture_state = _as_async(capture_state, "capture_state")
+        self._save_state = _as_async(save_state, "save_state")
         self._restore_state = _as_async(restore_state, "restore_state")
         self._runtime: CheckpointRuntime | None = None
         self._root: Path | None = None
 
     @property
-    def descriptor(self) -> ComponentSpec:
+    def descriptor(self) -> CheckpointComponentSpec:
         return self._descriptor
 
     def registration(self) -> CheckpointComponentRegistration:
         return CheckpointComponentRegistration(
-            descriptor=self.descriptor,
             component=self,
+            component_lifecycle=self,
+            save=self,
+            restore=self,
             object_lifecycle=self,
-            cleaner=self,
+            object_cleanup=self,
         )
 
     async def open(self, runtime: CheckpointRuntime) -> None:
         if self._runtime is not None:
             raise RuntimeError(
-                f"checkpoint backend {self.descriptor.component_id!r} is open"
+                f"checkpoint component {self.descriptor.component_id!r} is open"
             )
         root = Path(runtime.repository_root).resolve()
         await asyncio.to_thread(root.mkdir, parents=True, exist_ok=True)
@@ -132,7 +133,7 @@ class FilesystemCheckpointComponent(
         self._root = root
         await self._open_resources(runtime)
 
-    async def start_save(self, session: SaveSession) -> None:
+    async def prepare_save(self, session: SaveSession) -> None:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
         staging = self._staging_root(session)
@@ -153,9 +154,9 @@ class FilesystemCheckpointComponent(
                 f"checkpoint checkpoint_object path already exists: staging={staging} final={final}"
             )
         await asyncio.to_thread(staging.mkdir, parents=True, exist_ok=False)
-        state = await self._capture_state(session.instance, session)
+        state = await self._save_state(session.instance, session)
         metadata = await self._write_state(state, staging, session)
-        validate_checkpoint_value(metadata, "filesystem_backend.metadata")
+        validate_checkpoint_value(metadata, "filesystem_component.metadata")
         checkpoint_object = CheckpointObjectRef(
             component_id=self.descriptor.component_id,
             checkpoint_object_id="state",
@@ -177,9 +178,11 @@ class FilesystemCheckpointComponent(
     async def finish_save(self, session: SaveSession) -> None:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
-        await self._finalize_io(session)
+        await self._finish_save_io(session)
 
-    async def commit_save(self, session: CommitSaveSession) -> ComponentCheckpoint:
+    async def commit_save(
+        self, session: CommitSaveSession
+    ) -> CheckpointComponentPublication:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
         moves: list[tuple[Path, Path]] = []
@@ -223,7 +226,7 @@ class FilesystemCheckpointComponent(
                 if final.exists():
                     await asyncio.to_thread(os.replace, final, staging)
             raise
-        return ComponentCheckpoint(
+        return CheckpointComponentPublication(
             component_id=self.descriptor.component_id,
             format_version=self.descriptor.format_version,
             partitions=tuple(partitions),
@@ -237,10 +240,12 @@ class FilesystemCheckpointComponent(
             self._staging_path(session, partition_key),
             self._final_path(session, partition_key),
         ):
-            if path.exists():
+            try:
                 await asyncio.to_thread(shutil.rmtree, path)
+            except FileNotFoundError:
+                pass
 
-    async def on_checkpoint_available(self, session: SaveSession) -> None:
+    async def publish_save(self, session: SaveSession) -> None:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
 
@@ -248,14 +253,21 @@ class FilesystemCheckpointComponent(
         self._require_worker(session)
         publication = session.component_checkpoint
         if publication.component_id != self.descriptor.component_id:
-            raise ValueError("checkpoint publication belongs to another backend")
+            raise ValueError("checkpoint publication belongs to another component")
+
+        restore_spec = self.descriptor.restore
+        if restore_spec is None:
+            raise RuntimeError(
+                f"checkpoint component {self.descriptor.component_id!r} has no restore specification"
+            )
+
         current = session.current_topology or session.source_topology
         if (
-            self.descriptor.restore_topology is RestoreTopologyMode.EXACT_TOPOLOGY
+            restore_spec.topology is RestoreTopologyMode.EXACT_TOPOLOGY
             and current != session.source_topology
         ):
             raise TopologyMismatchError(
-                f"backend {self.descriptor.component_id!r} requires exact topology"
+                f"component {self.descriptor.component_id!r} requires exact topology"
             )
         record = self._select_restore_record(publication, session)
         state = await self._read_state(record, session)
@@ -264,15 +276,17 @@ class FilesystemCheckpointComponent(
     async def hold_checkpoint_object(
         self,
         checkpoint_object: CheckpointObjectRef,
-        owner_id: str,
+        lease_holder_id: str,
         ttl_seconds: float,
         request_id: str,
     ) -> CheckpointHold:
         self._require_control()
         if checkpoint_object.component_id != self.descriptor.component_id:
-            raise ValueError("checkpoint_object belongs to another backend")
-        if not owner_id or not request_id or ttl_seconds <= 0:
-            raise ValueError("lease requires owner, request ID, and positive TTL")
+            raise ValueError("checkpoint_object belongs to another component")
+        if not lease_holder_id or not request_id or ttl_seconds <= 0:
+            raise ValueError(
+                "lease requires lease holder, request ID, and positive TTL"
+            )
         with self._lifecycle_lock():
             state = self._read_lifecycle(checkpoint_object)
             self._drop_expired_leases(state)
@@ -284,16 +298,16 @@ class FilesystemCheckpointComponent(
                 raise LeaseConflictError("checkpoint_object is reserved for cleanup")
             for raw in state["leases"].values():
                 if raw["request_id"] == request_id:
-                    if raw["owner_id"] != owner_id:
+                    if raw["lease_holder_id"] != lease_holder_id:
                         raise LeaseConflictError(
-                            "lease request ID belongs to another owner"
+                            "lease request ID belongs to another lease holder"
                         )
                     self._write_lifecycle(checkpoint_object, state)
                     return self._lease_from_payload(checkpoint_object, raw)
             lease_id = uuid.uuid4().hex
             raw = {
                 "lease_id": lease_id,
-                "owner_id": owner_id,
+                "lease_holder_id": lease_holder_id,
                 "expires_at": time.time() + ttl_seconds,
                 "generation": 0,
                 "request_id": request_id,
@@ -343,7 +357,7 @@ class FilesystemCheckpointComponent(
             grouped: dict[str, list[tuple[CheckpointObjectRef, dict[str, Any]]]] = {}
             for checkpoint_object in request.ordered_candidates:
                 if checkpoint_object.component_id != self.descriptor.component_id:
-                    raise ValueError("cleanup candidate belongs to another backend")
+                    raise ValueError("cleanup candidate belongs to another component")
                 state = self._read_lifecycle(checkpoint_object)
                 self._drop_expired_leases(state)
                 grouped.setdefault(checkpoint_object.version_id, []).append(
@@ -402,7 +416,7 @@ class FilesystemCheckpointComponent(
                 )
             if len(available_versions) < needed:
                 raise CheckpointCleanupBlocked(
-                    f"backend {self.descriptor.component_id!r} checkpoint_object "
+                    f"component {self.descriptor.component_id!r} checkpoint_object "
                     f"{request.checkpoint_object_id!r} has {len(available_versions)} "
                     "cleanable versions "
                     f"but requires {needed}"
@@ -535,14 +549,14 @@ class FilesystemCheckpointComponent(
     async def close(self) -> None:
         if self._runtime is None:
             raise RuntimeError(
-                f"checkpoint backend {self.descriptor.component_id!r} is not open"
+                f"checkpoint component {self.descriptor.component_id!r} is not open"
             )
         await self._close_resources()
         self._runtime = None
         self._root = None
 
     def _select_restore_record(
-        self, publication: ComponentCheckpoint, context: RestoreSession
+        self, publication: CheckpointComponentPublication, context: RestoreSession
     ) -> CheckpointObjectRecord:
         partition_key = f"rank/{context.rank}"
         matches = [
@@ -561,7 +575,7 @@ class FilesystemCheckpointComponent(
         if runtime.role is not CheckpointRuntimeRole.WORKER:
             raise RuntimeError("checkpoint state operation requires worker runtime")
         if context.component_id != self.descriptor.component_id:
-            raise ValueError("checkpoint context belongs to another backend")
+            raise ValueError("checkpoint context belongs to another component")
         return runtime
 
     @staticmethod
@@ -582,7 +596,7 @@ class FilesystemCheckpointComponent(
     def _require_runtime(self) -> CheckpointRuntime:
         if self._runtime is None or self._root is None:
             raise RuntimeError(
-                f"checkpoint backend {self.descriptor.component_id!r} is not open"
+                f"checkpoint component {self.descriptor.component_id!r} is not open"
             )
         return self._runtime
 
@@ -599,7 +613,7 @@ class FilesystemCheckpointComponent(
     def _staging_path(self, context: SaveSession, partition_key: str) -> Path:
         return self._staging_root(context) / quote(partition_key, safe="")
 
-    def _final_backend_root(self, context: SaveSession) -> Path:
+    def _final_component_root(self, context: SaveSession) -> Path:
         root = self._require_root()
         progress = (
             Path("steps") / str(context.cut.logical_step)
@@ -617,13 +631,15 @@ class FilesystemCheckpointComponent(
 
     def _final_path(self, context: SaveSession, partition_key: str) -> Path:
         return (
-            self._final_backend_root(context) / "state" / quote(partition_key, safe="")
+            self._final_component_root(context)
+            / "state"
+            / quote(partition_key, safe="")
         )
 
     def _require_root(self) -> Path:
         if self._root is None:
             raise RuntimeError(
-                f"checkpoint backend {self.descriptor.component_id!r} is not open"
+                f"checkpoint component {self.descriptor.component_id!r} is not open"
             )
         return self._root
 
@@ -640,7 +656,7 @@ class FilesystemCheckpointComponent(
         return root
 
     @contextmanager
-    def _lifecycle_lock(self) -> Iterator[None]:
+    def _lifecycle_lock(self) -> Generator[None, None, None]:
         lock_path = self._lifecycle_root() / ".lock"
         with lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -718,7 +734,7 @@ class FilesystemCheckpointComponent(
         return CheckpointHold(
             lease_id=payload["lease_id"],
             checkpoint_object=checkpoint_object,
-            owner_id=payload["owner_id"],
+            lease_holder_id=payload["lease_holder_id"],
             expires_at=payload["expires_at"],
             generation=payload["generation"],
             request_id=payload["request_id"],
@@ -754,7 +770,7 @@ class FilesystemCheckpointComponent(
         uri = storage_locator.decode("utf-8")
         parsed = urlparse(uri)
         if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
-            raise ValueError(f"filesystem backend cannot access URI: {uri!r}")
+            raise ValueError(f"filesystem component cannot access URI: {uri!r}")
         return Path(unquote(parsed.path))
 
     async def _open_resources(self, runtime: CheckpointRuntime) -> None:
@@ -771,7 +787,7 @@ class FilesystemCheckpointComponent(
     ) -> Any: ...
 
     @abstractmethod
-    async def _finalize_io(self, context: SaveSession) -> None: ...
+    async def _finish_save_io(self, context: SaveSession) -> None: ...
 
     @abstractmethod
     async def _close_resources(self) -> None: ...

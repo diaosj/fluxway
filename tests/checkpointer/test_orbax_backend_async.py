@@ -15,14 +15,14 @@ from fluxway.common.types.checkpoint import (
     CheckpointCut,
     TopologySnapshot,
 )
-from fluxway.control_plane.checkpointer.orbax import (
+from fluxway.control_plane.checkpointer.orbax_component import (
     OrbaxCheckpointComponent,
     _barrier_sync_key,
 )
 
 
 @pytest.mark.asyncio
-async def test_orbax_backend_commits_and_restores_rank_local_state(tmp_path):
+async def test_orbax_component_commits_and_restores_rank_local_state(tmp_path):
     restored: list[dict[str, object]] = []
 
     async def save(module, context):
@@ -46,14 +46,14 @@ async def test_orbax_backend_commits_and_restores_rank_local_state(tmp_path):
         source_topology=topology,
         component_id="orbax",
     )
-    backend = OrbaxCheckpointComponent("orbax", save, restore, layout)
-    await backend.open(
+    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    await component.open(
         CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
     )
-    await backend.start_save(context)
-    prepared = await backend.save(context)
-    await backend.finish_save(context)
-    publication = await backend.commit_save(
+    await component.prepare_save(context)
+    prepared = await component.save(context)
+    await component.finish_save(context)
+    publication = await component.commit_save(
         CommitSaveSession(
             instance=context.instance,
             attempt_id=context.attempt_id,
@@ -67,7 +67,7 @@ async def test_orbax_backend_commits_and_restores_rank_local_state(tmp_path):
             worker_results={0: prepared},
         )
     )
-    await backend.restore(
+    await component.restore(
         RestoreSession(
             instance=None,
             checkpoint_id=context.checkpoint_id,
@@ -80,7 +80,7 @@ async def test_orbax_backend_commits_and_restores_rank_local_state(tmp_path):
             component_checkpoint=publication,
         )
     )
-    await backend.close()
+    await component.close()
 
     np.testing.assert_array_equal(restored[0]["optimizer"], np.array([3]))
 
@@ -140,23 +140,23 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
         )
         for rank in range(2)
     )
-    backends = tuple(
+    components = tuple(
         OrbaxCheckpointComponent("dense", save, restore, layout) for _ in range(2)
     )
-    for rank, backend in enumerate(backends):
-        await backend.open(
+    for rank, component in enumerate(components):
+        await component.open(
             CheckpointRuntime(
                 CheckpointRuntimeRole.WORKER, str(tmp_path), "train", rank
             )
         )
-    await backends[0].start_save(contexts[0])
+    await components[0].prepare_save(contexts[0])
     prepared = await asyncio.gather(
-        *(backend.save(contexts[rank]) for rank, backend in enumerate(backends))
+        *(component.save(contexts[rank]) for rank, component in enumerate(components))
     )
-    for rank, backend in enumerate(backends):
-        await backend.finish_save(contexts[rank])
+    for rank, component in enumerate(components):
+        await component.finish_save(contexts[rank])
     context = contexts[0]
-    publication = await backends[0].commit_save(
+    publication = await components[0].commit_save(
         CommitSaveSession(
             instance=context.instance,
             attempt_id=context.attempt_id,
@@ -178,8 +178,8 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
     shared_checkpoint_objects = publication.shared_records[0].checkpoint_objects
     assert len(shared_checkpoint_objects) == 1
     assert shared_checkpoint_objects[0].partition_key is None
-    for backend in backends:
-        await backend.close()
+    for component in components:
+        await component.close()
 
 
 def test_orbax_barrier_identity_scopes_component_snapshot_and_operation():

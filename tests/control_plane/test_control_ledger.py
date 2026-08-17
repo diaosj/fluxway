@@ -9,9 +9,10 @@ import pytest
 from fluxway.control_plane.control_ledger import ControlLedger
 from fluxway.control_plane.components import driver_component_id
 from fluxway.control_plane.controller import ControllerActor
-from fluxway.control_plane.ledger_client import ControlRecord
+from fluxway.control_plane.ledger_client import ControlRecord, ControlStreamExhausted
 from fluxway.control_plane.ledger_client import ControlLedgerClient
 from fluxway.common.types.checkpoint import SpmdCheckpoint, TopologySnapshot
+from fluxway.common.types import DrainBoundary
 
 
 CONTROLLER_CLASS = ControllerActor.__ray_metadata__.modified_class  # type: ignore[attr-defined]
@@ -75,7 +76,7 @@ async def test_receive_waits_for_append_without_polling() -> None:
 
 
 @pytest.mark.asyncio
-async def test_seal_checkpoints_boundary_without_waking_waiting_receiver() -> None:
+async def test_seal_wakes_receiver_at_exclusive_boundary_with_eof() -> None:
     ledger = ControlLedger(1)
     waiting = asyncio.create_task(ledger.receive("stream", 0))
     await asyncio.sleep(0)
@@ -83,14 +84,11 @@ async def test_seal_checkpoints_boundary_without_waking_waiting_receiver() -> No
     await ledger.seal("stream")
     await asyncio.sleep(0)
 
-    assert not waiting.done()
+    with pytest.raises(ControlStreamExhausted):
+        await waiting
     assert ledger.checkpoint_state(cuts={"stream": 0})["sealed_ends"] == {"stream": 0}
     state = ledger.checkpoint_state(cuts={"stream": 0})
     await ledger.commit_checkpoint(state)
-    await asyncio.sleep(0)
-    assert not waiting.done()
-    waiting.cancel()
-    await asyncio.gather(waiting, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -267,7 +265,12 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
     await ledger.receive(stream_b, 0)
     await ledger.receive(stream_b, 1)
 
-    source_spec = SimpleNamespace(source=object())
+    source_spec = SimpleNamespace(
+        source=object(),
+        has_source_descriptor=True,
+        is_source=True,
+        is_interleaved=False,
+    )
     views = {
         spmd_id: SimpleNamespace(
             operator_ids=("read",),
@@ -283,7 +286,7 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
     controller._graph = SimpleNamespace(require_compiled_graph=lambda: compiled)
     controller._control_ledger = ledger
     controller._control_plane_components = SimpleNamespace(checkpoint_state=lambda: {})
-    controller._last_checkpointed_step = 0
+    controller._drain_boundary = DrainBoundary()
     payload = {
         "source_a": SpmdCheckpoint(
             TopologySnapshot(1, (), (), "v1"),
@@ -308,7 +311,7 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
     "state",
     (
         {"control_ledger": {}},
-        {"components": {}, "last_checkpointed_step": 0},
+        {"components": {}, "drain_boundary": DrainBoundary().to_dict()},
         {"control_ledger": {}, "components": {}},
     ),
 )

@@ -17,12 +17,11 @@ import msgpack
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
-    ComponentCheckpoint,
+    CheckpointComponentPublication,
     CheckpointObjectRecord,
     CheckpointCut,
     CheckpointCommitPermit,
     CheckpointReference,
-    CheckpointTransactionState,
     NameReference,
     PendingCleanup,
     PartitionRecord,
@@ -156,7 +155,7 @@ def _decode_record(payload: Mapping[str, Any]) -> CheckpointObjectRecord:
     )
 
 
-def _encode_publication(publication: ComponentCheckpoint) -> dict[str, Any]:
+def _encode_publication(publication: CheckpointComponentPublication) -> dict[str, Any]:
     return {
         "component_id": publication.component_id,
         "format_version": publication.format_version,
@@ -174,8 +173,8 @@ def _encode_publication(publication: ComponentCheckpoint) -> dict[str, Any]:
     }
 
 
-def _decode_publication(payload: Mapping[str, Any]) -> ComponentCheckpoint:
-    return ComponentCheckpoint(
+def _decode_publication(payload: Mapping[str, Any]) -> CheckpointComponentPublication:
+    return CheckpointComponentPublication(
         component_id=payload["component_id"],
         format_version=payload["format_version"],
         shared_records=tuple(
@@ -199,7 +198,7 @@ def _encode_reference(reference: CheckpointReference) -> dict[str, Any]:
         return {
             "kind": "name",
             "name": reference.name,
-            "keep_forever": reference.keep_forever,
+            "retain_forever": reference.retain_forever,
         }
     if isinstance(reference, CheckpointIdReference):
         return {"kind": "snapshot", "checkpoint_id": reference.checkpoint_id}
@@ -211,7 +210,7 @@ def _decode_reference(payload: Mapping[str, Any]) -> CheckpointReference:
     if kind == "step":
         return StepReference(payload["step"])
     if kind == "name":
-        return NameReference(payload["name"], payload["keep_forever"])
+        return NameReference(payload["name"], payload["retain_forever"])
     if kind == "snapshot":
         return CheckpointIdReference(payload["checkpoint_id"])
     raise ValueError(f"unsupported checkpoint reference kind: {kind!r}")
@@ -298,13 +297,11 @@ class CheckpointRepository:
         self._root = CheckpointDirectory.open(root_dir).path
         self._manifests = self._root / "manifests"
         self._references = self._root / "refs"
-        self._transactions = self._root / "transactions"
         self._cleaned_up = self._root / "cleaned_up"
         self._pending_cleanups = self._root / "pending-cleanups"
         self._manifests.mkdir(exist_ok=True)
         (self._references / "steps").mkdir(parents=True, exist_ok=True)
         (self._references / "names").mkdir(parents=True, exist_ok=True)
-        self._transactions.mkdir(exist_ok=True)
         self._cleaned_up.mkdir(exist_ok=True)
         self._pending_cleanups.mkdir(exist_ok=True)
         self._lock_path = self._root / ".repository.lock"
@@ -411,21 +408,11 @@ class CheckpointRepository:
                 path: path.read_bytes() if path.exists() else None
                 for path in reference_paths
             }
-            transaction_path = self._transactions / f"{manifest.checkpoint_id}.state"
-            previous_transaction = (
-                transaction_path.read_bytes() if transaction_path.exists() else None
-            )
             written_pending: list[Path] = []
             try:
                 self._atomic_write(final_path, encoded)
                 for path in reference_paths:
                     self._atomic_write(path, manifest.checkpoint_id.encode("utf-8"))
-                self._write_transaction_state_unlocked(
-                    manifest.checkpoint_id,
-                    CheckpointTransactionState.RECLAIM_PENDING
-                    if pending_cleanups
-                    else CheckpointTransactionState.PUBLISHED,
-                )
                 for pending, path in zip(pending_cleanups, pending_paths, strict=True):
                     self._atomic_write(
                         path,
@@ -443,10 +430,6 @@ class CheckpointRepository:
                         path.unlink(missing_ok=True)
                     else:
                         self._atomic_write(path, content)
-                if previous_transaction is None:
-                    transaction_path.unlink(missing_ok=True)
-                else:
-                    self._atomic_write(transaction_path, previous_transaction)
                 for path in written_pending:
                     path.unlink(missing_ok=True)
                 manifest_dir.rmdir()
@@ -593,44 +576,6 @@ class CheckpointRepository:
             if _decode_pending_cleanup(payload) != pending:
                 raise ValueError(f"pending cleanup index conflicts with {path}")
             path.unlink()
-            try:
-                if not self._pending_cleanups_for_snapshot_unlocked(
-                    pending.checkpoint_id
-                ):
-                    self._write_transaction_state_unlocked(
-                        pending.checkpoint_id, CheckpointTransactionState.PUBLISHED
-                    )
-            except BaseException as primary_error:
-                try:
-                    self._atomic_write(path, encoded)
-                except BaseException as rollback_error:
-                    raise BaseExceptionGroup(
-                        "pending cleanup completion and rollback failed",
-                        [primary_error, rollback_error],
-                    ) from None
-                raise
-
-    def write_transaction_state(
-        self, checkpoint_id: str, state: CheckpointTransactionState
-    ) -> None:
-        with self._locked():
-            self._write_transaction_state_unlocked(checkpoint_id, state)
-
-    def read_transaction_state(
-        self, checkpoint_id: str
-    ) -> CheckpointTransactionState | None:
-        path = self._transactions / f"{checkpoint_id}.state"
-        if not path.exists():
-            return None
-        return CheckpointTransactionState(path.read_text(encoding="ascii"))
-
-    def _write_transaction_state_unlocked(
-        self, checkpoint_id: str, state: CheckpointTransactionState
-    ) -> None:
-        self._atomic_write(
-            self._transactions / f"{checkpoint_id}.state",
-            state.value.encode("ascii"),
-        )
 
     def _reference_paths(
         self, references: tuple[CheckpointReference, ...]

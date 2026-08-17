@@ -23,10 +23,6 @@ class CheckpointObjectCleanedUpError(CheckpointError):
     pass
 
 
-class EagerCheckpointUnsupportedError(CheckpointError):
-    pass
-
-
 class LeaseConflictError(CheckpointError):
     pass
 
@@ -55,34 +51,23 @@ class CheckpointRuntimeRole(StrEnum):
     WORKER = "worker"
 
 
-class CheckpointCapability(StrEnum):
-    PERSISTENCE = "persistence"
-    LIFECYCLE = "lifecycle"
-    RETENTION = "keep"
-    RECLAIMER = "cleaner"
+class CheckpointComponentCapability(StrEnum):
+    COMPONENT_LIFECYCLE = "component_lifecycle"
+    SAVE = "save"
+    RESTORE = "restore"
+    OBJECT_LIFECYCLE = "object_lifecycle"
+    OBJECT_CLEANUP = "object_cleanup"
 
 
-class CheckpointCaptureMode(StrEnum):
-    FENCED = "fenced"
-    EAGER = "eager"
-
-
-class CheckpointTransactionState(StrEnum):
-    CUT_CREATED = "cut_created"
-    CAPTURING = "capturing"
-    CAPTURED = "captured"
-    FINALIZED = "finalized"
+class CheckpointSaveState(StrEnum):
+    PREPARED = "prepared"
+    SAVING = "saving"
+    SAVED = "saved"
+    FINISHED = "finished"
     COMMITTED = "committed"
-    PUBLISHED = "published"
-    RECLAIM_PENDING = "cleanup_pending"
 
 
-class PrepareScope(StrEnum):
-    LEADER = "leader"
-    ALL_RANKS = "all_ranks"
-
-
-class CommitScope(StrEnum):
+class CheckpointSaveScope(StrEnum):
     LEADER = "leader"
     ALL_RANKS = "all_ranks"
 
@@ -222,21 +207,34 @@ class CheckpointObjectRef:
 
 
 @dataclass(frozen=True, slots=True)
-class KeepPolicy:
-    keep_last: int | None = None
-    keep_forever: bool = False
+class CheckpointRetentionPolicy:
+    retain_last: int | None = None
+    retain_forever: bool = False
 
     def __post_init__(self) -> None:
-        if self.keep_last is not None and self.keep_last <= 0:
-            raise ValueError("keep_last must be positive or None")
-        if self.keep_forever and self.keep_last is not None:
-            raise ValueError("keep_forever keep cannot define keep_last")
+        if self.retain_last is not None and self.retain_last <= 0:
+            raise ValueError("retain_last must be positive or None")
+        if self.retain_forever and self.retain_last is not None:
+            raise ValueError("retain_forever cannot define retain_last")
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointSaveSpec:
+    prepare_scope: CheckpointSaveScope = CheckpointSaveScope.LEADER
+    commit_scope: CheckpointSaveScope = CheckpointSaveScope.LEADER
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointRestoreSpec:
+    topology: RestoreTopologyMode = RestoreTopologyMode.EXACT_TOPOLOGY
 
 
 @dataclass(frozen=True, slots=True)
 class CheckpointObjectSpec:
     checkpoint_object_id: str = "state"
-    keep: KeepPolicy = field(default_factory=KeepPolicy)
+    retention: CheckpointRetentionPolicy = field(
+        default_factory=CheckpointRetentionPolicy
+    )
     required_for_restore: bool = True
     cleanup_group: str | None = None
 
@@ -248,33 +246,38 @@ class CheckpointObjectSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class ComponentSpec:
+class CheckpointComponentSpec:
     component_id: str
     format_version: int = 1
-    prepare_scope: PrepareScope = PrepareScope.LEADER
-    commit_scope: CommitScope = CommitScope.LEADER
-    restore_topology: RestoreTopologyMode = RestoreTopologyMode.EXACT_TOPOLOGY
-    capabilities: frozenset[CheckpointCapability] = frozenset(
-        {CheckpointCapability.PERSISTENCE, CheckpointCapability.LIFECYCLE}
-    )
-    checkpoint_objects: tuple[CheckpointObjectSpec, ...] = field(
-        default_factory=lambda: (CheckpointObjectSpec(),)
-    )
-    supports_eager_capture: bool = False
+    save: CheckpointSaveSpec | None = None
+    restore: CheckpointRestoreSpec | None = None
+    checkpoint_objects: tuple[CheckpointObjectSpec, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.component_id:
             raise ValueError("checkpoint component requires component_id")
         if self.format_version <= 0:
-            raise ValueError("backend format_version must be positive")
+            raise ValueError("component format_version must be positive")
         checkpoint_object_ids = [
             checkpoint_object.checkpoint_object_id
             for checkpoint_object in self.checkpoint_objects
         ]
         if len(checkpoint_object_ids) != len(set(checkpoint_object_ids)):
-            raise ValueError("checkpoint backend checkpoint_object IDs must be unique")
-        if CheckpointCapability.PERSISTENCE not in self.capabilities:
-            raise ValueError("checkpoint backend descriptor requires persistence")
+            raise ValueError(
+                "checkpoint component checkpoint_object IDs must be unique"
+            )
+        if self.checkpoint_objects and self.save is None and self.restore is None:
+            raise ValueError("checkpoint objects require save or restore capability")
+        if (
+            any(
+                checkpoint_object.required_for_restore
+                for checkpoint_object in self.checkpoint_objects
+            )
+            and self.restore is None
+        ):
+            raise ValueError(
+                "checkpoint objects required for restore require restore capability"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,8 +345,8 @@ class SaveSession:
 
     def component_checkpoint(
         self, objects: tuple[CheckpointObjectRef, ...]
-    ) -> ComponentCheckpoint:
-        return ComponentCheckpoint(
+    ) -> CheckpointComponentPublication:
+        return CheckpointComponentPublication(
             component_id=self.component_id,
             format_version=self.format_version,
             shared_records=(CheckpointObjectRecord(checkpoint_objects=objects),),
@@ -372,7 +375,7 @@ class RestoreSession:
     saved_topology: TopologySnapshot
     restore_topology: TopologySnapshot
     component_id: str
-    component_checkpoint: ComponentCheckpoint
+    component_checkpoint: CheckpointComponentPublication
     format_version: int = 1
 
     def __post_init__(self) -> None:
@@ -409,9 +412,9 @@ class CheckpointRuntime:
 
     def __post_init__(self) -> None:
         if not self.repository_root or not self.spmd_id:
-            raise ValueError("backend runtime requires repository root and SPMD ID")
+            raise ValueError("component runtime requires repository root and SPMD ID")
         if self.role is CheckpointRuntimeRole.WORKER and self.rank is None:
-            raise ValueError("worker backend runtime requires rank")
+            raise ValueError("worker component runtime requires rank")
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,7 +424,7 @@ class CheckpointObjectRecord:
 
     def __post_init__(self) -> None:
         if not isinstance(self.payload, bytes):
-            raise TypeError("backend record payload must be opaque bytes")
+            raise TypeError("component record payload must be opaque bytes")
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,7 +451,7 @@ class PartitionRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class ComponentCheckpoint:
+class CheckpointComponentPublication:
     component_id: str
     format_version: int
     shared_records: tuple[CheckpointObjectRecord, ...] = ()
@@ -458,10 +461,10 @@ class ComponentCheckpoint:
         if not self.component_id:
             raise ValueError("component publication requires component_id")
         if self.format_version <= 0:
-            raise ValueError("backend publication format_version must be positive")
+            raise ValueError("component publication format_version must be positive")
         keys = [partition.partition_key for partition in self.partitions]
         if len(keys) != len(set(keys)):
-            raise ValueError("backend publication partition keys must be unique")
+            raise ValueError("component publication partition keys must be unique")
         records = (
             *self.shared_records,
             *(partition.record for partition in self.partitions),
@@ -492,7 +495,7 @@ class ComponentCheckpoint:
 class SpmdCheckpoint:
     source_topology: TopologySnapshot
     runtime_state: Mapping[str, Any]
-    components: Mapping[str, ComponentCheckpoint]
+    components: Mapping[str, CheckpointComponentPublication]
 
     def __post_init__(self) -> None:
         if any(
@@ -514,7 +517,7 @@ class StepReference:
 @dataclass(frozen=True, slots=True)
 class NameReference:
     name: str
-    keep_forever: bool = True
+    retain_forever: bool = True
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -577,7 +580,6 @@ class SaveCheckpointRequest:
     attempt_id: str
     cut: CheckpointCut
     references: tuple[CheckpointReference, ...]
-    capture_mode: CheckpointCaptureMode = CheckpointCaptureMode.FENCED
 
     def __post_init__(self) -> None:
         if not self.attempt_id:
@@ -616,7 +618,6 @@ class SaveCheckpointRequest:
         step: int,
         *,
         names: tuple[str, ...] = (),
-        capture_mode: CheckpointCaptureMode = CheckpointCaptureMode.FENCED,
     ) -> SaveCheckpointRequest:
         attempt_id = uuid.uuid4().hex
         references: tuple[CheckpointReference, ...] = (
@@ -627,7 +628,6 @@ class SaveCheckpointRequest:
             attempt_id=attempt_id,
             cut=CheckpointCut.for_step(uuid.uuid4().hex, step),
             references=references,
-            capture_mode=capture_mode,
         )
 
 
@@ -635,7 +635,7 @@ class SaveCheckpointRequest:
 class CheckpointHold:
     lease_id: str
     checkpoint_object: CheckpointObjectRef
-    owner_id: str
+    lease_holder_id: str
     expires_at: float
     generation: int
     request_id: str
@@ -678,7 +678,7 @@ class CleanupReservationRequest:
         if not self.checkpoint_object_id:
             raise ValueError("cleanup reservation requires checkpoint_object")
         if self.required_count < 0:
-            raise ValueError("keep required_count must be non-negative")
+            raise ValueError("retention required_count must be non-negative")
 
 
 @dataclass(frozen=True, slots=True)

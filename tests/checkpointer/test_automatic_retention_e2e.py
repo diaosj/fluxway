@@ -6,21 +6,22 @@ import pytest
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectCleanedUpError,
-    CheckpointTransactionState,
     CheckpointAssembly,
     SaveCheckpointRequest,
     SpmdCheckpoint,
     StepReference,
     TopologySnapshot,
-    KeepPolicy,
+    CheckpointRetentionPolicy,
 )
-from fluxway.control_plane.checkpointer.backend import (
+from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
-    CheckpointObjectCleaner,
+    CheckpointObjectCleanup,
 )
 from fluxway.control_plane.checkpointer.checkpoint import FluxwayCheckpointer
-from fluxway.control_plane.checkpointer.pickle_backend import PickleCheckpointComponent
+from fluxway.control_plane.checkpointer.pickle_component import (
+    PickleCheckpointComponent,
+)
 from fluxway.spmd.worker.checkpoint import WorkerCheckpointCoordinator
 
 
@@ -29,8 +30,8 @@ class _Owner:
         self.state = {"value": 1}
 
 
-class _FailOnceCleanuper(CheckpointObjectCleaner):
-    def __init__(self, delegate: CheckpointObjectCleaner) -> None:
+class _FailOnceCleanuper(CheckpointObjectCleanup):
+    def __init__(self, delegate: CheckpointObjectCleanup) -> None:
         self._delegate = delegate
         self._remaining_failures = 1
 
@@ -41,12 +42,12 @@ class _FailOnceCleanuper(CheckpointObjectCleaner):
         await self._delegate.cleanup(reservation)
 
 
-def _backend(keep_last: int = 1) -> PickleCheckpointComponent:
+def _component(retain_last: int = 1) -> PickleCheckpointComponent:
     return PickleCheckpointComponent(
         "model",
         lambda owner, context: owner.state,
         lambda owner, state, context: setattr(owner, "state", state),
-        keep=KeepPolicy(keep_last=keep_last),
+        retention=CheckpointRetentionPolicy(retain_last=retain_last),
     )
 
 
@@ -63,19 +64,16 @@ class _Controller:
         permit,
         cut,
         repository_dir,
-        capture_mode,
     ):
         coordinator = WorkerCheckpointCoordinator(
-            (_backend().registration(),),
+            (_component().registration(),),
             self.owner,
             repository_dir,
             "train",
             0,
             self.topology,
         )
-        await coordinator.start_save(
-            checkpoint_id, attempt_id, permit, cut, capture_mode
-        )
+        await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
         record = (await coordinator.save())["model"]
         await coordinator.finish_save()
         components = await coordinator.commit_save({"model": {0: record}})
@@ -92,18 +90,18 @@ class _Controller:
             },
         )
 
-    async def mark_snapshot_published(self, checkpoint_id, permit):
+    async def publish_snapshot(self, checkpoint_id, permit):
         coordinator = self._active.pop(checkpoint_id)
-        await coordinator.mark_available()
+        await coordinator.publish_save()
         await coordinator.close()
 
-    async def abort_snapshot_checkpoint_objects(self, checkpoint_id, permit):
+    async def rollback_snapshot(self, checkpoint_id, permit):
         coordinator = self._active.pop(checkpoint_id, None)
         if coordinator is not None:
             await coordinator.rollback_active()
             await coordinator.close()
 
-    async def finalize_snapshot(self, step, framework_state):
+    async def commit_checkpoint_state(self, step, framework_state):
         return None
 
     async def restore_snapshot(self, checkpoint_id, manifest, repository_dir):
@@ -123,11 +121,10 @@ class _MultiRankController:
         permit,
         cut,
         repository_dir,
-        capture_mode,
     ):
         coordinators = tuple(
             WorkerCheckpointCoordinator(
-                (_backend().registration(),),
+                (_component().registration(),),
                 owner,
                 repository_dir,
                 "train",
@@ -137,10 +134,8 @@ class _MultiRankController:
             for rank, owner in enumerate(self.owners)
         )
         for coordinator in coordinators:
-            await coordinator.start_save(
-                checkpoint_id, attempt_id, permit, cut, capture_mode
-            )
-        captured = await asyncio.gather(
+            await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
+        save_results = await asyncio.gather(
             *(coordinator.save() for coordinator in coordinators)
         )
         await asyncio.gather(
@@ -148,8 +143,8 @@ class _MultiRankController:
         )
         gathered = {
             "model": {
-                rank: rank_capture["model"]
-                for rank, rank_capture in enumerate(captured)
+                rank: rank_results["model"]
+                for rank, rank_results in enumerate(save_results)
             }
         }
         publications = await asyncio.gather(
@@ -168,21 +163,21 @@ class _MultiRankController:
             },
         )
 
-    async def mark_snapshot_published(self, checkpoint_id, permit):
+    async def publish_snapshot(self, checkpoint_id, permit):
         coordinators = self._active.pop(checkpoint_id)
         await asyncio.gather(
-            *(coordinator.mark_available() for coordinator in coordinators)
+            *(coordinator.publish_save() for coordinator in coordinators)
         )
         await asyncio.gather(*(coordinator.close() for coordinator in coordinators))
 
-    async def abort_snapshot_checkpoint_objects(self, checkpoint_id, permit):
+    async def rollback_snapshot(self, checkpoint_id, permit):
         coordinators = self._active.pop(checkpoint_id, ())
         await asyncio.gather(
             *(coordinator.rollback_active() for coordinator in coordinators)
         )
         await asyncio.gather(*(coordinator.close() for coordinator in coordinators))
 
-    async def finalize_snapshot(self, step, framework_state):
+    async def commit_checkpoint_state(self, step, framework_state):
         return None
 
 
@@ -216,19 +211,19 @@ def _checkpoint_object_paths(manifest) -> tuple[Path, ...]:
 
 
 @pytest.mark.asyncio
-async def test_keep_last_automatically_cleanups_old_physical_checkpoint_object(
+async def test_retain_last_automatically_cleanups_old_physical_checkpoint_object(
     tmp_path,
 ):
     topology = TopologySnapshot(1, (), (), "v1")
     owner = _Owner()
     controller = _Controller(owner, topology)
-    control_backend = _backend()
+    control_component = _component()
     checkpointer = FluxwayCheckpointer(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
         component_registries={
-            "train": CheckpointComponentRegistry((control_backend.registration(),))
+            "train": CheckpointComponentRegistry((control_component.registration(),))
         },
     )
 
@@ -246,19 +241,19 @@ async def test_keep_last_automatically_cleanups_old_physical_checkpoint_object(
 
 
 @pytest.mark.asyncio
-async def test_keep_last_counts_checkpoint_object_versions_instead_of_rank_checkpoint_objects(
+async def test_retain_last_counts_checkpoint_object_versions_instead_of_rank_checkpoint_objects(
     tmp_path,
 ):
     topology = TopologySnapshot(2, ("data",), (2,), "v1")
     owners = (_Owner(), _Owner())
     controller = _MultiRankController(owners, topology)
-    control_backend = _backend()
+    control_component = _component()
     checkpointer = FluxwayCheckpointer(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
         component_registries={
-            "train": CheckpointComponentRegistry((control_backend.registration(),))
+            "train": CheckpointComponentRegistry((control_component.registration(),))
         },
     )
 
@@ -282,13 +277,13 @@ async def test_multirank_reservation_write_failure_rolls_back_every_claim(
     topology = TopologySnapshot(2, ("data",), (2,), "v1")
     owners = (_Owner(), _Owner())
     controller = _MultiRankController(owners, topology)
-    control_backend = _backend()
+    control_component = _component()
     checkpointer = FluxwayCheckpointer(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
         component_registries={
-            "train": CheckpointComponentRegistry((control_backend.registration(),))
+            "train": CheckpointComponentRegistry((control_component.registration(),))
         },
     )
     first = await checkpointer.save(SaveCheckpointRequest.for_step(1))
@@ -296,7 +291,7 @@ async def test_multirank_reservation_write_failure_rolls_back_every_claim(
         partition.record.checkpoint_objects[0]
         for partition in first.spmds["train"].components["model"].partitions
     )
-    original_write = control_backend._write_lifecycle
+    original_write = control_component._write_lifecycle
     reservation_writes = 0
 
     def fail_second_reservation_write(checkpoint_object, state):
@@ -309,7 +304,7 @@ async def test_multirank_reservation_write_failure_rolls_back_every_claim(
         original_write(checkpoint_object, state)
 
     monkeypatch.setattr(
-        control_backend, "_write_lifecycle", fail_second_reservation_write
+        control_component, "_write_lifecycle", fail_second_reservation_write
     )
     with pytest.raises(OSError, match="injected lifecycle write failure"):
         await checkpointer.save(SaveCheckpointRequest.for_step(2))
@@ -331,14 +326,16 @@ async def test_failed_cleanup_is_automatically_repaired_before_next_save(tmp_pat
     topology = TopologySnapshot(2, ("data",), (2,), "v1")
     owners = (_Owner(), _Owner())
     controller = _MultiRankController(owners, topology)
-    control_backend = _backend()
-    registration = control_backend.registration()
-    fail_once = _FailOnceCleanuper(control_backend)
+    control_component = _component()
+    registration = control_component.registration()
+    fail_once = _FailOnceCleanuper(control_component)
     control_registration = CheckpointComponentRegistration(
-        descriptor=registration.descriptor,
         component=registration.component,
+        component_lifecycle=registration.component_lifecycle,
+        save=registration.save,
+        restore=registration.restore,
         object_lifecycle=registration.object_lifecycle,
-        cleaner=fail_once,
+        object_cleanup=fail_once,
     )
     checkpointer = FluxwayCheckpointer(
         controller,
@@ -357,9 +354,6 @@ async def test_failed_cleanup_is_automatically_repaired_before_next_save(tmp_pat
         await checkpointer.save(SaveCheckpointRequest.for_step(2))
     second = checkpointer.latest()
     assert second is not None
-    assert checkpointer.repository.read_transaction_state(second.checkpoint_id) is (
-        CheckpointTransactionState.RECLAIM_PENDING
-    )
     assert len(checkpointer.repository.list_pending_cleanups()) == 1
     assert all(path.is_dir() for path in first_paths)
     second_paths = _checkpoint_object_paths(second)
@@ -368,19 +362,16 @@ async def test_failed_cleanup_is_automatically_repaired_before_next_save(tmp_pat
     for owner in owners:
         owner.state = {"value": 3}
     next_controller = _MultiRankController(owners, topology)
-    next_backend = _backend()
+    next_component = _component()
     next_checkpointer = FluxwayCheckpointer(
         next_controller,
         str(tmp_path / "repository"),
         interval_steps=1,
         component_registries={
-            "train": CheckpointComponentRegistry((next_backend.registration(),))
+            "train": CheckpointComponentRegistry((next_component.registration(),))
         },
     )
     third = await next_checkpointer.save(SaveCheckpointRequest.for_step(3))
-    assert next_checkpointer.repository.read_transaction_state(
-        second.checkpoint_id
-    ) is (CheckpointTransactionState.PUBLISHED)
     assert next_checkpointer.repository.list_pending_cleanups() == ()
     assert all(not path.exists() for path in first_paths)
     assert all(not path.exists() for path in second_paths)

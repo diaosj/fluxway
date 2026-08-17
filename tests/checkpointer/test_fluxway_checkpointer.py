@@ -35,9 +35,9 @@ async def test_save_publishes_manifest_then_finalizes_framework_state(tmp_path):
     controller.request_snapshot = AsyncMock(
         return_value=CheckpointAssembly(cut, {}, {})
     )
-    controller.mark_snapshot_published = AsyncMock()
-    controller.finalize_snapshot = AsyncMock()
-    controller.abort_snapshot_checkpoint_objects = AsyncMock()
+    controller.publish_snapshot = AsyncMock()
+    controller.commit_checkpoint_state = AsyncMock()
+    controller.rollback_snapshot = AsyncMock()
     checkpointer = FluxwayCheckpointer(
         controller, str(tmp_path / "repository"), interval_steps=1
     )
@@ -49,7 +49,7 @@ async def test_save_publishes_manifest_then_finalizes_framework_state(tmp_path):
     )
 
     assert checkpointer.repository.resolve(StepReference(4)) == manifest
-    published_snapshot, permit = controller.mark_snapshot_published.await_args.args
+    published_snapshot, permit = controller.publish_snapshot.await_args.args
     assert published_snapshot == manifest.checkpoint_id
     assert permit.attempt_id == "attempt"
-    controller.finalize_snapshot.assert_awaited_once_with(4, {})
+    controller.commit_checkpoint_state.assert_awaited_once_with(4, {})

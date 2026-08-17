@@ -877,6 +877,8 @@ def spmd(
     mesh_axis_names: tuple[str, ...] | None = None,
     mesh_axis_shapes: tuple[int, ...] | None = None,
     checkpoint_components: tuple[Any, ...] = (),
+    heartbeat_interval_s: float = 5.0,
+    heartbeat_timeout_s: float = 90.0,
 ):
     """
     Configure a class for SPMD distributed execution.
@@ -907,21 +909,21 @@ def spmd(
 
     if not isinstance(checkpoint_components, tuple):
         raise TypeError("checkpoint_components must be a tuple")
-    from fluxway.control_plane.checkpointer.backend import (
+    from fluxway.control_plane.checkpointer.component import (
         CheckpointComponentRegistration,
     )
 
-    invalid_backends = [
-        backend
-        for backend in checkpoint_components
-        if not isinstance(backend, CheckpointComponentRegistration)
+    invalid_components = [
+        component
+        for component in checkpoint_components
+        if not isinstance(component, CheckpointComponentRegistration)
     ]
-    if invalid_backends:
+    if invalid_components:
         raise TypeError(
             "checkpoint_components must contain CheckpointComponentRegistration instances"
         )
     component_ids = [
-        backend.descriptor.component_id for backend in checkpoint_components
+        component.descriptor.component_id for component in checkpoint_components
     ]
     if len(component_ids) != len(set(component_ids)):
         raise ValueError("checkpoint_components must have unique component IDs")
@@ -1004,6 +1006,8 @@ def spmd(
                 runtime_env=c._runtime_env,
                 driver_runtime_env=c._driver_runtime_env,
                 checkpoint_components=c._checkpoint_components,
+                heartbeat_interval_s=heartbeat_interval_s,
+                heartbeat_timeout_s=heartbeat_timeout_s,
             )
 
         cls.get_spmd_config = classmethod(get_spmd_config)  # type: ignore
@@ -1021,6 +1025,8 @@ def spmd_source(
     runtime_env: dict[str, Any] | None = None,
     driver_runtime_env: dict[str, Any] | None = None,
     checkpoint_components: tuple[Any, ...] = (),
+    heartbeat_interval_s: float = 5.0,
+    heartbeat_timeout_s: float = 90.0,
 ):
     """
     Configure a class as an SPMD source.
@@ -1033,6 +1039,8 @@ def spmd_source(
         runtime_env=runtime_env,
         driver_runtime_env=driver_runtime_env,
         checkpoint_components=checkpoint_components,
+        heartbeat_interval_s=heartbeat_interval_s,
+        heartbeat_timeout_s=heartbeat_timeout_s,
     )
 
     def decorator(cls):

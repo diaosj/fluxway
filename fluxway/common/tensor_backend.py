@@ -281,6 +281,10 @@ class TensorBackend(ABC):
         )
 
     def readonly_view(self, value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            view = value.view()
+            view.flags.writeable = False
+            return view
         raise CoherenceStateTransitionError(
             f"backend {self.name()!r} cannot enforce readonly access for "
             f"{type(value).__name__}."
@@ -1701,6 +1705,8 @@ class HybridBackend(TensorBackend):
             readonly = value.view()
             readonly.flags.writeable = False
             return readonly
+        if self._cp is not None and isinstance(value, self._cp.ndarray):
+            return value
         return super().readonly_view(value)
 
     def adopt(self, x: Any) -> Any:

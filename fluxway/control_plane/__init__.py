@@ -19,7 +19,12 @@ from .components import (
     DriverComponentContext,
     DriverComponentRegistry,
 )
-from .ledger_client import ControlLedgerClient, ControlRecord, StreamProgress
+from .ledger_client import (
+    ControlLedgerClient,
+    ControlRecord,
+    ControlStreamExhausted,
+    StreamProgress,
+)
 from .execution import start, GraphExecution
 from .checkpointer import (
     CheckpointComponentRegistration,
@@ -50,6 +55,7 @@ __all__ = [
     "DriverComponentRegistry",
     "ControlLedgerClient",
     "ControlRecord",
+    "ControlStreamExhausted",
     "StreamProgress",
     "start",
     "GraphExecution",

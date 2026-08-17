@@ -6,6 +6,7 @@ import pytest
 
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.tensor_backend import set_backend
+from fluxway.common.coherence import CoherenceInstance, CoherenceSubject
 from fluxway.common.types.sharding import ShardingConfig
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.transport.communication import AsyncDataDistributor
@@ -24,6 +25,9 @@ def test_scalar_replication_self_delivery_uses_frame_abi():
     target_spec = ShardingConfig(type="static", axis=[]).to_spec().bind(mesh)
     scalar = TransportTensor.from_tensor(jnp.array(42.0), global_shape=())
     scalar.source_step = 1
+    scalar._bind_coherence_instances(
+        (CoherenceInstance(CoherenceSubject(9, 0, 20), 1),)
+    )
 
     async def capture_for_rank(rank):
         captured = {}

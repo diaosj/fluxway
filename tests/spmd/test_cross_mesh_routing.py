@@ -35,6 +35,7 @@ from fluxway.common.compiled_graph import (
 from fluxway.common.types.sharding import AlgebraicRouting, ChunkPartition
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
+from fluxway.common.coherence import CoherenceInstance, CoherenceSubject
 from fluxway.transport.manifest import (
     ENTRY_GLOBAL_SHAPE_BEGIN,
     ENTRY_GLOBAL_SHAPE_COUNT,
@@ -58,7 +59,7 @@ def make_tt(
     global_shape=None,
     source_step: int = 0,
 ) -> TransportTensor:
-    return TransportTensor(
+    tensor = TransportTensor(
         jnp.array(values, dtype=jnp.float32),
         origin_indices=(
             jnp.array(origin_indices, dtype=jnp.int32)
@@ -74,6 +75,10 @@ def make_tt(
         global_shape=global_shape,
         source_step=source_step,
     )
+    tensor._bind_coherence_instances(
+        (CoherenceInstance(CoherenceSubject(1, 0, 1), source_step),)
+    )
+    return tensor
 
 
 def make_receipt(sender_ranks, remote_indices, world_size=4) -> SymmetryReceipt:
@@ -687,6 +692,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
             global_shape=global_shape,
             source_step=0,
         )
+        tt._bind_coherence_instances(
+            (CoherenceInstance(CoherenceSubject(1, 0, 79), 0),)
+        )
         distributor = AsyncDataDistributor(local_rank=0)
 
         async def mock_send(*args, **kwargs):
@@ -712,6 +720,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
             jnp.ones((4, 1), dtype=jnp.float32),
             global_shape=(4, 1),
             source_step=0,
+        )
+        tt._bind_coherence_instances(
+            (CoherenceInstance(CoherenceSubject(1, 0, 79), 0),)
         )
         import asyncio
         from fluxway.transport.communication import AsyncDataDistributor
@@ -743,6 +754,9 @@ class TestStaticToStaticCoverageValidation(unittest.TestCase):
             jnp.ones((6, 1), dtype=jnp.float32),
             global_shape=(6, 1),
             source_step=0,
+        )
+        tt._bind_coherence_instances(
+            (CoherenceInstance(CoherenceSubject(1, 0, 80), 0),)
         )
         import asyncio
         from fluxway.transport.communication import AsyncDataDistributor

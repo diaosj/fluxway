@@ -11,16 +11,13 @@ from fluxway.common.utils.logging import get_logger
 from fluxway.common.types.tensor import TransportTensor
 from fluxway import ResourceProfile
 from fluxway.example.recommendation.data_types import LookupOutput
-from fluxway.example.recommendation.sparse_checkpoint import (
+from fluxway.integrations.sparse_embedding.checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
+    modulo_partition,
 )
 
 logger = get_logger(__name__)
-
-
-def _partition_for_restore(keys: Any, partition_count: int) -> np.ndarray:
-    return np.asarray(keys, dtype=np.uint64) % partition_count
 
 
 def _balanced_counts(total: int, shard_count: int) -> list[int]:
@@ -37,7 +34,7 @@ def _balanced_counts(total: int, shard_count: int) -> list[int]:
     mesh_axis_names=("shard",),
     checkpoint_components=(
         SparseEmbeddingCheckpointComponent(
-            _partition_for_restore,
+            modulo_partition,
             LocalLanceStorageFactory(),
         ).registration(),
     ),
@@ -149,7 +146,7 @@ class SparseEmbeddingSPMD:
         )
 
         # Lazy-insert new keys, return embeddings for all keys in this shard.
-        vals_dlm, _, _ = self.store.lookup_or_insert(ids_np, dim=self.embed_dim)
+        vals_dlm, _ = self.store.lookup_or_insert(ids_np, dim=self.embed_dim)
         backend = get_backend()
         emb_np = backend.from_dlpack(vals_dlm).reshape(ids_np.size, self.embed_dim)
 

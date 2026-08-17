@@ -6,24 +6,21 @@ from collections.abc import Mapping
 from typing import Any
 
 from fluxway.common.types.checkpoint import (
-    ComponentCheckpoint,
+    CheckpointComponentPublication,
     CheckpointRuntime,
     CheckpointRuntimeRole,
     CheckpointBusyError,
     CheckpointCommitPermit,
-    CheckpointCaptureMode,
     SaveSession,
     CommitSaveSession,
     RestoreSession,
     CheckpointCut,
-    CheckpointTransactionState,
-    CommitScope,
-    EagerCheckpointUnsupportedError,
-    PrepareScope,
+    CheckpointSaveState,
+    CheckpointSaveScope,
     WorkerSaveResult,
     TopologySnapshot,
 )
-from fluxway.control_plane.checkpointer.backend import (
+from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
 )
@@ -32,7 +29,7 @@ from fluxway.control_plane.checkpointer.backend import (
 class WorkerCheckpointCoordinator:
     def __init__(
         self,
-        backends: tuple[CheckpointComponentRegistration, ...],
+        components: tuple[CheckpointComponentRegistration, ...],
         operator_instance: Any,
         repository_root: str,
         spmd_id: str,
@@ -43,7 +40,7 @@ class WorkerCheckpointCoordinator:
             raise ValueError("worker checkpoint coordinator requires root and SPMD ID")
         if rank < 0 or rank >= source_topology.world_size:
             raise ValueError("worker checkpoint coordinator rank is outside topology")
-        self._registry = CheckpointComponentRegistry(backends)
+        self._registry = CheckpointComponentRegistry(components)
         self._owner = operator_instance
         self._repository_root = repository_root
         self._spmd_id = spmd_id
@@ -55,75 +52,74 @@ class WorkerCheckpointCoordinator:
         self._attempt_id: str | None = None
         self._permit: CheckpointCommitPermit | None = None
         self._cut: CheckpointCut | None = None
-        self._state: CheckpointTransactionState | None = None
-        self._captured: dict[str, WorkerSaveResult] = {}
+        self._state: CheckpointSaveState | None = None
 
     @property
-    def state(self) -> CheckpointTransactionState | None:
+    def state(self) -> CheckpointSaveState | None:
         return self._state
 
     @property
     def active_attempt_id(self) -> str | None:
         return self._attempt_id
 
-    async def start_save(
+    async def prepare_save(
         self,
         checkpoint_id: str,
         attempt_id: str,
         permit: CheckpointCommitPermit,
         cut: CheckpointCut,
-        capture_mode: CheckpointCaptureMode,
     ) -> None:
         self._require_available()
         if self._state is not None:
             raise CheckpointBusyError(
                 f"worker already owns checkpoint attempt {self.active_attempt_id!r}"
             )
-        if capture_mode is CheckpointCaptureMode.EAGER:
-            raise EagerCheckpointUnsupportedError(
-                "worker runtime does not yet provide an immutable eager save view"
-            )
         await self._ensure_open()
         self._checkpoint_id = checkpoint_id
         self._attempt_id = attempt_id
         self._permit = permit
         self._cut = cut
-        self._state = CheckpointTransactionState.CUT_CREATED
+        self._state = CheckpointSaveState.PREPARED
         attempted: list[CheckpointComponentRegistration] = []
         try:
-            for backend in self._registry:
+            for component in self._registry:
+                save = component.save
+                if save is None:
+                    continue
                 if (
-                    backend.descriptor.prepare_scope is PrepareScope.LEADER
+                    component.descriptor.save.prepare_scope
+                    is CheckpointSaveScope.LEADER
                     and self._rank != 0
                 ):
                     continue
-                attempted.append(backend)
-                await backend.component.start_save(
-                    self._session(backend.descriptor.component_id)
+                attempted.append(component)
+                await save.prepare_save(
+                    self._session(component.descriptor.component_id)
                 )
         except BaseException as primary_error:
-            cleanup_errors = await self._abort_backends(tuple(reversed(attempted)))
+            cleanup_errors = await self._rollback_components(tuple(reversed(attempted)))
             self._clear_transaction()
             if cleanup_errors:
                 raise BaseExceptionGroup(
-                    "checkpoint start_save and rollback failed",
+                    "checkpoint prepare_save and rollback failed",
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
 
     async def save(self) -> Mapping[str, WorkerSaveResult]:
-        self._require_state(CheckpointTransactionState.CUT_CREATED)
-        self._state = CheckpointTransactionState.CAPTURING
-        captured: dict[str, WorkerSaveResult] = {}
+        self._require_state(CheckpointSaveState.PREPARED)
+        self._state = CheckpointSaveState.SAVING
+        saved_results: dict[str, WorkerSaveResult] = {}
         try:
-            for backend in self._registry:
-                captured[
-                    backend.descriptor.component_id
-                ] = await backend.component.save(
-                    self._session(backend.descriptor.component_id)
+            for component in self._registry:
+                save = component.save
+                if save is None:
+                    continue
+                saved_results[component.descriptor.component_id] = await save.save(
+                    self._session(component.descriptor.component_id)
                 )
         except BaseException as primary_error:
-            cleanup_errors = await self._abort_backends(
+            cleanup_errors = await self._rollback_components(
                 tuple(reversed(tuple(self._registry)))
             )
             self._clear_transaction()
@@ -133,19 +129,19 @@ class WorkerCheckpointCoordinator:
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
-        self._captured = captured
-        self._state = CheckpointTransactionState.CAPTURED
-        return dict(captured)
+        self._state = CheckpointSaveState.SAVED
+        return dict(saved_results)
 
     async def finish_save(self) -> None:
-        self._require_state(CheckpointTransactionState.CAPTURED)
+        self._require_state(CheckpointSaveState.SAVED)
         try:
-            for backend in self._registry:
-                await backend.component.finish_save(
-                    self._session(backend.descriptor.component_id)
-                )
+            for component in self._registry:
+                save = component.save
+                if save is None:
+                    continue
+                await save.finish_save(self._session(component.descriptor.component_id))
         except BaseException as primary_error:
-            cleanup_errors = await self._abort_backends(
+            cleanup_errors = await self._rollback_components(
                 tuple(reversed(tuple(self._registry)))
             )
             self._clear_transaction()
@@ -155,29 +151,32 @@ class WorkerCheckpointCoordinator:
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
-        self._state = CheckpointTransactionState.FINALIZED
+        self._state = CheckpointSaveState.FINISHED
 
     async def commit_save(
         self,
         gathered_records: Mapping[str, Mapping[int, WorkerSaveResult]],
-    ) -> Mapping[str, ComponentCheckpoint]:
-        self._require_state(CheckpointTransactionState.FINALIZED)
-        publications: dict[str, ComponentCheckpoint] = {}
+    ) -> Mapping[str, CheckpointComponentPublication]:
+        self._require_state(CheckpointSaveState.FINISHED)
+        publications: dict[str, CheckpointComponentPublication] = {}
         try:
-            for backend in self._registry:
+            for component in self._registry:
+                save = component.save
+                if save is None:
+                    continue
                 if (
-                    backend.descriptor.commit_scope is CommitScope.LEADER
+                    component.descriptor.save.commit_scope is CheckpointSaveScope.LEADER
                     and self._rank != 0
                 ):
                     continue
-                component_id = backend.descriptor.component_id
+                component_id = component.descriptor.component_id
                 gathered = gathered_records.get(component_id)
                 if gathered is None:
                     raise KeyError(
-                        f"gathered checkpoint records missing backend {component_id!r}"
+                        f"gathered checkpoint records missing component {component_id!r}"
                     )
                 save_session = self._session(component_id)
-                publications[component_id] = await backend.component.commit_save(
+                publications[component_id] = await save.commit_save(
                     CommitSaveSession(
                         instance=save_session.instance,
                         attempt_id=save_session.attempt_id,
@@ -192,7 +191,7 @@ class WorkerCheckpointCoordinator:
                     )
                 )
         except BaseException as primary_error:
-            cleanup_errors = await self._abort_backends(
+            cleanup_errors = await self._rollback_components(
                 tuple(reversed(tuple(self._registry)))
             )
             self._clear_transaction()
@@ -202,21 +201,22 @@ class WorkerCheckpointCoordinator:
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
-        self._state = CheckpointTransactionState.COMMITTED
+        self._state = CheckpointSaveState.COMMITTED
         return publications
 
-    async def mark_available(self) -> None:
-        self._require_state(CheckpointTransactionState.COMMITTED)
-        for backend in self._registry:
-            await backend.component.on_checkpoint_available(
-                self._session(backend.descriptor.component_id)
-            )
+    async def publish_save(self) -> None:
+        self._require_state(CheckpointSaveState.COMMITTED)
+        for component in self._registry:
+            save = component.save
+            if save is None:
+                continue
+            await save.publish_save(self._session(component.descriptor.component_id))
         self._clear_transaction()
 
     async def rollback_save(self) -> None:
         if self._state is None:
             raise RuntimeError("worker has no active checkpoint transaction")
-        errors = await self._abort_backends(tuple(reversed(tuple(self._registry))))
+        errors = await self._rollback_components(tuple(reversed(tuple(self._registry))))
         self._clear_transaction()
         self._raise_errors("checkpoint rollback_save failed", errors)
 
@@ -228,7 +228,7 @@ class WorkerCheckpointCoordinator:
         self,
         checkpoint_id: str,
         cut: CheckpointCut,
-        publications: Mapping[str, ComponentCheckpoint],
+        publications: Mapping[str, CheckpointComponentPublication],
         source_topology: TopologySnapshot,
         current_topology: TopologySnapshot,
     ) -> None:
@@ -236,11 +236,13 @@ class WorkerCheckpointCoordinator:
         if self._state is not None:
             raise CheckpointBusyError("cannot restore during an active checkpoint")
         await self._ensure_open()
-        for backend in self._registry:
-            component_id = backend.descriptor.component_id
-            publication = publications.get(component_id)
-            if publication is None:
-                raise KeyError(f"restore manifest is missing backend {component_id!r}")
+        for component_id, publication in publications.items():
+            component = self._registry.require(component_id)
+            restore = component.restore
+            if restore is None:
+                raise RuntimeError(
+                    f"checkpoint component does not expose restore capability: {component_id!r}"
+                )
             session = RestoreSession(
                 instance=self._owner,
                 checkpoint_id=checkpoint_id,
@@ -251,9 +253,9 @@ class WorkerCheckpointCoordinator:
                 restore_topology=current_topology,
                 component_id=component_id,
                 component_checkpoint=publication,
-                format_version=backend.descriptor.format_version,
+                format_version=component.descriptor.format_version,
             )
-            await backend.component.restore(session)
+            await restore.restore(session)
 
     async def close(self) -> None:
         self._require_available()
@@ -278,14 +280,17 @@ class WorkerCheckpointCoordinator:
         )
         self._opened = True
 
-    async def _abort_backends(
-        self, backends: tuple[CheckpointComponentRegistration, ...]
+    async def _rollback_components(
+        self, components: tuple[CheckpointComponentRegistration, ...]
     ) -> list[BaseException]:
         errors: list[BaseException] = []
-        for backend in backends:
+        for component in components:
+            save = component.save
+            if save is None:
+                continue
             try:
-                await backend.component.rollback_save(
-                    self._session(backend.descriptor.component_id)
+                await save.rollback_save(
+                    self._session(component.descriptor.component_id)
                 )
             except BaseException as error:
                 errors.append(error)
@@ -314,12 +319,7 @@ class WorkerCheckpointCoordinator:
             ).descriptor.format_version,
         )
 
-    def _require_permit(self) -> CheckpointCommitPermit:
-        if self._permit is None:
-            raise RuntimeError("checkpoint transaction permit is not initialized")
-        return self._permit
-
-    def _require_state(self, state: CheckpointTransactionState) -> None:
+    def _require_state(self, state: CheckpointSaveState) -> None:
         if self._state is not state:
             raise RuntimeError(
                 f"checkpoint transaction requires {state.value}, "
@@ -336,7 +336,6 @@ class WorkerCheckpointCoordinator:
         self._permit = None
         self._cut = None
         self._state = None
-        self._captured = {}
 
     @staticmethod
     def _raise_errors(message: str, errors: list[BaseException]) -> None:

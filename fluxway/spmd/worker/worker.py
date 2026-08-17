@@ -27,7 +27,7 @@ import os
 import socket
 import time
 import inspect
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 
 
 import ray
@@ -50,8 +50,7 @@ from fluxway.common.execution import compile
 from fluxway.common.compiled_graph import CompiledDependency
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types import (
-    ComponentCheckpoint,
-    CheckpointCaptureMode,
+    CheckpointComponentPublication,
     CheckpointCommitPermit,
     CheckpointCut,
     ExecutionFailure,
@@ -60,10 +59,16 @@ from fluxway.common.types import (
     TopologySnapshot,
     WorkerHeartbeat,
     WorkerStatus,
+    DrainBoundary,
+    DrainEvent,
+    DrainEventKind,
+    DrainPhase,
+    reduce_drain_boundary,
 )
 from fluxway.common.coherence import (
     CoherenceAction,
     CoherenceDirectory,
+    InvalidationResult,
     CoherenceState,
     CoherenceSubject,
     CoherenceStateTransitionError,
@@ -74,9 +79,8 @@ from fluxway.common.coherence import (
     GrantReady,
     GrantRejected,
     GrantToken,
-    RetirementInvariantError,
     TensorAccessIntent,
-    TensorInstance,
+    CoherenceInstance,
     UnsupportedAllocationHandoffError,
 )
 from fluxway.common.allocation import AllocationRegistry, AllocationRelation
@@ -136,6 +140,15 @@ from fluxway.spmd.worker.data_plane import (
     skipped_dependency_decisions,
 )
 from fluxway.spmd.worker.data_plane_executor import BatchingDataPlaneExecutor
+from fluxway.spmd.worker.coherence_runtime import (
+    CoherenceAdmissionRuntime,
+    CoherenceBatchRetireRuntime,
+    InputCoherenceRelease,
+    InputCoherenceReleasePlan,
+    ParentGrantReturnRuntime,
+    ParentReturnRoute,
+)
+from fluxway.spmd.worker.coherence_sequencer import CoherenceSequencer
 from fluxway.spmd.worker.assembly import (
     CompiledAssemblePlan,
     compile_assemble_plan,
@@ -514,8 +527,8 @@ class _OwnershipReservation:
 class _AllocationHandoffIntent:
     input_tensor: TransportTensor
     output_tensor: Any
-    old_instance: TensorInstance
-    new_instance: TensorInstance
+    old_instance: CoherenceInstance
+    new_instance: CoherenceInstance
     output_descriptor: Any
 
 
@@ -657,7 +670,8 @@ class SPMDWorker:
             op_name: set() for op_name in operator_names
         }
         self._plan_tasks: set[asyncio.Task] = set()
-        self._send_tasks: set[asyncio.Task] = set()
+        self._plan_task_steps: dict[asyncio.Task, tuple[str, int]] = {}
+        self._send_tasks: dict[asyncio.Task, tuple[str, int]] = {}
 
         # Priority queue: asyncio.PriorityQueue with (priority, prepare_state, step, op_name).
         # All cross-operator ordering goes through _effective_schedule_key().
@@ -716,7 +730,7 @@ class SPMDWorker:
                 tuple[str | None, int, CoherenceSubject, int, int], _InputCoherenceGrant
             ],
         ] = {}
-        self._coherence_revocations: set[tuple[CoherenceSubject, int]] = set()
+        self._coherence_revocations: set[CoherenceInstance] = set()
         self._coherence_input_tensors: dict[
             tuple[str, int],
             set[TransportTensor],
@@ -725,12 +739,14 @@ class SPMDWorker:
             tuple[str, int], tuple[_PreparedTensorBinding, ...]
         ] = {}
         self._coherence_alias_dependencies: dict[
-            tuple[str, int],
-            set[tuple[CoherenceSubject, int]],
+            tuple[str, int], set[CoherenceInstance]
+        ] = {}
+        self._coherence_output_intents: dict[
+            tuple[str, int], tuple[CoherenceInstance, ...]
         ] = {}
 
         # Heartbeat configuration
-        self._heartbeat_interval: float = 5.0
+        self._heartbeat_interval: float = self.config.heartbeat_interval_s
         self._heartbeat_running: bool = False
         self._heartbeat_task: asyncio.Task | None = None
 
@@ -756,9 +772,24 @@ class SPMDWorker:
         self._mailbox = self._profiler_runtime.create_worker_mailbox()
         self._mailbox.set_ready_callback(self._on_step_ready)
         self._coherence_directory = CoherenceDirectory()
+        self._coherence_admission_runtime = CoherenceAdmissionRuntime(
+            self._coherence_directory
+        )
+        self._coherence_sequencer = CoherenceSequencer(
+            self._retire_coherence_payload,
+            self._coherence_admission_runtime.admit,
+        )
+        self._coherence_batch_retire_runtime = CoherenceBatchRetireRuntime(
+            self._coherence_directory,
+            self._coherence_sequencer,
+        )
+        self._parent_grant_return_runtime = ParentGrantReturnRuntime(
+            self._coherence_directory,
+            self._send_parent_return_group,
+        )
         self._allocation_registry = AllocationRegistry()
         self._data_plane_executor = self._profiler_runtime.data_plane_backend_executor(
-            BatchingDataPlaneExecutor(self._coherence_directory)
+            BatchingDataPlaneExecutor()
         )
         self._worker_process_call_runtime = WorkerProcessCallRuntime(
             max_workers=self._worker_process_call_max_workers(),
@@ -793,6 +824,11 @@ class SPMDWorker:
 
         # Source operator pause control
         self._source_pause_events: dict[str, asyncio.Event] = {}
+        self._source_operator_names = tuple(
+            op_name for op_name, spec in self._operator_specs.items() if spec.is_source
+        )
+        self._drain_boundary = DrainBoundary()
+        self._pending_terminal_observation: tuple[str, int] | None = None
 
         # Drain-to-step state
         self._drain_step_count: int | None = None
@@ -1665,9 +1701,8 @@ class SPMDWorker:
             )
             if action is CoherenceAction.GRANT_RETURN:
                 child_slot = self._coherence_child_slot(route_code, sender_rank)
-                entry_state = self._coherence_directory.register(
-                    local_subject,
-                    epoch,
+                entry_state = self._coherence_directory.admit(
+                    CoherenceInstance(local_subject, epoch)
                 )
                 if entry_state.ownership_child_id == child_slot:
                     self._coherence_directory.return_ownership_child(
@@ -1719,19 +1754,19 @@ class SPMDWorker:
         epoch: int,
         sender_rank: int,
     ) -> None:
-        revocation = (subject, epoch)
+        revocation = CoherenceInstance(subject, epoch)
         if revocation in self._coherence_revocations:
             raise CoherenceStateTransitionError(
                 f"duplicate invalidation for subject={subject} epoch={epoch}."
             )
         self._coherence_revocations.add(revocation)
         try:
-            self._coherence_directory.begin_invalidation(subject, epoch)
-            entry = self._coherence_directory.register(subject, epoch)
-            await self._coherence_directory.wait_until_deliveries_complete(
-                subject,
-                epoch,
-                entry.child_share_bitmap,
+            invalidation = self._coherence_directory.begin_invalidation(subject, epoch)
+            if invalidation is InvalidationResult.SATISFIED_BY_PARENT_RETURN:
+                return
+            entry = self._coherence_directory.admit(CoherenceInstance(subject, epoch))
+            await self._coherence_admission_runtime.await_deliveries_complete(
+                CoherenceInstance(subject, epoch), entry.child_share_bitmap
             )
             if entry.child_share_bitmap:
                 plan = self._coherence_send_plan(route_code)
@@ -1752,15 +1787,21 @@ class SPMDWorker:
                         )
                     )
                 )
-            await self._coherence_directory.wait_until_quiescent(subject, epoch)
-            self._coherence_directory.finish_invalidation(subject, epoch)
-            await self._send_coherence_to_parent(
-                subject,
-                route_code,
-                epoch,
-                CoherenceAction.GRANT_RETURN,
+            await self._coherence_admission_runtime.await_quiescent(
+                CoherenceInstance(subject, epoch)
             )
-            self._coherence_directory.return_parent(subject, epoch)
+            self._coherence_directory.finish_invalidation(subject, epoch)
+            await self._parent_grant_return_runtime.return_parent_grants(
+                (
+                    ParentReturnRoute(
+                        subject=subject,
+                        route_code=route_code,
+                        epoch=epoch,
+                        parent_spmd_id=self._spmd_id_by_code[subject.owner_spmd_code],
+                        parent_rank=subject.owner_rank,
+                    ),
+                )
+            )
         finally:
             self._coherence_revocations.remove(revocation)
 
@@ -1775,18 +1816,16 @@ class SPMDWorker:
     ) -> None:
         plan = self._coherence_send_plan(route_code)
         requester_slot = plan.coherence_child_slot(route_code, requester_rank)
-        entry = self._coherence_directory.register(subject, epoch)
+        entry = self._coherence_directory.admit(CoherenceInstance(subject, epoch))
         grant = self._coherence_directory.request_write(
             subject,
             epoch,
             ExecutionToken(requester_slot),
         )
-        await self._coherence_directory.wait_until_deliveries_complete(
-            subject,
-            epoch,
-            entry.child_share_bitmap,
+        await self._coherence_admission_runtime.await_deliveries_complete(
+            CoherenceInstance(subject, epoch), entry.child_share_bitmap
         )
-        entry = self._coherence_directory.register(subject, epoch)
+        entry = self._coherence_directory.admit(CoherenceInstance(subject, epoch))
         if entry.child_share_bitmap & (1 << requester_slot):
             self._coherence_directory.return_child(
                 subject,
@@ -1807,7 +1846,7 @@ class SPMDWorker:
             )
         )
         if isinstance(grant, GrantPending):
-            token = await grant.ready
+            token = await self._coherence_admission_runtime.await_grant(grant)
         elif isinstance(grant, GrantReady):
             token = grant.token
         elif isinstance(grant, GrantRejected):
@@ -1870,6 +1909,33 @@ class SPMDWorker:
             (route_code,),
             epoch,
             action,
+        )
+
+    async def _send_parent_return_group(
+        self,
+        routes: tuple[ParentReturnRoute, ...],
+    ) -> None:
+        if not routes:
+            raise ValueError("parent return group cannot be empty.")
+        canonical = routes[0]
+        if any(
+            route.parent_spmd_id != canonical.parent_spmd_id
+            or route.parent_rank != canonical.parent_rank
+            or route.epoch != canonical.epoch
+            for route in routes
+        ):
+            raise ValueError("parent return group contains incompatible routes.")
+        handlers = self._predecessor_handlers.get(canonical.parent_spmd_id)
+        if handlers is None or canonical.parent_rank not in handlers:
+            raise ValueError(
+                "missing direct parent handler "
+                f"sender={canonical.parent_spmd_id}:{canonical.parent_rank}."
+            )
+        await self._send_coherence_frame(
+            handlers[canonical.parent_rank],
+            tuple(route.route_code for route in routes),
+            canonical.epoch,
+            CoherenceAction.GRANT_RETURN,
         )
 
     async def _send_coherence_batch_to_parent(
@@ -2030,7 +2096,7 @@ class SPMDWorker:
         logger.debug(
             f"Step ready op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
         )
-        if not self._running:
+        if not self._running or self._source_is_exhausted(op_name):
             return
         if not self.op_manager.is_periodic_trigger(op_name):
             if self._scheduler_knows_step(op_name, step):
@@ -2139,7 +2205,7 @@ class SPMDWorker:
     def _should_start_prepare_on_ready(self, op_name: str, step: int) -> bool:
         if not self._should_prepare_inputs_on_ready(op_name):
             return False
-        if self._drain_step_count is not None and step >= self._drain_step_count:
+        if self._drain_blocks_step(op_name, step):
             return False
         return True
 
@@ -2150,7 +2216,7 @@ class SPMDWorker:
     def _prepare_inputs_if_policy_allows(self, op_name: str, step: int) -> None:
         if not self._should_prepare_inputs_on_ready(op_name):
             return
-        if self._drain_step_count is not None and step >= self._drain_step_count:
+        if self._drain_blocks_step(op_name, step):
             return
         self._input_prepare_runtime.start(
             op_name,
@@ -2754,9 +2820,7 @@ class SPMDWorker:
         shutdown_errors.extend(
             result for result in cancel_results if isinstance(result, Exception)
         )
-        send_tasks = [
-            task for task in getattr(self, "_send_tasks", set()) if not task.done()
-        ]
+        send_tasks = [task for task in self._send_tasks if not task.done()]
         for task in send_tasks:
             task.cancel()
         if send_tasks:
@@ -2787,8 +2851,8 @@ class SPMDWorker:
             shutdown_errors.extend(
                 result for result in background_results if isinstance(result, Exception)
             )
-        if hasattr(self, "_plan_tasks"):
-            self._plan_tasks.clear()
+        self._plan_tasks.clear()
+        self._plan_task_steps.clear()
         if hasattr(self, "_send_tasks"):
             self._send_tasks.clear()
         self._background_tasks.clear()
@@ -2812,7 +2876,10 @@ class SPMDWorker:
         for tensors in self._coherence_input_tensors.values():
             for tensor in tensors:
                 tensor._invalidate_runtime_access()
+                tensor._release_runtime_payload()
         self._coherence_input_tensors.clear()
+        self._coherence_output_intents.clear()
+        self._coherence_sequencer.fence()
         self._coherence_directory.fence()
         self._allocation_registry.fence()
         self._fence_state = ExecutionFenceState.FENCED
@@ -2872,8 +2939,6 @@ class SPMDWorker:
         empty_values = backend.zeros((0,), dtype=backend.int32())
         tasks = await self._data_plane_executor.send_completed_without_tensor_frames(
             compiled_plan=send_context.compiled_plan,
-            flat_results=[],
-            step_transfer_cache={},
             exec_step=step,
             successor_handlers=send_context.successor_handlers,
             source_spmd_id=self.spmd_id,
@@ -2881,9 +2946,14 @@ class SPMDWorker:
             batch_flush_us=self._data_plane_batch_flush_us,
             submit_delivery=self._delivery_submitter(op_name, step),
             delivery_schedule_key=self._effective_schedule_key(op_name, step),
+            batch_submit=partial(
+                self._coherence_batch_retire_runtime.retire,
+                send_context.compiled_plan,
+            ),
             dependency_decisions=dependency_decisions,
             empty_values=empty_values,
         )
+        self._close_step_coherence_intents(op_name, step)
         return tuple(tasks)
 
     async def _propagate_skipped_completion(
@@ -2920,8 +2990,13 @@ class SPMDWorker:
             batch_flush_us=self._data_plane_batch_flush_us,
             submit_delivery=self._delivery_submitter(op_name, step),
             delivery_schedule_key=self._effective_schedule_key(op_name, step),
+            batch_submit=partial(
+                self._coherence_batch_retire_runtime.retire,
+                send_context.compiled_plan,
+            ),
             dependency_decisions=dependency_decisions,
         )
+        self._close_step_coherence_intents(op_name, step)
         return tuple(tasks)
 
     def _operator_pipeline_depth(self, op_name: str) -> int:
@@ -2941,13 +3016,16 @@ class SPMDWorker:
     def _start_local_step_plan(self, op_name: str, step: int) -> None:
         if self._failure is not None or not self._running:
             return
+        self._declare_step_coherence_intents(op_name, step)
         self._record_local_plan_scheduled(op_name, step)
         self._running_plan_steps[op_name].add(step)
         task = asyncio.create_task(self._run_local_step_plan(op_name, step))
         self._plan_tasks.add(task)
+        self._plan_task_steps[task] = (op_name, step)
 
         def _done(done_task: asyncio.Task) -> None:
             self._plan_tasks.discard(done_task)
+            self._plan_task_steps.pop(done_task, None)
             self._running_plan_steps[op_name].discard(step)
             if done_task.cancelled():
                 return
@@ -2965,6 +3043,57 @@ class SPMDWorker:
 
         task.add_done_callback(_done)
 
+    def _declare_step_coherence_intents(self, op_name: str, step: int) -> None:
+        key = (op_name, step)
+        if key in self._coherence_output_intents:
+            raise CoherenceStateTransitionError(
+                f"duplicate output coherence intents for op={op_name} step={step}."
+            )
+        send_context = self._operator_send_context(op_name)
+        local_code = self._require_local_spmd_code()
+        instances_list: list[CoherenceInstance] = []
+        instances_seen: set[CoherenceInstance] = set()
+        for successor in send_context.compiled_plan.successor_routes:
+            for route in successor.tensor_routes:
+                instance = CoherenceInstance(
+                    CoherenceSubject(local_code, self.rank, route.logical_tuuid),
+                    step,
+                )
+                if instance not in instances_seen:
+                    instances_seen.add(instance)
+                    instances_list.append(instance)
+        instances = tuple(instances_list)
+        for instance in instances:
+            self._coherence_sequencer.issue_intent(instance)
+        self._coherence_output_intents[key] = instances
+
+    async def _retire_coherence_payload(
+        self,
+        instances: tuple[CoherenceInstance, ...],
+        payload: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        del instances
+        if not callable(payload):
+            raise TypeError(
+                "coherence sequencer payload must be an async retirement callable."
+            )
+        return await payload()
+
+    def _close_step_coherence_intents(self, op_name: str, step: int) -> None:
+        instances = self._coherence_output_intents.pop((op_name, step), ())
+        for instance in instances:
+            self._coherence_sequencer.close_intent(instance)
+
+    def _abort_step_coherence_intents(
+        self,
+        op_name: str,
+        step: int,
+        error: BaseException,
+    ) -> None:
+        instances = self._coherence_output_intents.pop((op_name, step), ())
+        for instance in instances:
+            self._coherence_sequencer.abort_intent(instance, error)
+
     def _record_local_plan_scheduled(self, op_name: str, step: int) -> None:
         is_periodic = self.op_manager.is_periodic_trigger(op_name)
         if is_periodic:
@@ -2978,7 +3107,7 @@ class SPMDWorker:
         self._scheduled_step_count[op_name] = scheduled_count + 1
 
     async def _start_pending_pipeline_steps(self, op_name: str) -> None:
-        if not self._running:
+        if not self._running or self._source_is_exhausted(op_name):
             return
         await self._move_future_steps_into_pipeline_queue(op_name)
         pending = self._ready_pending_pipeline_steps[op_name]
@@ -3194,7 +3323,7 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
 
-        def start_save():
+        def prepare_save():
             if self._should_prepare_inputs_on_ready(op_name):
                 return self._input_prepare_runtime.consume(
                     op_name,
@@ -3204,13 +3333,13 @@ class SPMDWorker:
             return self._execute_operator_prepare_input(op_name, step)
 
         if recorder is None:
-            return await start_save()
+            return await prepare_save()
         async with recorder.local_step_node(
             spec=LOCAL_STEP_WAIT_INPUTS,
             op_name=op_name,
             step=step,
         ):
-            return await start_save()
+            return await prepare_save()
 
     async def _local_plan_call_user(
         self, op_name: str, step: int, input_data: Any
@@ -3246,8 +3375,7 @@ class SPMDWorker:
                         spec
                     )
                 )
-        self._validate_interleaved_source_result(op_name, step, result)
-        return result
+        return self._normalize_interleaved_source_result(op_name, step, result)
 
     async def _apply_operator_tensor_access(
         self,
@@ -3285,7 +3413,21 @@ class SPMDWorker:
                 selected_grants,
             )
         for tensor, intent in intents.items():
-            tensor._set_runtime_access_intent(intent)
+            try:
+                tensor._set_runtime_access_intent(intent)
+            except Exception as error:
+                ports = tuple(
+                    binding.port
+                    for binding in prepared_input.tensor_bindings
+                    if binding.tensor is tensor
+                )
+                raise RuntimeError(
+                    "cannot grant operator tensor access: "
+                    f"op={op_name!r} step={step} ports={ports!r} "
+                    f"tensor_id={id(tensor)} source_step={tensor.source_step!r} "
+                    f"coherence_instances={tensor._coherence_instances!r} "
+                    f"intent={intent!r}: {error.__class__.__name__}({error})"
+                ) from error
 
     async def _acquire_owned_inputs(
         self,
@@ -3311,15 +3453,7 @@ class SPMDWorker:
                     "donation requires active local read grants."
                 )
             grouped.setdefault((grant.subject, grant.epoch), []).append(grant)
-        ordered_groups = sorted(
-            grouped.values(),
-            key=lambda group: (
-                group[0].subject.owner_spmd_code,
-                group[0].subject.owner_rank,
-                group[0].subject.logical_tuuid,
-                group[0].epoch,
-            ),
-        )
+        ordered_groups = tuple(grouped.values())
         reservations: list[_OwnershipReservation] = []
         parent_dispatch_started = False
         try:
@@ -3392,15 +3526,21 @@ class SPMDWorker:
                 if reservation.pending is not None
             )
             if pending_reservations:
-                pending_futures = []
-                for reservation in pending_reservations:
-                    pending = reservation.pending
-                    if pending is None:
-                        raise CoherenceStateTransitionError(
-                            "pending reservation lost its readiness future."
-                        )
-                    pending_futures.append(pending.ready)
-                tokens = await asyncio.gather(*pending_futures)
+                pending_grants = tuple(
+                    reservation.pending
+                    for reservation in pending_reservations
+                    if reservation.pending is not None
+                )
+                if len(pending_grants) != len(pending_reservations):
+                    raise CoherenceStateTransitionError(
+                        "pending reservation lost its request handle."
+                    )
+                tokens = await asyncio.gather(
+                    *(
+                        self._coherence_admission_runtime.await_grant(pending)
+                        for pending in pending_grants
+                    )
+                )
                 for reservation, token in zip(
                     pending_reservations,
                     tokens,
@@ -3445,34 +3585,63 @@ class SPMDWorker:
         tensor: TransportTensor,
     ) -> _InputCoherenceGrant:
         try:
-            owner_id, owner_rank = self._local_input_origins[
+            source_spmd_id, source_rank = self._local_input_origins[
                 (op_name, step, transfer_code)
             ]
         except KeyError as exc:
             raise CoherenceStateTransitionError(
                 f"local-only input origin is missing for transfer_code={transfer_code}."
             ) from exc
-        if owner_id == self.spmd_id:
+        if source_spmd_id == self.spmd_id:
             owner_code = self._require_local_spmd_code()
         else:
             owner_codes = [
                 code
                 for code, spmd_id in self._spmd_id_by_code.items()
-                if spmd_id == owner_id
+                if spmd_id == source_spmd_id
             ]
             if len(owner_codes) != 1:
                 raise CoherenceStateTransitionError(
-                    f"local-only input origin {owner_id!r} has no unique SPMD code."
+                    f"local-only input origin {source_spmd_id!r} has no unique SPMD code."
                 )
             owner_code = owner_codes[0]
-        subject = self._coherence_subject(owner_code, owner_rank, transfer_code)
-        epoch = step
+        logical_tuuid = self._compiled_assemble_plan(
+            op_name, transfer_code
+        ).logical_tensor.logical_tuuid
+        subject = self._coherence_subject(owner_code, source_rank, logical_tuuid)
+        expected_subject = subject
+        bound_instances = tensor._coherence_instances
+        if len(bound_instances) > 1:
+            matching_instances = tuple(
+                instance
+                for instance in bound_instances
+                if instance.subject == expected_subject
+            )
+            if len(matching_instances) != 1:
+                raise CoherenceStateTransitionError(
+                    "local-only input has ambiguous coherence instances: "
+                    f"transfer_code={transfer_code} instances={bound_instances!r}."
+                )
+            epoch = matching_instances[0].epoch
+        elif bound_instances:
+            instance = bound_instances[0]
+            if instance.subject != expected_subject:
+                raise CoherenceStateTransitionError(
+                    "local-only input coherence subject mismatch: "
+                    f"expected={expected_subject} actual={instance.subject}."
+                )
+            epoch = instance.epoch
+        else:
+            raise CoherenceStateTransitionError(
+                "local-only input has no canonical coherence epoch: "
+                f"transfer_code={transfer_code}."
+            )
         grants = self._coherence_input_grants.setdefault((op_name, step), {})
-        identity = (None, owner_rank, subject, transfer_code, epoch)
+        identity = (None, source_rank, subject, transfer_code, epoch)
         existing = grants.get(identity)
         if existing is not None:
             return existing
-        entry = self._coherence_directory.register(subject, epoch)
+        entry = self._coherence_directory.admit(CoherenceInstance(subject, epoch))
         if entry.state is CoherenceState.INVALID:
             self._coherence_directory.publish_local_payload(subject, epoch)
         local_read = self._coherence_directory.request_read(
@@ -3486,7 +3655,7 @@ class SPMDWorker:
             )
         grant = _InputCoherenceGrant(
             parent_spmd_id=None,
-            parent_rank=owner_rank,
+            parent_rank=source_rank,
             subject=subject,
             route_code=transfer_code,
             epoch=epoch,
@@ -3494,7 +3663,7 @@ class SPMDWorker:
             parent_return_required=False,
         )
         grants[grant.identity] = grant
-        tensor_instance = TensorInstance(subject, epoch)
+        tensor_instance = CoherenceInstance(subject, epoch)
         if not tensor._coherence_instances:
             tensor._bind_coherence_instances((tensor_instance,))
             if not self._allocation_registry.is_bound(tensor_instance):
@@ -3515,11 +3684,10 @@ class SPMDWorker:
         try:
             for reservation in reservations:
                 canonical = reservation.canonical
-                if (
-                    reservation.pending is not None
-                    and not reservation.pending.ready.done()
-                ):
-                    reservation.pending.ready.cancel()
+                if reservation.pending is not None:
+                    self._coherence_directory.cancel_pending_request(
+                        reservation.pending.request_id
+                    )
                 if reservation.write_token is not None:
                     self._coherence_directory.release(reservation.write_token)
                 else:
@@ -3551,38 +3719,68 @@ class SPMDWorker:
                         canonical.parent_return_required
                         and not reservation.ownership_granted
                     ):
-                        await self._send_coherence_to_parent(
-                            canonical.subject,
-                            canonical.route_code,
-                            canonical.epoch,
-                            CoherenceAction.GRANT_RETURN,
-                        )
-                    if canonical.parent_return_required:
-                        self._coherence_directory.return_parent(
-                            canonical.subject,
-                            canonical.epoch,
+                        assert canonical.parent_spmd_id is not None
+                        await self._parent_grant_return_runtime.return_parent_grants(
+                            (
+                                ParentReturnRoute(
+                                    subject=canonical.subject,
+                                    route_code=canonical.route_code,
+                                    epoch=canonical.epoch,
+                                    parent_spmd_id=canonical.parent_spmd_id,
+                                    parent_rank=canonical.parent_rank,
+                                ),
+                            )
                         )
         finally:
             for reservation in reservations:
                 for grant in reservation.grants:
                     grants.pop(cast(Any, grant.identity), None)
 
-    def _validate_interleaved_source_result(
+    def _normalize_interleaved_source_result(
         self,
         op_name: str,
         step: int,
         result: Any,
-    ) -> None:
-        if result is not None:
-            return
+    ) -> Any:
         operator = self.config.require_graph_view().operator(op_name)
         if not operator.spec.is_source or not operator.spec.is_interleaved:
+            return result
+        if self._source_blocks_step(op_name, step):
+            return ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
+        if result is None:
+            self._record_source_terminal(op_name, step)
+            return ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
+        return result
+
+    def _record_source_terminal(
+        self, op_name: str, step: int, *, notify_controller: bool = True
+    ) -> None:
+        transition = reduce_drain_boundary(
+            self._drain_boundary,
+            DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, step),
+        )
+        self._drain_boundary = transition.boundary
+        if notify_controller and (
+            self._pending_terminal_observation is None
+            or step < self._pending_terminal_observation[1]
+        ):
+            self._pending_terminal_observation = (op_name, step)
+
+    def _notify_source_terminal(self) -> None:
+        observation = self._pending_terminal_observation
+        if observation is None:
             return
-        raise RuntimeError(
-            f"interleaved source {self.spmd_id}.{op_name} returned None at step "
-            f"{step}; one physical worker cannot terminate the shared "
-            "virtual-SPMD stream. Configure max_steps to the number of complete "
-            "global source steps so execution stops before an incomplete step."
+        op_name, terminal_step = observation
+        self._pending_terminal_observation = None
+        driver = self._driver_handle
+        if driver is None:
+            raise RuntimeError(
+                f"Worker {self.spmd_id!r} rank {self.rank} has no Driver handle "
+                "for a terminal boundary event"
+            )
+        driver.report_boundary_event.remote(
+            op_name,
+            DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, terminal_step),
         )
 
     async def _local_plan_send_output(
@@ -3661,7 +3859,7 @@ class SPMDWorker:
             (
                 route,
                 flat_results[route.output_index],
-                TensorInstance(
+                CoherenceInstance(
                     CoherenceSubject(
                         owner_spmd_code=local_code,
                         owner_rank=self.rank,
@@ -3675,7 +3873,7 @@ class SPMDWorker:
         )
         outputs_by_root: dict[
             tuple[str, str, int, int],
-            list[tuple[Any, TensorInstance, Any]],
+            list[tuple[Any, CoherenceInstance, Any]],
         ] = {}
         for _route, output, instance, descriptor in outputs:
             if (
@@ -3705,7 +3903,7 @@ class SPMDWorker:
             for binding in bindings
             if spec.tensor_access[binding.port] is TensorAccessIntent.DONATE
         )
-        claimed_outputs: set[TensorInstance] = set()
+        claimed_outputs: set[CoherenceInstance] = set()
         handoffs: list[_AllocationHandoffIntent] = []
         for input_tensor in input_tensors:
             input_descriptor = runtime_allocation_descriptor(input_tensor)
@@ -3728,7 +3926,7 @@ class SPMDWorker:
                 self._coherence_alias_dependencies.setdefault(
                     (op_name, step),
                     set(),
-                ).add((instance.subject, instance.epoch))
+                ).add(instance)
             donation_binding = next(
                 (
                     binding
@@ -3840,6 +4038,7 @@ class SPMDWorker:
                 ExecutionStatus.SKIPPED,
                 ExecutionStatus.INACTIVE,
                 ExecutionStatus.COMPLETED_WITHOUT_TENSOR,
+                ExecutionStatus.SOURCE_EXHAUSTED,
             ):
                 return {}
         raise TypeError(
@@ -3867,6 +4066,8 @@ class SPMDWorker:
                     step_transfer_cache,
                 ),
             )
+        else:
+            self._close_step_coherence_intents(op_name, step)
         return LocalSendToken(
             op_name=op_name,
             step=step,
@@ -3887,6 +4088,7 @@ class SPMDWorker:
             ExecutionStatus.SKIPPED,
             ExecutionStatus.INACTIVE,
             ExecutionStatus.COMPLETED_WITHOUT_TENSOR,
+            ExecutionStatus.SOURCE_EXHAUSTED,
             ExecutionStatus.STALE_AFTER_RESTORE,
         ):
             return op_result
@@ -3898,6 +4100,7 @@ class SPMDWorker:
     def _result_requires_send(self, result: ExecutionResult) -> bool:
         if result.status in (
             ExecutionStatus.INACTIVE,
+            ExecutionStatus.SOURCE_EXHAUSTED,
             ExecutionStatus.STALE_AFTER_RESTORE,
         ):
             return False
@@ -3925,10 +4128,10 @@ class SPMDWorker:
         coro: Any,
     ) -> asyncio.Task[ExecutionResult]:
         task = asyncio.create_task(coro)
-        self._send_tasks.add(task)
+        self._send_tasks[task] = (op_name, step)
 
         def _done(done_task: asyncio.Task) -> None:
-            self._send_tasks.discard(done_task)
+            self._send_tasks.pop(done_task, None)
             if done_task.cancelled():
                 return
             exc = done_task.exception()
@@ -3955,7 +4158,7 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
         if recorder is None:
-            await self._await_alias_send_registration(send_token)
+            await self._await_send_registration(send_token)
             self._observe_local_send_registration(send_token)
             return await self._commit_local_plan_result(
                 op_name,
@@ -3970,7 +4173,7 @@ class SPMDWorker:
             source_spmd_code=source_spmd_code,
             source_rank=self.rank,
         ):
-            await self._await_alias_send_registration(send_token)
+            await self._await_send_registration(send_token)
             self._observe_local_send_registration(send_token)
         async with recorder.local_step_node(
             spec=LOCAL_STEP_COMMIT,
@@ -3983,14 +4186,11 @@ class SPMDWorker:
                 send_token.result,
             )
 
-    async def _await_alias_send_registration(
+    async def _await_send_registration(
         self,
         send_token: LocalSendToken,
     ) -> None:
-        dependencies = self._coherence_alias_dependencies.get(
-            (send_token.op_name, send_token.step)
-        )
-        if not dependencies or send_token.send_task is None:
+        if send_token.send_task is None:
             return
         await send_token.send_task
 
@@ -4008,8 +4208,10 @@ class SPMDWorker:
             raise exc
 
     async def _execute_operator_prepare_input(self, op_name: str, step: int) -> Any:
+        if self._source_blocks_step(op_name, step):
+            return ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
         async with self._drain_cond:
-            while self._drain_step_count is not None and step >= self._drain_step_count:
+            while self._drain_blocks_step(op_name, step):
                 recorder = (
                     self._profiler_runtime.recorder
                     if self._profiler_runtime.enabled
@@ -4018,6 +4220,7 @@ class SPMDWorker:
                 if recorder is None:
                     await self._drain_cond.wait()
                 else:
+                    assert self._drain_step_count is not None
                     async with recorder.worker_scheduler_span(
                         spec=WORKER_DRAIN_WAIT,
                         payload=recorder.worker_op_payload(
@@ -4056,6 +4259,11 @@ class SPMDWorker:
     ) -> ExecutionResult:
         if result.status is ExecutionStatus.STALE_AFTER_RESTORE:
             return result
+        if (
+            self._source_blocks_step(op_name, step)
+            and result.status is not ExecutionStatus.SOURCE_EXHAUSTED
+        ):
+            return ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
         self._finished_plan_steps[op_name][step] = result
         await self._commit_finished_steps(op_name)
         return result
@@ -4065,127 +4273,109 @@ class SPMDWorker:
         while self._completed_step_count[op_name] in pending:
             step = self._completed_step_count[op_name]
             result = pending.pop(step)
-            await self._return_input_coherence(op_name, step)
+            self._spawn_background_task(self._return_input_coherence(op_name, step))
+            await self._mailbox.clear_step(op_name, step)
             self._clear_direct_local_step(op_name, step)
             self._barriers_declared.pop((op_name, step), None)
+            if result.status is ExecutionStatus.SOURCE_EXHAUSTED:
+                self._record_source_terminal(op_name, step)
+                self._discard_source_pipeline(op_name, step)
+                self._notify_source_terminal()
+                return
             await self._advance_step(op_name, result=result)
+
+    def _discard_source_pipeline(self, op_name: str, terminal_step: int) -> None:
+        finished = self._finished_plan_steps[op_name]
+        for step in tuple(finished):
+            if step >= terminal_step:
+                finished.pop(step)
+        pending_steps_by_name = (
+            self._pending_blocked[op_name],
+            self._pending_future_steps[op_name],
+            self._ready_pending_pipeline_steps[op_name],
+            self._pending_async_lag_steps[op_name],
+            self._pending_phase_order_steps[op_name],
+        )
+        for pending_steps in pending_steps_by_name:
+            pending_steps[:] = [step for step in pending_steps if step < terminal_step]
+        running_steps = self._running_plan_steps[op_name]
+        for task, (task_op_name, task_step) in tuple(self._plan_task_steps.items()):
+            if (
+                task_op_name == op_name
+                and task_step >= terminal_step
+                and not task.done()
+            ):
+                task.cancel()
+        for intent_op, intent_step in tuple(self._coherence_output_intents):
+            if intent_op == op_name and intent_step >= terminal_step:
+                self._abort_step_coherence_intents(
+                    intent_op,
+                    intent_step,
+                    RuntimeError(
+                        f"source pipeline discarded op={intent_op} step={intent_step}."
+                    ),
+                )
+        running_steps.difference_update(
+            step for step in tuple(running_steps) if step >= terminal_step
+        )
+        mailbox_ready_steps = self._mailbox_ready_steps[op_name]
+        mailbox_ready_steps.difference_update(
+            step for step in tuple(mailbox_ready_steps) if step >= terminal_step
+        )
+        direct_ready_steps = self._direct_local_ready_steps[op_name]
+        direct_ready_steps.difference_update(
+            step for step in tuple(direct_ready_steps) if step >= terminal_step
+        )
+        self._in_op_step_queue.difference_update(
+            {
+                (queued_op, step)
+                for queued_op, step in self._in_op_step_queue
+                if queued_op == op_name and step >= terminal_step
+            }
+        )
+        for key in tuple(self._local_input_origins):
+            if key[0] == op_name and key[1] >= terminal_step:
+                del self._local_input_origins[key]
+        for task, key in tuple(self._send_tasks.items()):
+            if key[0] == op_name and key[1] >= terminal_step and not task.done():
+                task.cancel()
+        self._spawn_background_task(
+            self._delivery_runtime.cancel_matching(
+                lambda schedule_key: (
+                    schedule_key[3] == op_name and schedule_key[2] >= terminal_step
+                )
+            )
+        )
 
     async def _return_input_coherence(self, op_name: str, step: int) -> None:
         grants = self._coherence_input_grants.pop((op_name, step), {})
-        if not grants:
-            self._coherence_alias_dependencies.pop((op_name, step), None)
-            self._coherence_input_tensors.pop((op_name, step), None)
-            self._coherence_input_bindings.pop((op_name, step), None)
-            local_input_origins = getattr(self, "_local_input_origins", None)
-            if local_input_origins is not None:
-                for key in tuple(local_input_origins):
-                    if key[:2] == (op_name, step):
-                        del local_input_origins[key]
-            return
         alias_dependencies = self._coherence_alias_dependencies.pop(
             (op_name, step),
             set(),
         )
-        for subject, epoch in sorted(
-            alias_dependencies,
-            key=lambda item: (
-                item[0].owner_spmd_code,
-                item[0].owner_rank,
-                item[0].logical_tuuid,
-                item[1],
-            ),
-        ):
-            await self._coherence_directory.wait_until_quiescent(subject, epoch)
-            instance = TensorInstance(subject, epoch)
-            if self._allocation_registry.is_bound(instance):
-                self._allocation_registry.retire(instance)
-                self._allocation_registry.advance_watermark(subject, epoch + 1)
-        local_code = self._require_local_spmd_code()
-        returns: dict[
-            tuple[str, int, int],
-            list[_InputCoherenceGrant],
-        ] = {}
-        for grant in grants.values():
-            if not grant.parent_return_required:
-                if self._coherence_directory.grant_is_active(grant.local_access_token):
-                    self._coherence_directory.release(grant.local_access_token)
-                await self._coherence_directory.wait_until_quiescent(
-                    grant.subject,
-                    grant.epoch,
-                )
-                continue
-            if grant.parent_spmd_id is None:
-                raise ValueError(
-                    "parent_spmd_id cannot be None if parent_return_required is True"
-                )
-            handlers = self._predecessor_handlers.get(grant.parent_spmd_id)
-            if handlers is None or grant.parent_rank not in handlers:
-                raise ValueError(
-                    "missing direct parent handler "
-                    f"sender={grant.parent_spmd_id}:{grant.parent_rank}."
-                )
-            if self._coherence_directory.grant_is_active(grant.local_access_token):
-                self._coherence_directory.release(grant.local_access_token)
-            if (grant.subject, grant.epoch) in self._coherence_revocations:
-                continue
-            await self._coherence_directory.wait_until_quiescent(
-                grant.subject,
-                grant.epoch,
-            )
-            if not self._coherence_directory.parent_return_ready(
-                grant.subject,
-                grant.epoch,
-            ):
-                raise RetirementInvariantError(
-                    "input authority is not returnable after local quiescence."
-                )
-            returns.setdefault(
-                (grant.parent_spmd_id, grant.parent_rank, grant.epoch),
-                [],
-            ).append(grant)
-
-        async def send_returns(group: list[_InputCoherenceGrant]) -> None:
-            canonical = group[0]
-            parent_spmd_id = canonical.parent_spmd_id
-            assert parent_spmd_id is not None
-            handlers = self._predecessor_handlers[parent_spmd_id]
-            header = build_coherence_frame(
-                step=canonical.epoch,
-                sender_spmd_code=local_code,
-                sender_rank=self.rank,
-                sender_world_size=self._world_size,
-                epoch=canonical.epoch,
-                action=CoherenceAction.GRANT_RETURN,
-                route_codes=tuple(grant.route_code for grant in group),
-            )
-            await handlers[canonical.parent_rank].receive_transport_frames(
-                (TransportFrameEnvelope(header=header, payload_segments=()),)
-            )
-
-        await asyncio.gather(*(send_returns(group) for group in returns.values()))
-        for group in returns.values():
-            for grant in group:
-                self._coherence_directory.return_parent(
-                    grant.subject,
-                    grant.epoch,
-                )
         input_tensors = self._coherence_input_tensors.pop((op_name, step), set())
         self._coherence_input_bindings.pop((op_name, step), None)
-        local_input_origins = getattr(self, "_local_input_origins", None)
-        if local_input_origins is not None:
-            for key in tuple(local_input_origins):
-                if key[:2] == (op_name, step):
-                    del local_input_origins[key]
-        for tensor in input_tensors:
-            for instance in tensor._coherence_instances:
-                if self._allocation_registry.is_bound(instance):
-                    self._coherence_directory.require_retirement_quiescence(instance)
-                    self._allocation_registry.retire(instance)
-                    self._allocation_registry.advance_watermark(
-                        instance.subject,
-                        instance.epoch + 1,
-                    )
-            tensor._invalidate_runtime_access()
+        for key in tuple(self._local_input_origins):
+            if key[:2] == (op_name, step):
+                del self._local_input_origins[key]
+
+        if not grants and not alias_dependencies and not input_tensors:
+            return
+
+        plan = InputCoherenceReleasePlan.create(
+            grants=tuple(grants.values()),
+            alias_dependencies=alias_dependencies,
+            revoked_instances=frozenset(self._coherence_revocations),
+            parent_handlers=self._predecessor_handlers,
+            tensors=input_tensors,
+        )
+        await InputCoherenceRelease(
+            directory=self._coherence_directory,
+            admission_runtime=self._coherence_admission_runtime,
+            parent_return_runtime=self._parent_grant_return_runtime,
+            allocation_registry=self._allocation_registry,
+            plan=plan,
+        ).complete()
 
     def _operator_user_callable_spec(
         self, op_name: str, step: int, input_data: Any
@@ -4351,7 +4541,7 @@ class SPMDWorker:
             if isinstance(assembled, TransportTensor):
                 assembled.source_step = transfer_to_source_step[transfer_code]
                 instances = tuple(
-                    TensorInstance(grant.subject, grant.epoch)
+                    CoherenceInstance(grant.subject, grant.epoch)
                     for grant in self._coherence_input_grants.get(
                         (op_name, step), {}
                     ).values()
@@ -5826,7 +6016,7 @@ class SPMDWorker:
             raise ValueError(
                 f"_fill_source_pipeline requires a source op, got {op_name!r}."
             )
-        if not self._running:
+        if not self._running or self._source_is_exhausted(op_name):
             return
         depth = self._operator_pipeline_depth(op_name)
         max_steps = self.config.max_steps
@@ -6036,35 +6226,56 @@ class SPMDWorker:
         exec_step: int,
         dependency_decisions: DependencyDecisions,
     ) -> list[asyncio.Task[Any]]:
-        await self._deposit_local_only_outputs(
-            flat_results,
-            send_context,
-            step_transfer_cache,
-            exec_step,
-            dependency_decisions,
-        )
-        transport = send_context.transport
-        if transport is None:
-            return []
-        return await self._data_plane_executor.send_tensor_frames(
-            compiled_plan=transport.compiled_plan,
-            flat_results=flat_results,
-            step_transfer_cache=step_transfer_cache,
-            exec_step=exec_step,
-            successor_handlers=transport.successor_handlers,
-            source_spmd_id=self.spmd_id,
-            batch_max_frames=self._data_plane_batch_max_frames,
-            batch_flush_us=self._data_plane_batch_flush_us,
-            submit_delivery=self._delivery_submitter(
-                send_context.compiled_plan.op_name, exec_step
-            ),
-            delivery_schedule_key=self._effective_schedule_key(
-                send_context.compiled_plan.op_name, exec_step
-            ),
-            dependency_decisions=transport.select_dependency_decisions(
-                dependency_decisions
-            ),
-        )
+        op_name = send_context.compiled_plan.op_name
+        local_deliveries: tuple[asyncio.Task[Any], ...] = ()
+        remote_deliveries: tuple[asyncio.Task[Any], ...] = ()
+        try:
+            local_deliveries = await self._prepare_local_only_outputs(
+                flat_results,
+                send_context,
+                step_transfer_cache,
+                exec_step,
+                dependency_decisions,
+            )
+            transport = send_context.transport
+            if transport is None:
+                self._close_step_coherence_intents(op_name, exec_step)
+                if local_deliveries:
+                    await asyncio.gather(*local_deliveries)
+                return []
+            tasks = await self._data_plane_executor.send_tensor_frames(
+                compiled_plan=transport.compiled_plan,
+                flat_results=flat_results,
+                step_transfer_cache=step_transfer_cache,
+                exec_step=exec_step,
+                successor_handlers=transport.successor_handlers,
+                source_spmd_id=self.spmd_id,
+                batch_max_frames=self._data_plane_batch_max_frames,
+                batch_flush_us=self._data_plane_batch_flush_us,
+                submit_delivery=self._delivery_submitter(op_name, exec_step),
+                delivery_schedule_key=self._effective_schedule_key(op_name, exec_step),
+                dependency_decisions=transport.select_dependency_decisions(
+                    dependency_decisions
+                ),
+                batch_submit=partial(
+                    self._coherence_batch_retire_runtime.retire,
+                    transport.compiled_plan,
+                ),
+            )
+            remote_deliveries = tuple(tasks)
+            self._close_step_coherence_intents(op_name, exec_step)
+            await asyncio.gather(*tasks)
+            if local_deliveries:
+                await asyncio.gather(*local_deliveries)
+            return tasks
+        except BaseException as exc:
+            self._abort_step_coherence_intents(op_name, exec_step, exc)
+            pending = tuple(
+                task for task in local_deliveries + remote_deliveries if not task.done()
+            )
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            raise
 
     def _delivery_submitter(self, op_name: str, step: int):
         return partial(
@@ -6080,6 +6291,57 @@ class SPMDWorker:
         exec_step: int,
         dependency_decisions: DependencyDecisions,
     ) -> None:
+        deliveries = await self._prepare_local_only_outputs(
+            flat_results,
+            send_context,
+            step_transfer_cache,
+            exec_step,
+            dependency_decisions,
+        )
+        self._close_step_coherence_intents(
+            send_context.compiled_plan.op_name,
+            exec_step,
+        )
+        if deliveries:
+            await asyncio.gather(*deliveries)
+
+    async def _prepare_local_only_outputs(
+        self,
+        flat_results: list[Any],
+        send_context: _OperatorSendContext,
+        step_transfer_cache: dict[int, Any],
+        exec_step: int,
+        dependency_decisions: DependencyDecisions,
+    ) -> tuple[asyncio.Task[Any], ...]:
+        deliveries: list[asyncio.Task[Any]] = []
+        try:
+            return await self._prepare_local_only_outputs_impl(
+                flat_results,
+                send_context,
+                step_transfer_cache,
+                exec_step,
+                dependency_decisions,
+                deliveries,
+            )
+        except BaseException as error:
+            self._abort_step_coherence_intents(
+                send_context.compiled_plan.op_name,
+                exec_step,
+                error,
+            )
+            if deliveries:
+                await asyncio.gather(*deliveries, return_exceptions=True)
+            raise
+
+    async def _prepare_local_only_outputs_impl(
+        self,
+        flat_results: list[Any],
+        send_context: _OperatorSendContext,
+        step_transfer_cache: dict[int, Any],
+        exec_step: int,
+        dependency_decisions: DependencyDecisions,
+        deliveries: list[asyncio.Task[Any]],
+    ) -> tuple[asyncio.Task[Any], ...]:
         wrapped_results: dict[int, TransportTensor] = {}
         await self._deposit_local_only_orderings(
             send_context.compiled_plan,
@@ -6121,41 +6383,65 @@ class SPMDWorker:
                     step_transfer_cache=step_transfer_cache,
                     exec_step=exec_step,
                     wrapped_results=wrapped_results,
-                )
+                ).zero_copy_readonly_alias()
                 output_subject = self._coherence_subject(
                     self._require_local_spmd_code(),
                     self.rank,
-                    tensor_route.transfer_code,
+                    tensor_route.logical_tuuid,
                 )
-                output_entry = self._coherence_directory.register(
-                    output_subject,
-                    exec_step,
+                output_instance = CoherenceInstance(output_subject, exec_step)
+
+                async def retire_local_output(
+                    *,
+                    leaf_tensor=leaf_tensor,
+                    output_subject=output_subject,
+                    output_instance=output_instance,
+                    tensor_route=tensor_route,
+                ) -> None:
+                    output_entry = self._coherence_directory.admit(output_instance)
+                    if output_entry.state is CoherenceState.INVALID:
+                        self._coherence_directory.publish_local_payload(
+                            output_subject,
+                            exec_step,
+                        )
+                    if leaf_tensor._coherence_instances:
+                        if leaf_tensor._coherence_instances != (output_instance,):
+                            raise CoherenceStateTransitionError(
+                                "local-only output has a conflicting coherence identity: "
+                                f"expected={output_instance} "
+                                f"actual={leaf_tensor._coherence_instances}."
+                            )
+                    else:
+                        leaf_tensor._bind_coherence_instances((output_instance,))
+                    target_op = tensor_route.target_op
+                    if self._uses_direct_local_input_fast_path(target_op):
+                        self._deposit_direct_local_input(
+                            op_name=target_op,
+                            transfer_code=tensor_route.transfer_code,
+                            step=exec_step,
+                            sender_id=self.spmd_id,
+                            rank=self.rank,
+                            tensor=leaf_tensor,
+                        )
+                    else:
+                        self._ensure_step_declared(target_op, exec_step)
+                        await self._mailbox.deposit_local_tensor(
+                            target_op,
+                            tensor_route.transfer_code,
+                            exec_step,
+                            self.spmd_id,
+                            self.rank,
+                            leaf_tensor,
+                        )
+
+                deliveries.append(
+                    asyncio.create_task(
+                        self._coherence_sequencer.commit_payload(
+                            (output_instance,), retire_local_output
+                        )
+                    )
                 )
-                if output_entry.state is CoherenceState.INVALID:
-                    self._coherence_directory.publish_local_payload(
-                        output_subject,
-                        exec_step,
-                    )
-                target_op = tensor_route.target_op
-                if self._uses_direct_local_input_fast_path(target_op):
-                    self._deposit_direct_local_input(
-                        op_name=target_op,
-                        transfer_code=tensor_route.transfer_code,
-                        step=exec_step,
-                        sender_id=self.spmd_id,
-                        rank=self.rank,
-                        tensor=leaf_tensor,
-                    )
-                else:
-                    self._ensure_step_declared(target_op, exec_step)
-                    await self._mailbox.deposit_local_tensor(
-                        target_op,
-                        tensor_route.transfer_code,
-                        exec_step,
-                        self.spmd_id,
-                        self.rank,
-                        leaf_tensor,
-                    )
+        return tuple(deliveries)
 
     async def _deposit_local_only_dependency_decisions(
         self,
@@ -6477,51 +6763,69 @@ class SPMDWorker:
     # State Persistence (checkpoint I/O)
     # =========================================================================
 
-    async def checkpoint_prepare(
+    async def checkpoint_prepare_save(
         self,
         repository_root: str,
         checkpoint_id: str,
         attempt_id: str,
         permit: CheckpointCommitPermit,
         cut: CheckpointCut,
-        capture_mode: CheckpointCaptureMode,
     ) -> None:
         await self._drain_outbound_tasks()
         coordinator = self._get_checkpoint_coordinator(repository_root)
-        await coordinator.start_save(
-            checkpoint_id, attempt_id, permit, cut, capture_mode
-        )
+        await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
 
-    async def checkpoint_capture(
+    async def checkpoint_save(
         self,
     ) -> tuple[dict[str, Any], Mapping[str, WorkerSaveResult]]:
         await self._drain_outbound_tasks()
         coordinator = self._require_checkpoint_coordinator()
         records = await coordinator.save()
+        snapshot_boundary = self._drain_boundary
+        if self._drain_step_count is not None:
+            snapshot_cut = self._drain_step_count
+            if snapshot_boundary.observed_cut is not None:
+                snapshot_cut = min(snapshot_cut, snapshot_boundary.observed_cut)
+            snapshot_boundary = DrainBoundary(
+                phase=(
+                    DrainPhase.COMPLETED
+                    if snapshot_boundary.observed_cut is not None
+                    else DrainPhase.OPEN
+                ),
+                observed_cut=snapshot_boundary.observed_cut,
+                admitted_cut=snapshot_cut,
+                drained_cut=snapshot_cut,
+                committed_cut=snapshot_cut,
+                revision=snapshot_boundary.revision + 1,
+            )
         runtime_state = {
-            "completed_step_count": dict(self._completed_step_count),
+            "completed_step_count": {
+                op_name: self._committed_step(op_name)
+                for op_name in self._completed_step_count
+            },
+            "drain_boundary": snapshot_boundary.to_dict(),
         }
         return runtime_state, records
 
-    async def checkpoint_finalize(self) -> None:
+    async def checkpoint_finish_save(self) -> None:
         await self._drain_outbound_tasks()
         await self._require_checkpoint_coordinator().finish_save()
 
-    async def checkpoint_commit(
+    async def checkpoint_commit_save(
         self,
         gathered_records: Mapping[str, Mapping[int, WorkerSaveResult]],
-    ) -> Mapping[str, ComponentCheckpoint]:
+    ) -> Mapping[str, CheckpointComponentPublication]:
         await self._drain_outbound_tasks()
         return await self._require_checkpoint_coordinator().commit_save(
             gathered_records
         )
 
-    async def checkpoint_abort(self) -> None:
+    async def checkpoint_rollback_save(self) -> None:
         await self._drain_outbound_tasks()
         await self._require_checkpoint_coordinator().rollback_active()
 
-    async def checkpoint_mark_published(self) -> None:
-        await self._require_checkpoint_coordinator().mark_available()
+    async def checkpoint_publish_save(self) -> None:
+        await self._require_checkpoint_coordinator().publish_save()
 
     async def checkpoint_restore(
         self,
@@ -6531,7 +6835,7 @@ class SPMDWorker:
         source_topology: TopologySnapshot,
         current_topology: TopologySnapshot,
         runtime_state: Mapping[str, Any],
-        publications: Mapping[str, ComponentCheckpoint],
+        publications: Mapping[str, CheckpointComponentPublication],
     ) -> None:
         await self._drain_outbound_tasks()
         restored_source_steps = self._restore_checkpoint_runtime_state(runtime_state)
@@ -6552,13 +6856,22 @@ class SPMDWorker:
         if not isinstance(completed, Mapping):
             raise ValueError("checkpoint runtime state is missing completed_step_count")
         expected = set(self._completed_step_count)
-        if set(completed) != expected:
+        restored = set(completed)
+        if restored != expected:
+            missing = expected - restored
+            extra = restored - expected
             raise ValueError(
                 "checkpoint runtime operator IDs do not match current SPMD: "
-                f"expected={sorted(expected)} actual={sorted(completed)}"
+                f"missing={sorted(missing)} extra={sorted(extra)} "
+                f"checkpoint={sorted(restored)}"
             )
+        boundary_state = runtime_state.get("drain_boundary")
+        if not isinstance(boundary_state, Mapping):
+            raise ValueError("checkpoint runtime state is missing drain_boundary")
+        self._drain_boundary = DrainBoundary.from_mapping(boundary_state)
         restored_source_steps: list[tuple[str, int]] = []
-        for op_name, count in completed.items():
+        for op_name in expected:
+            count = completed[op_name]
             if isinstance(count, bool) or not isinstance(count, int) or count < 0:
                 raise ValueError(
                     f"checkpoint completed step for {op_name!r} must be a "
@@ -6568,7 +6881,9 @@ class SPMDWorker:
             self._scheduled_step_count[op_name] = count
             if self.op_manager.is_source_operator(op_name):
                 maximum = self.config.max_steps
-                if maximum is None or count < maximum:
+                if self._drain_boundary.phase is not DrainPhase.COMPLETED and (
+                    maximum is None or count < maximum
+                ):
                     restored_source_steps.append((op_name, count))
         return restored_source_steps
 
@@ -6604,12 +6919,12 @@ class SPMDWorker:
             modules = tuple(self._operator_instances().values())
             if len(modules) != 1:
                 raise RuntimeError(
-                    "checkpoint backends require exactly one SPMD owner instance, "
+                    "checkpoint components require exactly one SPMD owner instance, "
                     f"got {len(modules)} for spmd_id={self.spmd_id!r}"
                 )
             operator_instance = modules[0]
         coordinator = WorkerCheckpointCoordinator(
-            backends=checkpoint_components,
+            components=checkpoint_components,
             operator_instance=operator_instance,
             repository_root=repository_root,
             spmd_id=self.spmd_id,
@@ -6689,6 +7004,7 @@ class SPMDWorker:
             "operators": snapshots,
             "runtime": {
                 "drain_step_count": self._drain_step_count,
+                "drain_boundary": self._drain_boundary.to_dict(),
                 "scheduled_step_count": dict(self._scheduled_step_count),
                 "barriers_declared": [
                     [op_name, step] for op_name, step in sorted(self._barriers_declared)
@@ -6788,31 +7104,69 @@ class SPMDWorker:
     # Drain Control (called by Driver before drain_to_step_count)
     # =========================================================================
 
-    async def set_drain_step_count(self, step_count: int) -> None:
-        """
-        Request worker to self-block once 'step_count' steps are finished.
-        """
+    def _drain_blocks_step(self, op_name: str, step: int) -> bool:
+        del op_name
+        target = self._drain_step_count
+        return target is not None and step >= target
+
+    async def _set_drain_boundary(
+        self, step_count: int | None, terminal_cut: int | None = None
+    ) -> None:
+        if step_count is not None and (
+            isinstance(step_count, bool) or not isinstance(step_count, int)
+        ):
+            raise TypeError("drain step count must be an integer or None")
+        if step_count is not None and step_count < 0:
+            raise ValueError(f"drain step count must be non-negative, got {step_count}")
         async with self._drain_cond:
+            if terminal_cut is not None:
+                transition = reduce_drain_boundary(
+                    self._drain_boundary,
+                    DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, terminal_cut),
+                )
+                self._drain_boundary = transition.boundary
             self._drain_step_count = step_count
             self._drain_cond.notify_all()
             logger.debug(
-                f"Drain target set to {step_count} spmd_id={self.spmd_id} rank={self.rank}"
+                "Drain step count set to %s spmd_id=%s rank=%s",
+                step_count,
+                self.spmd_id,
+                self.rank,
             )
+        if terminal_cut is not None:
+            for op_name in self._source_operator_names:
+                self._discard_source_pipeline(op_name, terminal_cut)
         await self._input_prepare_runtime.cancel_matching(
             lambda op_name, step: (
-                step >= step_count
+                self._drain_blocks_step(op_name, step)
                 and step not in self._running_plan_steps.get(op_name, set())
             )
         )
 
-    async def clear_drain_step_count(self) -> None:
+    def _source_is_exhausted(self, op_name: str) -> bool:
+        del op_name
+        return self._drain_boundary.observed_cut is not None
+
+    def _source_blocks_step(self, op_name: str, step: int) -> bool:
+        del op_name
+        terminal_step = self._drain_boundary.observed_cut
+        return terminal_step is not None and step >= terminal_step
+
+    def _committed_step(self, op_name: str) -> int:
+        execution_step = self._completed_step_count[op_name]
+        terminal_cut = self._drain_boundary.observed_cut
+        if terminal_cut is None:
+            return execution_step
+        return min(execution_step, terminal_cut)
+
+    async def set_drain_boundary(
+        self, step_count: int, terminal_cut: int | None = None
+    ) -> None:
+        await self._set_drain_boundary(step_count, terminal_cut)
+
+    async def clear_drain_boundary(self) -> None:
         """Remove the drain target and let deferred executions proceed."""
-        async with self._drain_cond:
-            self._drain_step_count = None
-            self._drain_cond.notify_all()
-            logger.debug(
-                f"Drain target cleared spmd_id={self.spmd_id} rank={self.rank}"
-            )
+        await self._set_drain_boundary(None)
 
     # =========================================================================
     # Source Node Control

@@ -565,6 +565,7 @@ class OutboundDeliveryRuntime:
         self._background_tasks = background_tasks
         self._on_task_done = on_task_done
         self._tasks: set[asyncio.Task] = set()
+        self._task_keys: dict[asyncio.Task, ScheduleKey] = {}
 
     async def submit(
         self,
@@ -598,13 +599,16 @@ class OutboundDeliveryRuntime:
                 task = asyncio.create_task(coro)
                 self._background_tasks.add(task)
                 self._tasks.add(task)
+                self._task_keys[task] = schedule_key
         else:
             task = asyncio.create_task(coro)
             self._background_tasks.add(task)
             self._tasks.add(task)
+            self._task_keys[task] = schedule_key
 
         def _done(done_task: asyncio.Task) -> None:
             self._tasks.discard(done_task)
+            self._task_keys.pop(done_task, None)
             if self._profiler_runtime.enabled and not done_task.cancelled():
                 exc = done_task.exception()
                 if exc is not None:
@@ -675,6 +679,21 @@ class OutboundDeliveryRuntime:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._task_keys.clear()
+
+    async def cancel_matching(self, predicate: Callable[[ScheduleKey], bool]) -> None:
+        tasks = [
+            task
+            for task in self._tasks
+            if not task.done() and predicate(self._task_keys[task])
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in tasks:
+            self._tasks.discard(task)
+            self._task_keys.pop(task, None)
 
 
 class _PriorityCapacityGate:

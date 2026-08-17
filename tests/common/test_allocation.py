@@ -9,7 +9,7 @@ from fluxway.common.allocation import (
 from fluxway.common.coherence import (
     CoherenceSubject,
     RetirementInvariantError,
-    TensorInstance,
+    CoherenceInstance,
     UnsupportedAllocationHandoffError,
 )
 from fluxway.common.tensor_backend import set_backend
@@ -41,8 +41,8 @@ def test_numpy_allocation_relation_distinguishes_exact_overlap_and_copy() -> Non
 
 def test_handoff_atomically_moves_exact_binding() -> None:
     values = np.arange(8, dtype=np.int64)
-    old = TensorInstance(CoherenceSubject(1, 0, 7), 3)
-    new = TensorInstance(CoherenceSubject(1, 0, 8), 3)
+    old = CoherenceInstance(CoherenceSubject(1, 0, 7), 3)
+    new = CoherenceInstance(CoherenceSubject(1, 0, 8), 3)
     registry = AllocationRegistry()
     registry.bind(old, runtime_allocation_descriptor(values))
 
@@ -60,8 +60,8 @@ def test_handoff_atomically_moves_exact_binding() -> None:
 
 def test_handoff_rejects_partial_overlap() -> None:
     values = np.arange(8, dtype=np.int64)
-    old = TensorInstance(CoherenceSubject(1, 0, 7), 3)
-    new = TensorInstance(CoherenceSubject(1, 0, 8), 3)
+    old = CoherenceInstance(CoherenceSubject(1, 0, 7), 3)
+    new = CoherenceInstance(CoherenceSubject(1, 0, 8), 3)
     registry = AllocationRegistry()
     registry.bind(old, runtime_allocation_descriptor(values))
 
@@ -71,7 +71,7 @@ def test_handoff_rejects_partial_overlap() -> None:
 
 def test_retirement_watermark_only_removes_unbound_retired_instances() -> None:
     values = np.arange(8, dtype=np.int64)
-    instance = TensorInstance(CoherenceSubject(1, 0, 7), 3)
+    instance = CoherenceInstance(CoherenceSubject(1, 0, 7), 3)
     registry = AllocationRegistry()
     registry.bind(instance, runtime_allocation_descriptor(values))
     registry.retire(instance)

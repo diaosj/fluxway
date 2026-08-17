@@ -643,3 +643,26 @@ def test_zero_copy_alias_has_independent_runtime_lifetime():
     )
     tensor._invalidate_runtime_access()
     assert alias.flat_values.tolist() == values.tolist()
+
+
+def test_zero_copy_readonly_alias_is_readonly_until_operator_grant():
+    import numpy as np
+    from fluxway.common.coherence import TensorAccessIntent
+    from fluxway.common.types.tensor import TransportTensor
+
+    values = np.arange(6, dtype=np.float32)
+    tensor = TransportTensor(values)
+    alias = tensor.zero_copy_readonly_alias()
+
+    assert alias is not tensor
+    assert (
+        alias.flat_values.__array_interface__["data"][0]
+        == values.__array_interface__["data"][0]
+    )
+    assert alias._runtime_access_intent is TensorAccessIntent.READONLY
+    with pytest.raises(ValueError):
+        alias.flat_values[0] = 99
+
+    alias._set_runtime_access_intent(TensorAccessIntent.WRITABLE)
+    alias.flat_values[0] = 99
+    assert values[0] == 99

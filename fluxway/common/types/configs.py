@@ -16,7 +16,6 @@ from fluxway.common.schema import FluxwayBaseSchema
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types.failure import ExecutionFailure
 from fluxway.resources import ResourceProfile
-from fluxway.common.types.checkpoint import CheckpointCaptureMode
 
 
 from enum import StrEnum
@@ -142,6 +141,9 @@ class SPMDConfig(FluxwayBaseSchema):
     data_plane_batch_max_frames: int = 8
     data_plane_batch_flush_us: int = 100
     data_plane_max_in_flight: int = 50
+
+    heartbeat_interval_s: float = 5.0
+    heartbeat_timeout_s: float = 90.0
 
     # Optional profiler runtime configuration. ``None`` is the zero-overhead path:
     # workers construct the original executors and data-plane handlers directly.
@@ -426,6 +428,7 @@ class DriverState(StrEnum):
 
     INITIALIZING = "initializing"  # Initializing workers
     READY = "ready"  # Ready, waiting for Controller command
+    RESTORING = "restoring"  # Restoring a published checkpoint
     RUNNING = "running"  # Running
     BLOCKED = "blocked"  # Blocked
     DRAINING = "draining"  # Draining to checkpoint_object step
@@ -450,8 +453,11 @@ class DriverEvent(StrEnum):
     DRAIN_REQUESTED = "drain_requested"
     DRAIN_COMPLETE = "drain_complete"
     SNAPSHOT_REQUESTED = "snapshot_requested"
-    SNAPSHOT_COMPLETE = "snapshot_complete"
+    RESUME = "resume"
     SNAPSHOT_FAILED = "snapshot_failed"
+    RESTORE_REQUESTED = "restore_requested"
+    RESTORE_COMPLETE = "restore_complete"
+    RESTORE_FAILED = "restore_failed"
 
 
 class _FailureHeartbeat[StatusT](FluxwayBaseSchema):
@@ -509,7 +515,6 @@ class CheckpointConfig(FluxwayBaseSchema):
 
     repository_dir: str
     interval_steps: int
-    capture_mode: CheckpointCaptureMode = CheckpointCaptureMode.FENCED
 
     @model_validator(mode="after")
     def _validate_checkpoint_config(self):

@@ -18,6 +18,7 @@ from fluxway.common.coherence import ExecutionFenceState
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.operator_policy import PeriodicBarrierConfig
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
+from fluxway.common.types import DrainBoundary
 from fluxway.spmd.worker.data_plane import (
     CompiledDependencyCondition,
     CompiledDependencyDecisionRoute,
@@ -853,6 +854,7 @@ async def test_skipped_ready_step_does_not_call_user_function():
     worker.rank = 0
     worker._world_size = 1
     worker._completed_step_count = {"consume": 0}
+    worker._drain_boundary = DrainBoundary()
     worker._mailbox = WorkerMailbox()
     worker._mailbox.declare_step(
         "consume",
@@ -881,6 +883,17 @@ async def test_skipped_ready_step_does_not_call_user_function():
                     "Dispatcher",
                     (),
                     {"should_execute": staticmethod(lambda *_args: True)},
+                )()
+            ),
+            "get_operator_spec": staticmethod(
+                lambda _name: type(
+                    "OperatorSpec",
+                    (),
+                    {
+                        "is_source": False,
+                        "is_interleaved": False,
+                        "has_source_descriptor": False,
+                    },
                 )()
             ),
         },

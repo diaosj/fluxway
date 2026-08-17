@@ -4,7 +4,7 @@ import pytest
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
-    ComponentCheckpoint,
+    CheckpointComponentPublication,
     CheckpointObjectRecord,
     CheckpointCut,
     NameReference,
@@ -38,7 +38,7 @@ def _manifest(sequence: int) -> CheckpointManifest:
                 source_topology=TopologySnapshot(1, (), (), "v1"),
                 runtime_state={},
                 components={
-                    "state": ComponentCheckpoint(
+                    "state": CheckpointComponentPublication(
                         component_id="state",
                         format_version=1,
                         shared_records=(
@@ -120,7 +120,7 @@ def test_spmd_snapshot_rejects_component_identity_aliases():
             source_topology=TopologySnapshot(1, (), (), "v1"),
             runtime_state={},
             components={
-                "declared": ComponentCheckpoint(
+                "declared": CheckpointComponentPublication(
                     component_id="actual",
                     format_version=1,
                 )
@@ -141,7 +141,7 @@ def test_checkpoint_object_publication_requires_one_logical_version():
     )
 
     with pytest.raises(ValueError, match="one logical checkpoint_object version"):
-        ComponentCheckpoint(
+        CheckpointComponentPublication(
             component_id="state",
             format_version=1,
             shared_records=(

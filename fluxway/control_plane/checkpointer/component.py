@@ -1,4 +1,4 @@
-"""Capability-composed checkpoint backend registrations."""
+"""Capability-composed checkpoint component registrations."""
 
 from __future__ import annotations
 
@@ -6,32 +6,39 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from fluxway.common.types.checkpoint import (
-    CheckpointObjectRef,
-    CheckpointCapability,
-    ComponentCheckpoint,
-    CheckpointRuntime,
-    ComponentSpec,
+    CheckpointComponentCapability,
+    CheckpointComponentPublication,
+    CheckpointComponentSpec,
     CheckpointCommitPermit,
-    SaveSession,
-    CommitSaveSession,
-    RestoreSession,
-    WorkerSaveResult,
     CheckpointHold,
+    CheckpointObjectRef,
+    CheckpointRuntime,
     CleanupReservation,
     CleanupReservationRequest,
+    CommitSaveSession,
+    RestoreSession,
+    SaveSession,
+    WorkerSaveResult,
 )
 
 
 class CheckpointComponent(ABC):
     @property
     @abstractmethod
-    def descriptor(self) -> ComponentSpec: ...
+    def descriptor(self) -> CheckpointComponentSpec: ...
 
+
+class CheckpointComponentLifecycle(ABC):
     @abstractmethod
     async def open(self, runtime: CheckpointRuntime) -> None: ...
 
     @abstractmethod
-    async def start_save(self, session: SaveSession) -> None: ...
+    async def close(self) -> None: ...
+
+
+class CheckpointComponentSave(ABC):
+    @abstractmethod
+    async def prepare_save(self, session: SaveSession) -> None: ...
 
     @abstractmethod
     async def save(self, session: SaveSession) -> WorkerSaveResult: ...
@@ -40,19 +47,20 @@ class CheckpointComponent(ABC):
     async def finish_save(self, session: SaveSession) -> None: ...
 
     @abstractmethod
-    async def commit_save(self, session: CommitSaveSession) -> ComponentCheckpoint: ...
+    async def commit_save(
+        self, session: CommitSaveSession
+    ) -> CheckpointComponentPublication: ...
 
     @abstractmethod
     async def rollback_save(self, session: SaveSession) -> None: ...
 
     @abstractmethod
-    async def on_checkpoint_available(self, session: SaveSession) -> None: ...
+    async def publish_save(self, session: SaveSession) -> None: ...
 
+
+class CheckpointComponentRestore(ABC):
     @abstractmethod
     async def restore(self, session: RestoreSession) -> None: ...
-
-    @abstractmethod
-    async def close(self) -> None: ...
 
 
 class CheckpointObjectLifecycle(ABC):
@@ -60,7 +68,7 @@ class CheckpointObjectLifecycle(ABC):
     async def hold_checkpoint_object(
         self,
         checkpoint_object: CheckpointObjectRef,
-        owner_id: str,
+        lease_holder_id: str,
         ttl_seconds: float,
         request_id: str,
     ) -> CheckpointHold: ...
@@ -93,39 +101,78 @@ class CheckpointObjectLifecycle(ABC):
     ) -> None: ...
 
 
-class CheckpointObjectCleaner(ABC):
+class CheckpointObjectCleanup(ABC):
     @abstractmethod
-    async def cleanup(
-        self,
-        reservation: CleanupReservation,
-    ) -> None: ...
+    async def cleanup(self, reservation: CleanupReservation) -> None: ...
+
+
+_CAPABILITY_IMPLEMENTATIONS = (
+    (
+        CheckpointComponentCapability.COMPONENT_LIFECYCLE,
+        "component_lifecycle",
+        CheckpointComponentLifecycle,
+    ),
+    (CheckpointComponentCapability.SAVE, "save", CheckpointComponentSave),
+    (CheckpointComponentCapability.RESTORE, "restore", CheckpointComponentRestore),
+    (
+        CheckpointComponentCapability.OBJECT_LIFECYCLE,
+        "object_lifecycle",
+        CheckpointObjectLifecycle,
+    ),
+    (
+        CheckpointComponentCapability.OBJECT_CLEANUP,
+        "object_cleanup",
+        CheckpointObjectCleanup,
+    ),
+)
 
 
 @dataclass(frozen=True, slots=True)
 class CheckpointComponentRegistration:
-    descriptor: ComponentSpec
     component: CheckpointComponent
+    component_lifecycle: CheckpointComponentLifecycle | None = None
+    save: CheckpointComponentSave | None = None
+    restore: CheckpointComponentRestore | None = None
     object_lifecycle: CheckpointObjectLifecycle | None = None
-    cleaner: CheckpointObjectCleaner | None = None
+    object_cleanup: CheckpointObjectCleanup | None = None
+
+    @property
+    def descriptor(self) -> CheckpointComponentSpec:
+        return self.component.descriptor
+
+    @property
+    def capabilities(self) -> frozenset[CheckpointComponentCapability]:
+        return frozenset(
+            capability
+            for capability, field_name, _ in _CAPABILITY_IMPLEMENTATIONS
+            if getattr(self, field_name) is not None
+        )
 
     def __post_init__(self) -> None:
-        declared = self.descriptor.capabilities
-        actual = {CheckpointCapability.PERSISTENCE}
-        actual.add(CheckpointCapability.LIFECYCLE)
-        if self.object_lifecycle is not None:
-            actual.add(CheckpointCapability.RETENTION)
-        if self.cleaner is not None:
-            actual.add(CheckpointCapability.RECLAIMER)
-        if declared != actual:
+        for capability, field_name, interface in _CAPABILITY_IMPLEMENTATIONS:
+            implementation = getattr(self, field_name)
+            if implementation is not None and not isinstance(implementation, interface):
+                raise TypeError(
+                    f"{capability.value} capability must implement {interface.__name__}"
+                )
+        if (self.save is None) != (self.descriptor.save is None):
             raise ValueError(
-                "checkpoint backend capability declaration does not match registration"
+                "checkpoint save implementation must match save specification"
+            )
+        if (self.restore is None) != (self.descriptor.restore is None):
+            raise ValueError(
+                "checkpoint restore implementation must match restore specification"
+            )
+        if self.object_cleanup is not None and self.object_lifecycle is None:
+            raise ValueError(
+                "object cleanup capability requires object lifecycle capability"
             )
         if any(
-            checkpoint_object.keep.keep_last is not None
+            checkpoint_object.retention.retain_last is not None
             for checkpoint_object in self.descriptor.checkpoint_objects
-        ) and (self.object_lifecycle is None or self.cleaner is None):
+        ) and (self.object_lifecycle is None or self.object_cleanup is None):
             raise ValueError(
-                "finite checkpoint_object cleanup requires keep and cleaner capabilities"
+                "finite checkpoint retention requires object lifecycle and object cleanup capabilities"
             )
 
 
@@ -159,11 +206,14 @@ class CheckpointComponentRegistry:
         return registration
 
     async def open_all(self, runtime: CheckpointRuntime) -> None:
-        opened: list[CheckpointComponent] = []
+        opened: list[CheckpointComponentLifecycle] = []
         try:
             for registration in self._registrations:
-                await registration.component.open(runtime)
-                opened.append(registration.component)
+                lifecycle = registration.component_lifecycle
+                if lifecycle is None:
+                    continue
+                await lifecycle.open(runtime)
+                opened.append(lifecycle)
         except BaseException as primary_error:
             cleanup_errors: list[BaseException] = []
             for lifecycle in reversed(opened):
@@ -173,7 +223,7 @@ class CheckpointComponentRegistry:
                     cleanup_errors.append(close_error)
             if cleanup_errors:
                 raise BaseExceptionGroup(
-                    "checkpoint backend open and cleanup failed",
+                    "checkpoint component open and cleanup failed",
                     [primary_error, *cleanup_errors],
                 ) from None
             raise
@@ -181,11 +231,14 @@ class CheckpointComponentRegistry:
     async def close_all(self) -> None:
         errors: list[BaseException] = []
         for registration in reversed(self._registrations):
+            lifecycle = registration.component_lifecycle
+            if lifecycle is None:
+                continue
             try:
-                await registration.component.close()
+                await lifecycle.close()
             except BaseException as error:
                 errors.append(error)
         if len(errors) == 1:
             raise errors[0]
         if errors:
-            raise BaseExceptionGroup("checkpoint backend close failed", errors)
+            raise BaseExceptionGroup("checkpoint component close failed", errors)

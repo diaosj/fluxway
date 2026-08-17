@@ -27,6 +27,7 @@ from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.common.types.configs import SPMDConfig
+from fluxway.common.types import DrainBoundary
 from fluxway.common.operator_policy import ArgumentType, PeriodicBarrierConfig
 from fluxway import OperatorSpec
 from fluxway.common.types.tensor import TransportTensor
@@ -107,6 +108,8 @@ async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
     worker = worker_type.__new__(worker_type)
     worker._completed_step_count = {"Reader": 0, "Dense": 0}
     worker._scheduled_step_count = {"Reader": 0, "Dense": 0}
+    worker._drain_boundary = DrainBoundary()
+    worker._source_operator_names = ("Reader",)
     worker.spmd_id = "Reader"
     worker.rank = 0
     worker.config = type("Config", (), {"max_steps": None})()
@@ -116,11 +119,39 @@ async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
         {"is_source_operator": lambda _self, name: name == "Reader"},
     )()
     restored = worker._restore_checkpoint_runtime_state(
-        {"completed_step_count": {"Reader": 1, "Dense": 1}}
+        {
+            "completed_step_count": {"Reader": 1, "Dense": 1},
+            "drain_boundary": DrainBoundary().to_dict(),
+        }
     )
 
     assert worker._scheduled_step_count == {"Reader": 1, "Dense": 1}
     assert restored == [("Reader", 1)]
+
+
+def test_checkpoint_restore_rejects_operators_absent_from_eval_graph() -> None:
+    worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
+    worker = worker_type.__new__(worker_type)
+    worker._completed_step_count = {"lookup": 0}
+    worker._scheduled_step_count = {"lookup": 0}
+    worker._drain_boundary = DrainBoundary()
+    worker._source_operator_names = ("lookup",)
+    worker.spmd_id = "Embedding"
+    worker.rank = 0
+    worker.config = type("Config", (), {"max_steps": None})()
+    worker._op_manager = type(
+        "OperatorManager",
+        (),
+        {"is_source_operator": lambda _self, name: name == "lookup"},
+    )()
+
+    with pytest.raises(ValueError, match=r"extra=\['update'\]"):
+        worker._restore_checkpoint_runtime_state(
+            {
+                "completed_step_count": {"lookup": 4, "update": 4},
+                "drain_boundary": DrainBoundary().to_dict(),
+            }
+        )
 
 
 def _values_frame_entry(
@@ -1034,7 +1065,7 @@ async def test_send_output_uses_compiled_mesh():
 
         async def send_tensor_frames(self, **kwargs):
             self.calls.append(kwargs)
-            return [True]
+            return [asyncio.sleep(0)]
 
     worker.register_spmd_code_map(4, {4: "source"})
     worker._successor_handlers = {"target": {0: object()}}

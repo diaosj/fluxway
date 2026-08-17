@@ -146,11 +146,23 @@ B_n = disjoint_union_(r=0..u-1) shard(B_n, r, u)
 
 ## 5. Checkpoint 算法
 
-Fluxway drain 后从每个 source operator 的 canonical `completed_step_count` 构造 cut 向量：
+Fluxway drain 后从每个 source operator 的 canonical committed frontier 构造 cut 向量。
+Worker 内部同时保留两个不同语义的量：
+
+```text
+execution_cursor(s) = worker 已执行并可继续调度到的位置
+committed_cut(s)    = 允许进入 checkpoint/runtime snapshot 的连续边界
+```
+
+`execution_cursor` 可以短暂超过 terminal target；它绝不能被当成 durable progress，也不能
+通过回写它来制造 rank 收敛。terminal drain 只单调收缩尚未提交的 boundary，并清理 target 之后的
+source pipeline。
+
+从每个 source operator 的 canonical `committed_cut` 构造 cut 向量：
 
 ```text
 kappa: S -> N
-kappa(s) = 对应 operator 在全图 drain 中完成的 logical position count
+kappa(s) = 对应 operator 在全图 drain 中允许提交的 logical position count
 ```
 
 使用向量而不是单个 scalar，使多个 source operator、periodic operator 和未来的不同 step 映射仍共享
@@ -208,12 +220,69 @@ one global logical clock. Its terminal transition is therefore defined only on:
 Z_global = {z in N^S | exists T in N, forall s in S: z_s = T}
 ```
 
-For `z in Z_global`, every Driver drains to the same `T`. For `z` outside this set,
-using `min(z)` would discard valid records from a longer source and using `max(z)`
-would require nonexistent batches from a shorter source. Fluxway rejects that state
-instead of guessing a completion policy. Independently terminating graph branches
-require an explicit source-position-to-Driver-clock morphism and are not part of the
-current scalar whole-job completion protocol.
+For `z in Z_global`, every Driver drains to the same `T`. This rule applies to
+independent control-ledger streams: their sealed ends are durable facts and must be
+aligned. An interleaved source without a control stream reports a local first-missing
+position through the existing Worker -> Driver -> Controller failure-free event path.
+Physical ranks in one virtual source are observations of one boundary, so the
+Controller keeps the minimum observed position and may shorten an active terminal
+drain. This is not a ledger `sealed_end` reduction and does not discard a record: a
+drain target `T` means that positions `[0, T)` are complete, while position `T` is
+the first unavailable position for at least one virtual source. Independently
+terminating graph branches still require an explicit source-position-to-Driver-clock
+morphism and are not part of the current scalar whole-job completion protocol.
+
+### Source exhaustion ABI
+
+Fluxway 不把 Python `None` 定义为 source exhaustion ABI。外部框架或 source component
+必须通过 typed source result 表达 data item 与 terminal exhaustion；如果某个 Python
+iterator 内部使用 `None` 表示 EOF，必须在该 adapter 内转换完成，不能让 `None` 穿过
+source adapter 边界进入 Fluxway。Worker 只消费显式 terminal result，并将其映射为
+`ExecutionStatus.SOURCE_EXHAUSTED` 与统一 `TERMINAL_OBSERVATION` boundary event。
+
+运行时只存在一个 `DrainBoundary` reducer，字段为：
+
+```text
+observed_cut   terminal observation 的全局最小上界
+admitted_cut   当前周期或 terminal drain command 的有效目标
+drained_cut    所有 Driver/rank/operator 到达的 barrier
+committed_cut  已原子发布的 checkpoint cut
+```
+
+周期 drain 与 terminal observation 都进入同一个 reducer；terminal 只是把有效 admission
+目标单调收缩。`committed_cut` 一旦发布不可向后移动，late completion 只在本地按
+`observed_cut` clamp，不改写 execution cursor。restore 直接灌入完整 reducer 快照，不重建
+source terminal map。
+
+### DrainBoundary 状态与事件词汇
+
+`DrainPhase` 是 reducer 对当前全局 scalar execution cut 的阶段投影，不是
+`ControlLedger` 的 stream 状态，也不允许各 Worker/Driver 自行推进：
+
+| 状态 | 含义 | 进入条件 | 允许的后续 |
+|---|---|---|---|
+| `OPEN` | 没有待处理的 terminal observation 或 active drain；系统可正常执行 | 初始化、普通 checkpoint 完成并恢复运行 | `OBSERVED`、`DRAINING` |
+| `OBSERVED` | 已收到 terminal observation，但尚未完成本轮 drain admission | `TERMINAL_OBSERVATION` 收敛出新的最小 cut | `DRAINING`、`COMPLETED`（已恢复且无需再 drain 的 terminal cut） |
+| `DRAINING` | 已发布 drain command，等待所有 Driver/rank/operator 到达 admitted cut | 周期 request 或 terminal observation 改变 admission target | `DRAINED`；更小 terminal observation 可继续收缩 |
+| `DRAINED` | 所有参与者已在 admitted cut 处完成物理 drain | 收到全图 `DRAIN_COMPLETE` | `SNAPSHOTTING`；late terminal observation 可使未提交 drain 回到 `DRAINING` |
+| `SNAPSHOTTING` | drain 已完成，checkpoint snapshot 正在收集或发布，尚未 durable commit | `SNAPSHOT_BEGIN` | `OPEN`（普通 checkpoint）、`COMPLETED`（terminal checkpoint）；未 commit 时可被更小 cut 收缩 |
+| `COMPLETED` | terminal cut 已原子提交，作业在该 scalar boundary 终止 | terminal `CHECKPOINT_COMMITTED` 或 terminal restore | 只允许幂等重复事件；任何更小 observation/commit 都必须抛错 |
+
+`DrainEventKind` 是唯一进入 reducer 的事件集合：
+
+| 事件 | 载荷 | 语义与约束 |
+|---|---|---|
+| `PERIODIC_REQUEST` | 目标 cut `C` | 周期 checkpoint 请求；只能推进或保持 durable boundary，不能低于已提交 cut |
+| `TERMINAL_OBSERVATION` | 首个不可用位置 `T` | source EOF/全体 sealed end 的事实；对 observation 取全局最小值，并收缩尚未提交的 admission |
+| `DRAIN_COMPLETE` | 实际完成 cut | 所有 Driver/rank/operator 已到达该 cut；不得大于当前 admitted cut |
+| `SNAPSHOT_BEGIN` | snapshot cut | 仅当该 cut 已 drained 时开始 checkpoint；进入 `SNAPSHOTTING` |
+| `CHECKPOINT_COMMITTED` | 已发布 cut | 原子发布成功后更新 durable `committed_cut`；小于既有 durable cut 直接失败 |
+| `RESTORE` | checkpoint cut | 从完整 checkpoint boundary 恢复 `admitted/drained/committed`；不重新发现 source，也不启动新的 source discovery |
+| `LATE_COMPLETION` | worker raw completion | 不改变 boundary 或 execution cursor，只返回按 terminal/admitted cut clamp 后的报告值 |
+
+事件按 Controller 的串行 reducer 顺序处理；重复事件必须幂等，旧版本 command
+不得推进新版本状态。`observed_cut` 可以在 commit 前变小，但任何已原子发布的
+`committed_cut` 永远不能回退。
 
 ## 6. Safety 定理
 

@@ -4,8 +4,6 @@ import types
 
 import numpy as np
 import pytest
-from fluxway.common.coherence import CoherenceDirectory
-
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
 from fluxway.rpc.protocol import (
     AxonDataPlane,
@@ -125,6 +123,42 @@ async def test_target_batch_queue_drains_enqueue_during_inflight_flush():
 
 
 @pytest.mark.asyncio
+async def test_target_batch_queue_cancels_waiters_when_flush_is_cancelled():
+    class BlockingHandler(DataPlaneCallable):
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+
+        async def receive_transport_frames(self, _frames):
+            self.entered.set()
+            await asyncio.Event().wait()
+
+        async def receive_control(self, _op_name, _step, _names, _values):
+            return True
+
+    queue = _TargetBatchQueue(max_frames=1, flush_us=0)
+    handler = BlockingHandler()
+    frames = (TransportFrameEnvelope(header=_empty_header(), payload_segments=()),)
+    enqueue = asyncio.create_task(
+        queue.enqueue(
+            handler=handler,
+            frames=frames,
+            compiled_plan=_compiled_plan(),
+            output_step=0,
+            target_spmd_id="succ",
+            target_rank=0,
+            batch_seq=0,
+            profiler_recorder=None,
+            schedule_key=(0, 0, 0, "op"),
+        )
+    )
+    await handler.entered.wait()
+    queue._flush_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(enqueue), timeout=1.0)
+
+
+@pytest.mark.asyncio
 async def test_profiler_builds_frames_in_background_thread_and_records_split_spans(
     monkeypatch,
     tmp_path,
@@ -181,7 +215,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         delivery_tasks.append(task)
         return task
 
-    executor = BatchingDataPlaneExecutor(CoherenceDirectory())
+    executor = BatchingDataPlaneExecutor()
     result = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
         flat_results=[],
@@ -194,10 +228,12 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 3, "op"),
         profiler_recorder=runtime.recorder,
+        batch_submit=lambda _batch, enqueue: enqueue(),
     )
 
-    assert result == delivery_tasks
     await asyncio.gather(*result)
+    assert delivery_tasks
+    await asyncio.gather(*delivery_tasks)
     assert handler.calls == 1
     assert build_threads and build_threads[0] != event_loop_thread
     names = [
@@ -286,7 +322,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
     )
     handle = AxonHandle()
     axon = AxonDataPlane(handle, sender_spmd_code=7)
-    executor = BatchingDataPlaneExecutor(CoherenceDirectory())
+    executor = BatchingDataPlaneExecutor()
     delivery_tasks = []
 
     async def submit_delivery(coro):
@@ -305,6 +341,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 4, "op"),
+        batch_submit=lambda _batch, enqueue: enqueue(),
     )
     second = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
@@ -317,10 +354,9 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 4, "op"),
+        batch_submit=lambda _batch, enqueue: enqueue(),
     )
-
-    assert first + second == delivery_tasks
-    await asyncio.gather(*delivery_tasks)
+    await asyncio.gather(*first, *second)
 
     assert len(handle.calls) == 1
     frames = handle.calls[0][0]

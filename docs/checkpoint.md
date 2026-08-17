@@ -45,35 +45,59 @@ For a non-step execution, construct `SaveCheckpointRequest` with a
 `CheckpointCut` containing stream cuts and a named reference. The cut is the
 only progress fact in the manifest.
 
-## Component authoring
+## Component SPI
 
-The extension point is `CheckpointComponent`. Implement the lifecycle once;
-Fluxway supplies all transaction data through sessions rather than growing every
-method signature.
+`CheckpointComponent` only supplies the descriptor. Runtime behavior is
+composed from independent SPI contracts; a component does not need to expose
+every contract.
 
 ```python
-class MyComponent(CheckpointComponent):
+class MyComponent(
+    CheckpointComponent,
+    CheckpointComponentLifecycle,
+    CheckpointComponentSave,
+    CheckpointComponentRestore,
+):
+    @property
+    def descriptor(self) -> CheckpointComponentSpec: ...
+
     async def open(self, runtime): ...
-    async def start_save(self, session): ...
+    async def close(self): ...
+    async def prepare_save(self, session): ...
     async def save(self, session) -> WorkerSaveResult: ...
     async def finish_save(self, session): ...
-    async def commit_save(self, session) -> ComponentCheckpoint: ...
+    async def commit_save(self, session) -> CheckpointComponentPublication: ...
     async def rollback_save(self, session): ...
-    async def on_checkpoint_available(self, session): ...
+    async def publish_save(self, session): ...
     async def restore(self, session): ...
-    async def close(self): ...
 ```
 
-Register a component with `register_checkpoint_component(component)`. For a
-component with finite keep or external holds, pass its
-`CheckpointObjectLifecycle` and `CheckpointObjectCleaner` to that same helper.
+The five capability names map directly to the five SPI contracts:
+`COMPONENT_LIFECYCLE` (`open`/`close`), `SAVE`, `RESTORE`,
+`OBJECT_LIFECYCLE` (holds and cleanup reservations), and `OBJECT_CLEANUP`
+(`cleanup`). `SAVE` is one atomic transaction contract; its phases are not
+independent capabilities. `commit_save` creates the component publication;
+`publish_save` is called only after the global manifest is durable and visible.
+
+Register each implemented SPI explicitly. The registration's non-null SPI
+fields are the only source of truth for `registration.capabilities`:
+
+```python
+registration = CheckpointComponentRegistration(
+    component=component,
+    component_lifecycle=component,
+    save=component,
+    restore=component,
+)
+```
+
 All stable authoring imports live in `fluxway.checkpoint`.
 
 `SaveSession` is passed to worker-side save methods. It contains the component
 instance, `checkpoint_id`, save attempt, commit permit, progress cut, SPMD,
 rank, source topology, and component identity. `CommitSaveSession` adds every
 worker's `WorkerSaveResult`. `RestoreSession` contains the selected checkpoint,
-the saved topology, current topology, and the `ComponentCheckpoint` to restore.
+the saved topology, current topology, and the `CheckpointComponentPublication` to restore.
 
 Use session helpers instead of building manifest records by hand:
 
@@ -109,7 +133,7 @@ from fluxway.checkpoint import state_checkpoint_component
 
 reader = state_checkpoint_component(
     "reader",
-    save=lambda reader, session: reader.capture_checkpoint_state(),
+    save=lambda reader, session: reader.save_checkpoint_state(session),
     restore=lambda reader, state, session: reader.restore_checkpoint_state(state),
 )
 ```
@@ -121,23 +145,24 @@ component actually owns rank-local state.
 
 ## Component registration and cleanup
 
-A registration declares the component's exact capabilities. Persistence and
-lifecycle are always present. A component that exposes holds or a finite
-`KeepPolicy(keep_last=N)` must also register both `CheckpointObjectLifecycle`
-and `CheckpointObjectCleaner`. Registration fails otherwise; there is no
-silent no-op cleanup mode.
+A component with finite
+`CheckpointRetentionPolicy(retain_last=N)` must register both
+`CheckpointObjectLifecycle` and `CheckpointObjectCleanup`. Registration fails
+otherwise; there is no silent no-op cleanup mode.
 
 ```python
-ComponentSpec(
+CheckpointComponentSpec(
     component_id="dense",
+    save=CheckpointSaveSpec(),
+    restore=CheckpointRestoreSpec(),
     checkpoint_objects=(
-        CheckpointObjectSpec("model_state", keep=KeepPolicy(keep_last=3)),
-        CheckpointObjectSpec("optimizer_state", keep=KeepPolicy(keep_last=3)),
+        CheckpointObjectSpec("model_state", retention=CheckpointRetentionPolicy(retain_last=3)),
+        CheckpointObjectSpec("optimizer_state", retention=CheckpointRetentionPolicy(retain_last=3)),
     ),
 )
 ```
 
-Each declared checkpoint object is independently kept, held, and cleaned. The
+Each declared checkpoint object is independently retained, held, and cleaned. The
 component returns one logical `version_id` for all physical partitions of that
 object. `partition_key` distinguishes those partitions; it is a component-owned
 stable restore key and is not a worker rank.
@@ -169,7 +194,7 @@ pass `session.commit_authority(scope)` to a storage system with its own CAS or
 commit authority. A permit token is never written to the manifest. Restore and
 `close()` do not need a permit.
 
-## Topology and eager save
+## Topology
 
 The manifest records source topology. Restore receives both source and current
 topologies. A component explicitly chooses one topology mode:
@@ -180,7 +205,3 @@ topologies. A component explicitly chooses one topology mode:
 
 Fluxway never guesses a partition function or silently copies rank-local state.
 The user-side adapter supplies any component-specific restore policy.
-
-`CheckpointCaptureMode.EAGER` requires a component that declares eager capture
-support and captures an immutable view. Unsupported components fail explicitly;
-Fluxway does not silently turn eager capture into a fenced save.

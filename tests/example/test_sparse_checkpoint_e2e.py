@@ -10,8 +10,7 @@ from sparse_embedding.checkpoint.spi import CheckpointConflictError
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectCleanedUpError,
-    CheckpointCapability,
-    CheckpointCaptureMode,
+    CheckpointComponentCapability,
     CheckpointCommitPermit,
     CheckpointCut,
     CheckpointAssembly,
@@ -21,12 +20,13 @@ from fluxway.common.types.checkpoint import (
     CheckpointCleanupBlocked,
     TopologySnapshot,
 )
-from fluxway.control_plane.checkpointer.backend import CheckpointComponentRegistry
+from fluxway.control_plane.checkpointer.component import CheckpointComponentRegistry
 from fluxway.control_plane.checkpointer.checkpoint import FluxwayCheckpointer
-from fluxway.example.recommendation.sparse_checkpoint import (
+from fluxway.integrations.sparse_embedding.checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
 )
+from fluxway.example.recommendation.sparse_spmd import modulo_partition
 from fluxway.spmd.worker.checkpoint import WorkerCheckpointCoordinator
 
 
@@ -44,10 +44,6 @@ def _store(keys: np.ndarray) -> se.EmbeddingStore:
 def _lookup(store: se.EmbeddingStore, keys: np.ndarray) -> np.ndarray:
     values, _ = store.lookup(keys, dim=4)
     return np.from_dlpack(values).reshape(-1, 4)
-
-
-def _partition(keys, partition_count):
-    return np.asarray(keys, dtype=np.uint64) % partition_count
 
 
 class _Owner:
@@ -69,12 +65,9 @@ class _LocalLanceController:
         permit,
         cut,
         repository_dir,
-        capture_mode,
     ):
         coordinator = _coordinator(repository_dir, 0, self.topology, self.owner)
-        await coordinator.start_save(
-            checkpoint_id, attempt_id, permit, cut, capture_mode
-        )
+        await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
         record = (await coordinator.save())["embedding"]
         await coordinator.finish_save()
         publications = await coordinator.commit_save({"embedding": {0: record}})
@@ -91,18 +84,18 @@ class _LocalLanceController:
             },
         )
 
-    async def mark_snapshot_published(self, checkpoint_id, permit):
+    async def publish_snapshot(self, checkpoint_id, permit):
         coordinator = self._active.pop(checkpoint_id)
-        await coordinator.mark_available()
+        await coordinator.publish_save()
         await coordinator.close()
 
-    async def abort_snapshot_checkpoint_objects(self, checkpoint_id, permit):
+    async def rollback_snapshot(self, checkpoint_id, permit):
         coordinator = self._active.pop(checkpoint_id, None)
         if coordinator is not None:
             await coordinator.rollback_active()
             await coordinator.close()
 
-    async def finalize_snapshot(self, step, framework_state):
+    async def commit_checkpoint_state(self, step, framework_state):
         return None
 
     async def restore_snapshot(self, checkpoint_id, manifest, repository_dir):
@@ -121,9 +114,11 @@ class _LocalLanceController:
 
 
 def _coordinator(root, rank, topology, owner):
-    backend = SparseEmbeddingCheckpointComponent(_partition, LocalLanceStorageFactory())
+    component = SparseEmbeddingCheckpointComponent(
+        modulo_partition, LocalLanceStorageFactory()
+    )
     return WorkerCheckpointCoordinator(
-        (backend.registration(),),
+        (component.registration(),),
         owner,
         str(root),
         "embedding",
@@ -137,15 +132,17 @@ async def test_fluxway_restores_selected_step_from_exact_lance_version(tmp_path)
     topology = TopologySnapshot(1, (), (), "modulo-v1")
     owner = _Owner(_store(np.asarray([1, 2], dtype=np.uint64)))
     controller = _LocalLanceController(owner, topology)
-    control_backend = SparseEmbeddingCheckpointComponent(
-        _partition, LocalLanceStorageFactory()
+    control_component = SparseEmbeddingCheckpointComponent(
+        modulo_partition, LocalLanceStorageFactory()
     )
     checkpointer = FluxwayCheckpointer(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
         component_registries={
-            "embedding": CheckpointComponentRegistry((control_backend.registration(),))
+            "embedding": CheckpointComponentRegistry(
+                (control_component.registration(),)
+            )
         },
     )
 
@@ -171,10 +168,10 @@ async def test_fluxway_automatically_cleanups_sparse_versions(tmp_path):
     topology = TopologySnapshot(1, (), (), "modulo-v1")
     owner = _Owner(_store(np.asarray([1], dtype=np.uint64)))
     controller = _LocalLanceController(owner, topology)
-    control_backend = SparseEmbeddingCheckpointComponent(
-        _partition,
+    control_component = SparseEmbeddingCheckpointComponent(
+        modulo_partition,
         LocalLanceStorageFactory(),
-        keep_last=1,
+        retain_last=1,
     )
     repository = tmp_path / "repository"
     checkpointer = FluxwayCheckpointer(
@@ -182,7 +179,9 @@ async def test_fluxway_automatically_cleanups_sparse_versions(tmp_path):
         str(repository),
         interval_steps=1,
         component_registries={
-            "embedding": CheckpointComponentRegistry((control_backend.registration(),))
+            "embedding": CheckpointComponentRegistry(
+                (control_component.registration(),)
+            )
         },
     )
 
@@ -221,17 +220,19 @@ async def test_sparse_lease_blocks_automatic_cleanup_until_release(tmp_path):
     topology = TopologySnapshot(1, (), (), "modulo-v1")
     owner = _Owner(_store(np.asarray([1], dtype=np.uint64)))
     controller = _LocalLanceController(owner, topology)
-    control_backend = SparseEmbeddingCheckpointComponent(
-        _partition,
+    control_component = SparseEmbeddingCheckpointComponent(
+        modulo_partition,
         LocalLanceStorageFactory(),
-        keep_last=1,
+        retain_last=1,
     )
     checkpointer = FluxwayCheckpointer(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
         component_registries={
-            "embedding": CheckpointComponentRegistry((control_backend.registration(),))
+            "embedding": CheckpointComponentRegistry(
+                (control_component.registration(),)
+            )
         },
     )
     first = await checkpointer.save(SaveCheckpointRequest.for_step(1))
@@ -261,7 +262,7 @@ async def test_sparse_lease_blocks_automatic_cleanup_until_release(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_local_lance_backend_roundtrip_with_elastic_restore(tmp_path):
+async def test_local_lance_component_roundtrip_with_elastic_restore(tmp_path):
     source_topology = TopologySnapshot(2, ("shard",), (2,), "modulo-v1")
     permit = CheckpointCommitPermit("attempt-1", 7, b"coordinator-token")
     cut = CheckpointCut.for_step("cut-10", 10)
@@ -275,25 +276,24 @@ async def test_local_lance_backend_roundtrip_with_elastic_restore(tmp_path):
     ]
 
     for coordinator in source:
-        await coordinator.start_save(
+        await coordinator.prepare_save(
             "snapshot-10",
             "attempt-1",
             permit,
             cut,
-            CheckpointCaptureMode.FENCED,
         )
-    captured = await asyncio.gather(*(coordinator.save() for coordinator in source))
+    save_results = await asyncio.gather(*(coordinator.save() for coordinator in source))
     for coordinator in source:
         await coordinator.finish_save()
     gathered = {
         "embedding": {
-            rank: records["embedding"] for rank, records in enumerate(captured)
+            rank: records["embedding"] for rank, records in enumerate(save_results)
         }
     }
     publication = (await source[0].commit_save(gathered))["embedding"]
     await source[1].commit_save(gathered)
     for coordinator in source:
-        await coordinator.mark_available()
+        await coordinator.publish_save()
         await coordinator.close()
 
     checkpoint_object = publication.shared_records[0].checkpoint_objects[0]
@@ -380,22 +380,23 @@ async def test_local_lance_backend_roundtrip_with_elastic_restore(tmp_path):
         await coordinator.close()
 
 
-def test_sparse_backend_declares_only_implemented_capabilities():
-    descriptor = SparseEmbeddingCheckpointComponent(
-        _partition, LocalLanceStorageFactory()
-    ).descriptor
-    assert descriptor.capabilities == frozenset(
+def test_sparse_component_declares_only_implemented_capabilities():
+    registration = SparseEmbeddingCheckpointComponent(
+        modulo_partition, LocalLanceStorageFactory()
+    ).registration()
+    assert registration.capabilities == frozenset(
         {
-            CheckpointCapability.PERSISTENCE,
-            CheckpointCapability.LIFECYCLE,
-            CheckpointCapability.RETENTION,
-            CheckpointCapability.RECLAIMER,
+            CheckpointComponentCapability.COMPONENT_LIFECYCLE,
+            CheckpointComponentCapability.SAVE,
+            CheckpointComponentCapability.RESTORE,
+            CheckpointComponentCapability.OBJECT_LIFECYCLE,
+            CheckpointComponentCapability.OBJECT_CLEANUP,
         }
     )
 
 
 @pytest.mark.asyncio
-async def test_local_lance_backend_rejects_stale_commit_authority(tmp_path):
+async def test_local_lance_component_rejects_stale_commit_authority(tmp_path):
     topology = TopologySnapshot(1, (), (), "modulo-v1")
     cut = CheckpointCut.for_step("cut", 1)
     owner = _Owner(_store(np.asarray([1], dtype=np.uint64)))
@@ -404,27 +405,25 @@ async def test_local_lance_backend_rejects_stale_commit_authority(tmp_path):
     stale_permit = CheckpointCommitPermit("attempt-old", 1, b"old")
     current_permit = CheckpointCommitPermit("attempt-new", 2, b"new")
 
-    await current.start_save(
+    await current.prepare_save(
         "shared-snapshot",
         "attempt-new",
         current_permit,
         cut,
-        CheckpointCaptureMode.FENCED,
     )
     current_record = (await current.save())["embedding"]
     await current.finish_save()
 
     with pytest.raises(CheckpointConflictError, match="authority is stale"):
-        await stale.start_save(
+        await stale.prepare_save(
             "shared-snapshot",
             "attempt-old",
             stale_permit,
             cut,
-            CheckpointCaptureMode.FENCED,
         )
     await stale.close()
 
     publication = await current.commit_save({"embedding": {0: current_record}})
     assert publication["embedding"].shared_records
-    await current.mark_available()
+    await current.publish_save()
     await current.close()

@@ -1,4 +1,5 @@
 import logging
+from enum import Enum, auto
 from typing import Any, Optional
 
 import numpy as np
@@ -10,7 +11,7 @@ from fluxway.common.allocation import (
 from fluxway.common.coherence import (
     CoherenceStateTransitionError,
     TensorAccessIntent,
-    TensorInstance,
+    CoherenceInstance,
 )
 
 from fluxway.common.tensor_backend import get_backend
@@ -31,6 +32,19 @@ from fluxway.common.tensor_components import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class TensorRuntimeState(Enum):
+    VALID = auto()
+    INVALIDATED = auto()
+    RELEASED = auto()
+
+
+class _ReleasedPayload:
+    __slots__ = ()
+
+
+_RELEASED_PAYLOAD = _ReleasedPayload()
 
 
 def runtime_allocation_descriptor(value: Any) -> AllocationDescriptor:
@@ -241,8 +255,8 @@ class TransportTensor:
         self._receipt = self._lineage.receipt
         self._source_step = None
         self._runtime_access_intent = TensorAccessIntent.WRITABLE
-        self._runtime_valid = True
-        self._coherence_instances: tuple[TensorInstance, ...] = ()
+        self._runtime_state = TensorRuntimeState.VALID
+        self._coherence_instances: tuple[CoherenceInstance, ...] = ()
         self._allocation_descriptor: AllocationDescriptor | None = None
         self.source_step = source_step
         validate_metadata_lengths(
@@ -438,8 +452,10 @@ class TransportTensor:
 
     @property
     def flat_values(self) -> Any:
-        if not self._runtime_valid:
-            raise CoherenceStateTransitionError("tensor access is invalidated.")
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"tensor access is {self._runtime_state.name.lower()}."
+            )
         values = self._payload.values
         if self._runtime_access_intent is TensorAccessIntent.READONLY:
             return get_backend().readonly_view(values)
@@ -450,14 +466,40 @@ class TransportTensor:
             raise TypeError(
                 f"intent must be TensorAccessIntent, got {type(intent).__name__}."
             )
-        if not self._runtime_valid:
+        if self._runtime_state is not TensorRuntimeState.VALID:
             raise CoherenceStateTransitionError("cannot grant access to invalid data.")
         self._runtime_access_intent = intent
 
     def _invalidate_runtime_access(self) -> None:
-        self._runtime_valid = False
+        if self._runtime_state is TensorRuntimeState.RELEASED:
+            raise CoherenceStateTransitionError("tensor payload was already released.")
+        self._runtime_state = TensorRuntimeState.INVALIDATED
 
-    def _bind_coherence_instances(self, instances: tuple[TensorInstance, ...]) -> None:
+    def _release_runtime_payload(self) -> None:
+        if self._runtime_state is TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                "tensor payload cannot be released while runtime access is valid."
+            )
+        if self._runtime_state is TensorRuntimeState.RELEASED:
+            raise CoherenceStateTransitionError("tensor payload was already released.")
+        self._payload = TensorPayload(_RELEASED_PAYLOAD)
+        self._layout = TensorLayout((), None, self._routing_axes)
+        self._flat_values = _RELEASED_PAYLOAD
+        self._nested_splits.clear()
+        self._routing = TensorRouting(None)
+        self._lineage = TensorLineage(origin=TensorRouting(None), receipt=None)
+        self._routing_indices = None
+        self._origin_indices = None
+        self._receipt = None
+        self._coherence_instances = ()
+        self._routing_indices_materialize_cache = None
+        self._origin_indices_materialize_cache = None
+        self._allocation_descriptor = None
+        self._runtime_state = TensorRuntimeState.RELEASED
+
+    def _bind_coherence_instances(
+        self, instances: tuple[CoherenceInstance, ...]
+    ) -> None:
         if self._coherence_instances:
             raise CoherenceStateTransitionError(
                 "tensor coherence instances are already bound."
@@ -468,10 +510,31 @@ class TransportTensor:
             )
         self._coherence_instances = instances
 
+    def _extend_coherence_instances(
+        self,
+        instances: tuple[CoherenceInstance, ...],
+    ) -> None:
+        if not instances:
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances to extend must be non-empty."
+            )
+        if len(set(instances)) != len(instances):
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances to extend must be unique."
+            )
+        merged_values = list(self._coherence_instances)
+        seen = set(self._coherence_instances)
+        for instance in instances:
+            if instance not in seen:
+                seen.add(instance)
+                merged_values.append(instance)
+        merged = tuple(merged_values)
+        self._coherence_instances = merged
+
     def _handoff_coherence_instance(
         self,
-        old: TensorInstance,
-        new: TensorInstance,
+        old: CoherenceInstance,
+        new: CoherenceInstance,
     ) -> None:
         if self._coherence_instances != (old,):
             raise CoherenceStateTransitionError(
@@ -488,6 +551,10 @@ class TransportTensor:
 
     @property
     def payload(self) -> TensorPayload:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"tensor payload is {self._runtime_state.name.lower()}."
+            )
         return self._payload
 
     @property
@@ -615,7 +682,13 @@ class TransportTensor:
         )
 
     def zero_copy_alias(self) -> "TransportTensor":
-        return TransportTensor(
+        return self._zero_copy_alias(TensorAccessIntent.WRITABLE)
+
+    def zero_copy_readonly_alias(self) -> "TransportTensor":
+        return self._zero_copy_alias(TensorAccessIntent.READONLY)
+
+    def _zero_copy_alias(self, intent: TensorAccessIntent) -> "TransportTensor":
+        alias = TransportTensor(
             self._payload.values,
             nested_splits=self.nested_splits,
             origin_indices=self.origin_indices,
@@ -625,6 +698,14 @@ class TransportTensor:
             routing_axes=self.routing_axes,
             source_step=self.source_step,
         )
+        if alias._payload.values is not self._payload.values and (
+            runtime_allocation_relation(alias, self) is not AllocationRelation.EXACT
+        ):
+            raise CoherenceStateTransitionError(
+                "zero-copy alias construction changed the backing allocation."
+            )
+        alias._set_runtime_access_intent(intent)
+        return alias
 
     @property
     def source_step(self) -> int | None:

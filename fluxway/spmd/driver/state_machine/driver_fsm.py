@@ -35,6 +35,12 @@ class DriverStateMachine:
         (DriverState.INITIALIZING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.INITIALIZING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.READY, DriverEvent.START): DriverState.RUNNING,
+        (DriverState.READY, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
+        (DriverState.DRAINED, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
+        (DriverState.RESTORING, DriverEvent.RESTORE_COMPLETE): DriverState.READY,
+        (DriverState.RESTORING, DriverEvent.RESTORE_FAILED): DriverState.ERROR,
+        (DriverState.RESTORING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.RESTORING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.READY, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.READY, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.RUNNING, DriverEvent.BLOCK_REQUESTED): DriverState.BLOCKED,
@@ -51,11 +57,12 @@ class DriverStateMachine:
         (DriverState.DRAINING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.DRAINING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.DRAINED, DriverEvent.SNAPSHOT_REQUESTED): DriverState.SNAPSHOTTING,
+        (DriverState.SNAPSHOTTING, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
         (DriverState.DRAINED, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.DRAINED, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         # Allow resuming even if we didn't snapshot
-        (DriverState.DRAINED, DriverEvent.SNAPSHOT_COMPLETE): DriverState.RUNNING,
-        (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_COMPLETE): DriverState.RUNNING,
+        (DriverState.DRAINED, DriverEvent.RESUME): DriverState.RUNNING,
+        (DriverState.SNAPSHOTTING, DriverEvent.RESUME): DriverState.RUNNING,
         (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_FAILED): DriverState.ERROR,
         (DriverState.SNAPSHOTTING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.SNAPSHOTTING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
@@ -166,6 +173,32 @@ class DriverStateMachine:
 
         return True
 
+    def require_transition(self, event: DriverEvent, **kwargs) -> DriverState:
+        if not self.trigger(event, **kwargs):
+            raise RuntimeError(
+                f"Driver event {event.name} is invalid in {self.state.name} state "
+                f"spmd_id={self._driver.spmd_id}"
+            )
+        return self.state
+
+    def admit_drain(self) -> bool:
+        """Admit a periodic or terminal drain through one lifecycle path.
+
+        Returns whether this call entered DRAINING. Existing DRAINING/DRAINED
+        states are already owned by the same drain cycle and are handled by the
+        synchronizer target reducer.
+        """
+        state = self.state
+        if state in (DriverState.RUNNING, DriverState.SNAPSHOTTING):
+            self.require_transition(DriverEvent.DRAIN_REQUESTED)
+            return True
+        if state in (DriverState.DRAINING, DriverState.DRAINED):
+            return False
+        raise RuntimeError(
+            "drain requires RUNNING, DRAINING, or DRAINED Driver state, "
+            f"got {state} spmd_id={self._driver.spmd_id}"
+        )
+
     def _failure_for_event(
         self,
         event: DriverEvent,
@@ -208,6 +241,17 @@ class DriverStateMachine:
                 phase="SNAPSHOT",
                 exception_type="SnapshotFailed",
                 message="SPMD snapshot failed.",
+                traceback=None,
+            )
+        if event is DriverEvent.RESTORE_FAILED:
+            return ExecutionFailure(
+                spmd_id=self._driver.spmd_id,
+                rank=None,
+                op_name=None,
+                step=None,
+                phase="RESTORE",
+                exception_type="RestoreFailed",
+                message="SPMD restore failed.",
                 traceback=None,
             )
         raise ValueError(f"Driver event {event.name} cannot enter ERROR.")

@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -9,6 +10,10 @@ from fluxway.common.types import (
     CheckpointManifest,
     SpmdCheckpoint,
     TopologySnapshot,
+    DrainBoundary,
+    DrainPhase,
+    DrainEvent,
+    DrainEventKind,
 )
 from fluxway.common.types import ControllerState, ExecutionFailure
 from fluxway.common.types.drain import DrainStrategy
@@ -99,15 +104,50 @@ def test_whole_job_terminal_rejects_divergent_source_clocks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_virtual_source_eof_shortens_to_minimum_observed_terminal() -> None:
+    source_spec = SimpleNamespace(is_source=True, is_interleaved=True)
+    graph_view = SimpleNamespace(
+        operator=lambda _name: SimpleNamespace(spec=source_spec)
+    )
+    controller_type = ControllerActor.__ray_metadata__.modified_class
+    controller = controller_type.__new__(controller_type)
+    controller._graph = SimpleNamespace(
+        require_compiled_graph=lambda: SimpleNamespace(spmd=lambda _spmd_id: graph_view)
+    )
+    controller._drain_boundary = DrainBoundary()
+    controller._state_machine = SimpleNamespace(is_running=lambda: True)
+    controller._async_step_manager = SimpleNamespace(
+        _config=SimpleNamespace(max_steps=None)
+    )
+    controller._dispatch_drain = AsyncMock()
+
+    await controller.report_boundary_event(
+        "source", "read", DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 14)
+    )
+    await controller.report_boundary_event(
+        "source", "read", DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 13)
+    )
+    await controller.report_boundary_event(
+        "source", "read", DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 15)
+    )
+
+    assert controller._drain_boundary.observed_cut == 13
+    assert controller._dispatch_drain.await_args_list[0].args == (14, 14)
+    assert controller._dispatch_drain.await_args_list[1].args == (13, 13)
+    assert controller._dispatch_drain.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
-    controller._last_requested_drain_target = 0
+    controller._drain_boundary = DrainBoundary()
     controller._drained_drivers = set()
+    controller._state_machine._state = ControllerState.RUNNING
 
     # Initial drain issued
     await controller._issue_initial_drain()
-    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_with(2)
-    mock_spmd_manager.mock_driver2.request_drain.remote.assert_called_with(2)
-    assert controller._last_requested_drain_target == 2
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_with(2, None)
+    mock_spmd_manager.mock_driver2.request_drain.remote.assert_called_with(2, None)
+    assert controller._drain_boundary.admitted_cut == 2
 
     # Driver 1 reports drained
     await controller.report_driver_drained("op1")
@@ -124,7 +164,7 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
     mock_spmd_manager.mock_driver2.resume.remote.assert_called()
 
     # Verifies next target issued
-    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_with(4)
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_with(4, None)
 
 
 @pytest.mark.asyncio
@@ -148,14 +188,10 @@ async def test_terminal_control_stream_reuses_driver_drain(
 
     await controller.seal_control_stream("op1:read")
 
-    assert controller._terminal_drain_target == 3
-    assert controller._last_requested_drain_target == 3
-    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_called_once_with(
-        3
-    )
-    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
-        3
-    )
+    assert controller._drain_boundary.observed_cut == 3
+    assert controller._drain_boundary.admitted_cut == 3
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_once_with(3, 3)
+    mock_spmd_manager.mock_driver2.request_drain.remote.assert_called_once_with(3, 3)
 
 
 @pytest.mark.asyncio
@@ -179,19 +215,15 @@ async def test_terminal_control_stream_defers_driver_rpc_until_running(
 
     await controller.seal_control_stream("op1:read")
 
-    assert controller._terminal_drain_target == 3
-    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_not_called()
-    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_not_called()
+    assert controller._drain_boundary.observed_cut == 3
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_not_called()
+    mock_spmd_manager.mock_driver2.request_drain.remote.assert_not_called()
 
     controller._state_machine._state = ControllerState.RUNNING
-    await controller._schedule_terminal_drain_if_complete()
+    await controller._dispatch_drain(3, 3)
 
-    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_called_once_with(
-        3
-    )
-    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
-        3
-    )
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_once_with(3, 3)
+    mock_spmd_manager.mock_driver2.request_drain.remote.assert_called_once_with(3, 3)
 
 
 @pytest.mark.asyncio
@@ -216,14 +248,10 @@ async def test_terminal_beyond_max_steps_drains_to_run_boundary(
 
     await controller.seal_control_stream("op1:read")
 
-    assert controller._terminal_drain_target == 3
-    assert controller._last_requested_drain_target == 2
-    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_called_once_with(
-        2
-    )
-    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_called_once_with(
-        2
-    )
+    assert controller._drain_boundary.observed_cut == 3
+    assert controller._drain_boundary.admitted_cut == 3
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_called_once_with(2, 3)
+    mock_spmd_manager.mock_driver2.request_drain.remote.assert_called_once_with(2, 3)
 
 
 @pytest.mark.asyncio
@@ -243,12 +271,8 @@ async def test_zero_terminal_checkpoints_before_completion(
 
     await controller.seal_control_stream("op1:read")
 
-    mock_spmd_manager.mock_driver1.request_terminal_drain.remote.assert_awaited_once_with(
-        0
-    )
-    mock_spmd_manager.mock_driver2.request_terminal_drain.remote.assert_awaited_once_with(
-        0
-    )
+    mock_spmd_manager.mock_driver1.request_drain.remote.assert_awaited_once_with(0, 0)
+    mock_spmd_manager.mock_driver2.request_drain.remote.assert_awaited_once_with(0, 0)
     await controller.report_driver_drained("op1")
     await controller.report_driver_drained("op2")
     await controller._checkpoint_task
@@ -267,23 +291,21 @@ async def test_start_dispatches_latched_terminal_without_periodic_drain(controll
     controller._state_machine._state = ControllerState.READY
     controller._control_ledger = MagicMock()
 
-    async def schedule_terminal():
-        assert controller._state_machine.state is ControllerState.RUNNING
-        controller._terminal_drain_target = 3
-        events.append("terminal")
-
     async def start_sources():
         events.append("sources")
 
-    controller._schedule_terminal_drain_if_complete = AsyncMock(
-        side_effect=schedule_terminal
+    controller._control_ledger = None
+    controller._drain_boundary = DrainBoundary(
+        phase=DrainPhase.OBSERVED,
+        observed_cut=3,
+        admitted_cut=3,
     )
     controller._issue_initial_drain = AsyncMock()
     controller.start_source_operators = AsyncMock(side_effect=start_sources)
 
     assert await controller.start() is None
 
-    assert events == ["terminal", "sources"]
+    assert events == ["sources"]
     controller._issue_initial_drain.assert_not_awaited()
 
 
@@ -295,11 +317,9 @@ async def test_start_without_checkpoint_skips_terminal_ledger(controller):
     controller._control_ledger = None
     controller._issue_initial_drain = AsyncMock()
     controller.start_source_operators = AsyncMock()
-    controller._schedule_terminal_drain_if_complete = AsyncMock()
 
     assert await controller.start() is None
 
-    controller._schedule_terminal_drain_if_complete.assert_not_awaited()
     controller._issue_initial_drain.assert_awaited_once_with()
     controller.start_source_operators.assert_awaited_once_with()
 
@@ -309,16 +329,12 @@ async def test_zero_terminal_target_completes_without_starting_sources(controlle
     controller.initialize = AsyncMock()
     controller._ready_event.set()
     controller._state_machine._state = ControllerState.READY
-    controller._control_ledger = MagicMock()
+    controller._control_ledger = ControlLedger(4)
     controller._issue_initial_drain = AsyncMock()
     controller.start_source_operators = AsyncMock()
 
-    async def complete_terminal():
-        controller._terminal_drain_target = 0
-        controller._state_machine._state = ControllerState.COMPLETED
-
-    controller._schedule_terminal_drain_if_complete = AsyncMock(
-        side_effect=complete_terminal
+    controller._drain_boundary = DrainBoundary(
+        phase=DrainPhase.OBSERVED, observed_cut=0, admitted_cut=0
     )
 
     assert await controller.start() is None
@@ -339,7 +355,9 @@ async def test_stop_checkpointer_skips_self_await(controller):
 @pytest.mark.asyncio
 async def test_checkpoint_failure_enters_failed_without_resuming(controller):
     controller._state_machine._state = ControllerState.RUNNING
-    controller._last_requested_drain_target = 2
+    controller._drain_boundary = DrainBoundary(
+        phase=DrainPhase.DRAINED, admitted_cut=2, drained_cut=2
+    )
     controller._checkpointer.save.side_effect = RuntimeError("storage unavailable")
     controller._finalize_runtime = AsyncMock()
     controller._resume_and_schedule_next_drain = AsyncMock()
@@ -742,7 +760,7 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
         framework_state={
             "control_ledger": controller._control_ledger.checkpoint_state(cuts={}),
             "components": {},
-            "last_checkpointed_step": 0,
+            "drain_boundary": DrainBoundary().to_dict(),
         },
         spmds={
             spmd_id: SpmdCheckpoint(topology, spmd_state, {})
@@ -825,7 +843,13 @@ async def test_terminal_checkpoint_restore_uses_existing_completion_path(
         framework_state={
             "control_ledger": terminal_state,
             "components": {},
-            "last_checkpointed_step": 3,
+            "drain_boundary": DrainBoundary(
+                phase=DrainPhase.COMPLETED,
+                observed_cut=3,
+                admitted_cut=3,
+                drained_cut=3,
+                committed_cut=3,
+            ).to_dict(),
         },
         spmds={
             spmd_id: SpmdCheckpoint(topology, spmd_state, {})

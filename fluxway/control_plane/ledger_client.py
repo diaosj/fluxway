@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 
+class ControlStreamExhausted(EOFError):
+    """The requested position is at or beyond a sealed stream boundary."""
+
+
 @dataclass(frozen=True, slots=True, init=False)
 class ControlRecord:
     stream_id: str

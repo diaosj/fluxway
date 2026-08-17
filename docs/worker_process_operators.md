@@ -74,7 +74,7 @@ This preserves event-loop progress for:
 Pure Python CPU-heavy user code still competes for the CPython GIL. The runtime
 is an event-loop isolation mechanism, not a promise of CPU parallel speedup.
 JAX, CuPy, native kernels, Ray RPC waits, and many I/O paths can still overlap
-because they release the GIL or are backend driven.
+because they release the GIL or are component driven.
 
 On free-threaded CPython 3.14 and later, the same named worker-process lanes can
 run Python bytecode in parallel. Fluxway does not expose a second execution
@@ -122,26 +122,28 @@ Fluxway Worker Process Error: ... calls jax.distributed.initialize but is not ma
 The internal protocol field `__fluxway_process_affine__` is intentionally hidden
 behind the decorator. User code should use `@fluxway.requires_worker_process`.
 
-## Checkpoint Backends
+## Checkpoint Components
 
 Operators do not implement checkpoint hooks. A checkpoint format is registered once
-through `@spmd(checkpoint_components=(...))` and implements the single
-`CheckpointComponentRegistration` ABI. This keeps user state capture, collective publication,
-physical URI generation, restore, lease, and cleanup behind one explicit extension
-boundary.
+through `@spmd(checkpoint_components=(...))` and composes the optional
+`CheckpointComponentRegistration` SPI contracts. This keeps state serialization,
+collective publication, physical URI generation, restore, object holds, and cleanup
+behind one explicit extension boundary.
 
-The worker coordinator invokes the registered persistence capability's `prepare`, `capture`, `finalize`, `commit`, `abort`,
-and `restore` in that order. The Controller owns transaction ordering and Manifest
-publication; a backend owns its checkpoint_object URI, staging layout, version, and physical
-keep operations. A failed transaction calls `abort`; keep of an already
-published checkpoint_object calls `cleanup`; worker shutdown calls `close`.
+The worker coordinator invokes a registered `SAVE` component's
+`prepare_save`, `save`, `finish_save`, `commit_save`, and `publish_save` phases;
+`rollback_save` handles failed transactions. A registered `RESTORE` component
+handles `restore`. The Controller owns transaction ordering and Manifest
+publication; a component owns its checkpoint object URI, staging layout, version,
+and physical retention operations. Object holds and cleanup reservations belong to
+`OBJECT_LIFECYCLE`; physical deletion belongs to `OBJECT_CLEANUP`.
 
 `CheckpointContext` carries logical identity only: transaction, snapshot, cut,
 SPMD/rank, topology, and component ID. It deliberately has no physical storage_locator.
-Use `context.checkpoint_object_key(...)` for a logical checkpoint_object identity and return the
-backend-owned opaque `CheckpointObjectRef` from `capture`/`commit`.
+Use `context.checkpoint_object_key(...)` for a logical checkpoint object identity and return the
+component-owned opaque `CheckpointObjectRef` from `save`/`commit_save`.
 
 Every mutating phase receives Fluxway's `CheckpointCommitPermit`; stale permits are
 rejected after coordinator generation takeover. See [checkpoint.md](checkpoint.md)
 for the capability contract, Manifest schema,
-topology restore rules, keep leases, and built-in backend examples.
+topology restore rules, retention leases, and built-in component examples.
