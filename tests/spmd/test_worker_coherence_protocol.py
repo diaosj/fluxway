@@ -1,5 +1,6 @@
 import asyncio
 import types
+from typing import Any
 
 import pytest
 import numpy as np
@@ -996,11 +997,11 @@ async def test_cancelled_batch_delegation_rolls_back_prior_child_grants() -> Non
     directory.publish_local_payload(blocked, 7)
     blocker = directory.request_write(blocked, 7, ExecutionToken(9))
     assert isinstance(blocker, GrantReady)
-    runtime = CoherenceBatchRetireRuntime(
-        directory,
-        types.SimpleNamespace(commit_payload=lambda _instances, payload: payload()),
+    sequencer: Any = types.SimpleNamespace(
+        commit_payload=lambda _instances, payload: payload()
     )
-    plan = types.SimpleNamespace(
+    runtime = CoherenceBatchRetireRuntime(directory, sequencer)
+    plan: Any = types.SimpleNamespace(
         sender_spmd_code=1,
         rank=0,
         coherence_logical_tuuid=lambda code: 10 if code == 1 else 11,
@@ -1033,23 +1034,31 @@ async def test_delivery_failure_rolls_back_but_success_retentions_child_grant(
     directory = CoherenceDirectory()
     subject = CoherenceSubject(1, 0, 12)
     directory.publish_local_payload(subject, 7)
-    grant = directory.delegate_read(subject, 7, child_id=0)
-    assert isinstance(grant, GrantReady)
-    receipt = directory.register_child_delivery(grant.token)
-    runtime = CoherenceBatchRetireRuntime(
-        directory,
-        types.SimpleNamespace(commit_payload=lambda _instances, payload: payload()),
+    sequencer: Any = types.SimpleNamespace(
+        commit_payload=lambda _instances, payload: payload()
+    )
+    runtime = CoherenceBatchRetireRuntime(directory, sequencer)
+    plan: Any = types.SimpleNamespace(
+        sender_spmd_code=1,
+        rank=0,
+        coherence_instance=lambda transfer_code, epoch: CoherenceInstance(
+            subject, epoch
+        ),
+        coherence_child_slot=lambda transfer_code, target_rank: 0,
+    )
+    batch = TransportFrameBatch(
+        context_index=0,
+        target_rank=0,
+        batch_seq=0,
+        frames=(),
+        delegations=(TransportDelegationDescriptor(1, 7),),
     )
 
     async def delivery():
         if delivery_fails:
             raise RuntimeError("delivery failed")
 
-    async def retire() -> None:
-        result = await delivery()
-        assert result is None
-
-    task = asyncio.create_task(runtime._complete_delivery((receipt,), retire()))
+    task = asyncio.create_task(runtime.retire(plan, batch, delivery))
     await asyncio.gather(task, return_exceptions=True)
     await asyncio.sleep(0)
 
@@ -1058,7 +1067,7 @@ async def test_delivery_failure_rolls_back_but_success_retentions_child_grant(
 
 
 def test_delegated_reads_preserve_batch_order_and_drop_duplicates() -> None:
-    plan = types.SimpleNamespace(
+    plan: Any = types.SimpleNamespace(
         sender_spmd_code=7,
         rank=1,
         coherence_logical_tuuid=lambda transfer_code: transfer_code + 100,
@@ -1080,7 +1089,7 @@ def test_delegated_reads_preserve_batch_order_and_drop_duplicates() -> None:
         ),
     )
 
-    delegated_reads = _delegated_reads(plan, batch)  # type: ignore[arg-type]
+    delegated_reads = _delegated_reads(plan, batch)
 
     assert [(epoch, slot) for _subject, epoch, slot in delegated_reads] == [
         (1, 3),
@@ -1094,15 +1103,24 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
     directory = CoherenceDirectory()
     subject = CoherenceSubject(1, 0, 13)
     directory.publish_local_payload(subject, 7)
-    first = directory.delegate_read(subject, 7, child_id=0)
-    second = directory.delegate_read(subject, 7, child_id=0)
-    assert isinstance(first, GrantReady)
-    assert isinstance(second, GrantReady)
-    first_receipt = directory.register_child_delivery(first.token)
-    second_receipt = directory.register_child_delivery(second.token)
-    runtime = CoherenceBatchRetireRuntime(
-        directory,
-        types.SimpleNamespace(commit_payload=lambda _instances, payload: payload()),
+    sequencer: Any = types.SimpleNamespace(
+        commit_payload=lambda _instances, payload: payload()
+    )
+    runtime = CoherenceBatchRetireRuntime(directory, sequencer)
+    plan: Any = types.SimpleNamespace(
+        sender_spmd_code=1,
+        rank=0,
+        coherence_instance=lambda transfer_code, epoch: CoherenceInstance(
+            subject, epoch
+        ),
+        coherence_child_slot=lambda transfer_code, target_rank: 0,
+    )
+    batch = TransportFrameBatch(
+        context_index=0,
+        target_rank=0,
+        batch_seq=0,
+        frames=(),
+        delegations=(TransportDelegationDescriptor(1, 7),),
     )
     fail_first = asyncio.Event()
 
@@ -1113,12 +1131,8 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
     async def second_delivery():
         return None
 
-    first_task = asyncio.create_task(
-        runtime._complete_delivery((first_receipt,), first_delivery())
-    )
-    second_task = asyncio.create_task(
-        runtime._complete_delivery((second_receipt,), second_delivery())
-    )
+    first_task = asyncio.create_task(runtime.retire(plan, batch, first_delivery))
+    second_task = asyncio.create_task(runtime.retire(plan, batch, second_delivery))
     await second_task
     await asyncio.sleep(0)
     fail_first.set()

@@ -28,6 +28,7 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     InterleavedDispatcher,
 )
 from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.spmd.worker.admission import StepAdmissionState
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
@@ -217,6 +218,26 @@ async def test_source_exhaustion_does_not_advance_the_data_watermark():
     worker._clear_direct_local_step = Mock()
     worker._advance_step = AsyncMock(
         side_effect=AssertionError("source exhaustion is not a data step")
+    )
+    worker._scheduled_step_count = {"loader": 3}
+    worker._admission_state = StepAdmissionState(
+        completed=worker._completed_step_count,
+        scheduled=worker._scheduled_step_count,
+        queue_membership=worker._in_op_step_queue,
+        pending_blocked=worker._pending_blocked,
+        pending_future=worker._pending_future_steps,
+        pending_async_lag=worker._pending_async_lag_steps,
+        pending_phase_order=worker._pending_phase_order_steps,
+        ready_pipeline=worker._ready_pending_pipeline_steps,
+        mailbox_ready=worker._mailbox_ready_steps,
+        running=worker._running_plan_steps,
+        finished=worker._finished_plan_steps,
+        is_periodic=lambda _op: False,
+        is_runnable=lambda _op: True,
+        hold_prepare_token=lambda _op, _step: False,
+        async_lag_blocked=lambda _op, _step: False,
+        phase_order_blocked=lambda _op, _step: False,
+        can_start=lambda _op: True,
     )
 
     await worker_class._commit_finished_steps(worker, "loader")

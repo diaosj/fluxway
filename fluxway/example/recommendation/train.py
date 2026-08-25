@@ -139,6 +139,8 @@ def _export_graph_visualization(task_graph, args) -> None:
 
 
 async def run_training(args):
+    if args.num_epochs <= 0:
+        raise ValueError(f"num_epochs must be positive, got {args.num_epochs}")
     if args.dense_step_delay_ms < 0:
         raise ValueError(
             f"--dense-step-delay-ms must be non-negative, got {args.dense_step_delay_ms}."
@@ -167,7 +169,10 @@ async def run_training(args):
 
     with FunctionalGraph("End-to-End_Training_Flow") as graph:
         reader = RecommendationReader(
-            name="TrainingReader", mesh=reader_mesh, runtime_env=cpu_runtime_env
+            name="TrainingReader",
+            mesh=reader_mesh,
+            runtime_env=cpu_runtime_env,
+            num_epochs=args.num_epochs,
         )
         input_node = InputSPMD(
             name="InputProcessor", mesh=input_mesh, runtime_env=cpu_runtime_env
@@ -299,6 +304,12 @@ def main():
         default=2,
         dest="checkpoint_interval",
         help="Save a checkpoint every N steps",
+    )
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=1,
+        help="Number of synthetic reader epochs",
     )
     parser.add_argument(
         "--checkpoint-dir",

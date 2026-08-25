@@ -4,13 +4,11 @@ from fluxway.common.coherence import (
     CoherenceDirectory,
     CoherenceSubject,
     ExecutionToken,
-    GrantPending,
     GrantReady,
     ParentAuthority,
     CoherenceInstance,
 )
 from fluxway.spmd.worker.coherence_runtime import (
-    CoherenceAdmissionRuntime,
     ParentGrantReturnRuntime,
     ParentReturnRoute,
 )
@@ -91,8 +89,9 @@ async def test_parent_return_runtime_accepts_reentrant_next_epoch() -> None:
     delegated = parent.delegate_read(subject, 7, child_id=0)
     assert isinstance(delegated, GrantReady)
     _shared_child(child, subject)
-    pending = parent.delegate_local_payload(subject, 8, child_id=0)
-    assert isinstance(pending, GrantPending)
+    ready = parent.delegate_local_payload(subject, 8, child_id=0)
+    assert isinstance(ready, GrantReady)
+    assert ready.token.epoch == 8
 
     async def send(_group: tuple[ParentReturnRoute, ...]) -> None:
         parent.return_child(subject, 7, child_id=0)
@@ -101,7 +100,5 @@ async def test_parent_return_runtime_accepts_reentrant_next_epoch() -> None:
     runtime = ParentGrantReturnRuntime(child, send)
     retired = await runtime.return_parent_grants((route,))
 
-    token = await CoherenceAdmissionRuntime(parent).await_grant(pending)
-    assert token.epoch == 8
     assert _entry(child, subject, 8).parent_grant.authority is ParentAuthority.SHARED
     assert retired == frozenset((CoherenceInstance(subject, 7),))

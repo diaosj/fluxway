@@ -122,6 +122,9 @@ class AllocationRegistry:
         del self._bindings[instance]
         self._retired[instance.subject].append(instance)
 
+    def watermark(self, subject: CoherenceSubject) -> int:
+        return self._watermarks.get(subject, 0)
+
     def advance_watermark(self, subject: CoherenceSubject, epoch: int) -> int:
         current = self._watermarks.get(subject, 0)
         if epoch < current:

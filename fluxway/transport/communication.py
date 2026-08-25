@@ -1749,7 +1749,7 @@ class BaseDataDistributor:
                     "[Distributor Plan] [Rank %s] targets=%s tensors=%s counts=%s "
                     "sort_idx=%s global_shapes_list=%s "
                     "has_meta_tensor_state_list=%s slice_compact_desc_params=%s "
-                    "tensor_kind_list=%s",
+                    "tensor_kind_list=%s coherence_epochs_list=%s",
                     self.local_rank,
                     targets,
                     tensors,
@@ -2086,7 +2086,7 @@ def _iter_transport_frame_entry_plans(
             )
         cursor = 0
         for entry_index, transfer_code in enumerate(transfer_code_seq):
-            layout_state = int(layout_states[entry_index])
+            layout_state = layout_states[entry_index]
             component_count = 1 + ragged_level_count(layout_state)
             if layout_state & 2:
                 component_count += 1
@@ -2103,12 +2103,12 @@ def _iter_transport_frame_entry_plans(
                 else None
             )
             if compact is not None:
-                compact = tuple(int(value) for value in compact)
+                compact = tuple(value for value in compact)
             payloads = [
                 TransportPayloadPlan(
                     role=PayloadRole.VALUES,
                     segment=tensors[cursor],
-                    valid_count=int(payload_counts[0]),
+                    valid_count=payload_counts[0],
                 )
             ]
             cursor += 1
@@ -2117,7 +2117,7 @@ def _iter_transport_frame_entry_plans(
                     TransportPayloadPlan(
                         role=PayloadRole.RAGGED_LENGTHS,
                         segment=tensors[cursor],
-                        valid_count=int(counts[cursor]),
+                        valid_count=counts[cursor],
                     )
                 )
                 cursor += 1
@@ -2126,7 +2126,7 @@ def _iter_transport_frame_entry_plans(
                     TransportPayloadPlan(
                         role=PayloadRole.ORIGIN,
                         segment=tensors[cursor],
-                        valid_count=int(counts[cursor]),
+                        valid_count=counts[cursor],
                     )
                 )
                 cursor += 1
@@ -2135,11 +2135,11 @@ def _iter_transport_frame_entry_plans(
                 TransportFrameEntryPlan(
                     transfer_code=transfer_code,
                     layout_state=layout_state,
-                    tensor_kind=TensorEntryKind(int(tensor_kinds[entry_index])),
-                    coherence_epoch=int(coherence_epochs[entry_index]),
+                    tensor_kind=TensorEntryKind(tensor_kinds[entry_index]),
+                    coherence_epoch=coherence_epochs[entry_index],
                     expected_count=group.expected_count,
                     compact_params=compact,
-                    global_shape=tuple(int(value) for value in shape)
+                    global_shape=tuple(value for value in shape)
                     if shape is not None
                     else None,
                     payloads=tuple(payloads),
@@ -2338,8 +2338,8 @@ def _frame_table_capacity_for_groups(
         cursor = 0
         entry_count += len(transfer_code_seq)
         for entry_index, layout_state in enumerate(layout_states):
-            component_count = 1 + ragged_level_count(int(layout_state))
-            if int(layout_state) & 2:
+            component_count = 1 + ragged_level_count(layout_state)
+            if layout_state & 2:
                 component_count += 1
             if cursor + component_count > len(tensors):
                 raise ValueError(

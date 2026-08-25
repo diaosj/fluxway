@@ -8,6 +8,7 @@ from fluxway.common.types import (
     CheckpointComponentPublication,
     CheckpointCommitPermit,
     CheckpointCut,
+    checkpoint_position,
     DriverEvent,
     DriverState,
     WorkerSaveResult,
@@ -114,7 +115,7 @@ class SnapshotOrchestrator:
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.driver_snapshot(
                 snapshot_id=checkpoint_id,
-                target_step=cut.logical_step,
+                target_step=cut.position,
                 worker_count=len(self.executor.get_worker_handles()),
             ):
                 await self._request_snapshot_unprofiled(
@@ -187,17 +188,15 @@ class SnapshotOrchestrator:
                     f"checkpoint save returned no workers for {self.spmd_id!r}"
                 )
             await self.executor.checkpoint_finish_save()
-            runtime_state = self._canonical_runtime_state(save_results)
+            runtime_state = self._canonical_runtime_state(save_results, cut.position)
             component_records = self._gather_component_records(save_results)
             committed = await self.executor.checkpoint_commit_save(component_records)
             publications = self._canonical_publications(committed)
-            runtime_state["driver_components"] = (
-                self._component_registry.checkpoint_state()
-            )
             snapshot = SpmdCheckpoint(
                 source_topology=self._current_topology(),
                 runtime_state=runtime_state,
                 components=publications,
+                driver_components=self._component_registry.checkpoint_state(),
             )
             self._pending_snapshot = snapshot
         except BaseException as primary_error:
@@ -353,19 +352,15 @@ class SnapshotOrchestrator:
         self.state_machine.require_transition(DriverEvent.RESTORE_REQUESTED)
         await self._notify_component_state(DriverState.RESTORING)
         try:
-            runtime_state = dict(snapshot.runtime_state)
-            driver_components = runtime_state.pop("driver_components", None)
-            if not isinstance(driver_components, Mapping):
-                raise ValueError("SPMD snapshot is missing driver component state")
-            self._component_registry.restore_state(driver_components)
-            self.synchronizer.load_spmd_state(runtime_state)
+            self._component_registry.restore_state(snapshot.driver_components)
+            self.synchronizer.load_spmd_state(snapshot.runtime_state)
             await self.executor.checkpoint_restore(
                 repository_root,
                 checkpoint_id,
                 cut,
                 snapshot.source_topology,
                 self._current_topology(),
-                runtime_state,
+                snapshot.runtime_state,
                 snapshot.components,
             )
         except BaseException:
@@ -378,7 +373,14 @@ class SnapshotOrchestrator:
     @staticmethod
     def _canonical_runtime_state(
         save_results: list[tuple[int, dict[str, Any], Mapping[str, WorkerSaveResult]]],
+        position: int | None,
     ) -> dict[str, Any]:
+        if position is None:
+            raise ValueError("checkpoint runtime state requires a position")
+        if position < 0:
+            raise ValueError(
+                f"checkpoint position must be non-negative, got {position}"
+            )
         rank, first, _ = save_results[0]
         for candidate_rank, candidate, _ in save_results[1:]:
             if candidate != first:
@@ -387,7 +389,14 @@ class SnapshotOrchestrator:
                     f"rank={rank} state={first!r} rank={candidate_rank} "
                     f"state={candidate!r}"
                 )
-        return dict(first)
+        runtime_state = dict(first)
+        runtime_position = checkpoint_position(runtime_state)
+        if runtime_position != position:
+            raise RuntimeError(
+                "worker runtime checkpoint boundary does not match checkpoint position: "
+                f"position={position} runtime_position={runtime_position!r}"
+            )
+        return runtime_state
 
     @staticmethod
     def _gather_component_records(

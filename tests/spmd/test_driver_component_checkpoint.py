@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from fluxway.common.types import (
     CheckpointCommitPermit,
     CheckpointCut,
+    DrainBoundary,
     DriverState,
     SpmdCheckpoint,
     TopologySnapshot,
@@ -71,7 +72,15 @@ class _Executor:
         self._events.append("worker_save")
         if self.fail_save:
             raise RuntimeError("save failed")
-        return [(0, {"completed_step_count": {"read": 5}}, {})]
+        return [
+            (
+                0,
+                {
+                    "drain_boundary": DrainBoundary(committed_cut=5).to_dict(),
+                },
+                {},
+            )
+        ]
 
     async def checkpoint_finish_save(self):
         self._events.append("worker_finalize")
@@ -166,7 +175,7 @@ def test_snapshot_contains_driver_component_state():
 
     snapshot = controller.receive_snapshot_metadata.calls[0][2]
     assert isinstance(snapshot, SpmdCheckpoint)
-    assert snapshot.runtime_state["driver_components"] == {
+    assert snapshot.driver_components == {
         "reader:read": {"cursor": {"checkpoint_id": 3}}
     }
     assert events.index("worker_finalize") < events.index("worker_commit")
@@ -179,10 +188,10 @@ def test_restore_components_precedes_component_restore():
     snapshot = SpmdCheckpoint(
         topology,
         {
-            "completed_step_count": {"read": 5},
-            "driver_components": {"reader:read": {"cursor": {"checkpoint_id": 3}}},
+            "drain_boundary": DrainBoundary(committed_cut=5).to_dict(),
         },
         {},
+        {"reader:read": {"cursor": {"checkpoint_id": 3}}},
     )
 
     asyncio.run(

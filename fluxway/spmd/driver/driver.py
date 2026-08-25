@@ -643,6 +643,20 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         self.executor.resume_sources()
 
     async def start_source_operators(self) -> None:
+        started_from_ready = self.state_machine.state is DriverState.READY
+        if self.state_machine.state is DriverState.READY:
+            self.state_machine.require_transition(DriverEvent.START)
+        elif self.state_machine.state not in {
+            DriverState.RUNNING,
+            DriverState.DRAINING,
+            DriverState.DRAINED,
+        }:
+            raise RuntimeError(
+                "source operators require a running Driver, got "
+                f"{self.state_machine.state.name} spmd_id={self.spmd_id}"
+            )
+        if started_from_ready:
+            self.spmd_synchronizer.unblock_all_ops()
         await self._notify_driver_components(DriverState.RUNNING)
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.driver_source_start(

@@ -290,12 +290,12 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
     payload = {
         "source_a": SpmdCheckpoint(
             TopologySnapshot(1, (), (), "v1"),
-            {"completed_step_count": {"read": 1}},
+            {"drain_boundary": DrainBoundary(committed_cut=1).to_dict()},
             {},
         ),
         "source_b": SpmdCheckpoint(
             TopologySnapshot(1, (), (), "v1"),
-            {"completed_step_count": {"read": 2}},
+            {"drain_boundary": DrainBoundary(committed_cut=2).to_dict()},
             {},
         ),
     }

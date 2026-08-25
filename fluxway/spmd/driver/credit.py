@@ -252,7 +252,8 @@ class CreditManager:
                 f"Credit edge {edge_id!r} downstream mismatch: "
                 f"expected={edge.target_spmd_id!r}, got={downstream_id!r}."
             )
-        if self._upstream_credit_state.receive(edge_id, update):
+        accepted = self._upstream_credit_state.receive(edge_id, update)
+        if accepted:
             self._peer_credit_hints_by_op[edge.source_op] = (
                 self._upstream_credit_state.allowed_step(edge.source_op)
             )
@@ -274,9 +275,8 @@ class CreditManager:
                     f"Driver {self.spmd_id!r} has no peer credit hint "
                     f"for op {op_name!r}."
                 )
-            self.synchronizer.update_allowed_step(
-                op_name, min(controller_allowed, peer_allowed)
-            )
+            effective_allowed = min(controller_allowed, peer_allowed)
+            self.synchronizer.update_allowed_step(op_name, effective_allowed)
 
     def send_credit_updates(self, op_name: str, completed_count: int) -> None:
         edges = self._downstream_credit_edges_by_target_op.get(op_name, ())

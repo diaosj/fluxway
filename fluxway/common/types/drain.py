@@ -85,6 +85,19 @@ class DrainBoundary:
         }
 
     @classmethod
+    def from_committed_cut(cls, committed_cut: int) -> "DrainBoundary":
+        """Start a fresh execution epoch at a durable checkpoint position."""
+        if isinstance(committed_cut, bool) or not isinstance(committed_cut, int):
+            raise TypeError("committed cut must be an integer")
+        if committed_cut < 0:
+            raise ValueError(f"committed cut must be non-negative, got {committed_cut}")
+        return cls(
+            phase=DrainPhase.OPEN,
+            drained_cut=committed_cut,
+            committed_cut=committed_cut,
+        )
+
+    @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "DrainBoundary":
         if not isinstance(value, Mapping):
             raise TypeError("drain boundary state must be a mapping")

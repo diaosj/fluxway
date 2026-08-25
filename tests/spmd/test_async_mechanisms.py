@@ -384,6 +384,29 @@ def test_flow_control_manager_produces_controller_authoritative_windows():
         )
 
 
+def test_flow_control_frontier_follows_logical_completion_monotonically():
+    graph = _planned_graph(
+        name="flow-control-restore-frontier",
+        operators_by_spmd={
+            "A": {"produce": OperatorSpec(name="produce")},
+            "B": {
+                "consume": OperatorSpec(
+                    name="consume", async_policy=AsyncPolicy.pipelined(depth=3)
+                )
+            },
+        },
+        edges=(_dependency_edge("A", "produce", "B", "consume"),),
+    )
+    manager = FlowControlManager(graph, AsyncStepConfig())
+    manager.observe_op_completed("B", "consume", 10)
+
+    windows = manager.observe_op_completed("B", "consume", 6)
+
+    assert manager.epoch == 0
+    assert windows == {}
+    assert manager.observe_op_completed("B", "consume", 6) == {}
+
+
 def _make_driver(spmd_id: str, controller_handle=None):
     mesh = DeviceMesh(axis_names=("worker",), device_shape=(1,))
     operators = {
@@ -517,3 +540,81 @@ def test_async_manager_reports_all_completed_at_max_steps():
 
     manager.report_op_completed("B", op_b, 3)
     assert manager.is_all_completed() is True
+
+
+class TestResumeSkewRecheck:
+    """Prove root cause and fix: stale policy locks after snapshot resume."""
+
+    def _make_sync(self, max_skew: int = 1, num_workers: int = 2):
+        sync = SPMDSynchronizer(
+            "EmbeddingTable2",
+            num_workers=num_workers,
+            sync_policy=MaxSkewSyncPolicy(max_skew=max_skew),
+        )
+        blocks: list[tuple[int, str]] = []
+        unblocks: list[tuple[int, str]] = []
+        sync.set_callbacks(
+            block_worker_op=lambda r, o, e: blocks.append((r, o)),
+            unblock_worker_op=lambda r, o, e: unblocks.append((r, o)),
+        )
+        sync.register_expected_ops(["lookup"])
+        sync.unblock_all_ops()
+        return sync, blocks, unblocks
+
+    def test_policy_lock_persists_after_clear_drain(self):
+        """Root cause: clear_drain() does not release worker-level policy locks."""
+        sync, blocks, _ = self._make_sync()
+
+        for step in range(1, 5):
+            sync.report_worker_op_completed(0, "lookup", step)
+            sync.report_worker_op_completed(1, "lookup", step)
+
+        # rank 0 at step 6, rank 1 at step 4 -> skew=2 > 1 -> BLOCK rank 0
+        sync.report_worker_op_completed(0, "lookup", 6)
+        assert sync._worker_op_locked[0].get("lookup", False), (
+            "rank 0 must be policy-blocked"
+        )
+
+        blocks.clear()
+        sync.clear_drain()
+
+        assert sync._worker_op_locked[0].get("lookup", False), (
+            "ROOT CAUSE: clear_drain() does not release worker-level policy locks; "
+            "workers remain stuck after snapshot resume"
+        )
+
+    def test_clear_drain_resolves_stale_lock_when_skew_resolved(self):
+        """Clearing a drain reconciles worker locks with the current skew."""
+        sync, _, unblocks = self._make_sync()
+
+        # Both workers reach the drain boundary step=6
+        for step in range(1, 7):
+            sync.report_worker_op_completed(0, "lookup", step)
+            sync.report_worker_op_completed(1, "lookup", step)
+
+        # Manually introduce stale lock (as if it was set mid-drain)
+        sync._worker_op_locked[0]["lookup"] = True
+
+        unblocks.clear()
+        sync.clear_drain()
+
+        assert not sync._worker_op_locked[0].get("lookup", False), (
+            "With equal step counts (skew=0), recheck must unblock rank 0"
+        )
+        assert any(r == 0 and o == "lookup" for r, o in unblocks), (
+            "unblock callback must fire to wake the worker's execution loop"
+        )
+
+    def test_clear_drain_preserves_genuine_skew_block(self):
+        """Clearing a drain keeps a genuine skew block."""
+        sync, _, _ = self._make_sync()
+
+        # rank 0 at step 6, rank 1 at step 4 -> real skew=2 > 1
+        sync.report_worker_op_completed(0, "lookup", 6)
+        sync.report_worker_op_completed(1, "lookup", 4)
+
+        sync.clear_drain()
+
+        assert sync._worker_op_locked[0].get("lookup", False), (
+            "Genuine skew=2 > max_skew=1 must remain blocked after recheck"
+        )

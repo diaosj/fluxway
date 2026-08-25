@@ -13,6 +13,7 @@ from fluxway.common.types.checkpoint import (
     StepReference,
     TopologySnapshot,
 )
+from fluxway.common.types import DrainBoundary
 from fluxway.control_plane.checkpointer.repository import CheckpointRepository
 
 
@@ -25,7 +26,7 @@ def _manifest(sequence: int) -> CheckpointManifest:
         format_version=1,
     )
     return CheckpointManifest(
-        schema_version=4,
+        schema_version=1,
         checkpoint_id=f"snapshot-{sequence}",
         attempt_id=f"attempt-{sequence}",
         coordinator_generation=1,
@@ -36,7 +37,9 @@ def _manifest(sequence: int) -> CheckpointManifest:
         spmds={
             "train": SpmdCheckpoint(
                 source_topology=TopologySnapshot(1, (), (), "v1"),
-                runtime_state={},
+                runtime_state={
+                    "drain_boundary": DrainBoundary(committed_cut=sequence).to_dict()
+                },
                 components={
                     "state": CheckpointComponentPublication(
                         component_id="state",
@@ -118,7 +121,7 @@ def test_spmd_snapshot_rejects_component_identity_aliases():
     with pytest.raises(ValueError, match="mapping key"):
         SpmdCheckpoint(
             source_topology=TopologySnapshot(1, (), (), "v1"),
-            runtime_state={},
+            runtime_state={"drain_boundary": DrainBoundary(committed_cut=1).to_dict()},
             components={
                 "declared": CheckpointComponentPublication(
                     component_id="actual",

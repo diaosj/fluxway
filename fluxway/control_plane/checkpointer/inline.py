@@ -191,7 +191,22 @@ class StateCheckpointComponent(
                 f"inline component {self.descriptor.component_id!r} requires exact "
                 "source and current topology"
             )
-        if restore_spec.topology is RestoreTopologyMode.LOGICAL_PARTITION_REMAP:
+        if restore_spec.topology is RestoreTopologyMode.GLOBAL_RESHARD:
+            if not publication.partitions:
+                raise TopologyMismatchError(
+                    f"inline checkpoint component {self.descriptor.component_id!r} "
+                    "requires a shared partition for global reshard"
+                )
+            selected = publication.partitions[0]
+            if any(
+                partition.record.payload != selected.record.payload
+                for partition in publication.partitions[1:]
+            ):
+                raise TopologyMismatchError(
+                    f"inline checkpoint component {self.descriptor.component_id!r} "
+                    "has rank-dependent state and cannot be globally resharded"
+                )
+        elif restore_spec.topology is RestoreTopologyMode.LOGICAL_PARTITION_REMAP:
             selector = self._partition_selector
             if selector is None:
                 raise RuntimeError("logical partition remap selector is not configured")

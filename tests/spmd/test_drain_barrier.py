@@ -118,6 +118,29 @@ def test_boundary_restore_terminal_state_is_completed_and_clamps_late_report() -
         == 13
     )
 
+
+def test_restore_projection_discards_transient_drain_state() -> None:
+    historical = DrainBoundary(
+        phase=DrainPhase.COMPLETED,
+        observed_cut=9,
+        admitted_cut=9,
+        drained_cut=9,
+        committed_cut=9,
+        revision=41,
+    )
+
+    restored = DrainBoundary.from_committed_cut(historical.committed_cut)
+
+    assert restored == DrainBoundary(
+        phase=DrainPhase.OPEN,
+        drained_cut=9,
+        committed_cut=9,
+    )
+    transition = reduce_drain_boundary(
+        restored, DrainEvent(DrainEventKind.LATE_COMPLETION, 10)
+    )
+    assert transition.clamped_completion == 10
+
     def test_is_draining_property(self):
         sync = _make_sync()
         _register_op(sync, "op_a", step=0)
@@ -374,7 +397,11 @@ def test_zero_terminal_cut_converges_all_virtual_source_lanes() -> None:
             unblock_worker_op=lambda rank, op, epoch: None,
         )
 
-        sync.load_spmd_state({"completed_step_count": {"train_core": 2}})
+        sync.load_spmd_state(
+            {
+                "drain_boundary": DrainBoundary(committed_cut=2).to_dict(),
+            }
+        )
         sync.report_worker_op_completed(0, "train_core", 3)
 
         assert "train_core" not in sync._allowed_steps
@@ -384,9 +411,37 @@ def test_zero_terminal_cut_converges_all_virtual_source_lanes() -> None:
         sync = _make_sync(num_workers=1)
         sync.update_allowed_step("controlled", 1)
 
-        sync.load_spmd_state({"completed_step_count": {"controlled": 2}})
+        sync.load_spmd_state(
+            {
+                "drain_boundary": DrainBoundary(committed_cut=2).to_dict(),
+            }
+        )
 
         assert sync._allowed_steps == {"controlled": 2}
+
+    def test_restore_discards_transient_drain_boundary_state(self):
+        sync = _make_sync(num_workers=1)
+        sync.register_expected_ops(("controlled",))
+        sync.load_spmd_state(
+            {
+                "drain_boundary": DrainBoundary(
+                    phase=DrainPhase.COMPLETED,
+                    observed_cut=9,
+                    admitted_cut=9,
+                    drained_cut=9,
+                    committed_cut=9,
+                    revision=41,
+                ).to_dict(),
+            }
+        )
+
+        assert sync.drain_boundary == DrainBoundary(
+            phase=DrainPhase.OPEN,
+            drained_cut=9,
+            committed_cut=9,
+        )
+        sync.report_worker_op_completed(0, "controlled", 10)
+        assert sync.get_spmd_steps()["controlled"] == 10
 
 
 class TestWorkerDrainTarget:
@@ -402,6 +457,7 @@ class TestWorkerDrainTarget:
         stub = types.SimpleNamespace(
             _drain_step_count=None,
             _drain_cond=asyncio.Condition(),
+            _running=True,
             _running_plan_steps={},
             _background_tasks=set(),
             spmd_id="test_spmd",

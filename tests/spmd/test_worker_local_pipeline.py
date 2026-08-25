@@ -15,6 +15,8 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionResult,
     ExecutionStatus,
 )
+from fluxway.spmd.worker.admission import StepAdmissionState
+from fluxway.spmd.worker.source_maintenance import SourcePipelineMaintenance
 from fluxway.spmd.worker.worker import (
     LocalInputPrepareRuntime,
     SPMDWorker,
@@ -55,6 +57,28 @@ def _attach_execution_queue_methods(stub, raw_cls):
     _attach_schedule_key_methods(stub, raw_cls)
 
 
+def _attach_admission_state(stub) -> None:
+    stub._admission_state = StepAdmissionState(
+        completed=stub._completed_step_count,
+        scheduled=stub._scheduled_step_count,
+        queue_membership=stub._in_op_step_queue,
+        pending_blocked=stub._pending_blocked,
+        pending_future=stub._pending_future_steps,
+        pending_async_lag=stub._pending_async_lag_steps,
+        pending_phase_order=stub._pending_phase_order_steps,
+        ready_pipeline=stub._ready_pending_pipeline_steps,
+        mailbox_ready=stub._mailbox_ready_steps,
+        running=stub._running_plan_steps,
+        finished=stub._finished_plan_steps,
+        is_periodic=lambda op_name: stub.op_manager.is_periodic_trigger(op_name),
+        is_runnable=lambda _op_name: True,
+        hold_prepare_token=lambda _op_name, _step: False,
+        async_lag_blocked=stub._async_lag_limit_reached,
+        phase_order_blocked=stub._phase_order_step_blocked,
+        can_start=stub._can_start_local_plan,
+    )
+
+
 def _make_pipeline_stub(meta: OperatorSpec):
     return _make_pipeline_stub_with_profiler(meta, profiler_enabled=False)
 
@@ -85,6 +109,7 @@ def _make_pipeline_stub_with_profiler(
         _running_plan_steps={"op": set()},
         _finished_plan_steps={"op": {}},
         _ready_pending_pipeline_steps={"op": []},
+        _pending_blocked={"op": []},
         _pending_future_steps={"op": []},
         _pending_async_lag_steps={"op": []},
         _pending_phase_order_steps={"op": []},
@@ -119,6 +144,7 @@ def _make_pipeline_stub_with_profiler(
         _send_tasks={},
         _drain_boundary=DrainBoundary(),
         _source_operator_names=("op",),
+        _source_maintenance_tasks={},
     )
     stub._mailbox.clear_step = AsyncMock()
     stub._operator_pipeline_depth = types.MethodType(
@@ -127,12 +153,6 @@ def _make_pipeline_stub_with_profiler(
     stub._can_start_local_plan = types.MethodType(raw_cls._can_start_local_plan, stub)
     stub._record_local_plan_scheduled = types.MethodType(
         raw_cls._record_local_plan_scheduled, stub
-    )
-    stub._move_future_steps_into_pipeline_queue = types.MethodType(
-        raw_cls._move_future_steps_into_pipeline_queue, stub
-    )
-    stub._start_pending_pipeline_steps = types.MethodType(
-        raw_cls._start_pending_pipeline_steps, stub
     )
     stub._commit_finished_steps = types.MethodType(raw_cls._commit_finished_steps, stub)
     stub._commit_local_plan_result = types.MethodType(
@@ -234,10 +254,6 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._async_lag_limit_reached,
         stub,
     )
-    stub._release_async_lag_steps = types.MethodType(
-        raw_cls._release_async_lag_steps,
-        stub,
-    )
     stub._phase_schedule = compile_phase_schedule(
         {
             name: spec.runtime_policy.schedule
@@ -246,10 +262,6 @@ def _make_pipeline_stub_with_profiler(
     )
     stub._phase_order_step_blocked = types.MethodType(
         raw_cls._phase_order_step_blocked,
-        stub,
-    )
-    stub._release_phase_order_steps = types.MethodType(
-        raw_cls._release_phase_order_steps,
         stub,
     )
     stub.set_drain_boundary = types.MethodType(
@@ -267,8 +279,24 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._trigger_source_operators,
         stub,
     )
-    stub._source_known_steps = types.MethodType(raw_cls._source_known_steps, stub)
-    stub._fill_source_pipeline = types.MethodType(raw_cls._fill_source_pipeline, stub)
+    _attach_admission_state(stub)
+    stub._start_local_step_plan = types.MethodType(
+        raw_cls._start_local_step_plan,
+        stub,
+    )
+    stub._source_maintenance = SourcePipelineMaintenance(
+        tasks=stub._source_maintenance_tasks,
+        spawn=stub._spawn_background_task,
+        is_source=lambda op_name: stub.op_manager.is_source_operator(op_name),
+        running=lambda: stub._running,
+        exhausted=stub._source_is_exhausted,
+        depth=stub._operator_pipeline_depth,
+        completed=lambda op_name: stub._completed_step_count.get(op_name, 0),
+        max_steps=lambda: stub.config.max_steps,
+        drain_blocks=stub._drain_blocks_step,
+        known_steps=stub._admission_state.known_steps,
+        enqueue=stub._enqueue,
+    )
     stub._report_op_completed = MagicMock()
     return stub
 
@@ -497,15 +525,17 @@ async def test_bounded_stale_lag_release_requeues_lookup_after_update_progress()
     stub.op_manager._get_operator_spec.side_effect = lambda name: metas[name]
     stub.op_manager.get_operator_spec.side_effect = lambda name: metas[name]
     stub._completed_step_count = {"lookup": 7, "update": 1}
+    stub._scheduled_step_count = {"lookup": 9, "update": 1}
     stub._pending_async_lag_steps = {"lookup": [9], "update": []}
     stub._in_op_step_queue = set()
+    _attach_admission_state(stub)
 
-    await stub._release_async_lag_steps()
+    await stub._admission_state.release_async_lag(stub._enqueue)
     assert stub._pending_async_lag_steps["lookup"] == [9]
     assert stub._execution_queue.empty()
 
     stub._completed_step_count["update"] = 2
-    await stub._release_async_lag_steps()
+    await stub._admission_state.release_async_lag(stub._enqueue)
     assert stub._pending_async_lag_steps["lookup"] == []
     queued = await stub._execution_queue.get()
     assert queued == (-100, 0, 9, "lookup")
@@ -593,6 +623,12 @@ async def test_phase_order_gate_blocks_train_until_previous_update_commits():
             "scatter_sparse_grads": 1,
             "update": 0,
         },
+        _scheduled_step_count={
+            "prepare_dense_inputs": 2,
+            "train_core": 1,
+            "scatter_sparse_grads": 1,
+            "update": 0,
+        },
         _pending_phase_order_steps={"train_core": [1]},
         _execution_queue=asyncio.PriorityQueue(),
         _in_op_step_queue=set(),
@@ -608,11 +644,10 @@ async def test_phase_order_gate_blocks_train_until_previous_update_commits():
         raw_cls._phase_order_step_blocked,
         stub,
     )
-    stub._release_phase_order_steps = types.MethodType(
-        raw_cls._release_phase_order_steps,
-        stub,
-    )
     stub._enqueue = types.MethodType(raw_cls._enqueue, stub)
+    stub._record_local_plan_scheduled = types.MethodType(
+        raw_cls._record_local_plan_scheduled, stub
+    )
     _attach_execution_queue_methods(stub, raw_cls)
     stub._effective_schedule_key = types.MethodType(
         raw_cls._effective_schedule_key,
@@ -624,6 +659,16 @@ async def test_phase_order_gate_blocks_train_until_previous_update_commits():
     )
     stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
     stub._should_prepare_inputs_on_ready = lambda _op_name: False
+    stub._pending_blocked = {name: [] for name in metas}
+    stub._pending_future_steps = {name: [] for name in metas}
+    stub._pending_async_lag_steps = {name: [] for name in metas}
+    stub._ready_pending_pipeline_steps = {name: [] for name in metas}
+    stub._mailbox_ready_steps = {name: set() for name in metas}
+    stub._running_plan_steps = {name: set() for name in metas}
+    stub._finished_plan_steps = {name: {} for name in metas}
+    stub._can_start_local_plan = lambda _op_name: True
+    stub._async_lag_limit_reached = lambda _op_name, _step: False
+    _attach_admission_state(stub)
 
     assert not stub._phase_order_step_blocked("prepare_dense_inputs", 1)
     assert stub._phase_order_step_blocked("train_core", 1)
@@ -631,7 +676,7 @@ async def test_phase_order_gate_blocks_train_until_previous_update_commits():
     stub._completed_step_count["update"] = 1
     assert not stub._phase_order_step_blocked("train_core", 1)
 
-    await stub._release_phase_order_steps()
+    await stub._admission_state.release_phase_order(stub._enqueue)
     assert stub._pending_phase_order_steps["train_core"] == []
     assert await stub._execution_queue.get() == (5, 0, 1, "train_core")
 
@@ -677,6 +722,12 @@ async def test_phase_graph_allows_scatter_and_update_parallel_but_blocks_next_tr
             "scatter_sparse_grads": 0,
             "update": 0,
         },
+        _scheduled_step_count={
+            "prepare_dense_inputs": 2,
+            "train_core": 1,
+            "scatter_sparse_grads": 0,
+            "update": 0,
+        },
         _pending_phase_order_steps={"update": [0], "train_core": [1]},
         _execution_queue=asyncio.PriorityQueue(),
         _in_op_step_queue=set(),
@@ -692,11 +743,10 @@ async def test_phase_graph_allows_scatter_and_update_parallel_but_blocks_next_tr
         raw_cls._phase_order_step_blocked,
         stub,
     )
-    stub._release_phase_order_steps = types.MethodType(
-        raw_cls._release_phase_order_steps,
-        stub,
-    )
     stub._enqueue = types.MethodType(raw_cls._enqueue, stub)
+    stub._record_local_plan_scheduled = types.MethodType(
+        raw_cls._record_local_plan_scheduled, stub
+    )
     _attach_execution_queue_methods(stub, raw_cls)
     stub._effective_schedule_key = types.MethodType(
         raw_cls._effective_schedule_key,
@@ -708,18 +758,28 @@ async def test_phase_graph_allows_scatter_and_update_parallel_but_blocks_next_tr
     )
     stub._deadline_boost_active = types.MethodType(raw_cls._deadline_boost_active, stub)
     stub._should_prepare_inputs_on_ready = lambda _op_name: False
+    stub._pending_blocked = {name: [] for name in metas}
+    stub._pending_future_steps = {name: [] for name in metas}
+    stub._pending_async_lag_steps = {name: [] for name in metas}
+    stub._ready_pending_pipeline_steps = {name: [] for name in metas}
+    stub._mailbox_ready_steps = {name: set() for name in metas}
+    stub._running_plan_steps = {name: set() for name in metas}
+    stub._finished_plan_steps = {name: {} for name in metas}
+    stub._can_start_local_plan = lambda _op_name: True
+    stub._async_lag_limit_reached = lambda _op_name, _step: False
+    _attach_admission_state(stub)
 
     assert not stub._phase_order_step_blocked("scatter_sparse_grads", 0)
     assert not stub._phase_order_step_blocked("update", 0)
     assert stub._phase_order_step_blocked("train_core", 1)
 
-    await stub._release_phase_order_steps()
+    await stub._admission_state.release_phase_order(stub._enqueue)
     assert stub._pending_phase_order_steps["update"] == []
     assert stub._pending_phase_order_steps["train_core"] == [1]
     assert await stub._execution_queue.get() == (3, 0, 0, "update")
 
     stub._completed_step_count["update"] = 1
-    await stub._release_phase_order_steps()
+    await stub._admission_state.release_phase_order(stub._enqueue)
     assert stub._pending_phase_order_steps["train_core"] == []
     assert await stub._execution_queue.get() == (5, 0, 1, "train_core")
 
@@ -745,7 +805,7 @@ async def test_relaxed_finish_does_not_report_non_contiguous_step():
 
 
 @pytest.mark.asyncio
-async def test_future_steps_move_into_pipeline_window_by_scheduled_watermark():
+async def test_pending_future_steps_move_into_pipeline_window_by_scheduled_watermark():
     stub = _make_pipeline_stub(
         OperatorSpec(
             name="op",
@@ -764,7 +824,12 @@ async def test_future_steps_move_into_pipeline_window_by_scheduled_watermark():
     stub._pending_future_steps["op"].extend([1, 2])
 
     start_local_step_plan("op", 0)
-    await stub._start_pending_pipeline_steps("op")
+    await stub._admission_state.start_pending(
+        "op",
+        running=lambda: stub._running,
+        source_exhausted=stub._source_is_exhausted,
+        start_plan=stub._start_local_step_plan,
+    )
 
     assert started == [0, 1]
     assert stub._ready_pending_pipeline_steps["op"] == [2]
@@ -875,6 +940,81 @@ async def test_source_trigger_window_respects_max_steps():
         (0, 0, 1, "op"),
     ]
     assert stub._execution_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_source_pipeline_maintenance_requests_share_one_owner():
+    stub = _make_pipeline_stub(
+        OperatorSpec(
+            name="op",
+            async_policy=AsyncPolicy.pipelined(depth=2),
+        )
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fill(op_name: str):
+        nonlocal calls
+        assert op_name == "op"
+        calls += 1
+        entered.set()
+        await release.wait()
+
+    stub._source_maintenance.fill = fill
+    stub._source_maintenance.fill = fill
+    first = stub._source_maintenance.request("op")
+    second = stub._source_maintenance.request("op")
+    assert first is second
+    await entered.wait()
+    assert calls == 1
+    release.set()
+    await first
+    await asyncio.sleep(0)
+    assert stub._source_maintenance_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_source_pipeline_refill_stops_at_drain_ceiling():
+    stub = _make_pipeline_stub(
+        OperatorSpec(
+            name="op",
+            async_policy=AsyncPolicy.pipelined(depth=4),
+        )
+    )
+    stub.op_manager.is_source_operator.return_value = True
+    stub._drain_step_count = 3
+    await stub._source_maintenance.fill("op")
+    assert sorted(step for _, step in stub._in_op_step_queue) == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_clear_drain_boundary_requests_source_maintenance():
+    raw_cls = _raw_worker_class()
+    stub = _make_pipeline_stub(
+        OperatorSpec(
+            name="op",
+            async_policy=AsyncPolicy.pipelined(depth=2),
+        )
+    )
+    requested = []
+
+    def request(op_name: str):
+        requested.append(op_name)
+        return asyncio.create_task(asyncio.sleep(0))
+
+    stub._source_maintenance.request = request
+    stub._source_operator_names = ("op",)
+    stub._set_drain_boundary = types.MethodType(
+        lambda self, _step_count, _terminal_cut=None: asyncio.sleep(0),
+        stub,
+    )
+    stub.clear_drain_boundary = types.MethodType(
+        raw_cls.clear_drain_boundary,
+        stub,
+    )
+    await stub.clear_drain_boundary()
+    assert requested == ["op"]
 
 
 @pytest.mark.asyncio

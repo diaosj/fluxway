@@ -1,12 +1,13 @@
 import asyncio
 from types import SimpleNamespace
 import types
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from fluxway.common.types import ExecutionFailure, WorkerStatus
 from fluxway.spmd.worker.worker import SPMDWorker, _EXECUTION_STOP_ITEM
+from fluxway.spmd.worker.admission import StepAdmissionState
 
 
 def _raw_worker_class():
@@ -125,7 +126,6 @@ async def test_failure_heartbeat_carries_the_latched_execution_failure():
 
 @pytest.mark.asyncio
 async def test_failed_worker_does_not_admit_pending_pipeline_steps():
-    raw_class = _raw_worker_class()
     worker = SimpleNamespace(
         _running=False,
         _failure=ExecutionFailure(
@@ -139,7 +139,14 @@ async def test_failed_worker_does_not_admit_pending_pipeline_steps():
             traceback=None,
         ),
         _ready_pending_pipeline_steps={"op": [1]},
-        _move_future_steps_into_pipeline_queue=AsyncMock(),
+        _completed_step_count={"op": 0},
+        _scheduled_step_count={"op": 0},
+        _in_op_step_queue=set(),
+        _pending_blocked={"op": []},
+        _pending_future_steps={"op": []},
+        _mailbox_ready_steps={"op": set()},
+        _running_plan_steps={"op": set()},
+        _finished_plan_steps={"op": {}},
         _can_start_local_plan=MagicMock(return_value=True),
         _start_local_step_plan=MagicMock(),
         _async_lag_limit_reached=MagicMock(return_value=False),
@@ -147,14 +154,33 @@ async def test_failed_worker_does_not_admit_pending_pipeline_steps():
         _pending_async_lag_steps={"op": []},
         _pending_phase_order_steps={"op": []},
     )
-    worker._start_pending_pipeline_steps = types.MethodType(
-        raw_class._start_pending_pipeline_steps,
-        worker,
+    admission = StepAdmissionState(
+        completed=worker._completed_step_count,
+        scheduled=worker._scheduled_step_count,
+        queue_membership=worker._in_op_step_queue,
+        pending_blocked=worker._pending_blocked,
+        pending_future=worker._pending_future_steps,
+        pending_async_lag=worker._pending_async_lag_steps,
+        pending_phase_order=worker._pending_phase_order_steps,
+        ready_pipeline=worker._ready_pending_pipeline_steps,
+        mailbox_ready=worker._mailbox_ready_steps,
+        running=worker._running_plan_steps,
+        finished=worker._finished_plan_steps,
+        is_periodic=lambda _op: False,
+        is_runnable=lambda _op: True,
+        hold_prepare_token=lambda _op, _step: False,
+        async_lag_blocked=worker._async_lag_limit_reached,
+        phase_order_blocked=worker._phase_order_step_blocked,
+        can_start=worker._can_start_local_plan,
     )
 
-    await worker._start_pending_pipeline_steps("op")
+    await admission.start_pending(
+        "op",
+        running=lambda: worker._running,
+        source_exhausted=lambda _op: False,
+        start_plan=worker._start_local_step_plan,
+    )
 
-    worker._move_future_steps_into_pipeline_queue.assert_not_awaited()
     worker._start_local_step_plan.assert_not_called()
 
 

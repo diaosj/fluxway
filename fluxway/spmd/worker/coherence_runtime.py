@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
+import logging
 from typing import Any, Protocol
 
 from fluxway.common.allocation import AllocationRegistry
@@ -59,6 +60,8 @@ class InputGrant(Protocol):
 
 CoherenceDependency = CoherenceInstance
 
+logger = logging.getLogger(__name__)
+
 
 class CoherenceBatchRetireRuntime:
     """Adapts ordered coherence retirement to a pure data-plane enqueue."""
@@ -105,6 +108,7 @@ class CoherenceBatchRetireRuntime:
 
         if not instances:
             return admitted_delivery()
+
         return self._sequencer.commit_payload(instances, admitted_delivery)
 
     @staticmethod
@@ -112,17 +116,15 @@ class CoherenceBatchRetireRuntime:
         compiled_plan: CompiledSendPlan,
         batch: TransportFrameBatch,
     ) -> tuple[CoherenceInstance, ...]:
-        instances: list[CoherenceInstance] = []
-        seen: set[CoherenceInstance] = set()
-        for item in batch.delegations:
-            instance = compiled_plan.coherence_instance(
-                item.transfer_code,
-                item.epoch,
+        return tuple(
+            dict.fromkeys(
+                compiled_plan.coherence_instance(
+                    item.transfer_code,
+                    item.epoch,
+                )
+                for item in batch.delegations
             )
-            if instance not in seen:
-                seen.add(instance)
-                instances.append(instance)
-        return tuple(instances)
+        )
 
     async def _delegate_batch_reads(
         self,
@@ -152,29 +154,6 @@ class CoherenceBatchRetireRuntime:
             raise
         return tuple(tokens)
 
-    async def _complete_delivery(
-        self,
-        tokens: tuple[GrantToken, ...],
-        delivery: Awaitable[Any],
-    ) -> Any:
-        completed = False
-
-        def complete(*, delivered: bool) -> None:
-            nonlocal completed
-            if completed:
-                return
-            completed = True
-            for token in reversed(tokens):
-                self._directory.complete_child_delivery(token, delivered=delivered)
-
-        try:
-            result = await delivery
-        except BaseException:
-            complete(delivered=False)
-            raise
-        complete(delivered=True)
-        return result
-
 
 class CoherenceAdmissionRuntime:
     """Event-loop adapter for synchronous directory progress."""
@@ -184,25 +163,31 @@ class CoherenceAdmissionRuntime:
 
     async def await_grant(self, pending: GrantPending) -> GrantToken:
         try:
-            while True:
-                result = self._directory.pending_result(pending.request_id)
-                if result is not None:
-                    result = self._directory.take_pending_result(pending.request_id)
-                    if isinstance(result, GrantRejected):
-                        raise result.error
-                    if not isinstance(result, GrantReady):
-                        raise TypeError(
-                            f"unsupported pending grant result={type(result).__name__}."
-                        )
-                    return result.token
+
+            def poll_result():
+                return self._directory.pending_result(pending.request_id)
+
+            result = poll_result()
+            if result is None:
                 event = asyncio.Event()
                 remove = self._directory.add_progress_listener(event.set)
                 try:
-                    result = self._directory.pending_result(pending.request_id)
-                    if result is None:
+                    while (result := poll_result()) is None:
+                        event.clear()
+                        if (result := poll_result()) is not None:
+                            break
                         await event.wait()
                 finally:
                     remove()
+
+            taken = self._directory.take_pending_result(pending.request_id)
+            if isinstance(taken, GrantRejected):
+                raise taken.error
+            if not isinstance(taken, GrantReady):
+                raise TypeError(
+                    f"unsupported pending grant result={type(taken).__name__}."
+                )
+            return taken.token
         except asyncio.CancelledError:
             self._directory.cancel_pending_request(pending.request_id)
             raise
@@ -214,20 +199,17 @@ class CoherenceAdmissionRuntime:
         self._directory.admit(instance)
 
     async def await_quiescent(self, instance: CoherenceInstance) -> None:
-        await self.admit(instance)
+        if not self._directory.is_quiescent(instance):
+            await self.admit(instance)
         await self._wait_until(lambda: self._directory.is_quiescent(instance))
 
     async def await_quiescent_many(
         self, instances: Iterable[CoherenceInstance]
     ) -> None:
-        unique: list[CoherenceInstance] = []
-        seen: set[CoherenceInstance] = set()
-        for instance in instances:
-            if instance not in seen:
-                seen.add(instance)
-                unique.append(instance)
+        unique = tuple(dict.fromkeys(instances))
         for instance in unique:
-            await self.admit(instance)
+            if not self._directory.is_quiescent(instance):
+                await self.admit(instance)
         await self._wait_until(
             lambda: all(self._directory.is_quiescent(instance) for instance in unique)
         )
@@ -284,13 +266,7 @@ def _delegated_reads(
 def _ordered_dependencies(
     dependencies: Iterable[CoherenceDependency],
 ) -> tuple[CoherenceDependency, ...]:
-    values: list[CoherenceDependency] = []
-    seen: set[CoherenceDependency] = set()
-    for dependency in dependencies:
-        if dependency not in seen:
-            seen.add(dependency)
-            values.append(dependency)
-    return tuple(values)
+    return tuple(dict.fromkeys(dependencies))
 
 
 class ParentGrantReturnRuntime:
@@ -468,7 +444,9 @@ class InputCoherenceRelease:
             if not self.allocation_registry.is_bound(instance):
                 continue
             self.allocation_registry.retire(instance)
-            self.allocation_registry.advance_watermark(
-                instance.subject,
-                instance.epoch + 1,
-            )
+            target_watermark = instance.epoch + 1
+            if target_watermark > self.allocation_registry.watermark(instance.subject):
+                self.allocation_registry.advance_watermark(
+                    instance.subject,
+                    target_watermark,
+                )

@@ -616,8 +616,8 @@ class FilesystemCheckpointComponent(
     def _final_component_root(self, context: SaveSession) -> Path:
         root = self._require_root()
         progress = (
-            Path("steps") / str(context.cut.logical_step)
-            if context.cut.logical_step is not None
+            Path("steps") / str(context.cut.position)
+            if context.cut.position is not None
             else Path("cuts") / quote(context.cut.cut_id, safe="")
         )
         return (

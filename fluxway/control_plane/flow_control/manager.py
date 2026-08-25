@@ -65,10 +65,11 @@ class FlowControlManager:
                 self._allowed_by_edge_id[edge.edge_id] = allowed_step
                 changed_source_spmds.add(edge.source_spmd_id)
 
-            return {
+            windows = {
                 source_spmd_id: self._windows_for_driver_locked(source_spmd_id)
                 for source_spmd_id in sorted(changed_source_spmds)
             }
+            return windows
 
     def report_state(self, state: FlowControlState) -> None:
         if state.epoch != self._epoch:

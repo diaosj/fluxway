@@ -53,6 +53,7 @@ from fluxway.common.types import (
     CheckpointComponentPublication,
     CheckpointCommitPermit,
     CheckpointCut,
+    checkpoint_position,
     ExecutionFailure,
     WorkerSaveResult,
     SPMDConfig,
@@ -180,6 +181,8 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
     ExecutionResult,
 )
+from fluxway.spmd.worker.admission import AdmissionAction, StepAdmissionState
+from fluxway.spmd.worker.source_maintenance import SourcePipelineMaintenance
 from fluxway.profiler import ProfilerRuntimeFactory
 from fluxway.profiler.record import ProfilerSnapshot
 from fluxway.profiler.recorder import (
@@ -195,13 +198,10 @@ from fluxway.profiler.recorder import (
     WORKER_ASSEMBLE_SORT,
     WORKER_ADVANCE_STEP,
     WORKER_BACKGROUND_TASK,
-    WORKER_BLOCKED_TASK,
     WORKER_DRAIN_WAIT,
-    WORKER_FUTURE_TASK,
     WORKER_QUEUE_DEQUEUE,
     WORKER_QUEUE_ENQUEUE,
     WORKER_RUN_LOOP,
-    WORKER_STALE_TASK,
 )
 from typing import Any, Optional, get_type_hints, cast
 
@@ -669,6 +669,26 @@ class SPMDWorker:
         self._mailbox_ready_steps: dict[str, set[int]] = {
             op_name: set() for op_name in operator_names
         }
+        self._admission_state = StepAdmissionState(
+            completed=self._completed_step_count,
+            scheduled=self._scheduled_step_count,
+            queue_membership=set(),
+            pending_blocked=self._pending_blocked,
+            pending_future=self._pending_future_steps,
+            pending_async_lag=self._pending_async_lag_steps,
+            pending_phase_order=self._pending_phase_order_steps,
+            ready_pipeline=self._ready_pending_pipeline_steps,
+            mailbox_ready=self._mailbox_ready_steps,
+            running=self._running_plan_steps,
+            finished=self._finished_plan_steps,
+            is_periodic=lambda op_name: self.op_manager.is_periodic_trigger(op_name),
+            is_runnable=lambda op_name: self._op_runnable[op_name].is_set(),
+            hold_prepare_token=self._should_hold_prepare_pending_token,
+            async_lag_blocked=self._async_lag_limit_reached,
+            phase_order_blocked=self._phase_order_step_blocked,
+            can_start=self._can_start_local_plan,
+        )
+        self._in_op_step_queue = self._admission_state.queue_membership
         self._plan_tasks: set[asyncio.Task] = set()
         self._plan_task_steps: dict[asyncio.Task, tuple[str, int]] = {}
         self._send_tasks: dict[asyncio.Task, tuple[str, int]] = {}
@@ -750,13 +770,11 @@ class SPMDWorker:
         self._heartbeat_running: bool = False
         self._heartbeat_task: asyncio.Task | None = None
 
-        # Tracks tasks currently sitting in _execution_queue to prevent double-scheduling.
-        # Removed when dequeued (whether to execute, pending_blocked, or pending_future).
-        self._in_op_step_queue: set = set()
-
         # State tracking
         self._failure: ExecutionFailure | None = None
         self._fence_state = ExecutionFenceState.OPEN
+        self._last_progress_timestamp = time.time()
+        self._last_stall_warning_timestamp: float | None = None
 
         # Run loop synchronization
         self._start_event = asyncio.Event()  # Signals when to start execution
@@ -824,6 +842,20 @@ class SPMDWorker:
 
         # Source operator pause control
         self._source_pause_events: dict[str, asyncio.Event] = {}
+        self._source_maintenance_tasks: dict[str, asyncio.Task] = {}
+        self._source_maintenance = SourcePipelineMaintenance(
+            tasks=self._source_maintenance_tasks,
+            spawn=self._spawn_background_task,
+            is_source=lambda op_name: self.op_manager.is_source_operator(op_name),
+            running=lambda: self._running,
+            exhausted=self._source_is_exhausted,
+            depth=self._operator_pipeline_depth,
+            completed=lambda op_name: self._completed_step_count.get(op_name, 0),
+            max_steps=lambda: self.config.max_steps,
+            drain_blocks=self._drain_blocks_step,
+            known_steps=self._admission_state.known_steps,
+            enqueue=self._enqueue,
+        )
         self._source_operator_names = tuple(
             op_name for op_name, spec in self._operator_specs.items() if spec.is_source
         )
@@ -1418,7 +1450,7 @@ class SPMDWorker:
             f"Source operators identified ops={source_ops} spmd_id={self.spmd_id} rank={self.rank}"
         )
         for op_name in source_ops:
-            await self._fill_source_pipeline(op_name)
+            await self._source_maintenance.request(op_name)
 
     async def start_source_operators(self) -> None:
         await self._trigger_source_operators()
@@ -2638,139 +2670,53 @@ class SPMDWorker:
                 logger.debug(
                     f"Waiting for next task in execution queue lane={lane} spmd_id={self.spmd_id} rank={self.rank}"
                 )
-                (
-                    priority,
-                    _prepare_state,
-                    step,
-                    op_name,
-                ) = await execution_queue.get()
-                queue_key = (op_name, step)
-                if (
-                    op_name != _EXECUTION_STOP_OP
-                    and queue_key not in self._in_op_step_queue
-                ):
-                    execution_queue.task_done()
-                    continue
-                if profiler_recorder is not None:
-                    profiler_recorder.worker_scheduler_instant(
-                        spec=WORKER_QUEUE_DEQUEUE,
-                        payload=profiler_recorder.worker_op_payload(
-                            op_name,
-                            step,
-                            priority,
-                        ),
-                    )
-                logger.debug(
-                    f"Execution loop picked up task op={op_name} step={step} priority={priority} "
-                    f"spmd_id={self.spmd_id} rank={self.rank}"
-                )
-
-                # Check if we should stop
-                if not self._running:
-                    execution_queue.task_done()
-                    break
-
-                if not self._op_runnable[op_name].is_set():
-                    # Hold in pending queue instead of re-enqueueing
-                    self._in_op_step_queue.discard(queue_key)
-                    self._pending_blocked[op_name].append(step)
+                priority, _prepare_state, step, op_name = await execution_queue.get()
+                try:
+                    queue_key = (op_name, step)
+                    if (
+                        op_name != _EXECUTION_STOP_OP
+                        and queue_key not in self._in_op_step_queue
+                    ):
+                        continue
+                    if (
+                        priority,
+                        _prepare_state,
+                        step,
+                        op_name,
+                    ) == _EXECUTION_STOP_ITEM:
+                        break
                     if profiler_recorder is not None:
                         profiler_recorder.worker_scheduler_instant(
-                            spec=WORKER_BLOCKED_TASK,
+                            spec=WORKER_QUEUE_DEQUEUE,
                             payload=profiler_recorder.worker_op_payload(
                                 op_name,
                                 step,
+                                priority,
                             ),
                         )
                     logger.debug(
-                        f"Op blocked in queue op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
+                        f"Execution loop picked up task op={op_name} step={step} priority={priority} "
+                        f"spmd_id={self.spmd_id} rank={self.rank}"
                     )
-                    continue
 
-                logger.debug(
-                    f"Processing task op={op_name} step={step} spmd_id={self.spmd_id} rank={self.rank}"
-                )
-                # Check if this op is in periodic_trigger mode
-                is_periodic = (
-                    self.op_manager.is_periodic_trigger(op_name)
-                    if self._op_manager
-                    else False
-                )
+                    # Check if we should stop
+                    if not self._running:
+                        break
 
-                if not is_periodic:
-                    # Normal mode: allow local execution to run ahead up to the
-                    # operator's pipeline window.  _completed_step_count remains
-                    # the committed watermark reported to the driver.
-                    completed_count = self._completed_step_count[op_name]
-                    if step < completed_count:
-                        # Truly stale task (already executed), drop it
-                        self._in_op_step_queue.discard(queue_key)
-                        if profiler_recorder is not None:
-                            profiler_recorder.worker_scheduler_instant(
-                                spec=WORKER_STALE_TASK,
-                                payload=profiler_recorder.worker_op_payload(
-                                    op_name,
-                                    step,
-                                    completed_count,
-                                ),
-                            )
-                        logger.warning(
-                            f"Stale task dropped op={op_name} "
-                            f"task_step={step} completed_count={completed_count} spmd_id={self.spmd_id} rank={self.rank}"
-                        )
+                    decision = self._admission_state.evaluate(op_name, step)
+                    if decision.action is not AdmissionAction.DISPATCH:
                         continue
-                    scheduled_count = self._scheduled_step_count[op_name]
-                    if step < scheduled_count:
-                        self._in_op_step_queue.discard(queue_key)
-                        logger.debug(
-                            f"Already scheduled task dropped op={op_name} "
-                            f"task_step={step} scheduled_count={scheduled_count} "
-                            f"spmd_id={self.spmd_id} rank={self.rank}"
+                    self._start_local_step_plan(op_name, step)
+                    self._spawn_background_task(
+                        self._admission_state.start_pending(
+                            op_name,
+                            running=lambda: self._running,
+                            source_exhausted=self._source_is_exhausted,
+                            start_plan=self._start_local_step_plan,
                         )
-                        continue
-                    if step > scheduled_count:
-                        # Future task (arrived early), hold for later execution
-                        self._in_op_step_queue.discard(queue_key)
-                        self._pending_future_steps[op_name].append(step)
-                        if profiler_recorder is not None:
-                            profiler_recorder.worker_scheduler_instant(
-                                spec=WORKER_FUTURE_TASK,
-                                payload=profiler_recorder.worker_op_payload(
-                                    op_name,
-                                    step,
-                                    scheduled_count,
-                                ),
-                            )
-                        logger.debug(
-                            f"Future task held op={op_name} "
-                            f"task_step={step} scheduled_count={scheduled_count} "
-                            f"completed_count={completed_count} "
-                            f"spmd_id={self.spmd_id} rank={self.rank}"
-                        )
-                        continue
-
-                # Execute (for periodic mode, execute any task that comes)
-                if self._should_hold_prepare_pending_token(op_name, step):
-                    continue
-                if self._async_lag_limit_reached(op_name, step):
-                    self._in_op_step_queue.discard(queue_key)
-                    pending_lag = self._pending_async_lag_steps[op_name]
-                    if step not in pending_lag:
-                        pending_lag.append(step)
-                    continue
-                if self._phase_order_step_blocked(op_name, step):
-                    self._in_op_step_queue.discard(queue_key)
-                    pending_phase = self._pending_phase_order_steps[op_name]
-                    if step not in pending_phase:
-                        pending_phase.append(step)
-                    continue
-                if not self._can_start_local_plan(op_name):
-                    self._in_op_step_queue.discard(queue_key)
-                    self._ready_pending_pipeline_steps[op_name].append(step)
-                    continue
-                self._in_op_step_queue.discard(queue_key)
-                self._start_local_step_plan(op_name, step)
-                self._spawn_background_task(self._start_pending_pipeline_steps(op_name))
+                    )
+                finally:
+                    execution_queue.task_done()
 
             except asyncio.CancelledError:
                 logger.info(
@@ -3039,7 +2985,14 @@ class SPMDWorker:
                 )
                 return
             if self._running:
-                self._spawn_background_task(self._start_pending_pipeline_steps(op_name))
+                self._spawn_background_task(
+                    self._admission_state.start_pending(
+                        op_name,
+                        running=lambda: self._running,
+                        source_exhausted=self._source_is_exhausted,
+                        start_plan=self._start_local_step_plan,
+                    )
+                )
 
         task.add_done_callback(_done)
 
@@ -3106,38 +3059,6 @@ class SPMDWorker:
             )
         self._scheduled_step_count[op_name] = scheduled_count + 1
 
-    async def _start_pending_pipeline_steps(self, op_name: str) -> None:
-        if not self._running or self._source_is_exhausted(op_name):
-            return
-        await self._move_future_steps_into_pipeline_queue(op_name)
-        pending = self._ready_pending_pipeline_steps[op_name]
-        while self._running and pending and self._can_start_local_plan(op_name):
-            step = pending.pop(0)
-            if self._async_lag_limit_reached(op_name, step):
-                pending_lag = self._pending_async_lag_steps[op_name]
-                if step not in pending_lag:
-                    pending_lag.append(step)
-                continue
-            if self._phase_order_step_blocked(op_name, step):
-                pending_phase = self._pending_phase_order_steps[op_name]
-                if step not in pending_phase:
-                    pending_phase.append(step)
-                continue
-            self._start_local_step_plan(op_name, step)
-            await self._move_future_steps_into_pipeline_queue(op_name)
-
-    async def _move_future_steps_into_pipeline_queue(self, op_name: str) -> None:
-        is_periodic = self.op_manager.is_periodic_trigger(op_name)
-        if is_periodic:
-            return
-        pending = self._pending_future_steps[op_name]
-        while self._scheduled_step_count[op_name] in pending:
-            step = self._scheduled_step_count[op_name]
-            pending.remove(step)
-            if step in self._ready_pending_pipeline_steps[op_name]:
-                continue
-            self._ready_pending_pipeline_steps[op_name].append(step)
-
     def _bounded_async_ops(self) -> tuple[str, ...]:
         metas = self._operator_specs
         result = []
@@ -3167,34 +3088,11 @@ class SPMDWorker:
             return False
         return step - slowest_completed > max_async_lag
 
-    async def _release_async_lag_steps(self) -> None:
-        for op_name in self._bounded_async_ops():
-            pending = self._pending_async_lag_steps[op_name]
-            if not pending:
-                continue
-            self._pending_async_lag_steps[op_name] = []
-            for step in sorted(set(pending)):
-                if self._async_lag_limit_reached(op_name, step):
-                    self._pending_async_lag_steps[op_name].append(step)
-                else:
-                    await self._enqueue(op_name, step)
-
     def _phase_order_step_blocked(self, op_name: str, step: int) -> bool:
         gate = self._phase_schedule.gates.get(op_name)
         if gate is None:
             return False
         return gate.is_blocked(self._completed_step_count, step=step)
-
-    async def _release_phase_order_steps(self) -> None:
-        for op_name, pending in self._pending_phase_order_steps.items():
-            if not pending:
-                continue
-            self._pending_phase_order_steps[op_name] = []
-            for step in sorted(set(pending)):
-                if self._phase_order_step_blocked(op_name, step):
-                    self._pending_phase_order_steps[op_name].append(step)
-                else:
-                    await self._enqueue(op_name, step)
 
     def _state_resource_id(self, op_name: str) -> int:
         meta = self.op_manager.get_operator_spec(op_name)
@@ -3605,10 +3503,7 @@ class SPMDWorker:
                     f"local-only input origin {source_spmd_id!r} has no unique SPMD code."
                 )
             owner_code = owner_codes[0]
-        logical_tuuid = self._compiled_assemble_plan(
-            op_name, transfer_code
-        ).logical_tensor.logical_tuuid
-        subject = self._coherence_subject(owner_code, source_rank, logical_tuuid)
+        subject = self._coherence_subject(owner_code, source_rank, transfer_code)
         expected_subject = subject
         bound_instances = tensor._coherence_instances
         if len(bound_instances) > 1:
@@ -4298,6 +4193,7 @@ class SPMDWorker:
         )
         for pending_steps in pending_steps_by_name:
             pending_steps[:] = [step for step in pending_steps if step < terminal_step]
+        self._admission_state.discard_at_or_after(op_name, terminal_step)
         running_steps = self._running_plan_steps[op_name]
         for task, (task_op_name, task_step) in tuple(self._plan_task_steps.items()):
             if (
@@ -4322,9 +4218,9 @@ class SPMDWorker:
         mailbox_ready_steps.difference_update(
             step for step in tuple(mailbox_ready_steps) if step >= terminal_step
         )
-        direct_ready_steps = self._direct_local_ready_steps[op_name]
-        direct_ready_steps.difference_update(
-            step for step in tuple(direct_ready_steps) if step >= terminal_step
+        direct_mailbox_ready_steps = self._direct_local_ready_steps[op_name]
+        direct_mailbox_ready_steps.difference_update(
+            step for step in tuple(direct_mailbox_ready_steps) if step >= terminal_step
         )
         self._in_op_step_queue.difference_update(
             {
@@ -5940,6 +5836,7 @@ class SPMDWorker:
         Explicitly differentiates between Count (Progress Watermark) and Index (Task Sequence).
         """
         self._completed_step_count[op_name] += 1
+        self._last_progress_timestamp = time.time()
         completed_step_count = self._completed_step_count[op_name]
         logger.debug(
             f"Step completed op={op_name} total_count={completed_step_count} "
@@ -5977,7 +5874,7 @@ class SPMDWorker:
                 if op_name in self._source_pause_events:
                     await self._source_pause_events[op_name].wait()
 
-                self._spawn_background_task(self._fill_source_pipeline(op_name))
+                self._source_maintenance.request(op_name)
             else:
                 logger.debug(
                     f"Source op finished op={op_name} spmd_id={self.spmd_id} rank={self.rank}"
@@ -5985,8 +5882,8 @@ class SPMDWorker:
 
         # Report definitive completed count to Driver for synchronization/drain.
         self._report_op_completed(op_name, completed_step_count)
-        await self._release_async_lag_steps()
-        await self._release_phase_order_steps()
+        await self._admission_state.release_async_lag(self._enqueue)
+        await self._admission_state.release_phase_order(self._enqueue)
 
         # Check if this op is in periodic_trigger mode
         is_periodic = (
@@ -5995,50 +5892,13 @@ class SPMDWorker:
 
         if not is_periodic:
             # Normal mode: re-enqueue pending future tasks that match the new step
-            await self._move_future_steps_into_pipeline_queue(op_name)
-            await self._start_pending_pipeline_steps(op_name)
-
-    def _source_known_steps(self, op_name: str) -> set[int]:
-        known = set(self._running_plan_steps.get(op_name, set()))
-        known.update(self._finished_plan_steps.get(op_name, {}).keys())
-        known.update(self._ready_pending_pipeline_steps.get(op_name, []))
-        known.update(self._pending_future_steps.get(op_name, []))
-        known.update(
-            step for queued_op, step in self._in_op_step_queue if queued_op == op_name
-        )
-        completed = self._completed_step_count.get(op_name, 0)
-        scheduled = self._scheduled_step_count.get(op_name, completed)
-        known.update(range(completed, scheduled))
-        return known
-
-    async def _fill_source_pipeline(self, op_name: str) -> None:
-        if not self.op_manager.is_source_operator(op_name):
-            raise ValueError(
-                f"_fill_source_pipeline requires a source op, got {op_name!r}."
+            self._admission_state.move_future(op_name)
+            await self._admission_state.start_pending(
+                op_name,
+                running=lambda: self._running,
+                source_exhausted=self._source_is_exhausted,
+                start_plan=self._start_local_step_plan,
             )
-        if not self._running or self._source_is_exhausted(op_name):
-            return
-        depth = self._operator_pipeline_depth(op_name)
-        max_steps = self.config.max_steps
-        while self._running:
-            completed = self._completed_step_count.get(op_name, 0)
-            known = {
-                step
-                for step in self._source_known_steps(op_name)
-                if step >= completed and (max_steps is None or step < max_steps)
-            }
-            if len(known) >= depth:
-                return
-            candidate = completed
-            while candidate in known:
-                candidate += 1
-            if max_steps is not None and candidate >= max_steps:
-                return
-            logger.info(
-                f"Auto-triggering source op for step {candidate} op={op_name} "
-                f"pipeline_depth={depth} spmd_id={self.spmd_id} rank={self.rank}"
-            )
-            await self._enqueue(op_name, candidate)
 
     def _report_op_completed(self, op_name: str, step: int) -> None:
         """
@@ -6387,7 +6247,7 @@ class SPMDWorker:
                 output_subject = self._coherence_subject(
                     self._require_local_spmd_code(),
                     self.rank,
-                    tensor_route.logical_tuuid,
+                    tensor_route.transfer_code,
                 )
                 output_instance = CoherenceInstance(output_subject, exec_step)
 
@@ -6437,7 +6297,8 @@ class SPMDWorker:
                 deliveries.append(
                     asyncio.create_task(
                         self._coherence_sequencer.commit_payload(
-                            (output_instance,), retire_local_output
+                            (output_instance,),
+                            retire_local_output,
                         )
                     )
                 )
@@ -6665,6 +6526,7 @@ class SPMDWorker:
         """Heartbeat reporting loop (async)."""
         while self._heartbeat_running:
             try:
+                self._warn_if_stalled()
                 await self._send_heartbeat()
             except asyncio.CancelledError:
                 break
@@ -6674,6 +6536,102 @@ class SPMDWorker:
                 )
 
             await asyncio.sleep(self._heartbeat_interval)
+
+    def _warn_if_stalled(self) -> None:
+        if self._failure is not None or not self._running:
+            return
+        elapsed = time.time() - self._last_progress_timestamp
+        threshold = self.config.heartbeat_timeout_s
+        if elapsed < threshold:
+            return
+        if self._last_stall_warning_timestamp == self._last_progress_timestamp:
+            return
+        self._last_stall_warning_timestamp = self._last_progress_timestamp
+        diagnostics = self._execution_diagnostic_snapshot()
+        logger.warning(
+            "Worker execution made no committed progress for %.3fs; "
+            "stall_reason=%s. "
+            "spmd_id=%s rank=%s diagnostics=%s",
+            elapsed,
+            diagnostics["stall_reason"],
+            self.spmd_id,
+            self.rank,
+            diagnostics,
+        )
+
+    def _execution_diagnostic_snapshot(self) -> dict[str, Any]:
+        active_plan_steps = {
+            op_name: sorted(steps)
+            for op_name, steps in sorted(self._running_plan_steps.items())
+            if steps
+        }
+        queue_sizes = {
+            lane: queue.qsize()
+            for lane, queue in sorted(self._execution_queues.items())
+        }
+        pending_plan_steps = sorted(
+            {
+                (op_name, step)
+                for task, (op_name, step) in self._plan_task_steps.items()
+                if not task.done()
+            }
+        )
+        pending_send_steps = sorted(
+            {
+                (op_name, step)
+                for task, (op_name, step) in self._send_tasks.items()
+                if not task.done()
+            }
+        )
+        pending_plan_tasks = sum(1 for task in self._plan_tasks if not task.done())
+        pending_send_tasks = sum(1 for task in self._send_tasks if not task.done())
+        pending_input_prepare_tasks = self._input_prepare_runtime.pending_count()
+        if active_plan_steps or pending_plan_tasks:
+            stall_reason = "operator_plan"
+        elif pending_send_tasks:
+            stall_reason = "outbound_transport"
+        elif pending_input_prepare_tasks:
+            stall_reason = "input_prepare"
+        elif any(queue_sizes.values()):
+            stall_reason = "execution_queue"
+        else:
+            stall_reason = "completion_barrier_or_driver_wait"
+        return {
+            "active_plan_steps": active_plan_steps,
+            "pending_plan_steps": [
+                {"op_name": op_name, "step": step}
+                for op_name, step in pending_plan_steps
+            ],
+            "pending_send_steps": [
+                {"op_name": op_name, "step": step}
+                for op_name, step in pending_send_steps
+            ],
+            "completed_step_count": dict(sorted(self._completed_step_count.items())),
+            "scheduled_step_count": dict(sorted(self._scheduled_step_count.items())),
+            "execution_queue_sizes": queue_sizes,
+            "pending_background_tasks": sum(
+                1 for task in self._background_tasks if not task.done()
+            ),
+            "pending_plan_tasks": pending_plan_tasks,
+            "pending_send_tasks": pending_send_tasks,
+            "pending_input_prepare_tasks": pending_input_prepare_tasks,
+            "pending_phase_order_steps": {
+                op_name: list(steps)
+                for op_name, steps in sorted(self._pending_phase_order_steps.items())
+                if steps
+            },
+            "pending_future_steps": {
+                op_name: list(steps)
+                for op_name, steps in sorted(self._pending_future_steps.items())
+                if steps
+            },
+            "pending_async_lag_steps": {
+                op_name: list(steps)
+                for op_name, steps in sorted(self._pending_async_lag_steps.items())
+                if steps
+            },
+            "stall_reason": stall_reason,
+        }
 
     async def _send_heartbeat(self) -> None:
         """Send heartbeat to driver."""
@@ -6799,12 +6757,12 @@ class SPMDWorker:
                 revision=snapshot_boundary.revision + 1,
             )
         runtime_state = {
-            "completed_step_count": {
-                op_name: self._committed_step(op_name)
-                for op_name in self._completed_step_count
-            },
             "drain_boundary": snapshot_boundary.to_dict(),
         }
+        if snapshot_boundary.committed_cut is None:
+            raise RuntimeError(
+                "checkpoint save completed without a checkpoint position"
+            )
         return runtime_state, records
 
     async def checkpoint_finish_save(self) -> None:
@@ -6838,7 +6796,8 @@ class SPMDWorker:
         publications: Mapping[str, CheckpointComponentPublication],
     ) -> None:
         await self._drain_outbound_tasks()
-        restored_source_steps = self._restore_checkpoint_runtime_state(runtime_state)
+        self._restore_checkpoint_runtime_state(runtime_state)
+        await self._clear_restore_drain_target()
         coordinator = self._get_checkpoint_coordinator(repository_root)
         await coordinator.restore(
             checkpoint_id,
@@ -6847,59 +6806,22 @@ class SPMDWorker:
             source_topology,
             current_topology,
         )
-        self._trigger_restored_source_steps(restored_source_steps)
+
+    async def _clear_restore_drain_target(self) -> None:
+        async with self._drain_cond:
+            self._drain_step_count = None
+            self._drain_cond.notify_all()
 
     def _restore_checkpoint_runtime_state(
         self, runtime_state: Mapping[str, Any]
-    ) -> list[tuple[str, int]]:
-        completed = runtime_state.get("completed_step_count")
-        if not isinstance(completed, Mapping):
-            raise ValueError("checkpoint runtime state is missing completed_step_count")
-        expected = set(self._completed_step_count)
-        restored = set(completed)
-        if restored != expected:
-            missing = expected - restored
-            extra = restored - expected
-            raise ValueError(
-                "checkpoint runtime operator IDs do not match current SPMD: "
-                f"missing={sorted(missing)} extra={sorted(extra)} "
-                f"checkpoint={sorted(restored)}"
-            )
-        boundary_state = runtime_state.get("drain_boundary")
-        if not isinstance(boundary_state, Mapping):
-            raise ValueError("checkpoint runtime state is missing drain_boundary")
-        self._drain_boundary = DrainBoundary.from_mapping(boundary_state)
-        restored_source_steps: list[tuple[str, int]] = []
-        for op_name in expected:
-            count = completed[op_name]
-            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                raise ValueError(
-                    f"checkpoint completed step for {op_name!r} must be a "
-                    f"non-negative integer, got {count!r}"
-                )
-            self._completed_step_count[op_name] = count
-            self._scheduled_step_count[op_name] = count
-            if self.op_manager.is_source_operator(op_name):
-                maximum = self.config.max_steps
-                if self._drain_boundary.phase is not DrainPhase.COMPLETED and (
-                    maximum is None or count < maximum
-                ):
-                    restored_source_steps.append((op_name, count))
-        return restored_source_steps
-
-    def _trigger_restored_source_steps(
-        self, restored_source_steps: list[tuple[str, int]]
     ) -> None:
-        for op_name, count in restored_source_steps:
-            logger.info(
-                "Auto-triggering source op for restored step %s op=%s "
-                "spmd_id=%s rank=%s",
-                count,
-                op_name,
-                self.spmd_id,
-                self.rank,
-            )
-            self._spawn_background_task(self._enqueue(op_name, count))
+        committed_cut = checkpoint_position(runtime_state)
+        boundary_state = runtime_state["drain_boundary"]
+        DrainBoundary.from_mapping(boundary_state)
+        self._drain_boundary = DrainBoundary.from_committed_cut(committed_cut)
+        for op_name in self._completed_step_count:
+            self._completed_step_count[op_name] = committed_cut
+            self._scheduled_step_count[op_name] = committed_cut
 
     def _get_checkpoint_coordinator(
         self, repository_root: str
@@ -7142,9 +7064,13 @@ class SPMDWorker:
                 and step not in self._running_plan_steps.get(op_name, set())
             )
         )
+        if step_count is not None:
+            for op_name in self._source_operator_names:
+                self._source_maintenance.request(op_name)
 
     def _source_is_exhausted(self, op_name: str) -> bool:
-        del op_name
+        if op_name not in self._source_operator_names:
+            return False
         return self._drain_boundary.observed_cut is not None
 
     def _source_blocks_step(self, op_name: str, step: int) -> bool:
@@ -7167,6 +7093,8 @@ class SPMDWorker:
     async def clear_drain_boundary(self) -> None:
         """Remove the drain target and let deferred executions proceed."""
         await self._set_drain_boundary(None)
+        for op_name in self._source_operator_names:
+            self._source_maintenance.request(op_name)
 
     # =========================================================================
     # Source Node Control

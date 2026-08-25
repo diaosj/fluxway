@@ -13,6 +13,7 @@ from fluxway.common.types.checkpoint import (
     TopologySnapshot,
     CheckpointRetentionPolicy,
 )
+from fluxway.common.types import DrainBoundary
 from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
@@ -84,7 +85,11 @@ class _Controller:
             spmds={
                 "train": SpmdCheckpoint(
                     source_topology=self.topology,
-                    runtime_state={},
+                    runtime_state={
+                        "drain_boundary": DrainBoundary(
+                            committed_cut=cut.position
+                        ).to_dict()
+                    },
                     components=components,
                 )
             },
@@ -157,7 +162,11 @@ class _MultiRankController:
             spmds={
                 "train": SpmdCheckpoint(
                     source_topology=self.topology,
-                    runtime_state={},
+                    runtime_state={
+                        "drain_boundary": DrainBoundary(
+                            committed_cut=cut.position
+                        ).to_dict()
+                    },
                     components=publications[0],
                 )
             },

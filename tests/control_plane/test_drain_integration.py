@@ -109,6 +109,7 @@ async def test_virtual_source_eof_shortens_to_minimum_observed_terminal() -> Non
     graph_view = SimpleNamespace(
         operator=lambda _name: SimpleNamespace(spec=source_spec)
     )
+    # pyrefly: ignore [missing-attribute]
     controller_type = ControllerActor.__ray_metadata__.modified_class
     controller = controller_type.__new__(controller_type)
     controller._graph = SimpleNamespace(
@@ -159,7 +160,7 @@ async def test_controller_orchestrates_drain(controller, mock_spmd_manager):
     await controller._checkpoint_task
 
     request = controller._checkpointer.save.await_args.args[0]
-    assert request.cut.logical_step == 2
+    assert request.cut.position == 2
     mock_spmd_manager.mock_driver1.resume.remote.assert_called()
     mock_spmd_manager.mock_driver2.resume.remote.assert_called()
 
@@ -263,7 +264,7 @@ async def test_zero_terminal_checkpoints_before_completion(
     controller._source_control_stream_bindings = lambda: {"op1:read": ("op1", "read")}
     controller._state_machine._state = ControllerState.RUNNING
     controller._checkpointer.save.side_effect = lambda request: events.append(
-        ("checkpoint", request.cut.logical_step)
+        ("checkpoint", request.cut.position)
     )
     controller._state_machine.trigger_event = AsyncMock(
         side_effect=lambda event: events.append(("event", event))
@@ -743,14 +744,12 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
     controller.unblock_all_spmds = AsyncMock()
 
     spmd_state = {
-        "completed_step_count": {},
-        "static_args": {},
-        "driver_components": {},
+        "drain_boundary": DrainBoundary(committed_cut=0).to_dict(),
     }
     controller._control_ledger = ControlLedger(1)
     topology = TopologySnapshot(1, (), (), "v1")
     manifest = CheckpointManifest(
-        schema_version=4,
+        schema_version=1,
         checkpoint_id="restore_10_0",
         attempt_id="attempt",
         coordinator_generation=1,
@@ -760,7 +759,7 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
         framework_state={
             "control_ledger": controller._control_ledger.checkpoint_state(cuts={}),
             "components": {},
-            "drain_boundary": DrainBoundary().to_dict(),
+            "drain_boundary": DrainBoundary(committed_cut=0).to_dict(),
         },
         spmds={
             spmd_id: SpmdCheckpoint(topology, spmd_state, {})
@@ -794,7 +793,7 @@ async def test_restore_snapshot_waits_for_all_drivers_ready(
 
 
 @pytest.mark.asyncio
-async def test_terminal_checkpoint_restore_uses_existing_completion_path(
+async def test_terminal_checkpoint_restore_unblocks_spmds_and_resets_boundary(
     controller, mock_spmd_manager
 ):
     terminal_ledger = ControlLedger(4)
@@ -825,15 +824,13 @@ async def test_terminal_checkpoint_restore_uses_existing_completion_path(
     controller._apply_flow_control_windows = AsyncMock()
     controller.block_all_spmds = AsyncMock()
     controller.unblock_all_spmds = AsyncMock()
-    controller._resume_and_schedule_next_drain = AsyncMock()
+    controller._schedule_drain = AsyncMock()
     spmd_state = {
-        "completed_step_count": {"read": 3},
-        "static_args": {},
-        "driver_components": {},
+        "drain_boundary": DrainBoundary(committed_cut=3).to_dict(),
     }
     topology = TopologySnapshot(1, (), (), "v1")
     manifest = CheckpointManifest(
-        schema_version=4,
+        schema_version=1,
         checkpoint_id="restore_terminal",
         attempt_id="attempt",
         coordinator_generation=1,
@@ -859,5 +856,9 @@ async def test_terminal_checkpoint_restore_uses_existing_completion_path(
 
     await controller.restore_snapshot("restore_terminal", manifest, "/tmp/repository")
 
-    controller.unblock_all_spmds.assert_not_awaited()
-    controller._resume_and_schedule_next_drain.assert_awaited_once_with()
+    controller.unblock_all_spmds.assert_awaited_once_with()
+    assert controller._drain_boundary == DrainBoundary(
+        phase=DrainPhase.OPEN,
+        drained_cut=3,
+        committed_cut=3,
+    )

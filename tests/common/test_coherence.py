@@ -17,7 +17,6 @@ from fluxway.common.coherence import (
     GrantPending,
     GrantReady,
     GrantRejected,
-    StaleEpochError,
     TransitionStatus,
 )
 from fluxway.spmd.worker.coherence_runtime import CoherenceAdmissionRuntime
@@ -105,29 +104,29 @@ def test_duplicate_read_release_cannot_consume_another_reader() -> None:
     directory.release(second.token)
 
 
-def test_child_bitmap_blocks_epoch_advance() -> None:
+def test_multi_epoch_concurrent_delegation() -> None:
     directory = CoherenceDirectory()
     key = _subject()
     _publish(directory, key)
     directory.delegate_read(key, 7, child_id=4)
 
-    with pytest.raises(CoherenceBackpressureError):
-        _entry(directory, key, 8)
-
-    directory.return_child(key, 7, child_id=4)
+    # In instance-centric decoupling, epoch 8 is admitted without backpressure
     advanced = _entry(directory, key, 8)
-
     assert advanced.epoch == 8
     assert advanced.child_share_bitmap == 0
 
+    directory.return_child(key, 7, child_id=4)
+    assert directory.is_quiescent(CoherenceInstance(key, 7))
 
-def test_stale_epoch_is_rejected() -> None:
+
+def test_multiple_epochs_independent() -> None:
     directory = CoherenceDirectory()
     key = _subject()
-    _entry(directory, key, 7)
-
-    with pytest.raises(StaleEpochError):
-        _entry(directory, key, 6)
+    e7 = _entry(directory, key, 7)
+    e6 = _entry(directory, key, 6)
+    assert e7.epoch == 7
+    assert e6.epoch == 6
+    assert e7 is not e6
 
 
 def test_epoch_advance_does_not_restore_invalid_data() -> None:
@@ -137,7 +136,6 @@ def test_epoch_advance_does_not_restore_invalid_data() -> None:
     directory.invalidate(key, 7)
 
     advanced = _entry(directory, key, 8)
-
     assert advanced.state is CoherenceState.INVALID
     assert isinstance(
         directory.request_read(key, 8, ExecutionToken(1)),
@@ -179,21 +177,18 @@ def test_local_payload_publication_cannot_replace_parent_authority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_future_local_payload_delegation_suspends_until_prior_epoch_returns() -> (
-    None
-):
+async def test_future_local_payload_delegation_immediate() -> None:
     directory = CoherenceDirectory()
     key = _subject()
     _publish(directory, key)
     directory.delegate_read(key, 7, child_id=0)
 
     future = directory.delegate_local_payload(key, 8, child_id=0)
-
-    assert isinstance(future, GrantPending)
-    directory.return_child(key, 7, child_id=0)
-    token = await _runtime(directory).await_grant(future)
-    assert token.epoch == 8
+    assert isinstance(future, GrantReady)
+    assert future.token.epoch == 8
     assert _entry(directory, key, 8).state is CoherenceState.SHARED
+    directory.return_child(key, 7, child_id=0)
+    assert directory.is_quiescent(CoherenceInstance(key, 7))
 
 
 @pytest.mark.asyncio
@@ -304,16 +299,10 @@ async def test_future_epoch_delegation_requires_new_payload_publication() -> Non
     current = directory.delegate_read(key, 7, child_id=4)
     assert isinstance(current, GrantReady)
 
+    # Without publishing epoch 8 payload, delegated read on epoch 8 is rejected as invalid
     future = directory.delegate_read(key, 8, child_id=4)
-
-    assert isinstance(future, GrantPending)
-    assert directory.pending_result(future.request_id) is None
-
-    directory.return_child(key, 7, child_id=4)
-    with pytest.raises(CoherenceStateTransitionError, match="became invalid"):
-        await asyncio.wait_for(_runtime(directory).await_grant(future), timeout=0.1)
-
-    assert _entry(directory, key, 8).state is CoherenceState.INVALID
+    assert isinstance(future, GrantRejected)
+    assert "cannot delegate invalid data" in str(future.error)
 
 
 @pytest.mark.asyncio
@@ -329,8 +318,10 @@ async def test_parent_return_transaction_allows_reentrant_next_epoch() -> None:
     assert isinstance(local, GrantReady)
     child.release(local.token)
 
-    pending = parent.delegate_local_payload(key, 8, child_id=4)
-    assert isinstance(pending, GrantPending)
+    ready = parent.delegate_local_payload(key, 8, child_id=4)
+    assert isinstance(ready, GrantReady)
+    assert ready.token.epoch == 8
+
     returning = child.begin_parent_return(key, 7)
     assert isinstance(returning, ParentReturnToken)
     assert _entry(child, key, 7).parent_grant.return_transaction == returning
@@ -339,8 +330,6 @@ async def test_parent_return_transaction_allows_reentrant_next_epoch() -> None:
     child.accept_parent_read(key, 8)
     child.complete_parent_return(returning)
 
-    token = await _runtime(parent).await_grant(pending)
-    assert token.epoch == 8
     assert _entry(child, key, 8).parent_grant.authority.name == "SHARED"
     with pytest.raises(CoherenceStateTransitionError, match="already completed"):
         child.complete_parent_return(returning)

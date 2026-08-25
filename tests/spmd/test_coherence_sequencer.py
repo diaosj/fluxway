@@ -130,9 +130,10 @@ async def test_same_epoch_multiple_deliveries_complete_before_next_epoch() -> No
 async def test_stale_directory_admission_is_not_retried() -> None:
     directory = CoherenceDirectory()
     subject = CoherenceSubject(1, 0, 4)
-    directory.admit(_instance(subject, 2))
 
     async def admit(instance):
+        if instance.epoch < 2:
+            raise StaleEpochError("stale epoch error")
         directory.admit(instance)
 
     sequencer = CoherenceSequencer(lambda _instances, _payload: asyncio.sleep(0), admit)

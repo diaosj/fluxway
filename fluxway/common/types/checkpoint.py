@@ -51,6 +51,22 @@ class CheckpointRuntimeRole(StrEnum):
     WORKER = "worker"
 
 
+def checkpoint_position(runtime_state: Mapping[str, Any]) -> int:
+    if not isinstance(runtime_state, Mapping):
+        raise TypeError("checkpoint runtime state must be a mapping")
+    if set(runtime_state) != {"drain_boundary"}:
+        raise ValueError("checkpoint runtime state must contain only drain_boundary")
+    boundary = runtime_state["drain_boundary"]
+    if not isinstance(boundary, Mapping):
+        raise TypeError("checkpoint runtime drain_boundary must be a mapping")
+    position = boundary.get("committed_cut")
+    if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+        raise ValueError(
+            "checkpoint runtime drain_boundary requires a non-negative committed_cut"
+        )
+    return position
+
+
 class CheckpointComponentCapability(StrEnum):
     COMPONENT_LIFECYCLE = "component_lifecycle"
     SAVE = "save"
@@ -81,7 +97,7 @@ class RestoreTopologyMode(StrEnum):
 @dataclass(frozen=True, slots=True)
 class CheckpointCut:
     cut_id: str
-    logical_step: int | None
+    position: int | None
     stream_cuts: Mapping[str, Any] = field(default_factory=dict)
     sealed_ends: Mapping[str, Any] = field(default_factory=dict)
     control_epoch: int = 0
@@ -89,16 +105,20 @@ class CheckpointCut:
     def __post_init__(self) -> None:
         if not self.cut_id:
             raise ValueError("checkpoint cut requires cut_id")
-        if self.logical_step is not None and (
-            isinstance(self.logical_step, bool) or self.logical_step < 0
+        if self.position is not None and (
+            isinstance(self.position, bool) or self.position < 0
         ):
-            raise ValueError("logical_step must be a non-negative integer or None")
+            raise ValueError("position must be a non-negative integer or None")
         if self.control_epoch < 0:
             raise ValueError("control_epoch must be non-negative")
 
     @classmethod
+    def for_position(cls, cut_id: str, position: int) -> CheckpointCut:
+        return cls(cut_id=cut_id, position=position)
+
+    @classmethod
     def for_step(cls, cut_id: str, step: int) -> CheckpointCut:
-        return cls(cut_id=cut_id, logical_step=step)
+        return cls.for_position(cut_id, step)
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +178,7 @@ class CheckpointObjectKey:
     component_id: str
     checkpoint_object_id: str
     checkpoint_id: str
-    logical_step: int | None
+    position: int | None
     spmd_id: str
     partition_key: str | None
 
@@ -171,12 +191,10 @@ class CheckpointObjectKey:
         ):
             if not value:
                 raise ValueError(f"checkpoint_object key requires {name}")
-        if self.logical_step is not None and (
-            isinstance(self.logical_step, bool) or self.logical_step < 0
+        if self.position is not None and (
+            isinstance(self.position, bool) or self.position < 0
         ):
-            raise ValueError(
-                "checkpoint_object logical_step must be non-negative or None"
-            )
+            raise ValueError("checkpoint_object position must be non-negative or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,7 +330,7 @@ class SaveSession:
             component_id=self.component_id,
             checkpoint_object_id=checkpoint_object_id,
             checkpoint_id=self.checkpoint_id,
-            logical_step=self.cut.logical_step,
+            position=self.cut.position,
             spmd_id=self.spmd_id,
             partition_key=partition_key,
         )
@@ -496,6 +514,7 @@ class SpmdCheckpoint:
     source_topology: TopologySnapshot
     runtime_state: Mapping[str, Any]
     components: Mapping[str, CheckpointComponentPublication]
+    driver_components: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if any(
@@ -503,6 +522,8 @@ class SpmdCheckpoint:
             for component_id, publication in self.components.items()
         ):
             raise ValueError("component publication does not match its mapping key")
+        if not isinstance(self.driver_components, Mapping):
+            raise TypeError("driver_components must be a mapping")
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,8 +570,8 @@ class CheckpointManifest:
     spmds: Mapping[str, SpmdCheckpoint]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 4:
-            raise ValueError("only checkpoint manifest schema version 4 is supported")
+        if self.schema_version != 1:
+            raise ValueError("only checkpoint manifest schema version 1 is supported")
         if not self.checkpoint_id:
             raise ValueError("checkpoint manifest requires checkpoint_id")
         if self.checkpoint_sequence < 0:
@@ -591,9 +612,9 @@ class SaveCheckpointRequest:
             for reference in self.references
             if isinstance(reference, StepReference)
         )
-        if step_references and self.cut.logical_step is None:
-            raise ValueError("step references require a logical checkpoint step")
-        if any(step != self.cut.logical_step for step in step_references):
+        if step_references and self.cut.position is None:
+            raise ValueError("step references require a durable checkpoint position")
+        if any(step != self.cut.position for step in step_references):
             raise ValueError("step reference must match the checkpoint cut")
         names = tuple(
             reference.name

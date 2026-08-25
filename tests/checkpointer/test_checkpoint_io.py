@@ -48,7 +48,7 @@ async def test_safetensors_component_uses_transaction_context(tmp_path):
     restored: list[dict[str, object]] = []
 
     async def save(module, context):
-        assert context.cut.logical_step == 5
+        assert context.cut.position == 5
         return {"value": np.array([5], dtype=np.int64)}
 
     async def restore(module, state, context):

@@ -5,7 +5,7 @@ from fluxway.common.decorators import spmd_source, operator, requires_worker_pro
 from fluxway.common.index_descriptor import ContinuousIndex
 from fluxway.common.operator_policy import AsyncPolicy
 from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.types import SaveSession, RestoreSession
+from fluxway.common.types import RestoreTopologyMode
 from fluxway.control_plane.checkpointer import StateCheckpointComponent
 from fluxway.reader import GrainReader
 from fluxway import ResourceProfile
@@ -41,10 +41,11 @@ def _row_partitioned_int_tensor(
     checkpoint_components=(
         StateCheckpointComponent(
             "reader",
-            lambda owner, context: owner.save_checkpoint_state(context),
+            lambda owner, context: owner.save_state(context),
             lambda owner, state, context: owner.restore_checkpoint_state(
                 state, context
             ),
+            restore_topology=RestoreTopologyMode.GLOBAL_RESHARD,
         ).registration(),
     ),
 )
@@ -131,7 +132,6 @@ class RecommendationReader(GrainReader):
         super()._create_data_loader(
             static_args, rank, world_size, shard_index, shard_count
         )
-        self._completed_steps = 0
 
     @staticmethod
     def _zipf_probs(
@@ -181,10 +181,9 @@ class RecommendationReader(GrainReader):
         if not samples:
             return None
 
-        self._completed_steps += 1
-
+        sample_count = len(samples)
         logical_world = self.world_size if hasattr(self, "world_size") else 1
-        global_batch_size = batch_size * logical_world
+        global_batch_size = sample_count * logical_world
         g_shape = (global_batch_size,)
         g_shape_one_sparse = (global_batch_size, 1)
         g_shape_item_sparse = (
@@ -296,29 +295,3 @@ class RecommendationReader(GrainReader):
         )
 
         return UserBatch(active=active, passive=passive, labels=labels)
-
-    def save_checkpoint_state(self, context: SaveSession) -> dict[str, Any]:
-        static_args = self.static_args
-        state: dict[str, Any] = {
-            "completed_steps": self._completed_steps,
-            "batch_size": int(static_args["batch_size"]),
-        }
-        state["mode"] = "iterator"
-        state["grain_state"] = super().save_state(context)
-        return state
-
-    def restore_checkpoint_state(
-        self, state: dict[str, Any], context: RestoreSession
-    ) -> None:
-        completed_steps = int(state["completed_steps"])
-        saved_batch_size = int(state["batch_size"])
-        if completed_steps < 0 or saved_batch_size <= 0:
-            raise ValueError("Reader checkpoint state contains invalid progress")
-        mode = state.get("mode")
-        if mode != "iterator":
-            raise ValueError(f"unsupported reader checkpoint mode: {mode!r}")
-        grain_state = state.get("grain_state")
-        if not isinstance(grain_state, dict):
-            raise ValueError("iterator checkpoint is missing grain_state")
-        super().restore_checkpoint_state(grain_state, context)
-        self._completed_steps = completed_steps

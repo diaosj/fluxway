@@ -19,7 +19,8 @@ except ImportError:
 from dataclasses import dataclass
 
 from fluxway.common.decorators import data_type
-from fluxway.reader.grain_reader import GrainReader
+from fluxway.common.decorators import spmd_source
+from fluxway.reader.grain_reader import GrainReader, StridedIndexSampler
 from fluxway.spmd.worker.operator_manager.dispatcher import InterleavedDispatcher
 
 
@@ -73,6 +74,53 @@ def _drain(reader: GrainReader):
             break
         results.append(batch)
     return results
+
+
+@spmd_source(
+    mesh_axis_names=("worker",),
+    mesh_axis_shapes=(2,),
+    interleaved=True,
+    interleave_unit_size=2,
+)
+class _BatchedInterleavedReader(GrainReader):
+    def records_per_position(self) -> int:
+        return 3
+
+
+def _records_before_checkpoint(
+    *, world_size: int, checkpoint_position: int
+) -> set[int]:
+    records: set[int] = set()
+    for rank in range(world_size):
+        reader = object.__new__(_BatchedInterleavedReader)
+        reader.rank = rank
+        reader.world_size = world_size
+        sampler = StridedIndexSampler(
+            range(100),
+            shard_index=rank,
+            shard_count=world_size,
+            block_size=reader.records_per_position(),
+            drop_remainder=False,
+        )
+        records.update(
+            sampler[index]
+            for index in range(reader._local_items_before(checkpoint_position))
+        )
+    return records
+
+
+def test_virtual_interleave_checkpoint_reshards_record_blocks() -> None:
+    saved_records = _records_before_checkpoint(
+        world_size=4,
+        checkpoint_position=3,
+    )
+    restored_records = _records_before_checkpoint(
+        world_size=6,
+        checkpoint_position=3,
+    )
+
+    assert saved_records == set(range(18))
+    assert restored_records == saved_records
 
 
 @pytest.mark.skipif(grain is None, reason="google-grain not installed")
@@ -153,7 +201,7 @@ class TestGrainReaderSharding:
             attempt_id="tx",
             checkpoint_id="checkpoint",
             commit_permit=CheckpointCommitPermit("tx", 1, b"permit"),
-            cut=CheckpointCut.for_step("cut", 1),
+            cut=CheckpointCut.for_step("cut", 2),
             spmd_id="reader",
             rank=0,
             source_topology=topology,

@@ -16,6 +16,7 @@ from fluxway.common.types.checkpoint import (
     SpmdCheckpoint,
     TopologySnapshot,
 )
+from fluxway.common.types import DrainBoundary
 from fluxway.control_plane.checkpointer.retention import (
     CheckpointRetentionCoordinator,
     CheckpointCleanupReservation,
@@ -75,7 +76,7 @@ def _multi_object_manifest(sequence: int) -> CheckpointManifest:
         for checkpoint_object_id in ("model_state", "optimizer_state")
     )
     return CheckpointManifest(
-        schema_version=4,
+        schema_version=1,
         checkpoint_id=f"checkpoint-{sequence}",
         attempt_id=f"attempt-{sequence}",
         coordinator_generation=1,
@@ -86,7 +87,9 @@ def _multi_object_manifest(sequence: int) -> CheckpointManifest:
         spmds={
             "train": SpmdCheckpoint(
                 source_topology=TopologySnapshot(1, (), (), "v1"),
-                runtime_state={},
+                runtime_state={
+                    "drain_boundary": DrainBoundary(committed_cut=sequence).to_dict()
+                },
                 components={
                     "dense": CheckpointComponentPublication(
                         component_id="dense",

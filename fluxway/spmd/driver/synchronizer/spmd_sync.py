@@ -154,15 +154,21 @@ class SPMDSynchronizer:
         """
         with self._lock:
             boundary_state = spmd_state.get("drain_boundary")
-            if boundary_state is not None:
-                if not isinstance(boundary_state, dict):
-                    raise TypeError("SPMD drain_boundary state must be a dictionary")
-                self._drain_boundary = DrainBoundary.from_mapping(boundary_state)
+            if not isinstance(boundary_state, dict):
+                raise TypeError("SPMD checkpoint state requires drain_boundary")
+            restored_boundary = DrainBoundary.from_mapping(boundary_state)
+            committed_cut = restored_boundary.committed_cut
+            if committed_cut is None or committed_cut < 0:
+                raise ValueError(
+                    "SPMD checkpoint drain_boundary requires committed_cut"
+                )
+            self._drain_boundary = DrainBoundary.from_committed_cut(committed_cut)
             for worker_counts in self._worker_completed_count.values():
                 worker_counts.clear()
             self._spmd_completed_count.clear()
             self._committed_spmd_count.clear()
-            for op_name, count in spmd_state.get("completed_step_count", {}).items():
+            for op_name in self._expected_ops:
+                count = committed_cut
                 for rank in range(self.num_workers):
                     self._worker_completed_count[rank][op_name] = count
                 self._spmd_completed_count[op_name] = count
@@ -178,7 +184,7 @@ class SPMDSynchronizer:
             logger.debug(
                 "SPMD %s loaded spmd_state steps=%s for %d workers",
                 self.spmd_id,
-                spmd_state.get("completed_step_count", {}),
+                committed_cut,
                 self.num_workers,
             )
 
@@ -372,7 +378,16 @@ class SPMDSynchronizer:
                         else ("global" if should_block_global else "controller")
                     )
                     logger.debug(
-                        f"Blocking rank {rank} {op_name} (count {worker_count}, reason={reason})"
+                        "Blocking rank %s %s (count=%s max=%s min=%s "
+                        "allowed_limit=%s reason=%s spmd_id=%s)",
+                        rank,
+                        op_name,
+                        worker_count,
+                        max_count,
+                        min_count,
+                        allowed_limit,
+                        reason,
+                        self.spmd_id,
                     )
                     if self._block_worker_op:
                         self._block_worker_op(
@@ -477,11 +492,15 @@ class SPMDSynchronizer:
     def clear_drain(self) -> None:
         """Remove the drain target and unblock workers so training resumes."""
         with self._lock:
-            if self._drain_step_count is None:
-                return
             self._drain_step_count = None
             self._drain_on_drained = None
             self._drain_acked_ops = set()
+            ops = set(self._expected_ops)
+            ops.update(self._spmd_completed_count)
+            for worker_steps in self._worker_completed_count.values():
+                ops.update(worker_steps)
+            for op_name in sorted(ops):
+                self._check_worker_skew_internal(op_name)
             logger.debug(f"Drain cleared spmd_id={self.spmd_id}")
 
     # =========================================================================

@@ -28,6 +28,7 @@ from fluxway.common.types.checkpoint import (
     CleanupReservation,
     CheckpointManifest,
     CheckpointIdReference,
+    checkpoint_position,
     SpmdCheckpoint,
     StepReference,
     TopologySnapshot,
@@ -220,6 +221,20 @@ def manifest_to_payload(manifest: CheckpointManifest) -> dict[str, Any]:
     validate_checkpoint_value(manifest.cut.stream_cuts, "manifest.cut.stream_cuts")
     validate_checkpoint_value(manifest.cut.sealed_ends, "manifest.cut.sealed_ends")
     validate_checkpoint_value(manifest.framework_state, "manifest.framework_state")
+    for spmd_id, snapshot in manifest.spmds.items():
+        runtime_position = checkpoint_position(snapshot.runtime_state)
+        if manifest.cut.position != runtime_position:
+            raise ValueError(
+                f"manifest cut position {manifest.cut.position!r} does not match "
+                f"SPMD {spmd_id!r} runtime position {runtime_position!r}"
+            )
+        validate_checkpoint_value(
+            snapshot.runtime_state, f"manifest.spmds.{spmd_id}.runtime_state"
+        )
+        validate_checkpoint_value(
+            snapshot.driver_components,
+            f"manifest.spmds.{spmd_id}.driver_components",
+        )
     return {
         "schema_version": manifest.schema_version,
         "checkpoint_id": manifest.checkpoint_id,
@@ -227,7 +242,7 @@ def manifest_to_payload(manifest: CheckpointManifest) -> dict[str, Any]:
         "coordinator_generation": manifest.coordinator_generation,
         "cut": {
             "cut_id": manifest.cut.cut_id,
-            "logical_step": manifest.cut.logical_step,
+            "position": manifest.cut.position,
             "stream_cuts": dict(manifest.cut.stream_cuts),
             "sealed_ends": dict(manifest.cut.sealed_ends),
             "control_epoch": manifest.cut.control_epoch,
@@ -241,6 +256,7 @@ def manifest_to_payload(manifest: CheckpointManifest) -> dict[str, Any]:
             spmd_id: {
                 "source_topology": _encode_topology(snapshot.source_topology),
                 "runtime_state": dict(snapshot.runtime_state),
+                "driver_components": dict(snapshot.driver_components),
                 "components": {
                     component_id: _encode_publication(publication)
                     for component_id, publication in snapshot.components.items()
@@ -254,29 +270,39 @@ def manifest_to_payload(manifest: CheckpointManifest) -> dict[str, Any]:
 def manifest_from_payload(payload: Any) -> CheckpointManifest:
     if not isinstance(payload, Mapping):
         raise TypeError("checkpoint manifest root must be a mapping")
-    if payload.get("schema_version") != 4:
-        raise ValueError("only checkpoint manifest schema version 4 is supported")
+    if payload.get("schema_version") != 1:
+        raise ValueError("only checkpoint manifest schema version 1 is supported")
     raw_cut = payload["cut"]
     if not isinstance(raw_cut, Mapping):
         raise TypeError("checkpoint manifest cut must be a mapping")
     cut = CheckpointCut(
         cut_id=raw_cut["cut_id"],
-        logical_step=raw_cut.get("logical_step"),
+        position=raw_cut.get("position"),
         stream_cuts=raw_cut["stream_cuts"],
         sealed_ends=raw_cut["sealed_ends"],
         control_epoch=raw_cut["control_epoch"],
     )
-    spmds = {
-        spmd_id: SpmdCheckpoint(
+    spmds: dict[str, SpmdCheckpoint] = {}
+    for spmd_id, snapshot in payload["spmds"].items():
+        runtime_position = checkpoint_position(snapshot["runtime_state"])
+        if cut.position != runtime_position:
+            raise ValueError(
+                f"manifest cut position {cut.position!r} does not match "
+                f"SPMD {spmd_id!r} runtime position {runtime_position!r}"
+            )
+        validate_checkpoint_value(
+            snapshot["driver_components"],
+            f"manifest.spmds.{spmd_id}.driver_components",
+        )
+        spmds[spmd_id] = SpmdCheckpoint(
             source_topology=_decode_topology(snapshot["source_topology"]),
             runtime_state=snapshot["runtime_state"],
             components={
                 component_id: _decode_publication(publication)
                 for component_id, publication in snapshot["components"].items()
             },
+            driver_components=snapshot["driver_components"],
         )
-        for spmd_id, snapshot in payload["spmds"].items()
-    }
     return CheckpointManifest(
         schema_version=payload["schema_version"],
         checkpoint_id=payload["checkpoint_id"],

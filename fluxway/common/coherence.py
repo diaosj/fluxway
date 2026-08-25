@@ -319,7 +319,7 @@ class CoherenceDirectory:
     ] = None
 
     def __init__(self) -> None:
-        self._entries: dict[CoherenceSubject, CoherenceEntryState] = {}
+        self._entries: dict[CoherenceInstance, CoherenceEntryState] = {}
         self._next_grant_id = 1
         self._next_request_id = 1
         self._pending_requests: dict[int, _PendingRequest] = {}
@@ -755,35 +755,16 @@ class CoherenceDirectory:
         """Synchronously admit one canonical coherence instance."""
         self._require_subject(instance.subject)
         self._require_epoch(instance.epoch)
-        entry = self._entries.get(instance.subject)
+        entry = self._entries.get(instance)
         if entry is None:
             entry = CoherenceEntryState(epoch=instance.epoch)
-            self._entries[instance.subject] = entry
-            return entry
-        if instance.epoch < entry.epoch:
-            raise StaleEpochError(
-                f"coherence key={instance.subject} received stale epoch={instance.epoch}; "
-                f"current={entry.epoch}."
-            )
-        if instance.epoch > entry.epoch:
-            if not self._can_advance_epoch(entry):
-                raise CoherenceBackpressureError(
-                    f"coherence key={instance.subject} cannot advance epoch while "
-                    "grants are active."
-                )
-            self._advance_epoch(entry, instance.epoch)
+            self._entries[instance] = entry
         return entry
 
     def _admit_request(
         self, instance: CoherenceInstance
     ) -> tuple[CoherenceEntryState, bool]:
-        try:
-            return self.admit(instance), True
-        except CoherenceBackpressureError:
-            entry = self._entries.get(instance.subject)
-            if entry is None:
-                raise
-            return entry, False
+        return self.admit(instance), True
 
     def add_progress_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
         if listener in self._progress_listeners:
@@ -805,15 +786,7 @@ class CoherenceDirectory:
     def can_admit(self, instance: CoherenceInstance) -> bool:
         self._require_subject(instance.subject)
         self._require_epoch(instance.epoch)
-        entry = self._entries.get(instance.subject)
-        if entry is None:
-            return True
-        if instance.epoch < entry.epoch:
-            raise StaleEpochError(
-                f"coherence key={instance.subject} received stale epoch={instance.epoch}; "
-                f"current={entry.epoch}."
-            )
-        return instance.epoch == entry.epoch or self._can_advance_epoch(entry)
+        return True
 
     def take_pending_result(self, request_id: int) -> GrantReady | GrantRejected | None:
         request = self._pending_requests.get(request_id)
@@ -854,9 +827,16 @@ class CoherenceDirectory:
                     pass
         self._signal_progress()
 
+    def _inspect_instance_epoch(
+        self, instance: CoherenceInstance
+    ) -> CoherenceEntryState | None:
+        self._require_subject(instance.subject)
+        self._require_epoch(instance.epoch)
+        return self._entries.get(instance)
+
     def is_quiescent(self, instance: CoherenceInstance) -> bool:
-        entry = self._require_current(instance.subject, instance.epoch)
-        return self._is_locally_quiescent(entry)
+        entry = self._inspect_instance_epoch(instance)
+        return entry is None or self._is_locally_quiescent(entry)
 
     def deliveries_complete(
         self,
@@ -865,8 +845,8 @@ class CoherenceDirectory:
     ) -> bool:
         if child_bitmap < 0:
             raise ValueError("child_bitmap must be non-negative.")
-        entry = self._require_current(instance.subject, instance.epoch)
-        return not self._delivery_receipts_overlap(entry, child_bitmap)
+        entry = self._inspect_instance_epoch(instance)
+        return entry is None or not self._delivery_receipts_overlap(entry, child_bitmap)
 
     def fence(self) -> None:
         self._pending_requests.clear()
@@ -1003,15 +983,7 @@ class CoherenceDirectory:
         return GrantReady(token)
 
     def accept_parent_read(self, key: CoherenceSubject, epoch: int) -> None:
-        entry = self._entries.get(key)
-        if entry is not None and epoch > entry.epoch:
-            if entry.parent_grant.return_in_flight:
-                entry.parent_grant.observe_return(key)
-                self.admit(CoherenceInstance(key, epoch))
-            else:
-                entry = self.admit(CoherenceInstance(key, epoch))
-        else:
-            entry = self.admit(CoherenceInstance(key, epoch))
+        entry = self.admit(CoherenceInstance(key, epoch))
         result = self._evaluate_transition(CoherenceEvent.RxBusRd, entry)
         if result.status is TransitionStatus.ERROR_BACKPRESSURE:
             raise CoherenceBackpressureError(result.message)
@@ -1057,18 +1029,10 @@ class CoherenceDirectory:
                 "parent return transaction "
                 f"id={token.transaction_id} is already completed or inactive."
             )
-        entry = self._entries.get(token.key)
+        instance = CoherenceInstance(token.key, token.epoch)
+        entry = self._entries.get(instance)
         if entry is None:
-            raise CoherenceStateTransitionError(
-                f"parent return id={token.transaction_id} has no directory entry."
-            )
-        if entry.epoch > token.epoch:
             return
-        if entry.epoch < token.epoch:
-            raise StaleEpochError(
-                f"coherence key={token.key} completed future epoch={token.epoch}; "
-                f"current={entry.epoch}."
-            )
         entry.parent_grant.complete_return(token)
         entry.revoking = False
         self._wake_pending(entry, token.key)
@@ -1087,17 +1051,10 @@ class CoherenceDirectory:
         )
 
     def require_current_entry_retirement(self, instance: CoherenceInstance) -> None:
-        entry = self._entries.get(instance.subject)
+        entry = self._entries.get(instance)
         if entry is None:
-            raise RetirementInvariantError(
-                f"tensor instance has no current coherence entry: {instance}."
-            )
-        if instance.epoch != entry.epoch:
-            raise RetirementInvariantError(
-                f"tensor instance is not the current coherence epoch: {instance}; "
-                f"current={entry.epoch}."
-            )
-        if not self._can_advance_epoch(entry):
+            return
+        if not self._is_locally_quiescent(entry):
             raise RetirementInvariantError(
                 f"tensor instance is not retirement-quiescent: {instance}."
             )
@@ -1160,11 +1117,10 @@ class CoherenceDirectory:
             raise UnsupportedAllocationHandoffError(
                 "allocation handoff requires a new SSA subject."
             )
-        new_entry = self._entries.get(new.subject)
+        new_entry = self._entries.get(new)
         if new_entry is not None and (
-            new_entry.epoch != new.epoch
-            or new_entry.state is not CoherenceState.INVALID
-            or not self._can_advance_epoch(new_entry)
+            new_entry.state is not CoherenceState.INVALID
+            or not self._is_locally_quiescent(new_entry)
         ):
             raise UnsupportedAllocationHandoffError(
                 "allocation handoff destination must be invalid and quiescent."
@@ -1184,7 +1140,9 @@ class CoherenceDirectory:
         )
 
     def return_child(self, key: CoherenceSubject, epoch: int, child_id: int) -> None:
-        entry = self._require_current(key, epoch)
+        entry = self._inspect_instance_epoch(CoherenceInstance(key, epoch))
+        if entry is None:
+            return
         mask = 1 << child_id
         if not entry.child_share_bitmap & mask:
             raise CoherenceStateTransitionError(
@@ -1335,7 +1293,9 @@ class CoherenceDirectory:
         *,
         data_valid: bool = False,
     ) -> None:
-        entry = self._require_current(key, epoch)
+        entry = self._inspect_instance_epoch(CoherenceInstance(key, epoch))
+        if entry is None:
+            return
         if entry.ownership_child_id != child_id:
             raise CoherenceStateTransitionError(
                 f"child_id={child_id} does not own coherence key={key}."
@@ -1353,7 +1313,7 @@ class CoherenceDirectory:
     def begin_invalidation(
         self, key: CoherenceSubject, epoch: int
     ) -> InvalidationResult:
-        entry = self._entries.get(key)
+        entry = self._entries.get(CoherenceInstance(key, epoch))
         if entry is not None and entry.parent_grant.coalesces_invalidation(epoch):
             return InvalidationResult.SATISFIED_BY_PARENT_RETURN
         entry = self._require_current(key, epoch)
@@ -1579,13 +1539,12 @@ class CoherenceDirectory:
     def _require_current(
         self, key: CoherenceSubject, epoch: int
     ) -> CoherenceEntryState:
-        entry = self._entries.get(key)
+        self._require_subject(key)
+        self._require_epoch(epoch)
+        instance = CoherenceInstance(key, epoch)
+        entry = self._entries.get(instance)
         if entry is None:
-            raise CoherenceStateTransitionError(f"unknown coherence key={key}.")
-        if epoch != entry.epoch:
-            raise StaleEpochError(
-                f"coherence key={key} received epoch={epoch}; current={entry.epoch}."
-            )
+            entry = self.admit(instance)
         return entry
 
     @classmethod

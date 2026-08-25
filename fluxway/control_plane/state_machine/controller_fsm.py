@@ -299,18 +299,28 @@ class ControllerStateMachine:
         """Called when entering TOPOLOGY_REGISTERING state.
 
         All drivers have reported workers_ready.
-        Initiates topology registration on all SPMDs (fire-and-forget).
+        Initiates topology registration on all SPMDs.
         Workers will auto-start after handler registration.
         """
         logger.debug(
             "Controller entering TOPOLOGY_REGISTERING state, initiating topology registration"
         )
 
-        # Initiate topology registration (fire-and-forget, no await needed)
         try:
             await self._controller._initiate_topology_registration()
         except Exception as e:
-            logger.error(f"Failed to initiate topology registration: {e}")
+            failure = ExecutionFailure.from_exception(
+                spmd_id="controller",
+                rank=None,
+                phase="TOPOLOGY_REGISTRATION",
+                exception=e,
+            )
+            await self.trigger_event(
+                ControllerEvent.DRIVER_ERROR,
+                spmd_id="controller",
+                failure=failure,
+            )
+            raise
 
     async def _on_enter_ready(self) -> None:
         """Called when entering READY state.

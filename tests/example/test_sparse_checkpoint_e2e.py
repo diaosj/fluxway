@@ -20,6 +20,7 @@ from fluxway.common.types.checkpoint import (
     CheckpointCleanupBlocked,
     TopologySnapshot,
 )
+from fluxway.common.types import DrainBoundary
 from fluxway.control_plane.checkpointer.component import CheckpointComponentRegistry
 from fluxway.control_plane.checkpointer.checkpoint import FluxwayCheckpointer
 from fluxway.integrations.sparse_embedding.checkpoint import (
@@ -78,7 +79,11 @@ class _LocalLanceController:
             spmds={
                 "embedding": SpmdCheckpoint(
                     source_topology=self.topology,
-                    runtime_state={},
+                    runtime_state={
+                        "drain_boundary": DrainBoundary(
+                            committed_cut=cut.position or 0
+                        ).to_dict()
+                    },
                     components=publications,
                 )
             },

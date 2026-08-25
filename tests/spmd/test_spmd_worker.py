@@ -27,7 +27,7 @@ from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.common.types.configs import SPMDConfig
-from fluxway.common.types import DrainBoundary
+from fluxway.common.types import DrainBoundary, DrainPhase
 from fluxway.common.operator_policy import ArgumentType, PeriodicBarrierConfig
 from fluxway import OperatorSpec
 from fluxway.common.types.tensor import TransportTensor
@@ -118,18 +118,54 @@ async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
         (),
         {"is_source_operator": lambda _self, name: name == "Reader"},
     )()
-    restored = worker._restore_checkpoint_runtime_state(
+    worker._restore_checkpoint_runtime_state(
         {
-            "completed_step_count": {"Reader": 1, "Dense": 1},
-            "drain_boundary": DrainBoundary().to_dict(),
+            "drain_boundary": DrainBoundary(committed_cut=1).to_dict(),
         }
     )
 
     assert worker._scheduled_step_count == {"Reader": 1, "Dense": 1}
-    assert restored == [("Reader", 1)]
 
 
-def test_checkpoint_restore_rejects_operators_absent_from_eval_graph() -> None:
+def test_checkpoint_restore_discards_transient_drain_boundary_state() -> None:
+    worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
+    worker = worker_type.__new__(worker_type)
+    worker._completed_step_count = {"Reader": 0}
+    worker._scheduled_step_count = {"Reader": 0}
+    worker._drain_boundary = DrainBoundary()
+    worker._source_operator_names = ("Reader",)
+    worker.spmd_id = "Reader"
+    worker.rank = 0
+    worker.config = type("Config", (), {"max_steps": None})()
+    worker._op_manager = type(
+        "OperatorManager",
+        (),
+        {"is_source_operator": lambda _self, name: name == "Reader"},
+    )()
+
+    worker._restore_checkpoint_runtime_state(
+        {
+            "drain_boundary": DrainBoundary(
+                phase=DrainPhase.COMPLETED,
+                observed_cut=9,
+                admitted_cut=9,
+                drained_cut=9,
+                committed_cut=9,
+                revision=41,
+            ).to_dict(),
+        }
+    )
+
+    assert worker._drain_boundary == DrainBoundary(
+        phase=DrainPhase.OPEN,
+        drained_cut=9,
+        committed_cut=9,
+    )
+    assert worker._completed_step_count == {"Reader": 9}
+    assert worker._scheduled_step_count == {"Reader": 9}
+
+
+def test_checkpoint_restore_rejects_duplicate_runtime_cursor() -> None:
     worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
     worker = worker_type.__new__(worker_type)
     worker._completed_step_count = {"lookup": 0}
@@ -145,11 +181,11 @@ def test_checkpoint_restore_rejects_operators_absent_from_eval_graph() -> None:
         {"is_source_operator": lambda _self, name: name == "lookup"},
     )()
 
-    with pytest.raises(ValueError, match=r"extra=\['update'\]"):
+    with pytest.raises(ValueError, match="only drain_boundary"):
         worker._restore_checkpoint_runtime_state(
             {
                 "completed_step_count": {"lookup": 4, "update": 4},
-                "drain_boundary": DrainBoundary().to_dict(),
+                "drain_boundary": DrainBoundary(committed_cut=4).to_dict(),
             }
         )
 

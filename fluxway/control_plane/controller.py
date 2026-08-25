@@ -32,6 +32,7 @@ from fluxway.common.types import (
     AsyncStepConfig,
     CheckpointCommitPermit,
     CheckpointCut,
+    checkpoint_position,
     ControllerEvent,
     ControllerState,
     DriverHeartbeat,
@@ -480,7 +481,7 @@ class ControllerActor:
     async def start(self, resume: str | int | None = None) -> int | None:
         """
         Main execution entry point.
-        Sequence: Initialize -> wait READY -> restore -> START -> drain -> start source.
+        Sequence: Initialize -> wait READY -> restore -> START -> start source -> drain.
         """
         if self._initialized:
             raise RuntimeError("Controller is already initialized or started")
@@ -508,6 +509,28 @@ class ControllerActor:
             if not success:
                 raise RuntimeError("Failed to transition to RUNNING from READY")
 
+            # Early exit if the stream is already observed as empty (0 steps)
+            if self._drain_boundary.observed_cut == 0:
+                if self._drain_boundary.admitted_cut is not None:
+                    await self._dispatch_drain(0, 0)
+                return restored_step
+
+            # 5. UNIFIED ACTIVATION: transition Drivers before initial drain admission.
+            start_sources = getattr(self, "start_source_operators", None)
+            if start_sources is not None:
+                await start_sources()
+
+            if (
+                self._drain_strategy is not None
+                and self._drain_boundary.phase is DrainPhase.OPEN
+            ):
+                await self._issue_initial_drain()
+            if self._drain_boundary.phase is DrainPhase.DRAINING:
+                target = self._drain_boundary.admitted_cut
+                if target is None:
+                    raise RuntimeError("initial drain is missing its admitted target")
+                await self._dispatch_drain(target, self._drain_boundary.observed_cut)
+
             if self._control_ledger is not None:
                 target = self._terminal_target(
                     self._source_control_stream_bindings(),
@@ -520,6 +543,7 @@ class ControllerActor:
                 if not self.state_machine.is_running():
                     return restored_step
 
+            # 6. UNIFIED DRAIN DISPATCH
             if (
                 self._drain_boundary.admitted_cut is not None
                 and self._drain_boundary.phase
@@ -527,22 +551,11 @@ class ControllerActor:
             ):
                 target = self._drain_boundary.admitted_cut
                 max_steps = getattr(self.async_step_manager._config, "max_steps", None)
-                if max_steps is not None:
+                if isinstance(max_steps, int):
                     target = min(target, max_steps)
                 await self._dispatch_drain(target, self._drain_boundary.observed_cut)
                 if self._drain_boundary.observed_cut == 0:
                     return restored_step
-
-            # 5. Issue initial drain
-            if self._drain_boundary.admitted_cut is None and getattr(
-                self, "_issue_initial_drain", None
-            ):
-                await self._issue_initial_drain()
-
-            # 6. Start source operators
-            start_sources = getattr(self, "start_source_operators", None)
-            if start_sources:
-                await start_sources()
 
             return restored_step
 
@@ -648,11 +661,10 @@ class ControllerActor:
             completed_count: Completed count (number of steps finished)
         """
         self.async_step_manager.report_op_completed(spmd_id, op_name, completed_count)
-        await self._apply_flow_control_windows(
-            self._flow_control_manager.observe_op_completed(
-                spmd_id, op_name, completed_count
-            )
+        windows = self._flow_control_manager.observe_op_completed(
+            spmd_id, op_name, completed_count
         )
+        await self._apply_flow_control_windows(windows)
         if (
             self._drain_strategy is None
             and self.async_step_manager.is_all_completed()
@@ -683,10 +695,9 @@ class ControllerActor:
             raise ValueError(
                 f"boundary event references unknown operator {spmd_id}.{op_name}"
             ) from error
-        if not operator.spec.is_source or not operator.spec.is_interleaved:
+        if not operator.spec.is_source:
             raise ValueError(
-                f"boundary event requires an interleaved source operator, got "
-                f"{spmd_id}.{op_name}"
+                f"boundary event requires a source operator, got {spmd_id}.{op_name}"
             )
         await self._reduce_drain_event(event)
 
@@ -837,23 +848,7 @@ class ControllerActor:
                 raise TypeError(
                     f"SPMD checkpoint entry {spmd_id!r} must be SpmdCheckpoint"
                 )
-            completed = spmd_entry.runtime_state.get("completed_step_count")
-            if not isinstance(completed, Mapping):
-                raise ValueError(
-                    f"SPMD checkpoint state {spmd_id!r} is missing completed_step_count"
-                )
-            try:
-                cut = completed[operator_name]
-            except KeyError as exc:
-                raise ValueError(
-                    f"SPMD checkpoint state {spmd_id!r} is missing completion "
-                    f"for source operator {operator_name!r}"
-                ) from exc
-            if not isinstance(cut, int) or isinstance(cut, bool) or cut < 0:
-                raise ValueError(
-                    f"source operator completion must be a non-negative integer: "
-                    f"{spmd_id}.{operator_name}={cut!r}"
-                )
+            cut = checkpoint_position(spmd_entry.runtime_state)
             cuts[stream_id] = cut
         return cuts
 
@@ -905,21 +900,27 @@ class ControllerActor:
             raise ValueError("checkpoint control state is missing control_ledger")
         self._require_control_ledger().restore_state(ledger_state)
         restored_boundary = DrainBoundary.from_mapping(state["drain_boundary"])
-        self._drain_boundary = restored_boundary
+        if restored_boundary.committed_cut is None:
+            raise ValueError(
+                "checkpoint control state drain_boundary requires committed_cut"
+            )
+        self._drain_boundary = DrainBoundary.from_committed_cut(
+            restored_boundary.committed_cut
+        )
         components = state.get("components")
         if not isinstance(components, Mapping):
             raise ValueError("checkpoint control state is missing components")
         self.control_plane_components.restore_state(components)
 
     async def commit_checkpoint_state(
-        self, step: int, control_state: Mapping[str, Any]
+        self, position: int, control_state: Mapping[str, Any]
     ) -> None:
         ledger_state = control_state.get("control_ledger")
         if not isinstance(ledger_state, Mapping):
             raise ValueError("committed checkpoint is missing control_ledger state")
         await self._require_control_ledger().commit_checkpoint(ledger_state)
         await self._reduce_drain_event(
-            DrainEvent(DrainEventKind.CHECKPOINT_COMMITTED, step)
+            DrainEvent(DrainEventKind.CHECKPOINT_COMMITTED, position)
         )
 
     @require_spmd_manager
@@ -992,7 +993,7 @@ class ControllerActor:
             )
             if initial_target is not None:
                 max_steps = getattr(self.async_step_manager._config, "max_steps", None)
-                if max_steps is not None:
+                if isinstance(max_steps, int):
                     initial_target = min(initial_target, max_steps)
                 logger.info(f"Issuing initial drain target: {initial_target}")
                 await self._schedule_drain(initial_target)
@@ -1000,7 +1001,7 @@ class ControllerActor:
     async def _schedule_drain(self, target: int) -> None:
         """Broadcast a new drain target to all drivers."""
         max_steps = getattr(self.async_step_manager._config, "max_steps", None)
-        if max_steps is not None:
+        if isinstance(max_steps, int):
             target = min(target, max_steps)
 
         if self._profiler_runtime.enabled:
@@ -1271,7 +1272,7 @@ class ControllerActor:
         stream_cuts = self.control_stream_cuts(spmds)
         resolved_cut = CheckpointCut(
             cut_id=cut.cut_id,
-            logical_step=cut.logical_step,
+            position=cut.position,
             stream_cuts=stream_cuts,
             sealed_ends=self._require_control_ledger().sealed_ends,
             control_epoch=cut.control_epoch,
@@ -1376,10 +1377,10 @@ class ControllerActor:
         if manifest.checkpoint_id != checkpoint_id:
             raise ValueError("manifest checkpoint ID does not match restore request")
         self.restore_checkpoint_state(dict(manifest.framework_state))
-        logical_step = manifest.cut.logical_step
-        if logical_step is None:
+        position = manifest.cut.position
+        if position is None:
             raise RuntimeError(
-                "current Controller restore requires a logical checkpoint step"
+                "current Controller restore requires a durable checkpoint position"
             )
         if self.heartbeat_manager is not None:
             restore_timeout = int(
@@ -1392,10 +1393,8 @@ class ControllerActor:
                 raise RuntimeError(
                     "timed out waiting for drivers to become restore-ready"
                 )
-        if self._drain_boundary.committed_cut != logical_step:
-            await self._reduce_drain_event(
-                DrainEvent(DrainEventKind.RESTORE, logical_step)
-            )
+        # Reset runtime boundary to OPEN at the durable position for current runtime execution
+        self._drain_boundary = DrainBoundary.from_committed_cut(position)
         runtime_snapshot = {
             spmd_id: {0: dict(snapshot.runtime_state)}
             for spmd_id, snapshot in manifest.spmds.items()
@@ -1403,12 +1402,9 @@ class ControllerActor:
         self.state_manager.save_snapshot(checkpoint_id, runtime_snapshot)
         flow_control_updates: dict[str, tuple[Any, ...]] = {}
         for spmd_id, snapshot in manifest.spmds.items():
-            completed = snapshot.runtime_state.get("completed_step_count")
-            if not isinstance(completed, Mapping):
-                raise ValueError(
-                    f"checkpoint runtime state {spmd_id!r} is missing completed_step_count"
-                )
-            for op_name, count in completed.items():
+            count = checkpoint_position(snapshot.runtime_state)
+            graph_view = self._graph.require_compiled_graph().spmd(spmd_id)
+            for op_name in graph_view.operator_ids:
                 self.async_step_manager.report_op_completed(spmd_id, op_name, count)
                 flow_control_updates.update(
                     self._flow_control_manager.observe_op_completed(
@@ -1417,8 +1413,6 @@ class ControllerActor:
                 )
         await self._apply_flow_control_windows(flow_control_updates)
         await self.block_all_spmds()
-        terminal_boundary_restored = self._drain_boundary.phase is DrainPhase.COMPLETED
-        restore_completed = False
         try:
             tasks = []
             for spmd_id, snapshot in manifest.spmds.items():
@@ -1434,12 +1428,9 @@ class ControllerActor:
                 )
             if tasks:
                 await asyncio.gather(*tasks)
-            restore_completed = True
         finally:
-            if not restore_completed or not terminal_boundary_restored:
-                await self.unblock_all_spmds()
-        if terminal_boundary_restored:
-            await self._resume_and_schedule_next_drain()
+            await self.unblock_all_spmds()
+
         logger.info("Snapshot restored successfully")
 
     async def restore_checkpoint(self, step: int | None = None) -> int | None:
@@ -1455,8 +1446,8 @@ class ControllerActor:
         restored_step = await self._checkpointer.restore(reference)
         if restored_step is None:
             self._start_sources_when_running = True
-            if self.state_machine.is_running():
-                await self.start_source_operators()
+        if self.state_machine.is_running():
+            await self.start_source_operators()
         return restored_step
 
     async def acquire_checkpoint_lease(
@@ -1871,8 +1862,10 @@ class ControllerActor:
                 for sid, handles in all_worker_handles.items():
                     logger.debug(f"  - {sid}: {len(handles)} workers")
             except Exception as e:
-                logger.error(f"Failed to collect worker handles for topology: {e}")
-                return
+                raise RuntimeError(
+                    "Failed to collect worker handles for topology; "
+                    f"spmd_ids={spmd_ids_to_fetch!r}"
+                ) from e
 
         def _get_transport_type(checkpoint_object_spmd_id: str) -> str:
             if checkpoint_object_spmd_id in self._transport_config:
@@ -1956,15 +1949,14 @@ class ControllerActor:
                     upstream_driver_handles,
                     upstream_edges,
                     downstream_edges,
-                    0,
+                    self._flow_control_manager.epoch,
                 )
                 initial_windows = self._flow_control_manager.initial_windows_for_driver(
                     spmd_id
                 )
                 if initial_windows:
                     await driver.apply_credit_window.remote(initial_windows)
-                # Now call register_topology with ACTUAL DataPlaneCallable objects
-                driver.register_topology.remote(
+                await driver.register_topology.remote(
                     pred_handlers,
                     succ_handlers,
                     len(predecessors),
@@ -1972,11 +1964,11 @@ class ControllerActor:
                     spmd_code_by_id[spmd_id],
                     spmd_id_by_code,
                 )
-                logger.debug(f"Initiated topology registration for SPMD {spmd_id}")
+                logger.debug(f"Completed topology registration for SPMD {spmd_id}")
             except Exception as e:
-                logger.error(
-                    f"Failed to initiate topology registration for {spmd_id}: {e}"
-                )
+                raise RuntimeError(
+                    f"Failed to register topology for SPMD {spmd_id!r}"
+                ) from e
 
     @require_spmd_manager
     @require_heartbeat_manager
@@ -2158,7 +2150,31 @@ class ControllerActor:
     async def _wait_for_completion_unprofiled(
         self, timeout: float | None = None
     ) -> bool:
-        state = await self.state_machine.wait_until_terminal(timeout)
+        try:
+            state = await self.state_machine.wait_until_terminal(timeout)
+        except TimeoutError:
+            progress = {
+                spmd_id: dict(spmd_step.completed_step_count)
+                for spmd_id, spmd_step in (
+                    self.async_step_manager.get_all_spmd_steps().items()
+                )
+            }
+            graph_nodes = set(self._graph.nodes)
+            drained_drivers = set(getattr(self, "_drained_drivers", ()))
+            pending_drivers = sorted(graph_nodes - drained_drivers)
+            boundary = getattr(self, "_drain_boundary", None)
+            boundary_state = boundary.to_dict() if boundary is not None else None
+            logger.warning(
+                "Controller completion wait timed out: "
+                "timeout=%r state=%s pending_drivers=%s "
+                "drain_boundary=%s progress=%s",
+                timeout,
+                self.state_machine.state,
+                pending_drivers,
+                boundary_state,
+                progress,
+            )
+            raise
         if state == ControllerState.COMPLETED:
             return True
         if state == ControllerState.FAILED:

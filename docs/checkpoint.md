@@ -45,6 +45,39 @@ For a non-step execution, construct `SaveCheckpointRequest` with a
 `CheckpointCut` containing stream cuts and a named reference. The cut is the
 only progress fact in the manifest.
 
+### Durable position and transient execution
+
+The runtime meaning of the cut is a `position`: the single boundary at
+which every operator's persisted cursor is defined. `CheckpointCut.position` is
+the manifest's canonical value; each SPMD runtime projection stores the same
+value as `drain_boundary.committed_cut`, and publication rejects any mismatch.
+Reader cursors,
+virtual-interleave units, and model update counts may use different coordinate
+systems; each component maps the durable position to its own checkpoint state.
+
+Worker execution cursors, mailbox entries, coherence leases, ready queues, and
+credit observations are transient. Drain makes the durable position quiescent;
+save records that position, and restore starts a new empty execution runtime at
+it. No mailbox/coherence generation or credit-reset restore API is part of the
+checkpoint contract.
+
+### Source elasticity and exactly-once
+
+Source checkpointing is defined over logical output positions, not over a
+reader class, physical rank, or iterator implementation. A source component
+must persist state that reconstructs its output at the durable
+`CheckpointCut.position`; the checkpointer only applies the component SPI and
+does not inspect or special-case the reader. For a `GLOBAL_RESHARD` component,
+the restored state is topology-independent and the current virtual owner is
+derived from the current `(position, world_size, interleave_unit_size)`.
+
+This gives the checkpoint-relative invariant
+`Committed = [0, position)` and `Replay = [position, ...)`, with an empty
+intersection, even when the number of virtual-interleave workers changes.
+Internal reader records or batches are outside Fluxway's inference boundary;
+their mapping to logical output positions belongs to the source component's
+state contract.
+
 ## Component SPI
 
 `CheckpointComponent` only supplies the descriptor. Runtime behavior is

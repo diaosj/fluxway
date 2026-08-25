@@ -87,7 +87,7 @@ class FluxwayCheckpointer:
             self._validate_assembly_cut(request, assembly.cut)
             sequence = self._repository.next_checkpoint_sequence()
             manifest = CheckpointManifest(
-                schema_version=4,
+                schema_version=1,
                 checkpoint_id=str(checkpoint_id),
                 attempt_id=request.attempt_id,
                 coordinator_generation=permit.coordinator_generation,
@@ -112,9 +112,9 @@ class FluxwayCheckpointer:
             await self._commit_framework_state(manifest)
             await self._retention.cleanup(pending_cleanups)
             logger.info(
-                "checkpoint published snapshot=%s logical_step=%s",
+                "checkpoint published snapshot=%s position=%s",
                 checkpoint_id,
-                manifest.cut.logical_step,
+                manifest.cut.position,
             )
             return manifest
         except BaseException as primary_error:
@@ -162,7 +162,7 @@ class FluxwayCheckpointer:
             manifest,
             self._repository_dir,
         )
-        return manifest.cut.logical_step
+        return manifest.cut.position
 
     async def restore_latest(self) -> int | None:
         return await self.restore()
@@ -362,8 +362,8 @@ class FluxwayCheckpointer:
             raise TypeError("checkpoint assembly returned an invalid checkpoint cut")
         if resolved.cut_id != request.cut.cut_id:
             raise ValueError("checkpoint assembly changed the checkpoint cut ID")
-        if resolved.logical_step != request.cut.logical_step:
-            raise ValueError("checkpoint assembly changed the logical checkpoint step")
+        if resolved.position != request.cut.position:
+            raise ValueError("checkpoint assembly changed the durable position")
         if resolved.control_epoch != request.cut.control_epoch:
             raise ValueError("checkpoint assembly changed the control epoch")
 
@@ -390,8 +390,8 @@ class FluxwayCheckpointer:
             )
 
     async def _commit_framework_state(self, manifest: CheckpointManifest) -> None:
-        if manifest.cut.logical_step is None:
-            raise RuntimeError("checkpoint control ledger commit requires logical_step")
+        if manifest.cut.position is None:
+            raise RuntimeError("checkpoint control ledger commit requires position")
         await self._controller.commit_checkpoint_state(
-            manifest.cut.logical_step, manifest.framework_state
+            manifest.cut.position, manifest.framework_state
         )

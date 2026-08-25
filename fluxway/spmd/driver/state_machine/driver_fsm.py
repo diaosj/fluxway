@@ -37,6 +37,7 @@ class DriverStateMachine:
         (DriverState.READY, DriverEvent.START): DriverState.RUNNING,
         (DriverState.READY, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
         (DriverState.DRAINED, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
+        (DriverState.BLOCKED, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
         (DriverState.RESTORING, DriverEvent.RESTORE_COMPLETE): DriverState.READY,
         (DriverState.RESTORING, DriverEvent.RESTORE_FAILED): DriverState.ERROR,
         (DriverState.RESTORING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
