@@ -51,6 +51,7 @@ from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponent,
     CheckpointComponentLifecycle,
+    CheckpointComponentFinalize,
     CheckpointObjectCleanup,
     CheckpointObjectLifecycle,
     CheckpointComponentRestore,
@@ -77,6 +78,7 @@ def _as_async(function: Callable[..., Any], name: str) -> Callable[..., Awaitabl
 class FilesystemCheckpointComponent(
     CheckpointComponent,
     CheckpointComponentLifecycle,
+    CheckpointComponentFinalize,
     CheckpointComponentSave,
     CheckpointComponentRestore,
     CheckpointObjectLifecycle,
@@ -90,6 +92,7 @@ class FilesystemCheckpointComponent(
         save_state: Callable[[Any, SaveSession], Any],
         restore_state: Callable[[Any, Any, RestoreSession], Any],
         *,
+        finalize_state: Callable[[Any, SaveSession], Any] | None = None,
         retention: CheckpointRetentionPolicy,
         restore_topology: RestoreTopologyMode,
     ) -> None:
@@ -105,6 +108,11 @@ class FilesystemCheckpointComponent(
         )
         self._save_state = _as_async(save_state, "save_state")
         self._restore_state = _as_async(restore_state, "restore_state")
+        self._finalize_state = (
+            _as_async(finalize_state, "finalize_state")
+            if finalize_state is not None
+            else None
+        )
         self._runtime: CheckpointRuntime | None = None
         self._root: Path | None = None
 
@@ -116,11 +124,18 @@ class FilesystemCheckpointComponent(
         return CheckpointComponentRegistration(
             component=self,
             component_lifecycle=self,
+            finalize=self if self._finalize_state is not None else None,
             save=self,
             restore=self,
             object_lifecycle=self,
             object_cleanup=self,
         )
+
+    async def finalize_save(self, session: SaveSession) -> None:
+        self._require_permit(session, session.commit_permit)
+        self._require_worker(session)
+        if self._finalize_state is not None:
+            await self._finalize_state(session.instance, session)
 
     async def open(self, runtime: CheckpointRuntime) -> None:
         if self._runtime is not None:

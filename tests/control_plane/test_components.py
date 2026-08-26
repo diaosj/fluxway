@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from fluxway.common.operator_spec import OperatorSpec
-from fluxway.common.types import ControllerState
+from fluxway.common.types import CheckpointCut, ControllerState
 from fluxway.control_plane.components import (
     ControlPlaneComponentRegistry,
     DriverComponentContext,
@@ -19,15 +19,21 @@ class _Component:
     def __init__(self):
         self.states = []
         self.restored = None
+        self.last_cut = None
 
     async def on_state(self, state):
         self.states.append(state)
 
-    def checkpoint_state(self):
-        return {"states": [state.value for state in self.states]}
+    def checkpoint_state(self, cut: CheckpointCut):
+        self.last_cut = cut
+        return {
+            "states": [state.value for state in self.states],
+            "cut_id": cut.cut_id,
+        }
 
-    def restore_state(self, state):
+    def restore_state(self, state, cut: CheckpointCut):
         self.restored = state
+        self.last_cut = cut
 
 
 def test_source_descriptor_is_operator_metadata_only():
@@ -46,16 +52,38 @@ def test_registry_forwards_lifecycle_and_round_trips_domain_state():
     component = _Component()
     registry = ControlPlaneComponentRegistry()
     registry.register(component)
+    cut = CheckpointCut.for_step("cut-1", 1)
 
     async def scenario():
         await registry.notify_state(ControllerState.RUNNING)
         await registry.notify_state(ControllerState.COMPLETING)
 
     asyncio.run(scenario())
-    state = registry.checkpoint_state()
-    assert state == {"component": {"states": ["running", "completing"]}}
-    registry.restore_state(state)
+    state = registry.checkpoint_state(cut)
+    assert state == {
+        "component": {
+            "states": ["running", "completing"],
+            "cut_id": "cut-1",
+        }
+    }
+    assert component.last_cut == cut
+
+    restore_cut = CheckpointCut.for_step("cut-restore", 1)
+    registry.restore_state(state, restore_cut)
     assert component.restored == state["component"]
+    assert component.last_cut == restore_cut
+
+
+def test_registry_rejects_non_checkpoint_cut():
+    component = _Component()
+    registry = ControlPlaneComponentRegistry()
+    registry.register(component)
+
+    with pytest.raises(TypeError, match="CheckpointCut"):
+        registry.checkpoint_state(None)  # type: ignore
+
+    with pytest.raises(TypeError, match="CheckpointCut"):
+        registry.restore_state({"component": {}}, 1)  # type: ignore
 
 
 def test_driver_registry_uses_compiled_source_descriptor_and_canonical_id():

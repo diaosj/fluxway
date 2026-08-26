@@ -36,6 +36,11 @@ class CheckpointComponentLifecycle(ABC):
     async def close(self) -> None: ...
 
 
+class CheckpointComponentFinalize(ABC):
+    @abstractmethod
+    async def finalize_save(self, session: SaveSession) -> None: ...
+
+
 class CheckpointComponentSave(ABC):
     @abstractmethod
     async def prepare_save(self, session: SaveSession) -> None: ...
@@ -112,6 +117,11 @@ _CAPABILITY_IMPLEMENTATIONS = (
         "component_lifecycle",
         CheckpointComponentLifecycle,
     ),
+    (
+        CheckpointComponentCapability.FINALIZE,
+        "finalize",
+        CheckpointComponentFinalize,
+    ),
     (CheckpointComponentCapability.SAVE, "save", CheckpointComponentSave),
     (CheckpointComponentCapability.RESTORE, "restore", CheckpointComponentRestore),
     (
@@ -131,6 +141,7 @@ _CAPABILITY_IMPLEMENTATIONS = (
 class CheckpointComponentRegistration:
     component: CheckpointComponent
     component_lifecycle: CheckpointComponentLifecycle | None = None
+    finalize: CheckpointComponentFinalize | None = None
     save: CheckpointComponentSave | None = None
     restore: CheckpointComponentRestore | None = None
     object_lifecycle: CheckpointObjectLifecycle | None = None

@@ -118,13 +118,13 @@ class GravitinoLanceStorageFactory:
         runtime: CheckpointRuntime,
         component_id: str,
     ) -> SparseCheckpointStorage:
-        storage_component = f"{runtime.spmd_id}_{component_id}"
+        storage_component = f"{runtime.spmd_id}.{component_id}"
         storage_location = (
             f"{self.location.rstrip('/')}/{runtime.spmd_id}/{component_id}"
         )
         return GravitinoLanceStorage(
             self.config,
-            namespace=self.namespace,
+            self.namespace,
             component_id=storage_component,
             location=storage_location,
             max_storage_bytes=self.max_storage_bytes,

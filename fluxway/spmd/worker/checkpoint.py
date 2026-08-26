@@ -79,7 +79,19 @@ class WorkerCheckpointCoordinator:
         self._attempt_id = attempt_id
         self._permit = permit
         self._cut = cut
-        self._state = CheckpointSaveState.PREPARED
+        self._state = CheckpointSaveState.FINALIZING
+        try:
+            for component in self._registry:
+                finalizer = component.finalize
+                if finalizer is None:
+                    continue
+                await finalizer.finalize_save(
+                    self._session(component.descriptor.component_id)
+                )
+        except BaseException:
+            self._clear_transaction()
+            raise
+
         attempted: list[CheckpointComponentRegistration] = []
         try:
             for component in self._registry:
@@ -96,6 +108,7 @@ class WorkerCheckpointCoordinator:
                 await save.prepare_save(
                     self._session(component.descriptor.component_id)
                 )
+            self._state = CheckpointSaveState.PREPARED
         except BaseException as primary_error:
             cleanup_errors = await self._rollback_components(tuple(reversed(attempted)))
             self._clear_transaction()

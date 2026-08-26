@@ -314,6 +314,9 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
                 state, context
             ),
             lambda owner, context: owner.restore_checkpoint_layout(context),
+            finalize_state=lambda owner, context: owner.finalize_checkpoint_state(
+                context
+            ),
         ).registration(),
     ),
 )
@@ -341,6 +344,7 @@ class DenseSPMD:
         self.dense_stats_dim = dense_stats_dim
         self.grad_accum_steps = grad_accum_steps
         self.diagnostic_step_delay_ms = diagnostic_step_delay_ms
+        self._pending_accum_steps = 0
 
         # -- Invariants on configuration --
         assert isinstance(embed_dim, int) and embed_dim > 0, (
@@ -406,6 +410,21 @@ class DenseSPMD:
     def _checkpoint_state(self) -> dict:
         return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
 
+    def finalize_checkpoint_state(self, context: SaveSession) -> None:
+        if self._pending_accum_steps > 0:
+            scale = 1.0 / self._pending_accum_steps
+            params = nnx.state(self.model)
+            updated = jtu.tree_map(
+                lambda p, g: p - 0.01 * (g * scale), params, self.grad_accum
+            )
+            nnx.update(self.model, updated)
+            self.grad_accum = jtu.tree_map(jnp.zeros_like, self.grad_accum)
+            print(
+                f"[DenseSPMD.finalize] rank={self.rank} flushed "
+                f"{self._pending_accum_steps} pending accumulated steps into model"
+            )
+            self._pending_accum_steps = 0
+
     def save_checkpoint_state(self, context: SaveSession) -> dict:
         return self._checkpoint_state()
 
@@ -415,6 +434,7 @@ class DenseSPMD:
     def restore_checkpoint_state(self, state: dict, context: RestoreSession) -> None:
         nnx.update(self.model, state["model_state"])
         self.grad_accum = state["grad_accum"]
+        self._pending_accum_steps = 0
 
     @operator(
         name="prepare_dense_inputs",
@@ -779,12 +799,17 @@ class DenseSPMD:
             self.grad_accum,
             jtu.tree_unflatten(treedef, split_leaves),
         )
+        self._pending_accum_steps += 1
 
         if step % self.grad_accum_steps == 0:
             params = nnx.state(self.model)
-            updated = jtu.tree_map(lambda p, g: p - 0.01 * g, params, self.grad_accum)
+            scale = 1.0 / self._pending_accum_steps
+            updated = jtu.tree_map(
+                lambda p, g: p - 0.01 * (g * scale), params, self.grad_accum
+            )
             nnx.update(self.model, updated)
             self.grad_accum = jtu.tree_map(jnp.zeros_like, self.grad_accum)
+            self._pending_accum_steps = 0
             print(
                 f"[DenseSPMD.update] rank={self.rank} step={step} updated model params"
             )

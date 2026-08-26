@@ -69,6 +69,7 @@ def checkpoint_position(runtime_state: Mapping[str, Any]) -> int:
 
 class CheckpointComponentCapability(StrEnum):
     COMPONENT_LIFECYCLE = "component_lifecycle"
+    FINALIZE = "finalize"
     SAVE = "save"
     RESTORE = "restore"
     OBJECT_LIFECYCLE = "object_lifecycle"
@@ -76,6 +77,7 @@ class CheckpointComponentCapability(StrEnum):
 
 
 class CheckpointSaveState(StrEnum):
+    FINALIZING = "finalizing"
     PREPARED = "prepared"
     SAVING = "saving"
     SAVED = "saved"

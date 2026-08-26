@@ -78,7 +78,7 @@ Internal reader records or batches are outside Fluxway's inference boundary;
 their mapping to logical output positions belongs to the source component's
 state contract.
 
-## Component SPI
+## Component SPI and Capability Composition
 
 `CheckpointComponent` only supplies the descriptor. Runtime behavior is
 composed from independent SPI contracts; a component does not need to expose
@@ -88,6 +88,7 @@ every contract.
 class MyComponent(
     CheckpointComponent,
     CheckpointComponentLifecycle,
+    CheckpointComponentFinalize,
     CheckpointComponentSave,
     CheckpointComponentRestore,
 ):
@@ -96,6 +97,7 @@ class MyComponent(
 
     async def open(self, runtime): ...
     async def close(self): ...
+    async def finalize_save(self, session): ...
     async def prepare_save(self, session): ...
     async def save(self, session) -> WorkerSaveResult: ...
     async def finish_save(self, session): ...
@@ -105,12 +107,79 @@ class MyComponent(
     async def restore(self, session): ...
 ```
 
-The five capability names map directly to the five SPI contracts:
-`COMPONENT_LIFECYCLE` (`open`/`close`), `SAVE`, `RESTORE`,
+The six capability names map directly to the six SPI contracts:
+`COMPONENT_LIFECYCLE` (`open`/`close`), `FINALIZE` (`finalize_save`), `SAVE`, `RESTORE`,
 `OBJECT_LIFECYCLE` (holds and cleanup reservations), and `OBJECT_CLEANUP`
 (`cleanup`). `SAVE` is one atomic transaction contract; its phases are not
 independent capabilities. `commit_save` creates the component publication;
 `publish_save` is called only after the global manifest is durable and visible.
+
+### Worker Transaction: FINALIZING vs PREPARED
+
+The worker transaction separates **in-memory algorithm canonicalization** from **storage resource allocation**:
+
+```text
+WorkerCheckpointCoordinator.prepare_save()
+  │
+  ├─ 1. FINALIZING Stage (CheckpointComponentFinalize.finalize_save)
+  │      └─ In-memory model canonicalization (e.g., flush partial gradient accumulation)
+  │         [Scope: ALL_RANKS, Semantics: Fail-Stop, Storage I/O: None]
+  │
+  ├─ 2. Storage Staging Stage (CheckpointComponentSave.prepare_save)
+  │      └─ Staging path / lease reservation (e.g., mkdir, storage lock)
+  │         [Scope: LEADER / ALL_RANKS, Semantics: Rollbackable, Storage I/O: Yes]
+  │
+  ├─ 3. State -> PREPARED
+  │
+  ▼  [Driver SPMD-Local Barrier: Driver waits for all ranks to reach PREPARED]
+SAVING Stage (CheckpointComponentSave.save)
+  └─ Concurrent serialization & fragment upload (memory is 100% frozen and clean)
+```
+
+| Dimension | FINALIZING Stage (`finalize_save`) | PREPARED Stage (`prepare_save`) |
+| :--- | :--- | :--- |
+| **Target Object** | Local RAM / VRAM / Optimizer moments | Disk staging directory / Cloud storage path / Lease |
+| **Execution Scope** | Mandatory `ALL_RANKS` (every worker) | Configurable `LEADER` (Rank 0) or `ALL_RANKS` |
+| **Failure Semantics** | **Fail-Stop** (`SNAPSHOT_FAILED -> ERROR`) | **Rollbackable** (abort & delete staging directory) |
+| **Primary Duty** | Canonicalize dynamic runtime state into frozen state | Allocate physical storage resources |
+| **Storage I/O** | None | Yes |
+
+`FINALIZE` canonicalizes worker-local algorithm state before that worker's
+storage component reserves staging or writes bytes. It runs on every worker rank,
+regardless of a `SAVE` component's leader-only scopes. This is the extension
+point for a drained training runtime that must apply a partial accumulation
+window before serializing model state. It must not perform storage I/O, and a
+failure is fail-stop because an implementation may have mutated local state.
+
+The worker transaction order is:
+```text
+FINALIZING -> all local FINALIZE -> SAVE.prepare -> PREPARED -> SAVE.save -> SAVE.finish -> SAVE.commit -> SAVE.publish
+```
+The Driver waits for all ranks to reach `PREPARED` before `SAVE.save`; no Controller-wide finalize phase exists or is required.
+
+### Layered API Architecture
+
+Fluxway enforces a strict separation of concerns across developer personas so business users are never exposed to internal coordinator state machines:
+
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Level 1: Business & Model Author (95% of Users)                          │
+│ DX: Zero state machine concepts. Implement simple Python callables.      │
+│ e.g., OrbaxCheckpointComponent(..., finalize_state=flush_fn)             │
+└────────────────────────────────────┬─────────────────────────────────────┘
+                                     │ Direct capability dispatch
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Level 2: Storage Plugin Author (5% of Users)                             │
+│ DX: Implement CheckpointComponentSave / CheckpointComponentFinalize SPIs │
+└────────────────────────────────────┬─────────────────────────────────────┘
+                                     │ Internal transactional state guards
+                                     ▼
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Level 3: Fluxway Core Engine (Coordinator / Orchestrator)                │
+│ DX: FINALIZING, PREPARED, SAVING, COMMITTED defensive state assertions   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
 
 Register each implemented SPI explicitly. The registration's non-null SPI
 fields are the only source of truth for `registration.capabilities`:
@@ -119,6 +188,7 @@ fields are the only source of truth for `registration.capabilities`:
 registration = CheckpointComponentRegistration(
     component=component,
     component_lifecycle=component,
+    finalize=component,
     save=component,
     restore=component,
 )

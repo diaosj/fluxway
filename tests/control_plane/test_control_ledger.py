@@ -11,7 +11,11 @@ from fluxway.control_plane.components import driver_component_id
 from fluxway.control_plane.controller import ControllerActor
 from fluxway.control_plane.ledger_client import ControlRecord, ControlStreamExhausted
 from fluxway.control_plane.ledger_client import ControlLedgerClient
-from fluxway.common.types.checkpoint import SpmdCheckpoint, TopologySnapshot
+from fluxway.common.types.checkpoint import (
+    CheckpointCut,
+    SpmdCheckpoint,
+    TopologySnapshot,
+)
 from fluxway.common.types import DrainBoundary
 
 
@@ -285,7 +289,9 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
     controller = CONTROLLER_CLASS.__new__(CONTROLLER_CLASS)
     controller._graph = SimpleNamespace(require_compiled_graph=lambda: compiled)
     controller._control_ledger = ledger
-    controller._control_plane_components = SimpleNamespace(checkpoint_state=lambda: {})
+    controller._control_plane_components = SimpleNamespace(
+        checkpoint_state=lambda cut: {}
+    )
     controller._drain_boundary = DrainBoundary()
     payload = {
         "source_a": SpmdCheckpoint(
@@ -302,8 +308,12 @@ async def test_controller_builds_vector_cut_from_source_operator_snapshots() -> 
 
     cuts = controller.control_stream_cuts(payload)
     assert cuts == {stream_a: 1, stream_b: 2}
+    cut = CheckpointCut.for_step("cut-1", 1)
     assert (
-        controller.checkpoint_state(cuts=cuts)["control_ledger"]["durable_cuts"] == cuts
+        controller.checkpoint_state(cuts=cuts, cut=cut)["control_ledger"][
+            "durable_cuts"
+        ]
+        == cuts
     )
 
 
@@ -319,8 +329,8 @@ def test_controller_rejects_incomplete_control_checkpoint(state) -> None:
     controller = CONTROLLER_CLASS.__new__(CONTROLLER_CLASS)
     controller._control_ledger = ControlLedger(1)
     controller._control_plane_components = SimpleNamespace(
-        restore_state=lambda component_state: None
+        restore_state=lambda component_state, cut: None
     )
 
     with pytest.raises(ValueError, match="fields do not match protocol"):
-        controller.restore_checkpoint_state(state)
+        controller.restore_checkpoint_state(state, CheckpointCut.for_step("cut-1", 1))

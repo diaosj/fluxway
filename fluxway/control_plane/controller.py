@@ -852,8 +852,14 @@ class ControllerActor:
             cuts[stream_id] = cut
         return cuts
 
-    def checkpoint_state(self, *, cuts: Mapping[str, int]) -> dict[str, Any]:
+    def checkpoint_state(
+        self, *, cuts: Mapping[str, int], cut: CheckpointCut
+    ) -> dict[str, Any]:
         """Return all control-plane progress needed by a global checkpoint."""
+        if not isinstance(cut, CheckpointCut):
+            raise TypeError(
+                f"controller checkpoint requires CheckpointCut, got {type(cut).__name__}"
+            )
         ledger = self._require_control_ledger()
         snapshot_boundary = self._drain_boundary
         if (
@@ -875,14 +881,20 @@ class ControllerActor:
             )
         state = {
             "control_ledger": ledger.checkpoint_state(cuts=cuts),
-            "components": self.control_plane_components.checkpoint_state(),
+            "components": self.control_plane_components.checkpoint_state(cut),
             "drain_boundary": snapshot_boundary.to_dict(),
         }
         validate_checkpoint_value(state)
         return state
 
-    def restore_checkpoint_state(self, state: dict[str, Any]) -> None:
+    def restore_checkpoint_state(
+        self, state: dict[str, Any], cut: CheckpointCut
+    ) -> None:
         """Restore control-plane progress before any SPMD source is resumed."""
+        if not isinstance(cut, CheckpointCut):
+            raise TypeError(
+                f"controller restore requires CheckpointCut, got {type(cut).__name__}"
+            )
         if not isinstance(state, dict):
             raise TypeError("checkpoint control state must be a dictionary")
         expected_fields = {
@@ -910,7 +922,7 @@ class ControllerActor:
         components = state.get("components")
         if not isinstance(components, Mapping):
             raise ValueError("checkpoint control state is missing components")
-        self.control_plane_components.restore_state(components)
+        self.control_plane_components.restore_state(components, cut)
 
     async def commit_checkpoint_state(
         self, position: int, control_state: Mapping[str, Any]
@@ -1246,7 +1258,7 @@ class ControllerActor:
             "event": done_event,
         }
         for driver in drivers.values():
-            driver.request_snapshot.remote(
+            driver.prepare_snapshot.remote(
                 checkpoint_id, attempt_id, permit, cut, repository_root
             )
 
@@ -1268,8 +1280,8 @@ class ControllerActor:
             raise RuntimeError(
                 f"Snapshot '{checkpoint_id}' failed for SPMDs: {snap_info['errors']}"
             )
-        spmds = dict(snap_info["metadata"])
-        stream_cuts = self.control_stream_cuts(spmds)
+        prepared_spmds = dict(snap_info["metadata"])
+        stream_cuts = self.control_stream_cuts(prepared_spmds)
         resolved_cut = CheckpointCut(
             cut_id=cut.cut_id,
             position=cut.position,
@@ -1277,9 +1289,23 @@ class ControllerActor:
             sealed_ends=self._require_control_ledger().sealed_ends,
             control_epoch=cut.control_epoch,
         )
+        try:
+            finalized = await asyncio.gather(
+                *(
+                    driver.capture_driver_components.remote(checkpoint_id, resolved_cut)
+                    for driver in drivers.values()
+                )
+            )
+        except BaseException:
+            for driver in drivers.values():
+                driver.fail_snapshot.remote(checkpoint_id)
+            raise
+        spmds = dict(zip(drivers, finalized, strict=True))
+        if any(not isinstance(snapshot, SpmdCheckpoint) for snapshot in spmds.values()):
+            raise TypeError("Driver component capture must return SpmdCheckpoint")
         return CheckpointAssembly(
             cut=resolved_cut,
-            framework_state=self.checkpoint_state(cuts=stream_cuts),
+            framework_state=self.checkpoint_state(cuts=stream_cuts, cut=resolved_cut),
             spmds=spmds,
         )
 
@@ -1376,7 +1402,7 @@ class ControllerActor:
         )
         if manifest.checkpoint_id != checkpoint_id:
             raise ValueError("manifest checkpoint ID does not match restore request")
-        self.restore_checkpoint_state(dict(manifest.framework_state))
+        self.restore_checkpoint_state(dict(manifest.framework_state), manifest.cut)
         position = manifest.cut.position
         if position is None:
             raise RuntimeError(

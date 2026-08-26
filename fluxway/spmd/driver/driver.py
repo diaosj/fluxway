@@ -349,7 +349,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             target_count, terminal_cut, reason
         )
 
-    async def request_snapshot(
+    async def prepare_snapshot(
         self,
         snapshot_id: str,
         attempt_id: str,
@@ -357,9 +357,14 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         cut: CheckpointCut,
         repository_root: str,
     ) -> None:
-        await self.snapshot_orchestrator.request_snapshot(
+        await self.snapshot_orchestrator.prepare_snapshot(
             snapshot_id, attempt_id, permit, cut, repository_root
         )
+
+    async def capture_driver_components(
+        self, snapshot_id: str, cut: CheckpointCut
+    ) -> SpmdCheckpoint:
+        return self.snapshot_orchestrator.capture_driver_components(snapshot_id, cut)
 
     async def resume(self) -> None:
         await self.snapshot_orchestrator.resume()

@@ -36,14 +36,17 @@ class _Registry:
     def __init__(self, events):
         self._events = events
         self.restored = None
+        self.last_cut = None
 
-    def checkpoint_state(self):
-        self._events.append("component_checkpoint")
+    def checkpoint_state(self, cut):
+        self._events.append(("component_checkpoint", cut))
+        self.last_cut = cut
         return {"reader:read": {"cursor": {"checkpoint_id": 3}}}
 
-    def restore_state(self, state):
-        self._events.append("component_restore")
+    def restore_state(self, state, cut):
+        self._events.append(("component_restore", cut))
         self.restored = state
+        self.last_cut = cut
 
 
 class _Executor:
@@ -164,7 +167,7 @@ def test_snapshot_contains_driver_component_state():
     cut = CheckpointCut.for_step("tx", 5)
 
     asyncio.run(
-        orchestrator.request_snapshot(
+        orchestrator.prepare_snapshot(
             "snapshot",
             "attempt",
             CheckpointCommitPermit("attempt", 1, b"permit"),
@@ -173,12 +176,21 @@ def test_snapshot_contains_driver_component_state():
         )
     )
 
-    snapshot = controller.receive_snapshot_metadata.calls[0][2]
+    preliminary = controller.receive_snapshot_metadata.calls[0][2]
+    assert isinstance(preliminary, SpmdCheckpoint)
+    assert preliminary.driver_components == {}
+    resolved_cut = CheckpointCut(
+        cut_id=cut.cut_id,
+        position=cut.position,
+        stream_cuts={"reader:read": 5},
+    )
+    snapshot = orchestrator.capture_driver_components("snapshot", resolved_cut)
     assert isinstance(snapshot, SpmdCheckpoint)
     assert snapshot.driver_components == {
         "reader:read": {"cursor": {"checkpoint_id": 3}}
     }
     assert events.index("worker_finalize") < events.index("worker_commit")
+    assert ("component_checkpoint", resolved_cut) in events
 
 
 def test_restore_components_precedes_component_restore():
@@ -193,18 +205,22 @@ def test_restore_components_precedes_component_restore():
         {},
         {"reader:read": {"cursor": {"checkpoint_id": 3}}},
     )
+    restore_cut = CheckpointCut.for_step("restore", 5)
 
     asyncio.run(
         orchestrator._restore_from_manifest_unprofiled(
             "snapshot",
-            CheckpointCut.for_step("restore", 5),
+            restore_cut,
             snapshot,
             "/tmp/repository",
         )
     )
 
     assert registry.restored == {"reader:read": {"cursor": {"checkpoint_id": 3}}}
-    assert events.index("component_restore") < events.index("worker_restore")
+    assert registry.last_cut == restore_cut
+    assert events.index(("component_restore", restore_cut)) < events.index(
+        "worker_restore"
+    )
 
 
 def test_save_failure_rolls_back_component_transaction():
@@ -213,7 +229,7 @@ def test_save_failure_rolls_back_component_transaction():
     orchestrator.executor.fail_save = True
 
     asyncio.run(
-        orchestrator.request_snapshot(
+        orchestrator.prepare_snapshot(
             "snapshot",
             "attempt",
             CheckpointCommitPermit("attempt", 1, b"permit"),
@@ -242,7 +258,7 @@ def test_concurrent_snapshot_failure_coalesces_rollback():
 
         orchestrator.executor.checkpoint_rollback_save = rollback
         persist_task = asyncio.create_task(
-            orchestrator.request_snapshot(
+            orchestrator.prepare_snapshot(
                 "snapshot",
                 "attempt",
                 CheckpointCommitPermit("attempt", 1, b"permit"),

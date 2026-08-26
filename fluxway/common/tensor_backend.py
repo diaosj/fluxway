@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Any
 import contextlib
+import threading
 import numpy as np
 
 from fluxway.common.allocation import AllocationDescriptor, AllocationIdentity
@@ -996,6 +997,7 @@ class TorchBackend(TensorBackend):
 
 class JaxBackend(TensorBackend):
     def __init__(self):
+        # pyrefly: ignore [missing-import]
         import jax
         import jax.numpy as jnp
 
@@ -1581,9 +1583,11 @@ class HybridBackend(TensorBackend):
         self._torch = None
         self._use_jit = enable_numba_jit and _NUMBA_AVAILABLE
         self._default_device = default_device
+        self._worker_runtime_initialization_lock = threading.Lock()
+        self._worker_runtime_initialized = False
 
         try:
-            import torch
+            import torch  # pyrefly: ignore [missing-import]
 
             self._torch = torch
         except ImportError:
@@ -1600,6 +1604,47 @@ class HybridBackend(TensorBackend):
                     f"HybridBackend(default_device={default_device!r}) requested "
                     f"but CuPy/CUDA is not available: {exc}"
                 ) from exc
+
+    def initialize_worker_runtime(self) -> None:
+        if self._worker_runtime_initialized:
+            return
+        with self._worker_runtime_initialization_lock:
+            if self._worker_runtime_initialized:
+                return
+            if self._default_device == "cuda":
+                self._initialize_cuda_worker_runtime()
+            elif self._use_jit:
+                self._initialize_numba_worker_runtime()
+            self._worker_runtime_initialized = True
+
+    def _initialize_cuda_worker_runtime(self) -> None:
+        if self._cp is None:
+            raise RuntimeError("CUDA worker runtime initialization requires CuPy.")
+        values = self._cp.arange(2, dtype=self._cp.int32)
+        is_strictly_increasing = self._cp.min(values[1:] > values[:-1])
+        if not bool(is_strictly_increasing):
+            raise RuntimeError(
+                "CUDA worker runtime initialization produced an invalid ordering."
+            )
+        self._cp.cuda.Stream.null.synchronize()
+
+    @staticmethod
+    def _initialize_numba_worker_runtime() -> None:
+        indices = np.asarray([0, 2, 1], dtype=np.intp)
+        counts = np.zeros(3, dtype=np.int64)
+        _numba_bincount_loop(indices, counts)
+
+        weights = np.asarray([1.0, 2.0, 3.0], dtype=np.float32)
+        weighted_counts = np.zeros(3, dtype=np.float32)
+        _numba_bincount_weighted_loop(indices, weights, weighted_counts)
+
+        cumulative_input = np.asarray([1, 2, 3], dtype=np.int64)
+        cumulative_output = np.empty_like(cumulative_input)
+        _numba_cumsum_loop(cumulative_input, cumulative_output)
+
+        source = np.asarray([4, 5, 6], dtype=np.int64)
+        taken = np.empty(2, dtype=np.int64)
+        _numba_take_loop(source, np.asarray([2, 0], dtype=np.int64), taken)
 
     def _lib(self, device: str):
         """Return the array library for *device* ('cpu' or 'gpu')."""
@@ -2328,10 +2373,12 @@ def set_backend(name: str):
 
 def set_hybrid_device(device: str) -> None:
     global _BACKEND
-    _BACKEND = HybridBackend(
+    backend = HybridBackend(
         default_device=device,
         enable_numba_jit=device == "cpu",
     )
+    backend.initialize_worker_runtime()
+    _BACKEND = backend
 
 
 @contextlib.contextmanager

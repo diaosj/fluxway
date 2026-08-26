@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from fluxway.common.types import (
@@ -99,7 +100,7 @@ class SnapshotOrchestrator:
             step_count, on_drained=self._on_drain_complete
         )
 
-    async def request_snapshot(
+    async def prepare_snapshot(
         self,
         checkpoint_id: str,
         attempt_id: str,
@@ -118,7 +119,7 @@ class SnapshotOrchestrator:
                 target_step=cut.position,
                 worker_count=len(self.executor.get_worker_handles()),
             ):
-                await self._request_snapshot_unprofiled(
+                await self._prepare_snapshot_unprofiled(
                     checkpoint_id,
                     attempt_id,
                     permit,
@@ -126,11 +127,11 @@ class SnapshotOrchestrator:
                     repository_root,
                 )
             return
-        await self._request_snapshot_unprofiled(
+        await self._prepare_snapshot_unprofiled(
             checkpoint_id, attempt_id, permit, cut, repository_root
         )
 
-    async def _request_snapshot_unprofiled(
+    async def _prepare_snapshot_unprofiled(
         self,
         checkpoint_id: str,
         attempt_id: str,
@@ -196,7 +197,7 @@ class SnapshotOrchestrator:
                 source_topology=self._current_topology(),
                 runtime_state=runtime_state,
                 components=publications,
-                driver_components=self._component_registry.checkpoint_state(),
+                driver_components={},
             )
             self._pending_snapshot = snapshot
         except BaseException as primary_error:
@@ -220,6 +221,24 @@ class SnapshotOrchestrator:
         self.controller_handle.receive_snapshot_metadata.remote(
             self.spmd_id, checkpoint_id, snapshot
         )
+
+    def capture_driver_components(
+        self, checkpoint_id: str, cut: CheckpointCut
+    ) -> SpmdCheckpoint:
+        self._require_pending_snapshot(checkpoint_id)
+        snapshot = self._pending_snapshot
+        if snapshot is None:
+            raise RuntimeError("snapshot transaction has no prepared image")
+        if cut.position != checkpoint_position(snapshot.runtime_state):
+            raise ValueError(
+                "resolved component cut does not match prepared runtime position"
+            )
+        resolved = replace(
+            snapshot,
+            driver_components=self._component_registry.checkpoint_state(cut),
+        )
+        self._pending_snapshot = resolved
+        return resolved
 
     async def publish_save(
         self, checkpoint_id: str, permit: CheckpointCommitPermit
@@ -352,7 +371,7 @@ class SnapshotOrchestrator:
         self.state_machine.require_transition(DriverEvent.RESTORE_REQUESTED)
         await self._notify_component_state(DriverState.RESTORING)
         try:
-            self._component_registry.restore_state(snapshot.driver_components)
+            self._component_registry.restore_state(snapshot.driver_components, cut)
             self.synchronizer.load_spmd_state(snapshot.runtime_state)
             await self.executor.checkpoint_restore(
                 repository_root,

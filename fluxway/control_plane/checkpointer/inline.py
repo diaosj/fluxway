@@ -29,6 +29,7 @@ from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponent,
     CheckpointComponentLifecycle,
+    CheckpointComponentFinalize,
     CheckpointComponentRestore,
     CheckpointComponentSave,
 )
@@ -62,6 +63,7 @@ def _async_callable(
 class StateCheckpointComponent(
     CheckpointComponent,
     CheckpointComponentLifecycle,
+    CheckpointComponentFinalize,
     CheckpointComponentSave,
     CheckpointComponentRestore,
 ):
@@ -71,6 +73,7 @@ class StateCheckpointComponent(
         save_state: StateSave,
         restore_state: StateRestore,
         *,
+        finalize_state: StateSave | None = None,
         restore_topology: RestoreTopologyMode = RestoreTopologyMode.EXACT_TOPOLOGY,
         partition_selector: PartitionSelector | None = None,
     ) -> None:
@@ -86,6 +89,11 @@ class StateCheckpointComponent(
         )
         self._save_state = _async_callable(save_state, "save_state")
         self._restore_state = _async_callable(restore_state, "restore_state")
+        self._finalize_state = (
+            _async_callable(finalize_state, "finalize_state")
+            if finalize_state is not None
+            else None
+        )
         if restore_topology is RestoreTopologyMode.LOGICAL_PARTITION_REMAP:
             if partition_selector is None:
                 raise ValueError(
@@ -106,9 +114,16 @@ class StateCheckpointComponent(
         return CheckpointComponentRegistration(
             component=self,
             component_lifecycle=self,
+            finalize=self if self._finalize_state is not None else None,
             save=self,
             restore=self,
         )
+
+    async def finalize_save(self, session: SaveSession) -> None:
+        self._require_permit(session, session.commit_permit)
+        self._require_worker_runtime(session)
+        if self._finalize_state is not None:
+            await self._finalize_state(session.instance, session)
 
     async def open(self, runtime: CheckpointRuntime) -> None:
         if self._runtime is not None:

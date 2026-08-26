@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, cast, runtime_checkable
 
-from fluxway.common.types import ControllerState, DriverState
+from fluxway.common.types import CheckpointCut, ControllerState, DriverState
 
 type ComponentState = ControllerState | DriverState
 
@@ -53,9 +53,9 @@ class ControlPlaneComponent(Protocol):
        - `DriverState` (e.g., INITIALIZING, READY, RESTORING, RUNNING, BLOCKED, DRAINING, DRAINED, SNAPSHOTTING, ERROR, COMPLETED)
 
     3. State Checkpointing & Recovery:
-       During checkpointing or fault recovery operations, the host calls `registry.checkpoint_state()`
-       to aggregate state dicts from all components via `checkpoint_state()`. Upon restart or restore,
-       `registry.restore_state(checkpoint_dict)` distributes state back to each component via `restore_state()`.
+       During checkpointing or fault recovery operations, the host calls `registry.checkpoint_state(cut)`
+       to aggregate state dicts from all components via `checkpoint_state(cut)`. Upon restart or restore,
+       `registry.restore_state(checkpoint_dict, cut)` distributes state back to each component via `restore_state(state, cut)`.
 
     Example:
     --------
@@ -68,10 +68,10 @@ class ControlPlaneComponent(Protocol):
     ...         if state == DriverState.RUNNING:
     ...             print(f"Component {self.component_id} activated on state: {state}")
     ...
-    ...     def checkpoint_state(self) -> dict[str, Any]:
+    ...     def checkpoint_state(self, cut: CheckpointCut) -> dict[str, Any]:
     ...         return {"step_count": self.step_count}
     ...
-    ...     def restore_state(self, state: Mapping[str, Any]) -> None:
+    ...     def restore_state(self, state: Mapping[str, Any], cut: CheckpointCut) -> None:
     ...         self.step_count = int(state.get("step_count", 0))
     """
 
@@ -87,11 +87,11 @@ class ControlPlaneComponent(Protocol):
         """
         ...
 
-    def checkpoint_state(self) -> Mapping[str, Any]:
+    def checkpoint_state(self, cut: CheckpointCut) -> Mapping[str, Any]:
         """Serialize internal component state into a JSON-serializable mapping for checkpointing."""
         ...
 
-    def restore_state(self, state: Mapping[str, Any]) -> None:
+    def restore_state(self, state: Mapping[str, Any], cut: CheckpointCut) -> None:
         """Restore internal component state from a previously saved checkpoint mapping."""
         ...
 
@@ -126,13 +126,21 @@ class _ComponentRegistry:
                 )
             await result
 
-    def checkpoint_state(self) -> dict[str, dict[str, Any]]:
+    def checkpoint_state(self, cut: CheckpointCut) -> dict[str, dict[str, Any]]:
+        if not isinstance(cut, CheckpointCut):
+            raise TypeError(
+                f"component checkpoint requires CheckpointCut, got {type(cut).__name__}"
+            )
         return {
-            component_id: dict(component.checkpoint_state())
+            component_id: dict(component.checkpoint_state(cut))
             for component_id, component in self._components.items()
         }
 
-    def restore_state(self, state: Mapping[str, Any]) -> None:
+    def restore_state(self, state: Mapping[str, Any], cut: CheckpointCut) -> None:
+        if not isinstance(cut, CheckpointCut):
+            raise TypeError(
+                f"component restore requires CheckpointCut, got {type(cut).__name__}"
+            )
         if not isinstance(state, Mapping):
             raise TypeError("component checkpoint must be a mapping")
         expected = set(self._components)
@@ -143,7 +151,7 @@ class _ComponentRegistry:
                 f"expected={sorted(expected)} actual={sorted(actual)}"
             )
         for component_id, component in self._components.items():
-            component.restore_state(state[component_id])
+            component.restore_state(state[component_id], cut)
 
 
 class ControlPlaneComponentRegistry(_ComponentRegistry):

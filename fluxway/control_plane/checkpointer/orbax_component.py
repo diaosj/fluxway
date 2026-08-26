@@ -8,7 +8,7 @@ import hashlib
 import os
 import shutil
 import msgpack
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -89,16 +89,18 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
     def __init__(
         self,
         component_id: str,
-        save_state,
-        restore_state,
-        restore_layout,
+        save_state: Callable[[Any, SaveSession], Any],
+        restore_state: Callable[[Any, Any, RestoreSession], Any],
+        restore_layout: Callable[[Any, RestoreSession], Any],
         *,
+        finalize_state: Callable[[Any, SaveSession], Any] | None = None,
         retention: CheckpointRetentionPolicy = CheckpointRetentionPolicy(),
     ) -> None:
         super().__init__(
             component_id,
             save_state,
             restore_state,
+            finalize_state=finalize_state,
             retention=retention,
             restore_topology=RestoreTopologyMode.GLOBAL_RESHARD,
         )
