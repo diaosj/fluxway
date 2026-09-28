@@ -58,6 +58,7 @@ from fluxway.common.coherence import CoherenceAction
 from fluxway.transport.kernels import FrameTableCapacity
 from fluxway.transport.routing import (
     RoutingSourceKind,
+    compile_complete_shard_target,
     SelectedRoutingSource,
     TransportRoutingMode,
     receipt_destination_assignment,
@@ -914,6 +915,7 @@ class BaseDataDistributor:
         capacity: int | list[int] | None = None,
         transfer_codes: int | list[int] | None = None,
         transfer_code_to_name: dict[int, str] | None = None,
+        direct_targets: tuple[int, ...] | None = None,
     ):
         """Generates plans and padded sequences for a single distribution group.
 
@@ -1005,7 +1007,9 @@ class BaseDataDistributor:
                     "Tensors in one routing batch must have the same entity count: "
                     f"primary={actual_req} tensor[{tt_idx}]={tensor_entity_count}."
                 )
-            payloads.append(backend.adopt(tt.flat_values))
+            payloads.append(
+                backend.tensor(tt.flat_values, device=backend.default_device)
+            )
             payload_routing_axes.append(tt.routing_axes)
             meta_tensor_state = 0
 
@@ -1016,7 +1020,9 @@ class BaseDataDistributor:
                 )
                 level_lengths = []
                 for splits in tt.nested_splits:
-                    adopted_splits = backend.adopt(splits)
+                    adopted_splits = backend.tensor(
+                        splits, device=backend.default_device
+                    )
                     level_lengths.append(adopted_splits[1:] - adopted_splits[:-1])
                 nested_length_list.append(tuple(level_lengths))
             else:
@@ -1053,7 +1059,9 @@ class BaseDataDistributor:
                             "entities, not flat occurrences."
                         )
                     idx = tt.origin_indices.materialize()
-                    payloads.append(backend.adopt(idx))
+                    payloads.append(
+                        backend.asarray(idx, copy=False, device=backend.default_device)
+                    )
                     payload_routing_axes.append((0,))
                     nested_length_list.append(None)
                     compact_desc_info.append(None)
@@ -1061,6 +1069,39 @@ class BaseDataDistributor:
                 compact_desc_info.append(None)
 
             has_meta_tensor_state_list.append(meta_tensor_state)
+
+        if direct_targets is not None:
+            target_count = target.mesh.size
+            if len(set(direct_targets)) != len(direct_targets) or any(
+                type(rank) is not int or not 0 <= rank < target_count
+                for rank in direct_targets
+            ):
+                raise ValueError("direct destination ranks are invalid")
+            self._current_plan_manifest = TransportPlanManifest(
+                expected_senders_per_dst=(1,) * target_count,
+                sender_has_data_per_dst=tuple(
+                    rank in direct_targets for rank in range(target_count)
+                ),
+                emission_mode=SenderEmissionMode.STATIC_PRODUCERS_ONLY,
+            )
+            direct_payloads, counts, compact_params = _static_identity_payload_group(
+                payloads=payloads,
+                nested_length_list=nested_length_list,
+                has_meta_tensor_state_list=has_meta_tensor_state_list,
+                compact_desc_info=compact_desc_info,
+            )
+            yield (
+                direct_targets,
+                direct_payloads,
+                counts,
+                None,
+                [tt.global_shape for tt in tensors_to_pack],
+                has_meta_tensor_state_list,
+                compact_params,
+                [int(TensorEntryKind.TENSOR)] * len(tensors_to_pack),
+                coherence_epochs_list,
+            )
+            return
 
         if (
             not uses_receipt_routing
@@ -1263,7 +1304,7 @@ class BaseDataDistributor:
         identity_target_rank = (
             None
             if uses_receipt_routing
-            else _static_identity_target_rank(source, target, self.local_rank)
+            else compile_complete_shard_target(source, target, self.local_rank)
         )
         if identity_target_rank is not None and target is not None:
             target_world_size = target.mesh.size
@@ -1711,6 +1752,7 @@ class BaseDataDistributor:
         capacity: int | list[int] | None = None,
         transfer_codes: int | list[int] | None = None,
         transfer_code_to_name: dict[int, str] | None = None,
+        direct_targets: tuple[int, ...] | None = None,
     ) -> None:
         """Computes sharding plan and buffers data for all destinations."""
         if transfer_codes is None:
@@ -1743,6 +1785,7 @@ class BaseDataDistributor:
             capacity=capacity,
             transfer_codes=transfer_codes,
             transfer_code_to_name=transfer_code_to_name,
+            direct_targets=direct_targets,
         ):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
@@ -2188,44 +2231,6 @@ def _transport_frame_template_key(
             for entry in entry_plans
         ),
     )
-
-
-def _static_identity_target_rank(
-    source: PhysicalLayout | None,
-    target: PhysicalLayout | None,
-    local_rank: int,
-) -> int | None:
-    if source is None or target is None:
-        return None
-    if source.is_content_addressable or target.is_content_addressable:
-        return None
-    if source.is_referential or target.is_referential:
-        return None
-    if not source.is_static or not target.is_static:
-        return None
-    if not source.partitions or not target.partitions:
-        return None
-    if source.partitions != target.partitions:
-        return None
-    if not isinstance(source.spec.strategy, ChunkPartition):
-        return None
-    if not isinstance(target.spec.strategy, ChunkPartition):
-        return None
-    if source.mesh.axis_names != target.mesh.axis_names:
-        return None
-    if source.mesh.shape != target.mesh.shape:
-        return None
-    if tuple(source.mesh.flatten()) != tuple(target.mesh.flatten()):
-        return None
-
-    consumers = source.resolve_consumers(target, local_rank)
-    if len(consumers) != 1:
-        return None
-    target_rank = consumers[0]
-    producers = source.resolve_producers(target, target_rank)
-    if producers != [local_rank]:
-        return None
-    return target_rank
 
 
 def _payload_row_count(payload: Any) -> int:
@@ -2879,16 +2884,16 @@ def _pack_payloads_by_plan(
 ):
     has_ragged_payload = any(levels is not None for levels in nested_length_list)
     if sort_indices is not None:
-        sort_indices = backend.adopt(sort_indices)
+        sort_indices = backend.asarray(sort_indices, copy=True)
 
     cs = backend.cumsum(send_counts, dim=0)
     zero = send_counts[:1] * 0
     send_offsets = backend.cat([zero, cs[:-1]], dim=0)
     packing_send_counts = (
-        backend.adopt(send_counts) if has_ragged_payload else send_counts
+        backend.asarray(send_counts, copy=True) if has_ragged_payload else send_counts
     )
     packing_send_offsets = (
-        backend.adopt(send_offsets) if has_ragged_payload else send_offsets
+        backend.asarray(send_offsets, copy=True) if has_ragged_payload else send_offsets
     )
     packing_zero = packing_send_counts[:1] * 0
 
@@ -2903,7 +2908,9 @@ def _pack_payloads_by_plan(
         level_lengths = (
             None
             if raw_level_lengths is None
-            else tuple(backend.adopt(lengths) for lengths in raw_level_lengths)
+            else tuple(
+                backend.asarray(lengths, copy=True) for lengths in raw_level_lengths
+            )
         )
         is_ragged = level_lengths is not None
         axes = payload_routing_axes[i]

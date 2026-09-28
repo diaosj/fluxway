@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -12,9 +13,17 @@ from fluxway.common.compiled_graph import (
     TensorTransfer,
     compile_graph,
 )
+from fluxway.common.driver_control import IngestionLayoutActivationRequest
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.execution_layout import compile_execution_layout
 from fluxway.common.operator_spec import OperatorSpec
-from fluxway.common.types import DrainBoundary
+from fluxway.common.types import DrainBoundary, SPMDConfig
+from fluxway.common.ingestion import (
+    CompiledSegment,
+    IngestionLayoutActivation,
+    WorkerLayoutDescriptor,
+    ingestion_worker_id,
+)
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.spmd.worker.data_plane import (
     SuccessorRouteContext,
@@ -25,16 +34,96 @@ from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionResult,
     ExecutionStatus,
-    InterleavedDispatcher,
+    ExecutionDispatcher,
 )
 from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.spmd.worker.source_scope import SourceExecutionScope
 from fluxway.spmd.worker.admission import StepAdmissionState
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
 class _SourceDescriptor:
+    requires_source_control_runtime = True
+
     def build_component(self, context):
         raise AssertionError("descriptor is not built in this worker unit test")
+
+    def build_reader_topology(self, *, spmd_id, operator_name, config):
+        raise AssertionError(
+            "build_reader_topology is not called in this worker unit test"
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_activates_layout_on_matching_source_operator_only():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "reader"
+    worker.rank = 1
+    worker._profiler_runtime = SimpleNamespace(enabled=False)
+    worker._background_tasks = set()
+    worker._source_scope = SourceExecutionScope(
+        acquire=worker._acquire_source_work,
+        spawn=worker._spawn_background_task,
+        completed=lambda op: 0,
+        depth=lambda op: 1,
+    )
+    received = []
+
+    class Reader:
+        async def activate_ingestion_layout(self, activation):
+            received.append(activation)
+
+    reader = Reader()
+    worker._op_manager = SimpleNamespace(
+        get_operator_spec=lambda op_name: OperatorSpec(
+            name=op_name,
+            is_source=True,
+        ),
+        require_operator_instance=lambda op_name: reader,
+        is_source_operator=lambda op_name: True,
+    )
+    worker_id = ingestion_worker_id("reader", "read", 1)
+    activation = IngestionLayoutActivation(
+        epoch=0,
+        start_position=0,
+        end_position=1,
+        layout_digest="layout",
+        terminal=True,
+        descriptor=WorkerLayoutDescriptor(
+            source_identity="source",
+            view_identity="view",
+            schema_digest="schema",
+            lineage_digest="lineage",
+            layout_digest="layout",
+            worker_id=worker_id,
+            segments=(
+                CompiledSegment(
+                    0,
+                    "assignment",
+                    worker_id,
+                    "unit",
+                    "revision",
+                    "node",
+                    "file",
+                    "rows",
+                    0,
+                    1,
+                    "token",
+                ),
+            ),
+        ).encode(),
+    )
+
+    await worker.dispatch_control(
+        IngestionLayoutActivationRequest(
+            rank=1,
+            operator_name="read",
+            activation=activation,
+        )
+    )
+
+    assert received == [activation]
 
 
 def _compile_interleaved_compiled_graph(
@@ -97,7 +186,10 @@ def test_controlled_interleaved_source_eof_is_explicit_execution_status():
     worker_class = worker_class.modified_class if worker_class else SPMDWorker
     worker = object.__new__(worker_class)
     worker.spmd_id = "loader"
-    worker.config = SimpleNamespace(require_graph_view=lambda: graph.spmd("loader"))
+    worker.config = SPMDConfig(
+        spmd_id="loader",
+        graph_view=graph.spmd("loader"),
+    )
     worker._drain_boundary = DrainBoundary()
     worker._driver_handle = SimpleNamespace(
         report_boundary_event=SimpleNamespace(remote=Mock())
@@ -127,7 +219,10 @@ def test_uncontrolled_interleaved_source_eof_is_reported():
     worker_class = worker_class.modified_class if worker_class else SPMDWorker
     worker = object.__new__(worker_class)
     worker.spmd_id = "loader"
-    worker.config = SimpleNamespace(require_graph_view=lambda: graph.spmd("loader"))
+    worker.config = SPMDConfig(
+        spmd_id="loader",
+        graph_view=graph.spmd("loader"),
+    )
     worker._drain_boundary = DrainBoundary()
     worker._pending_terminal_observation = None
 
@@ -167,7 +262,10 @@ def test_source_exhaustion_is_stable_for_already_prefetched_steps():
     worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
     worker = object.__new__(worker_class)
     worker.spmd_id = "loader"
-    worker.config = SimpleNamespace(require_graph_view=lambda: graph.spmd("loader"))
+    worker.config = SPMDConfig(
+        spmd_id="loader",
+        graph_view=graph.spmd("loader"),
+    )
     worker._drain_boundary = DrainBoundary()
     worker._pending_terminal_observation = None
 
@@ -212,7 +310,9 @@ async def test_source_exhaustion_does_not_advance_the_data_watermark():
     worker._plan_task_steps = {}
     worker._send_tasks = {}
     worker._delivery_runtime = SimpleNamespace(cancel_matching=lambda _predicate: None)
-    worker._spawn_background_task = Mock()
+    worker._spawn_background_task = Mock(
+        side_effect=lambda coro: coro.close() if inspect.iscoroutine(coro) else None
+    )
     worker._mailbox = SimpleNamespace(clear_step=AsyncMock())
     worker._return_input_coherence = AsyncMock()
     worker._clear_direct_local_step = Mock()
@@ -294,7 +394,7 @@ def test_multi_worker_interleaved_unit_mesh_inheritance():
 
     for exec_step, ranks, expected_device_ids in (
         (0, (0, 1), [0, 1]),
-        (1, (2, 3), [2, 3]),
+        (1, (2, 3), [0, 1]),
     ):
         with patch(
             "fluxway.spmd.worker.data_plane.AsyncDataDistributor"
@@ -370,10 +470,7 @@ def test_interleaved_dependency_uses_active_unit_size():
 def test_interleaved_source_requires_complete_units():
     with pytest.raises(
         ValueError,
-        match=(
-            "interleaved source loader.loader mesh size 3 must be divisible by "
-            "interleave_unit_size 2"
-        ),
+        match=("mesh size 3 must be divisible by interleave_unit_size 2"),
     ):
         _compile_interleaved_compiled_graph(
             source_mesh=DeviceMesh(("data",), (3,)),
@@ -387,10 +484,7 @@ def test_interleaved_source_requires_complete_units():
 def test_interleaved_source_unit_contains_complete_trailing_mesh():
     with pytest.raises(
         ValueError,
-        match=(
-            "interleaved source loader.loader interleave_unit_size 1 must be "
-            "divisible by trailing mesh size 2"
-        ),
+        match=("interleave_unit_size 1 must be divisible by trailing mesh size 2"),
     ):
         _compile_interleaved_compiled_graph(
             source_mesh=DeviceMesh(("data", "model"), (2, 2)),
@@ -402,7 +496,9 @@ def test_interleaved_source_unit_contains_complete_trailing_mesh():
 
 
 def test_interleaved_source_balances_complete_units_across_steps():
-    dispatcher = InterleavedDispatcher(2)
+    dispatcher = ExecutionDispatcher(
+        compile_execution_layout(DeviceMesh(("worker",), (6,)), unit_size=2)
+    )
 
     owners = [
         [rank for rank in range(6) if dispatcher.should_execute(rank, 6, step)]
@@ -431,7 +527,9 @@ async def test_inactive_interleaved_rank_does_not_send():
     worker._completed_step_count = {"loader": 0}
     worker._mailbox = WorkerMailbox()
     worker._op_manager = SimpleNamespace(
-        get_dispatcher=lambda _name: InterleavedDispatcher(2)
+        get_dispatcher=lambda _name: ExecutionDispatcher(
+            compile_execution_layout(DeviceMesh(("worker",), (4,)), unit_size=2)
+        )
     )
     worker._drain_cond = asyncio.Condition()
     worker._drain_step_count = None

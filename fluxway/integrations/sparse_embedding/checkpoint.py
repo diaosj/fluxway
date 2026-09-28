@@ -51,7 +51,6 @@ from fluxway.common.types.checkpoint import (
     LeaseConflictError,
     CheckpointCleanupBlocked,
     CheckpointHold,
-    CheckpointRetentionPolicy,
     CleanupReservation,
     CleanupReservationRequest,
     RestoreTopologyMode,
@@ -148,21 +147,20 @@ class SparseEmbeddingCheckpointComponent(
         storage_factory: SparseCheckpointStorageFactory,
         *,
         component_id: str = "embedding",
-        retain_last: int | None = 3,
+        load_optimizer_state: bool = True,
+        retention_domain: str | None = None,
     ) -> None:
         if not callable(partition_fn):
             raise TypeError("partition_fn must be callable")
         if not callable(storage_factory):
             raise TypeError("storage_factory must be callable")
+        if not isinstance(load_optimizer_state, bool):
+            raise TypeError("load_optimizer_state must be bool")
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
             format_version=_WIRE_VERSION,
-            checkpoint_objects=(
-                CheckpointObjectSpec(
-                    component_id,
-                    CheckpointRetentionPolicy(retain_last=retain_last),
-                ),
-            ),
+            retention_domain=retention_domain,
+            checkpoint_objects=(CheckpointObjectSpec(component_id),),
             save=CheckpointSaveSpec(
                 prepare_scope=CheckpointSaveScope.LEADER,
                 commit_scope=CheckpointSaveScope.LEADER,
@@ -173,6 +171,7 @@ class SparseEmbeddingCheckpointComponent(
         )
         self._partition_fn = partition_fn
         self._storage_factory = storage_factory
+        self._load_optimizer_state = load_optimizer_state
         self._runtime: CheckpointRuntime | None = None
         self._storage: SparseCheckpointStorage | None = None
 
@@ -318,6 +317,7 @@ class SparseEmbeddingCheckpointComponent(
             session.instance.store,
             storage_locator,
             mode,
+            self._load_optimizer_state,
         )
 
     async def hold_checkpoint_object(
@@ -436,6 +436,26 @@ class SparseEmbeddingCheckpointComponent(
                     checkpoint_object.component_id, storage_locator.checkpoint_name
                 ),
             )
+
+    async def compact_checkpoints(self) -> None:
+        self._require_control()
+        await self._require_storage().compact_checkpoints_async()
+
+    async def compact_checkpoint(
+        self,
+        locator: SparseCheckpointLocator | CheckpointObjectRef,
+    ) -> None:
+        self._require_control()
+        storage_locator = (
+            self._storage_locator_from_checkpoint_object(locator)
+            if isinstance(locator, CheckpointObjectRef)
+            else locator
+        )
+        if not isinstance(storage_locator, SparseCheckpointLocator):
+            raise TypeError(
+                "locator must be SparseCheckpointLocator or CheckpointObjectRef"
+            )
+        await self._require_storage().compact_checkpoint_async(storage_locator)
 
     async def close(self) -> None:
         if self._runtime is None or self._storage is None:
@@ -648,3 +668,40 @@ class SparseEmbeddingCheckpointComponent(
         return SparseCheckpointLocator(
             decoded["checkpoint_name"], decoded["checkpoint_version"]
         )
+
+
+async def compact_sparse_checkpoints(
+    repository_root: str | Path,
+    spmd_id: str,
+    *,
+    component_id: str = "embedding",
+    storage_factory: SparseCheckpointStorageFactory | None = None,
+    partition_fn: PartitionFn | None = None,
+) -> None:
+    runtime = CheckpointRuntime(
+        role=CheckpointRuntimeRole.CONTROL,
+        repository_root=str(repository_root),
+        spmd_id=spmd_id,
+    )
+    actual_factory = storage_factory or LocalLanceStorageFactory()
+    actual_partition_fn = partition_fn or modulo_partition
+    component = SparseEmbeddingCheckpointComponent(
+        actual_partition_fn,
+        actual_factory,
+        component_id=component_id,
+    )
+    await component.open(runtime)
+    try:
+        await component.compact_checkpoints()
+    finally:
+        await component.close()
+
+
+__all__ = [
+    "GravitinoLanceStorageFactory",
+    "LocalLanceStorageFactory",
+    "SparseCheckpointStorageFactory",
+    "SparseEmbeddingCheckpointComponent",
+    "compact_sparse_checkpoints",
+    "modulo_partition",
+]

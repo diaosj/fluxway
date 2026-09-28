@@ -10,7 +10,6 @@ import asyncio
 import os
 
 import pytest
-import ray
 
 import fluxway
 from fluxway.control_plane.graph.functional import FunctionalGraph
@@ -18,6 +17,7 @@ from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfil
 
 # Import helper nodes from the separate module so Ray can deserialize them.
 from tests.reader.helper_nodes import MockDataSource, SimpleProcessor, TypedGrainReader
+from tests.ray_cluster_process import local_ray_cluster
 
 os.environ["FLUXWAY_BACKEND"] = "jax"
 
@@ -28,11 +28,8 @@ _MAX_POLL_ROUNDS = 30
 
 @pytest.fixture(scope="module", autouse=True)
 def ray_session():
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, log_to_driver=True)
-    yield
-    # Ray is intentionally kept alive across tests in this module to avoid
-    # repeated cluster startup cost.
+    with local_ray_cluster(num_cpus=8):
+        yield
 
 
 def _build_graph() -> FunctionalGraph:

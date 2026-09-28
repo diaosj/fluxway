@@ -1,8 +1,12 @@
+from fluxway.common.types.drain import DrainAdmission
 from typing import Any
 
 
 class AbstractWorkerExecutor:
     """Abstract base class for executing commands across a fleet of SPMD workers."""
+
+    async def activate_execution(self) -> None:
+        raise NotImplementedError
 
     async def start_workers(
         self, spmd_id: str, driver_handle: Any, controller_handle: Any
@@ -35,9 +39,7 @@ class AbstractWorkerExecutor:
     ) -> None:
         raise NotImplementedError
 
-    async def set_drain_boundary(
-        self, step_count: int, terminal_cut: int | None = None
-    ) -> None:
+    async def set_drain_boundary(self, admission: DrainAdmission) -> None:
         raise NotImplementedError
 
     def clear_drain_boundary(self) -> None:
@@ -82,6 +84,9 @@ class AbstractWorkerExecutor:
     def broadcast_control_argument(
         self, target_op: str, names: list[str], step: int, values: list[Any]
     ) -> None:
+        raise NotImplementedError
+
+    async def dispatch(self, request: Any) -> object:
         raise NotImplementedError
 
     def pause_sources(self) -> None:

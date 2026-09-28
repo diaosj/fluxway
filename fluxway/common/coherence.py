@@ -82,6 +82,12 @@ class TensorAccessIntent(StrEnum):
     DONATE = "donate"
 
 
+class PhysicalMutability(StrEnum):
+    PROVEN_WRITABLE = "proven_writable"
+    UNKNOWN = "unknown"
+    READONLY = "readonly"
+
+
 class CoherenceEvent(IntEnum):
     PrRd = 1
     PrWr = 2

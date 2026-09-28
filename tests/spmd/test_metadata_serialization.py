@@ -38,8 +38,8 @@ from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.common.decorators import (
     operator,
     spmd,
-    _instance_storage,
 )
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.spmd.worker.worker import SPMDWorker
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 
@@ -280,23 +280,23 @@ class TestOwnerClassTransport:
     def test_pre_instantiate_operators_uses_owner_meta(self):
         config = _compiled_class_config(_InstantiableModel, "instantiable")
 
-        _instance_storage.clear()
+        container = OperatorInstanceContainer()
         SPMDWorker._pre_instantiate_operators(  # type: ignore
-            config, rank=0, static_args={}
+            config, rank=0, static_args={}, instance_container=container
         )
 
         cls = config.operator_specs["run"].owner
         assert cls is not None
-        assert id(cls) in _instance_storage
+        assert container.get(cls) is not None
 
     def test_pre_instantiate_operators_logs_init_boundaries(self, caplog):
         config = _compiled_class_config(_InstantiableModel, "instantiable")
 
-        _instance_storage.clear()
+        container = OperatorInstanceContainer()
         caplog.set_level("DEBUG", logger="fluxway.spmd.worker.worker")
 
         SPMDWorker._pre_instantiate_operators(  # type: ignore
-            config, rank=0, static_args={}
+            config, rank=0, static_args={}, instance_container=container
         )
 
         begin_records = [

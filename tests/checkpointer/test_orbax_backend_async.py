@@ -19,20 +19,40 @@ from fluxway.control_plane.checkpointer.orbax_component import (
     OrbaxCheckpointComponent,
     _barrier_sync_key,
 )
+import fluxway.control_plane.checkpointer.orbax_component as orbax_component
 
 
 @pytest.mark.asyncio
-async def test_orbax_component_commits_and_restores_rank_local_state(tmp_path):
+async def test_orbax_component_commits_and_restores_nested_pytree_state(tmp_path):
+    import jax
+    import jax.numpy as jnp
+
     restored: list[dict[str, object]] = []
 
+    saved_state = {
+        "model_state": {
+            "linear": {
+                "w": jnp.array([[1.0, 2.0], [3.0, 4.0]], dtype=jnp.float32),
+                "b": jnp.array([0.5, -0.5], dtype=jnp.float32),
+            }
+        }
+    }
+
     async def save(module, context):
-        return {"optimizer": np.array([3], dtype=np.int64)}
+        return saved_state
 
     async def restore(module, state, context):
         restored.append(state)
 
     async def layout(module, context):
-        return {"optimizer": np.array([0], dtype=np.int64)}
+        return {
+            "model_state": {
+                "linear": {
+                    "w": jax.ShapeDtypeStruct((2, 2), jnp.float32),
+                    "b": jax.ShapeDtypeStruct((2,), jnp.float32),
+                }
+            }
+        }
 
     topology = TopologySnapshot(1, (), (), "v1")
     context = SaveSession(
@@ -67,6 +87,9 @@ async def test_orbax_component_commits_and_restores_rank_local_state(tmp_path):
             worker_results={0: prepared},
         )
     )
+    assert len(publication.shared_records) == 1
+    assert publication.partitions == ()
+
     await component.restore(
         RestoreSession(
             instance=None,
@@ -82,7 +105,15 @@ async def test_orbax_component_commits_and_restores_rank_local_state(tmp_path):
     )
     await component.close()
 
-    np.testing.assert_array_equal(restored[0]["optimizer"], np.array([3]))
+    assert len(restored) == 1
+    np.testing.assert_allclose(
+        restored[0]["model_state"]["linear"]["w"],
+        saved_state["model_state"]["linear"]["w"],
+    )
+    np.testing.assert_allclose(
+        restored[0]["model_state"]["linear"]["b"],
+        saved_state["model_state"]["linear"]["b"],
+    )
 
 
 @pytest.mark.asyncio
@@ -91,6 +122,8 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
 ):
     import jax
     import orbax.checkpoint as ocp
+
+    monkeypatch.setattr(orbax_component, "_jax_process_count", lambda: 2)
 
     saved_paths = []
 
@@ -171,7 +204,7 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
         )
     )
 
-    assert len(saved_paths) == topology.world_size
+    assert len(saved_paths) == 2
     assert len(set(saved_paths)) == 1
     assert len(publication.shared_records) == 1
     assert publication.partitions == ()

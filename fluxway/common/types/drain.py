@@ -47,6 +47,35 @@ class DrainEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class DrainAdmission:
+    revision: int
+    target: int
+    terminal_cut: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("revision", "target"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"admission {name} must be a non-negative integer")
+        if self.terminal_cut is not None:
+            if type(self.terminal_cut) is not int or self.terminal_cut < 0:
+                raise ValueError(
+                    "admission terminal cut must be a non-negative integer"
+                )
+            if self.target > self.terminal_cut:
+                raise ValueError("admission target exceeds terminal cut")
+
+    def supersedes(self, previous: "DrainAdmission | None") -> bool:
+        if previous is None:
+            return True
+        if self.revision < previous.revision:
+            raise ValueError("stale admission revision")
+        if self.revision == previous.revision and self != previous:
+            raise ValueError("conflicting admission at the same revision")
+        return self != previous
+
+
+@dataclass(frozen=True, slots=True)
 class DrainBoundary:
     phase: DrainPhase = DrainPhase.OPEN
     observed_cut: int | None = None

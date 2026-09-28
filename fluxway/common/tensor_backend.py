@@ -1,4 +1,6 @@
 from abc import ABC, abstractmethod
+from functools import wraps
+from math import prod
 from typing import Any
 import contextlib
 import threading
@@ -7,8 +9,10 @@ import numpy as np
 from fluxway.common.allocation import AllocationDescriptor, AllocationIdentity
 from fluxway.common.coherence import (
     CoherenceStateTransitionError,
+    PhysicalMutability,
     UnsupportedAllocationHandoffError,
 )
+from fluxway.common.numba_runtime import call_numba_cached
 
 
 def force_writable(arr: Any) -> Any:
@@ -85,7 +89,22 @@ def force_writable(arr: Any) -> Any:
                     self._source = source  # prevent GC
 
             return cp.asarray(_WritableGPUView(arr))
-    except ImportError:
+
+        if hasattr(arr, "__cuda_array_interface__"):
+
+            class _WritableForeignGPUView:
+                __slots__ = ("__cuda_array_interface__", "_source")
+
+                def __init__(self, source: Any):
+                    iface = source.__cuda_array_interface__
+                    ptr, _ = iface["data"]
+                    new_iface = dict(iface)
+                    new_iface["data"] = (ptr, False)
+                    self.__cuda_array_interface__ = new_iface
+                    self._source = source
+
+            return cp.asarray(_WritableForeignGPUView(arr))
+    except Exception:
         pass
 
     # Fallback: non-ndarray types (JAX, Torch, etc.) — return as-is
@@ -154,6 +173,37 @@ class DLPackObject:
         return self._device
 
 
+def _unwrap_ragged(x: Any) -> Any:
+    """Unwrap one level of ragged/sparse tensor to its underlying dense data.
+
+    Known first-party types with ``flat_values``:
+      - ``TransportTensor``   (fluxway.common.types.tensor)
+      - ``TransportShardView`` (fluxway.spmd.worker.mailbox.mailbox)
+
+    ``TransportShardView`` cannot be imported here at module level because
+    ``mailbox.py`` itself imports ``tensor_backend``, creating a circular
+    dependency.  It is therefore handled by the duck-typed ``getattr`` fallback
+    below.  External sparse types (TF RaggedTensor / SparseTensor) with a
+    non-callable ``.values`` attribute are also caught by that fallback.
+    """
+    from fluxway.common.types.tensor import TransportTensor
+
+    if isinstance(x, TransportTensor):
+        return x.flat_values
+    # TransportShardView and external sparse types (e.g. TF RaggedTensor).
+    flat = getattr(x, "flat_values", None)
+    if flat is not None and not callable(flat):
+        return flat
+    values = getattr(x, "values", None)
+    if (
+        values is not None
+        and not callable(values)
+        and not isinstance(x, (dict, list, tuple))
+    ):
+        return values
+    return x
+
+
 def as_native_zerocopy(x: Any) -> Any:
     """Zero-copy normalize any tensor (jax/torch/np/cupy/...) to native numpy or cupy.
 
@@ -177,79 +227,60 @@ def as_native_zerocopy(x: Any) -> Any:
     | jax.Array            | np.from_dlpack     | cupy.from_dlpack   |
     | torch.Tensor         | np.from_dlpack     | cupy.from_dlpack   |
     | other __dlpack__     | np.from_dlpack     | cupy.from_dlpack   |
-    | exotic (no DLPack)   | np.asarray (copy)  | n/a                |
+    | unsupported          | TypeError           | n/a                |
     +----------------------+--------------------+--------------------+
 
-    Every supported (source, device) pair takes the zero-copy path when
-    DLPack is available; only the last fallback row may copy.
+    Every supported source takes the zero-copy path. Unsupported protocol
+    combinations fail at this boundary instead of being materialized on CPU.
     """
     # numpy fast-path
     if isinstance(x, np.ndarray):
         return x
 
     cp_mod = None
-    try:
-        import cupy as _cp  # type: ignore
-
+    if hasattr(x, "__dlpack__") or hasattr(x, "__cuda_array_interface__"):
+        try:
+            import cupy as _cp  # type: ignore
+        except ImportError:
+            _cp = None
         cp_mod = _cp
-        if isinstance(x, _cp.ndarray):
+        if cp_mod is not None and isinstance(x, cp_mod.ndarray):
             return x
-    except Exception:
-        pass
 
-    # Detect torch tensors explicitly so we can read .is_cuda even on
-    # builds that don't expose __dlpack_device__ uniformly.
-    is_torch_tensor = False
-    torch_on_cuda = False
-    try:
-        import torch  # type: ignore
-
-        if isinstance(x, torch.Tensor):
-            is_torch_tensor = True
-            torch_on_cuda = bool(x.is_cuda)
-    except Exception:
-        pass
-
-    # Decide the target device by inspecting the source.  DLPack device
-    # codes: 1=CPU, 2=CUDA, 4=OpenCL, 7=Vulkan, 8=Metal, 10=ROCm, ...
-    source_on_gpu = False
-    if is_torch_tensor:
-        source_on_gpu = torch_on_cuda
-    elif hasattr(x, "__dlpack_device__"):
-        try:
-            source_on_gpu = x.__dlpack_device__()[0] in (2, 10)
-        except Exception:
-            source_on_gpu = False
-
-    # DLPack zero-copy paths -- preferred for jax / torch / others.
     if hasattr(x, "__dlpack__"):
-        if source_on_gpu and cp_mod is not None:
-            try:
-                return cp_mod.from_dlpack(x)
-            except Exception:
-                pass
-        try:
-            # JAX arrays on CUDA without an active CuPy install fall
-            # through to here; np.from_dlpack will raise unless the
-            # source is on host, so the next fallback handles it.
+        if not hasattr(x, "__dlpack_device__"):
+            raise TypeError(
+                f"DLPack source {type(x).__name__} must expose __dlpack_device__."
+            )
+        source_device, _ = x.__dlpack_device__()
+        if source_device == 1:
             return np.from_dlpack(x)
-        except Exception:
-            pass
+        if source_device in (2, 10):
+            if cp_mod is None:
+                raise RuntimeError(
+                    "GPU DLPack adoption requires an available CuPy backend."
+                )
+            return cp_mod.from_dlpack(x)
+        raise ValueError(f"unsupported DLPack source device {source_device!r}")
 
-    # Last-resort fallback for objects without (working) DLPack support.
-    # For torch CUDA tensors prefer the explicit cuda->cupy path before
-    # an unavoidable host transfer.
-    if is_torch_tensor:
-        if torch_on_cuda and cp_mod is not None:
-            try:
-                return cp_mod.asarray(x.detach())
-            except Exception:
-                pass
-        return np.asarray(x.detach().cpu())
-    return np.asarray(x)
+    if hasattr(x, "__cuda_array_interface__"):
+        if cp_mod is None:
+            raise RuntimeError(
+                "CUDA array-interface adoption requires an available CuPy backend."
+            )
+        return cp_mod.asarray(x)
+
+    raise TypeError(
+        f"as_native_zerocopy requires a NumPy, CuPy, DLPack, or CUDA array-interface "
+        f"source, got {type(x).__name__}."
+    )
 
 
 class TensorBackend(ABC):
+    @property
+    def default_device(self) -> str:
+        return "cpu"
+
     """Abstract interface for tensor operations across different frameworks.
 
     This class defines a unified API for common tensor operations like creation,
@@ -318,16 +349,44 @@ class TensorBackend(ABC):
         return False
 
     @abstractmethod
-    def adopt(self, x: Any) -> Any:
-        """Zero-copy adopt a foreign tensor into this backend's native domain.
-
-        Used at every entry point where untrusted tensors (jax / torch /
-        numpy / cupy / anything DLPack-capable) cross into a backend's
-        eager pipeline.  Implementations MUST take the zero-copy path
-        whenever possible (DLPack capsules, isinstance fast paths) and
-        never silently insert host transfers.
-        """
+    def asarray(
+        self, x: Any, *, copy: bool | None = None, device: str | None = None
+    ) -> Any:
+        """Convert a foreign tensor with an explicit copy policy."""
         ...
+
+    def asarray_tree(
+        self, tree: Any, *, copy: bool | None = None, device: str | None = None
+    ) -> Any:
+        """Recursively convert all leaf tensors with one copy policy."""
+        if isinstance(tree, dict):
+            return {
+                k: self.asarray_tree(v, copy=copy, device=device)
+                for k, v in tree.items()
+            }
+        if isinstance(tree, list):
+            return [self.asarray_tree(v, copy=copy, device=device) for v in tree]
+        if isinstance(tree, tuple) and hasattr(tree, "_fields"):
+            return type(tree)(
+                *(self.asarray_tree(v, copy=copy, device=device) for v in tree)
+            )
+        if isinstance(tree, tuple):
+            return tuple(self.asarray_tree(v, copy=copy, device=device) for v in tree)
+        return self.asarray(tree, copy=copy, device=device)
+
+    def asarray_with_lease(
+        self, value: Any, *, copy: bool | None = None, device: str | None = None
+    ) -> tuple[Any, Any | None]:
+        from fluxway.common.types.tensor import TransportTensor
+
+        if not isinstance(value, TransportTensor):
+            return self.asarray(value, copy=copy, device=device), None
+        lease = value.acquire_consumer_lease()
+        try:
+            return self.asarray(value, copy=copy, device=device), lease
+        except BaseException:
+            lease.cancel()
+            raise
 
     @abstractmethod
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
@@ -659,20 +718,23 @@ class TorchBackend(TensorBackend):
     def requires_static_shapes(self) -> bool:
         return self._compile_enabled
 
-    def adopt(self, x: Any) -> Any:
-        """Zero-copy adopt foreign tensor as a torch.Tensor."""
+    def asarray(
+        self, x: Any, *, copy: bool | None = None, device: str | None = None
+    ) -> Any:
+        x = _unwrap_ragged(x)
+
         if isinstance(x, self._torch.Tensor):
-            return x
-        # DLPack zero-copy for jax.Array / cupy / numpy >=1.23.
+            return x.clone() if copy else x
         if hasattr(x, "__dlpack__"):
-            try:
-                return self._torch.from_dlpack(x)
-            except Exception:
-                pass
-        # numpy fallback (zero-copy when contiguous CPU array).
+            result = self._torch.from_dlpack(x)
+            return result.clone() if copy else result
         if isinstance(x, np.ndarray):
-            return self._torch.from_numpy(x)
-        return self._torch.as_tensor(x)
+            return self._torch.tensor(x) if copy else self._torch.from_numpy(x)
+        if copy is False:
+            raise TypeError(
+                f"torch zero-copy conversion does not support {type(x).__name__}."
+            )
+        return self._torch.tensor(x, device=device)
 
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
         return self._torch.tensor(data, dtype=dtype)
@@ -1000,26 +1062,38 @@ class JaxBackend(TensorBackend):
         # pyrefly: ignore [missing-import]
         import jax
         import jax.numpy as jnp
+        from jax.extend import backend
 
         self._jnp = jnp
         self._jax = jax
+        self._jax_backend = backend
         self._enable_x64 = jax.enable_x64
 
     def _x64_scope(self):
         return self._enable_x64()
+
+    def _resolve_device(self, device: str | None) -> Any:
+        if device is None:
+            return None
+        devices = self._jax.devices(device)
+        if len(devices) != 1:
+            raise ValueError(
+                f"JAX device selector must resolve to exactly one device: {device!r}."
+            )
+        return devices[0]
 
     def name(self) -> str:
         return "jax"
 
     def empty_cache(self) -> None:
         self._jax.clear_caches()
-        self._jax.clear_backends_caches()
+        self._jax_backend.clear_backends()
 
     def allocation_descriptor(self, value: Any) -> AllocationDescriptor:
         if not isinstance(value, self._jax.Array):
             return super().allocation_descriptor(value)
-        pointer = int(value.unsafe_buffer_pointer())
-        nbytes = int(value.nbytes)
+        pointer = value.unsafe_buffer_pointer()
+        nbytes = value.nbytes
         return AllocationDescriptor(
             AllocationIdentity(
                 "jax",
@@ -1046,14 +1120,82 @@ class JaxBackend(TensorBackend):
         # bucketing is required to retention recompilation rate bounded.
         return True
 
-    def adopt(self, x: Any) -> Any:
-        """Zero-copy adopt foreign tensor as a jax.Array."""
+    def asarray(
+        self, x: Any, *, copy: bool | None = None, device: str | None = None
+    ) -> Any:
+        from fluxway.common.types.tensor import TransportTensor
+
+        resolved_device = self._resolve_device(device)
+
+        coherent_readonly = isinstance(x, TransportTensor) and x.is_readonly
+        if coherent_readonly and isinstance(x._payload.values, self._jax.Array):
+            if copy is True:
+                return self._jnp.array(x._payload.values, copy=True)
+            return x._payload.values
+        if coherent_readonly:
+            if x.physical_mutability is PhysicalMutability.PROVEN_WRITABLE:
+                x = x.dlpack_values_for_consumer()
+            elif copy is False:
+                x.dlpack_values_for_consumer()
+            else:
+                x = x.flat_values
+                coherent_readonly = False
+        else:
+            x = _unwrap_ragged(x)
+
         if isinstance(x, self._jax.Array):
-            return x
+            return self._jnp.array(x, copy=True) if copy else x
+
+        if (
+            hasattr(x, "flags")
+            and hasattr(x.flags, "c_contiguous")
+            and not x.flags.c_contiguous
+        ):
+            if copy is False:
+                raise ValueError(
+                    "jax zero-copy conversion requires a contiguous source."
+                )
+            import cupy as cp
+
+            x = (
+                cp.ascontiguousarray(x)
+                if hasattr(x, "__cuda_array_interface__")
+                else np.ascontiguousarray(x)
+            )
+
         with self._x64_scope():
+            if copy is True and isinstance(x, np.ndarray):
+                return self._jnp.array(np.array(x, copy=True), device=resolved_device)
+            if (
+                copy is not False
+                and hasattr(x, "flags")
+                and hasattr(x.flags, "writeable")
+                and not x.flags.writeable
+                and not coherent_readonly
+            ):
+                return self._jnp.asarray(x, device=resolved_device)
             if hasattr(x, "__dlpack__"):
-                return self._jax.dlpack.from_dlpack(x)
-            return self._jnp.asarray(x)
+                return self._jax.dlpack.from_dlpack(
+                    x, device=resolved_device, copy=copy
+                )
+            if hasattr(x, "__cuda_array_interface__"):
+                import cupy as cp
+
+                cp_view = cp.asarray(x)
+                if not cp_view.flags.c_contiguous:
+                    if copy is False:
+                        raise ValueError(
+                            "jax zero-copy conversion requires a contiguous CUDA source."
+                        )
+                    cp_view = cp.ascontiguousarray(cp_view)
+                return self._jax.dlpack.from_dlpack(
+                    cp_view, device=resolved_device, copy=copy
+                )
+            if copy is False:
+                raise TypeError(
+                    f"jax zero-copy conversion does not support {type(x).__name__}."
+                )
+            return self._jnp.asarray(x, device=resolved_device)
 
     def tensor(self, data: Any, dtype: Any = None, device: str | None = None) -> Any:
         with self._x64_scope():
@@ -1369,6 +1511,10 @@ class JAXViewWrapper:
         return len(self._shape)
 
     @property
+    def size(self):
+        return prod(self._shape)
+
+    @property
     def dtype(self):
         return self._dtype
 
@@ -1524,7 +1670,19 @@ try:
 
     _NUMBA_AVAILABLE = True
 
-    @_numba.jit(nopython=True, cache=True)
+    def _cached_numba_kernel(**options):
+        def decorate(function):
+            dispatcher = _numba.jit(**options)(function)
+
+            @wraps(function)
+            def call(*args):
+                return call_numba_cached(dispatcher, *args)
+
+            return call
+
+        return decorate
+
+    @_cached_numba_kernel(nopython=True, cache=True)
     def _numba_bincount_loop(x, out):
         """Increment out[x[i]] for each element. Caller must zero *out* first."""
         for i in range(x.shape[0]):
@@ -1532,7 +1690,7 @@ try:
             if 0 <= idx < out.shape[0]:
                 out[idx] += 1
 
-    @_numba.jit(nopython=True, cache=True)
+    @_cached_numba_kernel(nopython=True, cache=True)
     def _numba_bincount_weighted_loop(x, weights, out):
         """Like _numba_bincount_loop but adds weights[i] instead of 1."""
         for i in range(x.shape[0]):
@@ -1540,7 +1698,7 @@ try:
             if 0 <= idx < out.shape[0]:
                 out[idx] += weights[i]
 
-    @_numba.jit(nopython=True, cache=True)
+    @_cached_numba_kernel(nopython=True, cache=True)
     def _numba_cumsum_loop(x, out):
         """1-D prefix sum. Caller allocates *out*."""
         if x.shape[0] == 0:
@@ -1549,7 +1707,7 @@ try:
         for i in range(1, x.shape[0]):
             out[i] = out[i - 1] + x[i]
 
-    @_numba.jit(nopython=True, cache=True)
+    @_cached_numba_kernel(nopython=True, cache=True)
     def _numba_take_loop(data, indices, out):
         """1-D gather: out[i] = data[indices[i]]."""
         for i in range(indices.shape[0]):
@@ -1604,6 +1762,10 @@ class HybridBackend(TensorBackend):
                     f"HybridBackend(default_device={default_device!r}) requested "
                     f"but CuPy/CUDA is not available: {exc}"
                 ) from exc
+
+    @property
+    def default_device(self) -> str:
+        return self._default_device
 
     def initialize_worker_runtime(self) -> None:
         if self._worker_runtime_initialized:
@@ -1754,7 +1916,9 @@ class HybridBackend(TensorBackend):
             return value
         return super().readonly_view(value)
 
-    def adopt(self, x: Any) -> Any:
+    def asarray(
+        self, x: Any, *, copy: bool | None = None, device: str | None = None
+    ) -> Any:
         """Zero-copy adopt foreign tensor into this HybridBackend's default device domain.
 
         Why follow ``self._default_device`` instead of the source device:
@@ -1768,33 +1932,47 @@ class HybridBackend(TensorBackend):
         Forcing the *target* domain to ``_default_device`` retentions the
         eager pipeline strictly single-domain.
 
-        Zero-copy paths:
-        - target=cpu, source on CPU (DLPack)        -> ``np.from_dlpack``
-        - target=cpu, source on GPU                  -> ``np.from_dlpack`` if it works,
-          else ``cp.asnumpy`` D2H (unavoidable cross-device transfer)
-        - target=gpu, source on GPU (DLPack)         -> ``cp.from_dlpack``
-        - target=gpu, source on CPU                  -> ``cp.asarray`` H2D
-          (unavoidable cross-device transfer)
+        Same-device foreign arrays use NumPy or CuPy DLPack adoption. Explicit
+        copy=False rejects device-domain changes. Missing CUDA support and
+        exporter errors propagate to the caller.
         """
-        target_is_gpu = self._default_device in ("gpu", "cuda") and self._cp is not None
+        if copy is not True and device is None:
+            raise ValueError(
+                "HybridBackend.asarray requires an explicit device unless copy=True."
+            )
+        target_device = device or self._default_device
+        if target_device not in ("cpu", "gpu", "cuda"):
+            raise ValueError(
+                f"HybridBackend.asarray device must be 'cpu' or 'cuda', got {device!r}."
+            )
+        target_is_gpu = target_device in ("gpu", "cuda")
         cp_mod = self._cp
-        if target_is_gpu:
-            assert cp_mod is not None
+        if target_is_gpu and cp_mod is None:
+            raise RuntimeError(
+                "CUDA array adoption requires CuPy and an available CUDA runtime."
+            )
+
+        x = _unwrap_ragged(x)
 
         # Native fast paths.
         if isinstance(x, np.ndarray):
             if target_is_gpu:
+                if copy is False:
+                    raise ValueError(
+                        "HybridBackend.asarray(copy=False) cannot convert CPU data to CUDA."
+                    )
                 assert cp_mod is not None
-                return cp_mod.asarray(x)  # H2D, unavoidable
-            return x
+                return cp_mod.array(x)
+            return x.copy() if copy else x
         if cp_mod is not None and isinstance(x, cp_mod.ndarray):
             if target_is_gpu:
-                return x
+                return x.copy() if copy else x
             # cupy -> numpy via DLPack zero-copy when possible.
-            try:
-                return np.from_dlpack(x)
-            except Exception:
-                return cp_mod.asnumpy(x)
+            if copy is False:
+                raise ValueError(
+                    "HybridBackend.asarray(copy=False) cannot convert CUDA data to CPU."
+                )
+            return cp_mod.asnumpy(x)
 
         # Identify torch tensors so we can honor .is_cuda even on builds
         # whose __dlpack_device__ is not perfectly aligned with reality.
@@ -1806,24 +1984,32 @@ class HybridBackend(TensorBackend):
             if isinstance(x, torch.Tensor):
                 is_torch_tensor = True
                 torch_on_cuda = bool(x.is_cuda)
-        except Exception:
+        except ImportError:
             pass
 
         # Foreign DLPack-capable arrays (jax.Array, torch.Tensor, ...).
         if hasattr(x, "__dlpack__"):
+            source_device, _ = x.__dlpack_device__()
+            if source_device not in (1, 2, 10):
+                raise ValueError(f"unsupported DLPack source device {source_device}")
+            source_is_gpu = source_device in (2, 10)
+            if copy is False and source_is_gpu != target_is_gpu:
+                raise ValueError(
+                    "HybridBackend.asarray(copy=False) cannot change device domains."
+                )
+            if not target_is_gpu and source_is_gpu:
+                return np.array(x)
             if target_is_gpu:
                 assert cp_mod is not None
-                try:
-                    return cp_mod.from_dlpack(x)
-                except Exception:
-                    pass
-            else:
-                try:
-                    return np.from_dlpack(x)
-                except Exception:
-                    pass
+                result = cp_mod.from_dlpack(x)
+                return result.copy() if copy else result
+            result = np.from_dlpack(x)
+            return result.copy() if copy else result
 
-        # Last-resort device-aware fallback (zero-copy when possible).
+        if copy is False:
+            raise TypeError(
+                f"hybrid zero-copy conversion does not support {type(x).__name__}."
+            )
         if is_torch_tensor:
             if target_is_gpu and not torch_on_cuda:
                 assert cp_mod is not None
@@ -1832,11 +2018,11 @@ class HybridBackend(TensorBackend):
                 assert cp_mod is not None
                 return cp_mod.asarray(x.detach())
             # target=cpu
-            return np.asarray(x.detach().cpu())
+            return np.array(x.detach().cpu())
         if target_is_gpu:
             assert cp_mod is not None
-            return cp_mod.asarray(x)
-        return np.asarray(x)
+            return cp_mod.array(x)
+        return np.array(x)
 
     # ------------------------------------------------------------------
     # Creation / conversion
@@ -1862,6 +2048,10 @@ class HybridBackend(TensorBackend):
                 return data if dtype is None else self._cp.asarray(data, dtype=dtype)
         lib = self._lib(device or self._default_device)
         if lib is np:
+            if self._cp is not None and isinstance(data, self._cp.ndarray):
+                data = self._cp.asnumpy(data)
+            elif self._cp is not None and hasattr(data, "__cuda_array_interface__"):
+                data = self._cp.asarray(data).get()
             return force_writable(np.asarray(data, dtype=dtype))
         return lib.asarray(data, dtype=dtype)
 

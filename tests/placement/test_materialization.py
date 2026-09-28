@@ -36,6 +36,87 @@ class FakePlacementGroup:
         return None
 
 
+@pytest.mark.asyncio
+async def test_cancelled_materialization_releases_group(monkeypatch):
+    graph, recipe, snapshot = scenario(1)
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
+    entered = asyncio.Event()
+
+    class PendingPlacementGroup:
+        async def ready(self):
+            entered.set()
+            await asyncio.Event().wait()
+
+    pg = PendingPlacementGroup()
+    removed = []
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.placement_group", lambda **_: pg
+    )
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.remove_placement_group",
+        removed.append,
+    )
+    manager = PGManager()
+    creation = asyncio.create_task(
+        manager.create_job_pg(plan=plan, snapshot=snapshot, timeout_s=10)
+    )
+    await asyncio.wait_for(entered.wait(), 1)
+    creation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await creation
+    assert removed == [pg]
+    assert not manager.has_job_pg
+
+
+def test_heterogeneous_nodes_preserve_resources_and_identity(monkeypatch):
+    profiles = {
+        "cuda": {"CPU": 2, "GPU": 2, "accelerator_type:H100": Decimal("0.001")},
+        "other": {"CPU": 4, "GPU": 1, "accelerator_type:V100": Decimal("0.001")},
+    }
+    graph = placement_graph(
+        nodes={
+            name: graph_node(
+                name, MultiAcceleratorSPMD, 1, ResourceProfile(base=resources)
+            )
+            for name, resources in profiles.items()
+        }
+    )
+    snapshot = ClusterSnapshot.from_nodes(
+        tuple(
+            ClusterNode(node_id=name, resources={**resources, "node:10.0.0.1": 1})
+            for name, resources in profiles.items()
+        )
+    )
+    recipe = PlacementRecipe(
+        recipe_id="heterogeneous",
+        version="1.0.0",
+        constraints=(),
+        objective=AFFINITY_FIRST_V1,
+    )
+    plan = PlacementPlanner(solve_timeout_s=10).resolve(
+        placement_inventory(graph), recipe, snapshot
+    )
+    captured = {}
+
+    def create(**options):
+        captured.update(options)
+        return FakePlacementGroup()
+
+    monkeypatch.setattr(
+        "fluxway.control_plane.scheduler.pg_manager.placement_group", create
+    )
+    asyncio.run(PGManager().create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1))
+    for selector, resources in zip(
+        captured["bundle_label_selector"], captured["bundles"], strict=True
+    ):
+        assert resources == {
+            key: float(value)
+            for key, value in profiles[selector["ray.io/node-id"]].items()
+        }
+
+
 def test_pg_manager_materializes_one_pinned_job_placement_group(monkeypatch) -> None:
     graph, recipe, snapshot_without_markers = scenario(2)
     nodes = tuple(
@@ -56,9 +137,10 @@ def test_pg_manager_materializes_one_pinned_job_placement_group(monkeypatch) -> 
     )
     captured = {}
 
-    def create_pg(*, bundles, strategy):
+    def create_pg(*, bundles, strategy, bundle_label_selector):
         captured["bundles"] = bundles
         captured["strategy"] = strategy
+        captured["bundle_label_selector"] = bundle_label_selector
         return FakePlacementGroup()
 
     monkeypatch.setattr(
@@ -72,9 +154,12 @@ def test_pg_manager_materializes_one_pinned_job_placement_group(monkeypatch) -> 
     assert captured["strategy"] == "STRICT_SPREAD"
     assert len(captured["bundles"]) == len(plan.bundle_resources())
     assert all(
-        len([key for key in bundle if key.startswith("node:")]) == 1
+        not any(key.startswith("node:") for key in bundle)
         for bundle in captured["bundles"]
     )
+    assert captured["bundle_label_selector"] == [
+        {"ray.io/node-id": node_id} for node_id in sorted(plan.bundle_resources())
+    ]
     allocation = manager.get_worker_group("s1")
     assert allocation.placement_group is pg
     assert len(allocation.rank_to_bundle) == 12
@@ -126,16 +211,19 @@ def test_pg_manager_raises_typed_timeout_and_releases_pg(monkeypatch) -> None:
     assert removed == [pg]
 
 
-def test_pg_manager_rejects_unexpressible_node_without_marker() -> None:
+def test_pg_manager_rejects_resolved_node_absent_from_snapshot() -> None:
     graph, recipe, snapshot = scenario(1)
     plan = PlacementPlanner(solve_timeout_s=10).resolve(
         placement_inventory(graph), recipe, snapshot
     )
 
-    with pytest.raises(PlacementMaterializationError, match="usable node resources"):
-        asyncio.run(
-            PGManager().create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1)
-        )
+    absent = ClusterSnapshot.from_nodes(
+        (ClusterNode(node_id="other", resources={"CPU": 16}),)
+    )
+    with pytest.raises(
+        PlacementMaterializationError, match="absent from the Ray snapshot"
+    ):
+        asyncio.run(PGManager().create_job_pg(plan=plan, snapshot=absent, timeout_s=1))
 
 
 def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> None:
@@ -177,8 +265,9 @@ def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> Non
     )
     captured = {}
 
-    def create_pg(*, bundles, strategy):
+    def create_pg(*, bundles, strategy, bundle_label_selector):
         captured["bundles"] = bundles
+        captured["bundle_label_selector"] = bundle_label_selector
         return FakePlacementGroup()
 
     monkeypatch.setattr(
@@ -191,9 +280,9 @@ def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> Non
         {
             "GPU": 1.0,
             "accelerator_type:H100": 0.001,
-            "node:10.0.2.1": 0.0001,
         }
     ]
+    assert captured["bundle_label_selector"] == [{"ray.io/node-id": "gpu"}]
 
 
 def test_worker_group_attestation_rejects_rank_node_mismatch() -> None:
@@ -255,8 +344,9 @@ def test_driver_resources_are_reserved_in_the_rank_zero_bundle(monkeypatch) -> N
     ).resolve(placement_inventory(graph), recipe, snapshot)
     captured = {}
 
-    def create_pg(*, bundles, strategy):
+    def create_pg(*, bundles, strategy, bundle_label_selector):
         captured["bundles"] = bundles
+        captured["bundle_label_selector"] = bundle_label_selector
         return FakePlacementGroup()
 
     monkeypatch.setattr(
@@ -266,7 +356,8 @@ def test_driver_resources_are_reserved_in_the_rank_zero_bundle(monkeypatch) -> N
 
     asyncio.run(manager.create_job_pg(plan=plan, snapshot=snapshot, timeout_s=1))
 
-    assert captured["bundles"] == [{"CPU": 1.5, "node:10.0.3.1": 0.0001}]
+    assert captured["bundles"] == [{"CPU": 1.5}]
+    assert captured["bundle_label_selector"] == [{"ray.io/node-id": "cpu"}]
     group = manager.get_worker_group("driver")
     assert group.driver_bundle_index == 0
     assert group.driver_resources == {"CPU": Decimal("0.5")}

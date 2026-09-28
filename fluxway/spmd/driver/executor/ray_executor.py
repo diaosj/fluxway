@@ -3,6 +3,7 @@ from typing import Any
 from collections.abc import Mapping
 
 import ray
+from ray.runtime_env import RuntimeEnv
 
 # pyrefly: ignore [missing-import]
 from ray.util.scheduling_strategies import (
@@ -10,6 +11,7 @@ from ray.util.scheduling_strategies import (
 )
 
 
+from fluxway.common.types.drain import DrainAdmission
 from fluxway.common.types import (
     CheckpointComponentPublication,
     CheckpointCommitPermit,
@@ -17,6 +19,10 @@ from fluxway.common.types import (
     WorkerSaveResult,
     SPMDConfig,
     TopologySnapshot,
+)
+from fluxway.common.driver_control import (
+    DriverControlRequest,
+    IngestionLayoutActivationRequest,
 )
 from fluxway.spmd.worker import SPMDWorker
 from fluxway.placement import PlacementAttestationError
@@ -26,6 +32,7 @@ from fluxway.placement.worker_group import (
     worker_tensor_device,
 )
 from fluxway.common.utils.logging import get_logger
+from fluxway.diagnostics import prepare_worker_runtime_env
 from fluxway.spmd.driver.executor.base import AbstractWorkerExecutor
 
 logger = get_logger(__name__)
@@ -61,8 +68,9 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
                 placement_group_bundle_index=bundle_idx,
                 placement_group_capture_child_tasks=False,
             )
-        if self._runtime_env:
-            opts["runtime_env"] = self._runtime_env
+        opts["runtime_env"] = RuntimeEnv(
+            **prepare_worker_runtime_env(self._runtime_env)
+        )
 
         opts.update(ray_actor_options(self.worker_resource))
         logger.debug(f"Worker opts for {name}: {opts}")
@@ -160,6 +168,11 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
                             )
                             for rank, worker in self._worker_handles.items()
                         ]
+                    )
+                    logger.info(
+                        "workers.setup_completed spmd_id=%s worker_count=%s",
+                        self.spmd_id,
+                        len(self._worker_handles),
                     )
                     break
                 except Exception as e:
@@ -285,12 +298,10 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
             for worker in self._worker_handles.values():
                 worker.register_successor_handlers.remote(spmd_id, handlers)
 
-    async def set_drain_boundary(
-        self, step_count: int, terminal_cut: int | None = None
-    ) -> None:
+    async def set_drain_boundary(self, admission: DrainAdmission) -> None:
         await asyncio.gather(
             *[
-                worker.set_drain_boundary.remote(step_count, terminal_cut)
+                worker.install_admission.remote(admission)
                 for worker in self._worker_handles.values()
             ]
         )
@@ -413,6 +424,19 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
         for rank, worker in self._worker_handles.items():
             worker.receive_control.remote(target_op, step, names, values)
 
+    async def dispatch(self, request: DriverControlRequest) -> object:
+        if not isinstance(request, IngestionLayoutActivationRequest):
+            raise TypeError(
+                "Ray worker control requires a registered DriverControlRequest"
+            )
+        try:
+            worker = self._worker_handles[request.rank]
+        except KeyError as error:
+            raise ValueError(
+                f"ingestion activation references unknown worker rank {request.rank}"
+            ) from error
+        return await worker.dispatch_control.remote(request)
+
     def pause_sources(self) -> None:
         for worker in self._worker_handles.values():
             worker.pause_sources.remote()
@@ -420,6 +444,14 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
     def resume_sources(self) -> None:
         for worker in self._worker_handles.values():
             worker.resume_sources.remote()
+
+    async def activate_execution(self) -> None:
+        await asyncio.gather(
+            *(
+                worker.activate_execution.remote()
+                for worker in self._worker_handles.values()
+            )
+        )
 
     async def start_source_operators(self) -> None:
         tasks = [

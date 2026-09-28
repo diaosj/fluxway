@@ -10,6 +10,7 @@ from fluxway.common.compiled_graph import (
 )
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
 from fluxway.spmd.worker.assembly import compile_assemble_plan
 from fluxway.spmd.worker.operator_manager.operator_manager import OperatorManager
@@ -29,6 +30,9 @@ class _Source:
 
     def before(self) -> None:
         return None
+
+    def read(self) -> dict[str, Any]:
+        return {"value": 1}
 
 
 class _Target:
@@ -50,6 +54,14 @@ class _ReferentialSource:
 class _ReferentialTarget:
     def consume(self, embedding: Any) -> None:
         del embedding
+
+
+class _ControlledSourceDescriptor:
+    requires_source_control_runtime = True
+
+    def build_component(self, context):
+        del context
+        raise AssertionError("context-only test must not construct source components")
 
 
 _SOURCE_OPERATORS = {
@@ -126,6 +138,7 @@ def _manager(plan, spmd_id: str) -> OperatorManager:
         rank=0,
         spmd_id=spmd_id,
         static_args={},
+        instance_container=OperatorInstanceContainer(),
     )
 
 
@@ -366,3 +379,75 @@ def test_assemble_plan_is_exactly_bound_to_one_transfer():
         shards_dict=shards,
         flatten_shards=flatten,
     ) == ["rank-0"]
+
+
+def _controlled_source_manager() -> tuple[OperatorManager, object]:
+    source = OperatorSpec(
+        name="read",
+        owner=_Source,
+        is_source=True,
+        source=_ControlledSourceDescriptor(),
+        output_arguments={"data": ("value",)},
+        output_sharding={"value": _REPLICATED},
+    )
+    graph = compile_test_graph(
+        name="controlled-source-context",
+        spmds={"source": (DeviceMesh(("data",), (1,)), {"read": source})},
+        dependencies=(),
+    )
+    return _manager(graph, "source"), source
+
+
+def _source_work(*, step: int, global_start: int, schema: str = "schema"):
+    from fluxway.common.ingestion import (
+        LayoutUnitDescriptor,
+        SourceWorkAssignment,
+        SourceWorkItem,
+    )
+
+    descriptor = LayoutUnitDescriptor(
+        unit_id=f"unit-{step}-{global_start}",
+        revision_identity="revision",
+        cardinality=1,
+        cardinality_metric="samples",
+        split_policy="AtomicItem",
+        locality_key="source",
+        physical_identity="source",
+        logical_start=global_start,
+        opaque_token=b"source-work",
+    )
+    assignment = SourceWorkAssignment.create(
+        epoch=0,
+        step=step,
+        source_identity="source",
+        schema_digest=schema,
+        descriptor=descriptor,
+        global_start=global_start,
+        global_batch_size=4,
+    )
+    return SourceWorkItem(assignment, global_start, global_start + 1)
+
+
+def test_controlled_source_context_requires_current_canonical_work():
+    manager, _ = _controlled_source_manager()
+    current = _source_work(step=0, global_start=0)
+    with manager._operator_execution_context("read", 0, (current,)):
+        pass
+    with pytest.raises(ValueError, match="canonical source work"):
+        with manager._operator_execution_context("read", 0, None):
+            pass
+    with pytest.raises(ValueError, match="another step"):
+        with manager._operator_execution_context(
+            "read", 0, (_source_work(step=1, global_start=4),)
+        ):
+            pass
+    with pytest.raises(ValueError, match="incompatible"):
+        with manager._operator_execution_context(
+            "read",
+            0,
+            (current, _source_work(step=0, global_start=1, schema="other")),
+        ):
+            pass
+    with pytest.raises(ValueError, match="duplicate"):
+        with manager._operator_execution_context("read", 0, (current, current)):
+            pass

@@ -330,7 +330,7 @@ def test_heartbeat_contract_excludes_progress_and_backpressure_fields():
         num_workers=1,
         healthy_num_workers=1,
         workers_ready=True,
-        workers_running=True,
+        topology_ready=True,
     )
 
     removed_worker_fields = {

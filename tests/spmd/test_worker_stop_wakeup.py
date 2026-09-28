@@ -10,7 +10,6 @@ Uses lightweight stubs (no Ray actors) matching the pattern in test_drain_barrie
 """
 
 import asyncio
-import threading
 import types
 from unittest.mock import AsyncMock, Mock
 
@@ -18,7 +17,9 @@ import pytest
 
 from fluxway.common.allocation import AllocationRegistry
 from fluxway.common.coherence import CoherenceDirectory, ExecutionFenceState
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.spmd.worker.coherence_sequencer import CoherenceSequencer
+from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle
 from fluxway.spmd.worker.worker import LocalInputPrepareRuntime, SPMDWorker as _ActorCls
 
 
@@ -30,7 +31,7 @@ def _make_worker_stub():
     raw_cls = _ActorCls.__ray_actor_class__  # type: ignore[reportAttributeAccessIssue]
     directory = CoherenceDirectory()
     stub = types.SimpleNamespace(
-        _running=True,
+        _execution_lifecycle=WorkerExecutionLifecycle(),
         _driver_handle=None,
         _drain_step_count=5,
         _drain_cond=asyncio.Condition(),
@@ -61,6 +62,8 @@ def _make_worker_stub():
         _checkpoint_coordinator=None,
         _checkpoint_repository_root=None,
     )
+    stub._execution_lifecycle.topology_ready()
+    stub._execution_lifecycle.activate()
     stub._execution_queues = {"__default__": stub._execution_queue}
     stub._input_prepare_runtime = LocalInputPrepareRuntime(
         background_tasks=stub._background_tasks,
@@ -84,6 +87,7 @@ def _make_worker_stub():
         raw_cls._shutdown_checkpoint_coordinator, stub
     )
     stub.stop = types.MethodType(raw_cls.stop, stub)
+    stub._shutdown = types.MethodType(raw_cls._shutdown, stub)
     return stub
 
 
@@ -132,11 +136,11 @@ class TestStopWakesDrainCondition:
     @pytest.mark.asyncio
     async def test_stop_sets_running_false(self):
         stub = _make_worker_stub()
-        assert stub._running is True
+        assert stub._execution_lifecycle.active is True
 
         await stub.stop()
 
-        assert stub._running is False  # type: ignore[reportUnnecessaryComparison]
+        assert stub._execution_lifecycle.active is False  # type: ignore[reportUnnecessaryComparison]
 
     @pytest.mark.asyncio
     async def test_stop_shuts_down_user_callables(self):
@@ -205,7 +209,7 @@ class TestStopWakesDrainCondition:
         stub._worker_process_call_runtime.close.assert_called_once_with()
 
     @pytest.mark.asyncio
-    async def test_stop_shuts_down_worker_process_operator_once(self, monkeypatch):
+    async def test_stop_shuts_down_worker_process_operator_once(self):
         stub = _make_worker_stub()
         shutdown_count = 0
 
@@ -221,10 +225,8 @@ class TestStopWakesDrainCondition:
             operator_specs={"step": operator_meta, "flush": operator_meta}
         )
         stub._operator_specs = stub.config.operator_specs
-        monkeypatch.setattr(
-            "fluxway.spmd.worker.worker.get_instance_storage",
-            lambda: ({id(Operator): operator}, threading.Lock()),
-        )
+        stub._instance_container = OperatorInstanceContainer()
+        stub._instance_container.get_or_create(Operator, lambda: operator)
 
         await stub.stop()
 
@@ -232,7 +234,7 @@ class TestStopWakesDrainCondition:
 
     @pytest.mark.asyncio
     async def test_stop_attempts_all_worker_process_operators_on_failure(
-        self, monkeypatch
+        self,
     ):
         stub = _make_worker_stub()
         calls = []
@@ -246,10 +248,6 @@ class TestStopWakesDrainCondition:
             def on_shutdown(self) -> None:
                 calls.append("healthy")
 
-        instances = {
-            id(FailingOperator): FailingOperator(),
-            id(HealthyOperator): HealthyOperator(),
-        }
         stub.config = types.SimpleNamespace(
             operator_specs={
                 "failing": types.SimpleNamespace(owner=FailingOperator),
@@ -257,10 +255,9 @@ class TestStopWakesDrainCondition:
             }
         )
         stub._operator_specs = stub.config.operator_specs
-        monkeypatch.setattr(
-            "fluxway.spmd.worker.worker.get_instance_storage",
-            lambda: (instances, threading.Lock()),
-        )
+        stub._instance_container = OperatorInstanceContainer()
+        stub._instance_container.get_or_create(FailingOperator, FailingOperator)
+        stub._instance_container.get_or_create(HealthyOperator, HealthyOperator)
 
         with pytest.raises(RuntimeError, match="local shutdown failed"):
             await stub.stop()
@@ -333,4 +330,4 @@ class TestStopCancelsRunTask:
         stub._heartbeat_task = None
 
         await stub.stop()
-        assert stub._running is False
+        assert stub._execution_lifecycle.active is False

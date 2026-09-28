@@ -195,7 +195,7 @@ def test_snapshot_contains_driver_component_state():
 
 def test_restore_components_precedes_component_restore():
     events = []
-    orchestrator, _, registry = _orchestrator(events)
+    orchestrator, _, registry = _orchestrator(events, state=DriverState.READY)
     topology = TopologySnapshot(1, ("data",), (1,), "fluxway-device-mesh-v1")
     snapshot = SpmdCheckpoint(
         topology,
@@ -273,6 +273,34 @@ def test_concurrent_snapshot_failure_coalesces_rollback():
         release_rollback.set()
         await asyncio.gather(persist_task, fail_task)
         assert rollback_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_unassembled_snapshot_failure_uses_prepublication_cleanup_once():
+    async def scenario():
+        events = []
+        orchestrator, _, _ = _orchestrator(events)
+        rollback_calls = 0
+
+        async def rollback():
+            nonlocal rollback_calls
+            rollback_calls += 1
+
+        orchestrator.executor.checkpoint_rollback_save = rollback
+        await orchestrator._prepare_snapshot_unprofiled(
+            "snapshot",
+            "attempt",
+            CheckpointCommitPermit("attempt", 1, b"permit"),
+            CheckpointCut.for_step("cut", 5),
+            "/tmp/repository",
+        )
+
+        await orchestrator.fail_snapshot("snapshot")
+        await orchestrator.fail_snapshot("snapshot")
+
+        assert rollback_calls == 1
+        assert "worker_rollback" not in events
 
     asyncio.run(scenario())
 

@@ -8,10 +8,12 @@ from fluxway.integrations.sparse_embedding.checkpoint import (
     GravitinoLanceStorageFactory,
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
+    compact_sparse_checkpoints,
 )
 
 __all__ = [
     "GravitinoLanceStorageFactory",
     "LocalLanceStorageFactory",
     "SparseEmbeddingCheckpointComponent",
+    "compact_sparse_checkpoints",
 ]

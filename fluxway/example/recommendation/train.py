@@ -7,18 +7,24 @@ from pathlib import Path
 import time
 
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.decorators import spmd_source
+from fluxway.common.transfer import WholeUnitRouting
+from fluxway.example.recommendation.source_adapter import RecommendationSourceDescriptor
 from fluxway.common.types.configs import AsyncStepConfig
 import fluxway
 from fluxway.control_plane.graph.functional import FunctionalGraph
 from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
-from fluxway.common.types import CheckpointConfig
+from fluxway.common.types import CheckpointConfig, SourceControlConfig
 from fluxway.profiler import ProfilerDiagnostic
-from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfile
-
-from fluxway.example.recommendation.reader import RecommendationReader
-from fluxway.example.recommendation.input_spmd import InputSPMD
-from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
-from fluxway.example.recommendation.dense_spmd import DenseSPMD
+from fluxway.placement import (
+    AFFINITY_FIRST_V1,
+    PlacementRecipe,
+    ResourceProfile,
+    equal,
+    rank,
+    support,
+    workers,
+)
 
 from fluxway import run_in_sandbox
 
@@ -114,6 +120,7 @@ def _jax_runtime_env(platform: str) -> dict[str, dict[str, str]]:
         "env_vars": {
             "JAX_PLATFORMS": platform,
             "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            "NCCL_MULTI_RANK_GPU_ENABLE": "1",
         }
     }
 
@@ -139,6 +146,26 @@ def _export_graph_visualization(task_graph, args) -> None:
 
 
 async def run_training(args):
+    from fluxway.example.recommendation.reader import RecommendationReader
+    from fluxway.example.recommendation.input_spmd import InputSPMD
+    from fluxway.example.recommendation.sparse_spmd import SparseEmbeddingSPMD
+    from fluxway.example.recommendation.dense_spmd import DenseSPMD
+    from fluxway.example.recommendation.sparse_checkpoint import (
+        compact_sparse_checkpoints,
+    )
+
+    if getattr(args, "compact_only", False):
+        for spmd_id in ("EmbeddingTable1", "EmbeddingTable2"):
+            print(
+                f"[Fluxway] Compacting sparse checkpoints for {spmd_id} in {args.checkpoint_dir} …"
+            )
+            await compact_sparse_checkpoints(
+                repository_root=args.checkpoint_dir,
+                spmd_id=spmd_id,
+            )
+        print("[Fluxway] Sparse checkpoint compaction completed.")
+        return
+
     if args.num_epochs <= 0:
         raise ValueError(f"num_epochs must be positive, got {args.num_epochs}")
     if args.dense_step_delay_ms < 0:
@@ -161,14 +188,28 @@ async def run_training(args):
             dense
     """
 
-    reader_mesh = DeviceMesh(device_shape=(1,), axis_names=("worker",))
+    reader_mesh = DeviceMesh(device_shape=(args.reader_shards,), axis_names=("worker",))
     input_mesh = DeviceMesh(device_shape=(args.dp,), axis_names=("dp",))
     table1_mesh = DeviceMesh(device_shape=(args.table1_shards,), axis_names=("shard",))
     table2_mesh = DeviceMesh(device_shape=(args.table2_shards,), axis_names=("shard",))
     dense_mesh = DeviceMesh(device_shape=(args.dp,), axis_names=("dp",))
 
+    reader_type = spmd_source(
+        resource_profile=RecommendationReader.get_resource_profile(),
+        mesh_axis_names=("worker",),
+        interleaved=True,
+        interleave_unit_size=args.dp,
+        execution_groups=tuple(
+            tuple(
+                lane * (args.reader_shards // args.dp) + slot for lane in range(args.dp)
+            )
+            for slot in range(args.reader_shards // args.dp)
+        ),
+        source=RecommendationSourceDescriptor(),
+    )(type("TrainingReader", (RecommendationReader,), {"__module__": __name__}))
+
     with FunctionalGraph("End-to-End_Training_Flow") as graph:
-        reader = RecommendationReader(
+        reader = reader_type(
             name="TrainingReader",
             mesh=reader_mesh,
             runtime_env=cpu_runtime_env,
@@ -210,7 +251,9 @@ async def run_training(args):
         )
 
         h_raw = reader.read()
-        h_proc = input_node.process(h_raw)
+        h_proc = input_node.process(
+            h_raw, unit_routing=WholeUnitRouting(tuple(range(args.dp)))
+        )
 
         h_emb1 = table1.lookup(
             unique_ids=h_proc.unique_user_ids  # type: ignore
@@ -250,22 +293,65 @@ async def run_training(args):
         table2.update(grads=h_scatter.grad2)  # type: ignore
         dense.update(dense_grad=h_scatter.dense_grad, local=True)  # type: ignore
 
-        placement_recipe = PlacementRecipe(
-            recipe_id="recommendation-training",
-            version="1.0.0",
-            constraints=(),
-            objective=AFFINITY_FIRST_V1,
+        input_dense_constraints = tuple(
+            equal(
+                support(rank(workers(InputSPMD), i)),
+                support(rank(workers(DenseSPMD), i)),
+            )
+            for i in range(args.dp)
         )
         task_graph = graph.build()
+        reader_pairs = set()
+        for dependency in task_graph.require_compiled_graph().dependencies:
+            if dependency.spec.source.spmd_id != "TrainingReader":
+                continue
+            for transfer in dependency.transfers:
+                relation = dependency.unit_relation(transfer.transfer_code)
+                if relation is None:
+                    raise ValueError(
+                        "recommendation Reader requires compiled unit routing"
+                    )
+                for group in dependency.source_operator.execution_layout.cycle:
+                    for consumer, producers in enumerate(relation.producers_by_target):
+                        reader_pairs.update(
+                            (group[producer], consumer) for producer in producers
+                        )
+        placement_recipe = PlacementRecipe(
+            recipe_id="recommendation-training",
+            version="2.0.0",
+            constraints=(
+                *(
+                    equal(
+                        support(rank(workers(reader_type), producer)),
+                        support(rank(workers(InputSPMD), consumer)),
+                    )
+                    for producer, consumer in sorted(reader_pairs)
+                ),
+                *input_dense_constraints,
+            ),
+            objective=AFFINITY_FIRST_V1,
+        )
 
     _apply_data_plane_config(task_graph, args)
     _export_graph_visualization(task_graph, args)
     print(f"[Fluxway] Graph compiled. Nodes: {list(task_graph.nodes.keys())}")
 
     async_step_config = AsyncStepConfig(max_steps=args.max_steps)
-    checkpoint_config = CheckpointConfig(
-        repository_dir=args.checkpoint_dir,
-        interval_steps=args.checkpoint_interval,
+    source_max_in_flight = args.source_max_in_flight
+    source_control = (
+        SourceControlConfig(
+            max_in_flight_steps=source_max_in_flight,
+        )
+        if task_graph.requires_source_control_runtime
+        else None
+    )
+    checkpoint_config = (
+        CheckpointConfig(
+            repository_dir=args.checkpoint_dir,
+            interval_steps=args.checkpoint_interval,
+        )
+        if args.checkpoint_interval > 0
+        else None
     )
     profiler_config = _build_profiler_config(args)
     if profiler_config is not None:
@@ -276,9 +362,10 @@ async def run_training(args):
         task_graph,
         placement_recipe=placement_recipe,
         async_step_config=async_step_config,
+        source_control=source_control,
         checkpoint_config=checkpoint_config,
         profiler_config=profiler_config,
-        resume="latest",
+        resume="latest" if checkpoint_config is not None else None,
     )
     await _print_resource_allocation_summary(execution)
 
@@ -291,6 +378,20 @@ async def run_training(args):
 
     await execution.cancel()
     print("[Fluxway] Training completed up to max steps.")
+
+    if getattr(args, "compact_checkpoints", False):
+        print(
+            "[Fluxway] Training finished. Triggering manual sparse checkpoint compaction …"
+        )
+        for spmd_id in ("EmbeddingTable1", "EmbeddingTable2"):
+            print(
+                f"[Fluxway] Compacting sparse checkpoints for {spmd_id} in {args.checkpoint_dir} …"
+            )
+            await compact_sparse_checkpoints(
+                repository_root=args.checkpoint_dir,
+                spmd_id=spmd_id,
+            )
+        print("[Fluxway] Manual sparse checkpoint compaction completed.")
 
 
 def main():
@@ -312,9 +413,21 @@ def main():
         help="Number of synthetic reader epochs",
     )
     parser.add_argument(
+        "--source-max-in-flight",
+        type=int,
+        default=4,
+        help="Maximum logical source work steps acquired in flight",
+    )
+    parser.add_argument(
         "--checkpoint-dir",
         default="/tmp/fluxway_recsys_ckpt",
         help="Checkpoint directory for this training run",
+    )
+    parser.add_argument(
+        "--reader-shards",
+        type=int,
+        default=4,
+        help="Number of Reader SPMD workers",
     )
     parser.add_argument(
         "--dp",
@@ -455,6 +568,16 @@ def main():
         type=int,
         default=None,
         help="Override local ray.init num_gpus for this example run",
+    )
+    parser.add_argument(
+        "--compact-checkpoints",
+        action="store_true",
+        help="Manually trigger sparse embedding checkpoint compaction after training",
+    )
+    parser.add_argument(
+        "--compact-only",
+        action="store_true",
+        help="Manually trigger sparse embedding checkpoint compaction without training",
     )
     args = parser.parse_args()
     if args.clear_ckpt:

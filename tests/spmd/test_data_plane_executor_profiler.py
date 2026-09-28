@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import threading
 import types
+import weakref
 
 import numpy as np
 import pytest
@@ -54,7 +56,7 @@ def _empty_header(step: int = 0) -> TransportFrameHeader:
 
 
 def _compiled_plan() -> CompiledSendPlan:
-    return CompiledSendPlan(
+    return CompiledSendPlan.create(
         op_name="op",
         source_spmd_id="source",
         rank=0,
@@ -191,7 +193,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         process_name="worker/spmd/rank:0",
     )
     handler = _Handler()
-    compiled_plan = CompiledSendPlan(
+    compiled_plan = CompiledSendPlan.create(
         op_name="op",
         source_spmd_id="source",
         rank=0,
@@ -228,7 +230,9 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 3, "op"),
         profiler_recorder=runtime.recorder,
-        batch_submit=lambda _batch, enqueue: enqueue(),
+        batch_submit=lambda batches, enqueue: asyncio.gather(
+            *(enqueue(batch) for batch in batches)
+        ),
     )
 
     await asyncio.gather(*result)
@@ -296,7 +300,7 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         async def invoke_control(self, op_name, step, names, values, sender_spmd_code):
             return True
 
-    compiled_plan = CompiledSendPlan(
+    compiled_plan = CompiledSendPlan.create(
         op_name="op",
         source_spmd_id="source",
         rank=0,
@@ -341,7 +345,9 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 4, "op"),
-        batch_submit=lambda _batch, enqueue: enqueue(),
+        batch_submit=lambda batches, enqueue: asyncio.gather(
+            *(enqueue(batch) for batch in batches)
+        ),
     )
     second = await executor.send_tensor_frames(
         compiled_plan=compiled_plan,
@@ -354,7 +360,9 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
         batch_flush_us=10_000,
         submit_delivery=submit_delivery,
         delivery_schedule_key=(0, 0, 4, "op"),
-        batch_submit=lambda _batch, enqueue: enqueue(),
+        batch_submit=lambda batches, enqueue: asyncio.gather(
+            *(enqueue(batch) for batch in batches)
+        ),
     )
     await asyncio.gather(*first, *second)
 
@@ -365,3 +373,120 @@ async def test_batching_executor_coalesces_same_target_frames_for_axon_flat_batc
     assert all(isinstance(frame, TransportFrameEnvelope) for frame in frames)
     assert [int(frame.header.frame_i32[1]) for frame in frames] == [4, 4]
     assert [float(frame.payload_segments[0][0]) for frame in frames] == [4.0, 4.0]
+
+
+@pytest.mark.asyncio
+async def test_executor_submits_one_complete_target_fanout_publication(monkeypatch):
+    def fake_build_step_frame_groups(**kwargs):
+        header = _empty_header(kwargs["exec_step"])
+        return [(0, (target_rank, header, ())) for target_rank in (0, 1)]
+
+    monkeypatch.setattr(
+        executor_module,
+        "build_step_frame_groups",
+        fake_build_step_frame_groups,
+    )
+    compiled_plan = CompiledSendPlan.create(
+        op_name="op",
+        source_spmd_id="source",
+        rank=0,
+        sender_spmd_code=1,
+        sender_world_size=1,
+        successor_routes=(
+            CompiledSuccessorRoute(
+                context_index=0,
+                spmd_id="sink",
+                effective_rank=0,
+                tensor_routes=(),
+            ),
+        ),
+        output_count=0,
+        transfer_code_to_name={},
+    )
+    handlers = {target_rank: _Handler() for target_rank in (0, 1)}
+    submitted: list[tuple[int, ...]] = []
+
+    async def submit_delivery(coro):
+        return asyncio.create_task(coro)
+
+    async def submit_publication(batches, enqueue):
+        submitted.append(tuple(batch.target_rank for batch in batches))
+        return await asyncio.gather(*(enqueue(batch) for batch in batches))
+
+    result = await BatchingDataPlaneExecutor().send_tensor_frames(
+        compiled_plan=compiled_plan,
+        flat_results=[],
+        step_transfer_cache={},
+        exec_step=5,
+        successor_handlers=(handlers,),
+        source_spmd_id="source",
+        batch_max_frames=8,
+        batch_flush_us=0,
+        submit_delivery=submit_delivery,
+        delivery_schedule_key=(0, 0, 5, "op"),
+        batch_submit=submit_publication,
+    )
+
+    assert len(result) == 1
+    await asyncio.gather(*result)
+    assert submitted == [(0, 1)]
+    assert [handlers[target_rank].calls for target_rank in (0, 1)] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_executor_drops_producer_frame_reference_after_publication(monkeypatch):
+    payload_reference: weakref.ReferenceType[np.ndarray] | None = None
+
+    def fake_build_step_frame_groups(**kwargs):
+        nonlocal payload_reference
+        payload = np.arange(64, dtype=np.int64)
+        payload_reference = weakref.ref(payload)
+        return [(0, (0, _empty_header(kwargs["exec_step"]), (payload,)))]
+
+    monkeypatch.setattr(
+        executor_module,
+        "build_step_frame_groups",
+        fake_build_step_frame_groups,
+    )
+    compiled_plan = CompiledSendPlan.create(
+        op_name="op",
+        source_spmd_id="source",
+        rank=0,
+        sender_spmd_code=1,
+        sender_world_size=1,
+        successor_routes=(
+            CompiledSuccessorRoute(
+                context_index=0,
+                spmd_id="sink",
+                effective_rank=0,
+                tensor_routes=(),
+            ),
+        ),
+        output_count=0,
+        transfer_code_to_name={},
+    )
+    handler = _Handler()
+
+    async def submit_delivery(coro):
+        return asyncio.create_task(coro)
+
+    async def submit_publication(batches, enqueue):
+        return await asyncio.gather(*(enqueue(batch) for batch in batches))
+
+    result = await BatchingDataPlaneExecutor().send_tensor_frames(
+        compiled_plan=compiled_plan,
+        flat_results=[],
+        step_transfer_cache={},
+        exec_step=6,
+        successor_handlers=({0: handler},),
+        source_spmd_id="source",
+        batch_max_frames=8,
+        batch_flush_us=0,
+        submit_delivery=submit_delivery,
+        delivery_schedule_key=(0, 0, 6, "op"),
+        batch_submit=submit_publication,
+    )
+    await asyncio.gather(*result)
+    gc.collect()
+    assert payload_reference is not None
+    assert payload_reference() is None

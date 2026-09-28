@@ -26,6 +26,7 @@ class LocalStepNodeKind(IntEnum):
     WAIT = 3
     # BARRIER observes SEND registration, clears local step state, and commits.
     BARRIER = 4
+    AWAIT_SEND = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +330,7 @@ class LocalStepPlanExecutor:
             LocalStepNodeKind.WAIT,
             LocalStepNodeKind.SEND,
             LocalStepNodeKind.BARRIER,
+            LocalStepNodeKind.AWAIT_SEND,
         ):
             # Runtime nodes fail by propagating their callable exception. SEND
             # returns a worker-owned token; BARRIER observes token registration,

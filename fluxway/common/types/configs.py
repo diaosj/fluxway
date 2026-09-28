@@ -5,6 +5,7 @@ Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
 from typing import Any, Annotated, TypeVar
+import os
 from pydantic import ConfigDict, Field, model_validator
 
 from fluxway.common.compiled_graph import (
@@ -15,12 +16,16 @@ from fluxway.common.compiled_graph import (
 from fluxway.common.schema import FluxwayBaseSchema
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types.failure import ExecutionFailure
+from fluxway.common.types.checkpoint import CheckpointRetentionPolicy
 from fluxway.resources import ResourceProfile
 
 
 from enum import StrEnum
 
 T = TypeVar("T")
+
+DEFAULT_SNAPSHOT_TIMEOUT_SECS: float = 86400.0
+DEFAULT_INACTIVITY_TIMEOUT_SECS: float = 600.0
 
 
 # Transport stream markers for fields within a @data_type
@@ -107,6 +112,9 @@ class SPMDConfig(FluxwayBaseSchema):
 
     # If true, workers enqueue source operators immediately after topology startup.
     auto_start_source_operators: bool = True
+
+    # Inactivity timeout threshold for checkpointing watchdog
+    inactivity_timeout_s: float = DEFAULT_INACTIVITY_TIMEOUT_SECS
 
     def require_graph_view(self) -> SPMDGraphView:
         if self.graph_view is None:
@@ -197,7 +205,9 @@ class OperatorContext(FluxwayBaseSchema):
     logical_rank: int
     logical_world_size: int
     step: int
+    global_source_offset: int | None = None
     is_interleaved: bool = False
+    source_work_items: Any | None = None
 
 
 class Graph(FluxwayBaseSchema):
@@ -232,6 +242,16 @@ class Graph(FluxwayBaseSchema):
     @property
     def sink_nodes(self) -> tuple[str, ...]:
         return self.require_compiled_graph().sink_spmd_ids
+
+    @property
+    def requires_source_control_runtime(self) -> bool:
+        """Whether this graph contains a descriptor-backed source operator."""
+        return self.require_compiled_graph().requires_source_control_runtime
+
+    @property
+    def source_control_spmd_ids(self) -> tuple[str, ...]:
+        """Canonical SPMD owners for ordered source-control publication."""
+        return self.require_compiled_graph().source_control_spmd_ids
 
 
 class GraphValidationResult(FluxwayBaseSchema):
@@ -381,29 +401,40 @@ class WorkerStatus(StrEnum):
     """Worker operational status."""
 
     INITIALIZING = "initializing"
+    READY = "ready"
+    RESTORING = "restoring"
+    STOPPED = "stopped"
     RUNNING = "running"
     BLOCKED = "blocked"
     ERROR = "error"
 
 
-class ControllerState(StrEnum):
-    """Controller state machine states.
+class CheckpointActivityPhase(StrEnum):
+    """Worker-local checkpoint activity reported in heartbeats."""
 
-    Lifecycle:
-      INITIALIZING → PENDING → TOPOLOGY_REGISTERING → READY → RUNNING
-                                                       ↓
-                                                  COMPLETING / FAILING
-                                                        ↓
-                                                 COMPLETED / FAILED
-    """
+    IDLE = "idle"
+    CUTTING = "cutting"
+    CAPTURING = "capturing"
+    STAGING = "staging"
+    COMMITTING = "committing"
+    PUBLISHED = "published"
+    FAILED = "failed"
+
+
+class ControllerState(StrEnum):
+    """Controller lifecycle phases coordinated by ExecutionLifecycle."""
 
     INITIALIZING = "initializing"  # Allocating resources, starting SPMDs
     PENDING = "pending"  # Waiting for all drivers to init (workers_ready)
     TOPOLOGY_REGISTERING = "topology_registering"  # topology registration in progress
     READY = "ready"  # Topology ready, waiting for start
+    ACTIVATING = "activating"
+    RESUMING = "resuming"
     RUNNING = "running"  # Normal execution
     COMPLETING = "completing"  # Final cleanup after successful execution
     FAILING = "failing"  # Final cleanup after unrecoverable failure
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
     COMPLETED = "completed"  # Task completed
     FAILED = "failed"  # Task failed
 
@@ -414,13 +445,16 @@ class ControllerEvent(StrEnum):
     INIT_COMPLETE = "init_complete"  # Resources allocated, SPMDs started
     ALL_DRIVERS_READY = "all_drivers_ready"  # All drivers report workers_ready
     ALL_SPMDS_TOPOLOGY_READY = (
-        "all_spmds_topology_ready"  # All workers running after topology
+        "all_spmds_topology_ready"  # All worker topologies ready after topology
     )
     START = "start"  # Start execution
+    ACTIVATION_COMPLETE = "activation_complete"
+    RESUME = "resume"
     DRIVER_ERROR = "driver_error"  # Driver heartbeat timeout or error
     ALL_DRIVERS_COMPLETED = "all_drivers_completed"  # All drivers report completion
     CLEANUP_FINISHED = "cleanup_finished"  # Terminal cleanup completed
     CLEANUP_FAILED = "cleanup_failed"  # Terminal cleanup failed
+    CANCEL = "cancel"
 
 
 class DriverState(StrEnum):
@@ -429,6 +463,7 @@ class DriverState(StrEnum):
     INITIALIZING = "initializing"  # Initializing workers
     READY = "ready"  # Ready, waiting for Controller command
     RESTORING = "restoring"  # Restoring a published checkpoint
+    ACTIVATING = "activating"
     RUNNING = "running"  # Running
     BLOCKED = "blocked"  # Blocked
     DRAINING = "draining"  # Draining to checkpoint_object step
@@ -436,6 +471,8 @@ class DriverState(StrEnum):
     SNAPSHOTTING = "snapshotting"  # Extracting operator states via save_state
     ERROR = "error"  # Error state
     COMPLETED = "completed"  # Completed
+    STOPPING = "stopping"
+    STOPPED = "stopped"
 
 
 class DriverEvent(StrEnum):
@@ -444,6 +481,7 @@ class DriverEvent(StrEnum):
     INIT_COMPLETE = "init_complete"
     INIT_FAILED = "init_failed"
     START = "start"
+    ACTIVATION_COMPLETE = "activation_complete"
     WORKER_ERROR = "worker_error"
     COMPONENT_ERROR = "component_error"
     BLOCK_REQUESTED = "block_requested"
@@ -458,6 +496,8 @@ class DriverEvent(StrEnum):
     RESTORE_REQUESTED = "restore_requested"
     RESTORE_COMPLETE = "restore_complete"
     RESTORE_FAILED = "restore_failed"
+    STOP = "stop"
+    STOPPED = "stopped"
 
 
 class _FailureHeartbeat[StatusT](FluxwayBaseSchema):
@@ -478,6 +518,10 @@ class WorkerHeartbeat(_FailureHeartbeat[WorkerStatus]):
     rank: int
     timestamp: float
     status: WorkerStatus = WorkerStatus.RUNNING
+    checkpoint_phase: CheckpointActivityPhase = CheckpointActivityPhase.IDLE
+    checkpoint_progress_timestamp: float = 0.0
+    checkpoint_id: str | None = None
+    checkpoint_completed_units: int = 0
 
 
 class DriverHeartbeat(_FailureHeartbeat[DriverStatus]):
@@ -490,7 +534,7 @@ class DriverHeartbeat(_FailureHeartbeat[DriverStatus]):
     num_workers: int = 0
     healthy_num_workers: int = 0
     workers_ready: bool = False  # All workers have reported heartbeat
-    workers_running: bool = False  # All workers are running main loop
+    topology_ready: bool = False
 
 
 class FlowControlState(FluxwayBaseSchema):
@@ -510,11 +554,51 @@ class HeartbeatConfig(FluxwayBaseSchema):
     max_missed_heartbeats: int = 60  # Maximum missed heartbeats before error
 
 
+DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS: int = 100
+
+
+class SourceControlConfig(FluxwayBaseSchema):
+    """Configuration for bounded logical source work acquisition."""
+
+    max_in_flight_steps: int = DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS
+    max_planning_units: int = 100_000
+    max_planning_descriptor_bytes: int = 64 * 1024 * 1024
+
+    @model_validator(mode="after")
+    def _validate_source_control_config(self) -> "SourceControlConfig":
+        if self.max_in_flight_steps < 1:
+            raise ValueError("source_control max_in_flight_steps must be positive")
+        if self.max_planning_units < 1:
+            raise ValueError("source_control max_planning_units must be positive")
+        if self.max_planning_descriptor_bytes < 1:
+            raise ValueError(
+                "source_control max_planning_descriptor_bytes must be positive"
+            )
+        return self
+
+
 class CheckpointConfig(FluxwayBaseSchema):
     """Configuration for checkpoint manager."""
 
     repository_dir: str
     interval_steps: int
+    snapshot_timeout_s: float = Field(
+        default_factory=lambda: float(
+            os.environ.get(
+                "FLUXWAY_SNAPSHOT_TIMEOUT_SECS",
+                str(DEFAULT_SNAPSHOT_TIMEOUT_SECS),
+            )
+        )
+    )
+    inactivity_timeout_s: float = DEFAULT_INACTIVITY_TIMEOUT_SECS
+    retention_policy: CheckpointRetentionPolicy = Field(
+        default_factory=CheckpointRetentionPolicy
+    )
+    retention_domains: dict[str, CheckpointRetentionPolicy] = Field(
+        default_factory=dict
+    )
+    restore_scope: tuple[str, ...] | None = None
+    restore_spmd_bindings: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_checkpoint_config(self):
@@ -522,6 +606,34 @@ class CheckpointConfig(FluxwayBaseSchema):
             raise ValueError("repository_dir must be non-empty")
         if self.interval_steps < 1:
             raise ValueError("interval_steps must be positive")
+        if self.snapshot_timeout_s <= 0:
+            raise ValueError("snapshot_timeout_s must be positive")
+        if self.inactivity_timeout_s <= 0:
+            raise ValueError("inactivity_timeout_s must be positive")
+        if any(not domain for domain in self.retention_domains):
+            raise ValueError("retention_domains keys must be non-empty")
+        if self.restore_scope is not None:
+            if not self.restore_scope:
+                raise ValueError("restore_scope must not be empty when provided")
+            if any(not value for value in self.restore_scope):
+                raise ValueError("restore_scope entries must be non-empty")
+            if len(set(self.restore_scope)) != len(self.restore_scope):
+                raise ValueError("restore_scope entries must be unique")
+        if any(
+            not source or not target
+            for source, target in self.restore_spmd_bindings.items()
+        ):
+            raise ValueError("restore_spmd_bindings requires non-empty IDs")
+        if len(set(self.restore_spmd_bindings.values())) != len(
+            self.restore_spmd_bindings
+        ):
+            raise ValueError("restore_spmd_bindings targets must be unique")
+        if self.restore_scope is not None and not set(
+            self.restore_spmd_bindings
+        ).issubset(self.restore_scope):
+            raise ValueError(
+                "restore_spmd_bindings sources must belong to restore_scope"
+            )
         return self
 
 

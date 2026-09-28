@@ -63,7 +63,6 @@ class AllocationRegistry:
         self._retired: dict[CoherenceSubject, deque[CoherenceInstance]] = defaultdict(
             deque
         )
-        self._watermarks: dict[CoherenceSubject, int] = {}
 
     def bind(
         self,
@@ -114,39 +113,28 @@ class AllocationRegistry:
                 "allocation handoff requires an exact allocation and byte span."
             )
 
-    def retire(self, instance: CoherenceInstance) -> None:
-        if instance not in self._bindings:
+    def detach(self, instance: CoherenceInstance) -> AllocationBinding:
+        """Drop an identity binding after payload ownership has transferred."""
+        try:
+            return self._bindings.pop(instance)
+        except KeyError as exc:
             raise RetirementInvariantError(
-                f"cannot retire an unbound tensor instance: {instance}."
-            )
-        del self._bindings[instance]
-        self._retired[instance.subject].append(instance)
+                f"cannot detach an unbound tensor instance: {instance}."
+            ) from exc
 
-    def watermark(self, subject: CoherenceSubject) -> int:
-        return self._watermarks.get(subject, 0)
-
-    def advance_watermark(self, subject: CoherenceSubject, epoch: int) -> int:
-        current = self._watermarks.get(subject, 0)
-        if epoch < current:
-            raise RetirementInvariantError(
-                f"retirement watermark regressed from {current} to {epoch}."
-            )
-        self._watermarks[subject] = epoch
-        retired = self._retired.get(subject)
+    def forget_retired(self, instance: CoherenceInstance) -> None:
+        """Remove a logically retired handoff tombstone after proof consumption."""
+        retired = self._retired.get(instance.subject)
         if retired is None:
-            return 0
-        removed = 0
-        while retired and retired[0].epoch < epoch:
-            instance = retired[0]
-            if instance in self._bindings:
-                raise RetirementInvariantError(
-                    f"retired instance still has a live binding: {instance}."
-                )
-            retired.popleft()
-            removed += 1
+            return
+        try:
+            retired.remove(instance)
+        except ValueError as exc:
+            raise RetirementInvariantError(
+                f"retired allocation instance is not tracked: {instance}."
+            ) from exc
         if not retired:
-            del self._retired[subject]
-        return removed
+            del self._retired[instance.subject]
 
     def binding(self, instance: CoherenceInstance) -> AllocationBinding:
         try:
@@ -162,4 +150,3 @@ class AllocationRegistry:
     def fence(self) -> None:
         self._bindings.clear()
         self._retired.clear()
-        self._watermarks.clear()

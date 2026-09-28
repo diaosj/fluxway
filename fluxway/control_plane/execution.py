@@ -1,8 +1,11 @@
+import asyncio
+from collections.abc import AsyncIterator
 from typing import Any, Literal, TYPE_CHECKING
 from fluxway.common.types import (
     Graph,
     HeartbeatConfig,
     AsyncStepConfig,
+    SourceControlConfig,
     CheckpointConfig,
 )
 from fluxway.placement import (
@@ -29,6 +32,7 @@ class GraphExecution:
         self._controller = controller_handle
         self._allocation = allocation
         self._restored_step = restored_step
+        self._completion_task: asyncio.Task[bool] | None = None
 
     @property
     def allocation(self) -> Any:
@@ -37,6 +41,16 @@ class GraphExecution:
     @property
     def restored_step(self) -> int | None:
         return self._restored_step
+
+    def _ensure_completion_task(self) -> asyncio.Task[bool]:
+        if self._completion_task is None:
+            ref = self._controller.wait_for_completion.remote(None)
+            self._completion_task = asyncio.create_task(self._await_object_ref(ref))
+        return self._completion_task
+
+    @staticmethod
+    async def _await_object_ref(ref: Any) -> bool:
+        return await ref
 
     async def progress(self) -> dict[str, dict[str, int]]:
         return await self._controller.get_async_step_progress.remote()
@@ -48,13 +62,36 @@ class GraphExecution:
         Raises ExecutionFailedError on failure.
         Raises TimeoutError on timeout.
         """
-        await self._controller.wait_for_completion.remote(timeout)
+        task = self._ensure_completion_task()
+        if timeout is None:
+            await task
+            return
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+
+    async def monitor_progress(
+        self, interval_s: float
+    ) -> AsyncIterator[dict[str, dict[str, int]]]:
+        """
+        Periodically stream progress updates until completion without raising TimeoutError.
+        """
+        if interval_s <= 0:
+            raise ValueError(f"progress interval must be positive, got {interval_s}")
+        while True:
+            try:
+                await self.wait(timeout=interval_s)
+                return
+            except TimeoutError:
+                yield await self.progress()
 
     async def cancel(self) -> None:
         """
         Cancel execution and clean up resources.
         """
-        await self._controller.stop.remote(save_checkpoint=False)
+        try:
+            await self._controller.stop.remote(save_checkpoint=False)
+        finally:
+            if self._completion_task is not None and not self._completion_task.done():
+                self._completion_task.cancel()
 
 
 async def start(
@@ -65,6 +102,7 @@ async def start(
     placement_runtime: PlacementRuntimeConfig | None = None,
     heartbeat_config: HeartbeatConfig | None = None,
     async_step_config: AsyncStepConfig | None = None,
+    source_control: SourceControlConfig | None = None,
     checkpoint_config: CheckpointConfig | None = None,
     resume: Literal["latest"] | int | None = None,
     runtime_env: dict[str, Any] | None = None,
@@ -85,6 +123,7 @@ async def start(
         placement_recipe=placement_recipe,
         heartbeat_config=heartbeat_config,
         async_step_config=async_step_config,
+        source_control=source_control,
         checkpoint_config=checkpoint_config,
         transport_config=transport_config,
         profiler_config=profiler_config,

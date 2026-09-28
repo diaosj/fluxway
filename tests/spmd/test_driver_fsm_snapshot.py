@@ -18,6 +18,7 @@ def _make_fsm() -> tuple[DriverStateMachine, MagicMock]:
     # Advance to RUNNING so snapshot path is reachable
     fsm.trigger(DriverEvent.INIT_COMPLETE)  # INITIALIZING → READY
     fsm.trigger(DriverEvent.START)  # READY → RUNNING
+    fsm.trigger(DriverEvent.ACTIVATION_COMPLETE)
     assert fsm.state == DriverState.RUNNING
     return fsm, driver
 
@@ -86,6 +87,7 @@ class TestSnapshotHappyPath:
         fsm.require_transition(DriverEvent.RESTORE_COMPLETE)
         assert fsm.state is DriverState.READY
         fsm.require_transition(DriverEvent.START)
+        fsm.require_transition(DriverEvent.ACTIVATION_COMPLETE)
         assert fsm.state is DriverState.RUNNING
 
     def test_repeated_drain_admission_is_state_owned(self):

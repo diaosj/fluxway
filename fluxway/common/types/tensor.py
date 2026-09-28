@@ -1,6 +1,6 @@
 import logging
 from enum import Enum, auto
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import numpy as np
 
@@ -12,9 +12,10 @@ from fluxway.common.coherence import (
     CoherenceStateTransitionError,
     TensorAccessIntent,
     CoherenceInstance,
+    PhysicalMutability,
 )
 
-from fluxway.common.tensor_backend import get_backend
+from fluxway.common.tensor_backend import force_writable, get_backend
 from fluxway.common.index_descriptor import (
     ContinuousIndex,
     IndexDescriptor,
@@ -40,11 +41,52 @@ class TensorRuntimeState(Enum):
     RELEASED = auto()
 
 
+class _ConsumerLeaseOwner(Protocol):
+    def acquire_consumer_lease(
+        self, instances: tuple[CoherenceInstance, ...]
+    ) -> Any: ...
+
+    def reserve_consumer_lease(
+        self, instances: tuple[CoherenceInstance, ...]
+    ) -> Any: ...
+
+
+class TensorConsumerLease:
+    __slots__ = ("_lease", "_tensor", "_released")
+
+    def __init__(self, tensor: "TransportTensor", lease: Any) -> None:
+        self._tensor = tensor
+        self._lease = lease
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            raise CoherenceStateTransitionError(
+                "tensor consumer lease was already released."
+            )
+        self._released = True
+        self._lease.release()
+        self._tensor._release_consumer_lease()
+
+    def cancel(self) -> None:
+        self.release()
+
+
 class _ReleasedPayload:
     __slots__ = ()
 
 
 _RELEASED_PAYLOAD = _ReleasedPayload()
+
+
+class _LocalConsumerLease:
+    __slots__ = ()
+
+    def release(self) -> None:
+        return None
+
+    def cancel(self) -> None:
+        self.release()
 
 
 def runtime_allocation_descriptor(value: Any) -> AllocationDescriptor:
@@ -256,6 +298,10 @@ class TransportTensor:
         self._source_step = None
         self._runtime_access_intent = TensorAccessIntent.WRITABLE
         self._runtime_state = TensorRuntimeState.VALID
+        self._consumer_lease_owner: _ConsumerLeaseOwner | None = None
+        self._consumer_lease_reservation: Any | None = None
+        self._active_consumer_leases = 0
+        self._release_requested = False
         self._coherence_instances: tuple[CoherenceInstance, ...] = ()
         self._allocation_descriptor: AllocationDescriptor | None = None
         self.source_step = source_step
@@ -278,6 +324,8 @@ class TransportTensor:
         routing_indices: Any | None = None,
         receipt: SymmetryReceipt | None = None,
         routing_axes: tuple[int, ...] = (0,),
+        logical_world_size: int | None = None,
+        is_uniform_dense_partition: bool = False,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
@@ -293,6 +341,9 @@ class TransportTensor:
                 domain. Default (0,) is correct for nearly all DP/MP/EP/SP/CP/TP
                 layouts. The planner stays 1-D regardless; routing_axes only
                 affects the apply (gather) step in the L1 distributor.
+            is_uniform_dense_partition: If True, auto-infers `global_shape` by multiplying
+                the leading dimension with `logical_world_size`. Must be False for ragged
+                or filtered data.
         """
         # NOTE: We intentionally do NOT auto-fill origin_indices here.
         # `origin_indices` is per-origin-rank state ("which global rows do I hold"),
@@ -300,6 +351,16 @@ class TransportTensor:
         # any auto-synthesized value would be a wrong guess (e.g. all ranks claiming
         # start=0). The caller MUST set origin_indices explicitly when it is needed,
         # otherwise leave it as None and let the receipt/transport layer take over.
+        backend = get_backend()
+        if (
+            global_shape is None
+            and logical_world_size is not None
+            and is_uniform_dense_partition
+        ):
+            p_shape = backend.shape(tensor)
+            if len(p_shape) > 0:
+                global_shape = (p_shape[0] * logical_world_size,) + tuple(p_shape[1:])
+
         return cls(
             flat_values=tensor,
             nested_splits=[],
@@ -320,6 +381,8 @@ class TransportTensor:
         routing_indices: Any | None = None,
         receipt: SymmetryReceipt | None = None,
         routing_axes: tuple[int, ...] = (0,),
+        logical_world_size: int | None = None,
+        is_uniform_dense_partition: bool = False,
     ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
@@ -357,6 +420,15 @@ class TransportTensor:
             if dtype is None:
                 dtype = backend.float32()
             dense_tensor = backend.tensor(data, dtype=dtype)
+
+            if (
+                global_shape is None
+                and logical_world_size is not None
+                and is_uniform_dense_partition
+            ):
+                p_shape = backend.shape(dense_tensor)
+                global_shape = (p_shape[0] * logical_world_size,) + tuple(p_shape[1:])
+
             return cls(
                 dense_tensor,
                 [],
@@ -409,6 +481,7 @@ class TransportTensor:
             dtype = backend.float32()
 
         flat_tensor = backend.tensor(current_level_lists, dtype=dtype)
+
         return cls(
             flat_tensor,
             all_splits,
@@ -416,6 +489,42 @@ class TransportTensor:
             origin_indices=origin_indices,
             routing_indices=routing_indices,
             receipt=receipt,
+            routing_axes=routing_axes,
+        )
+
+    @classmethod
+    def from_row_partitioned(
+        cls,
+        rows: list[list[Any]],
+        *,
+        width: int,
+        dtype: Any | None = None,
+        global_shape: tuple[int, int] | None = None,
+        origin_indices: Any | None = None,
+        routing_axes: tuple[int, ...] = (0,),
+    ) -> "TransportTensor":
+        if width <= 0:
+            raise ValueError("row-partitioned width must be positive")
+        if not all(isinstance(row, list) for row in rows):
+            raise TypeError("row-partitioned rows must be lists")
+        if global_shape is None:
+            raise ValueError("row-partitioned tensors require explicit global_shape")
+        if tuple(global_shape)[1] != width:
+            raise ValueError("global_shape width does not match row-partitioned width")
+        backend = get_backend()
+        flat = [value for row in rows for value in row]
+        offsets = [0]
+        for row in rows:
+            offsets.append(offsets[-1] + len(row))
+        if dtype is None:
+            dtype = backend.float32()
+        flat_tensor = backend.tensor(flat, dtype=dtype)
+        splits = backend.tensor(offsets, dtype=backend.int32())
+        return cls(
+            flat_tensor,
+            [splits],
+            global_shape=global_shape,
+            origin_indices=origin_indices,
             routing_axes=routing_axes,
         )
 
@@ -461,6 +570,97 @@ class TransportTensor:
             return get_backend().readonly_view(values)
         return values
 
+    @property
+    def is_readonly(self) -> bool:
+        return self._runtime_access_intent is TensorAccessIntent.READONLY
+
+    @property
+    def physical_mutability(self) -> PhysicalMutability:
+        return self._payload.physical_mutability
+
+    def dlpack_values_for_consumer(self) -> Any:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"tensor access is {self._runtime_state.name.lower()}."
+            )
+        if not self.is_readonly:
+            raise CoherenceStateTransitionError(
+                "DLPack consumer export requires a readonly coherence grant."
+            )
+        if self.physical_mutability is not PhysicalMutability.PROVEN_WRITABLE:
+            raise CoherenceStateTransitionError(
+                "DLPack consumer export requires a physically writable payload."
+            )
+        return force_writable(self._payload.values)
+
+    def acquire_consumer_lease(self) -> TensorConsumerLease:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"cannot acquire a consumer lease while tensor access is "
+                f"{self._runtime_state.name.lower()}."
+            )
+        owner = self._consumer_lease_owner
+        if self._coherence_instances and owner is None:
+            raise CoherenceStateTransitionError(
+                "coherence-bound tensor has no consumer lease owner."
+            )
+        reservation = self._consumer_lease_reservation
+        if reservation is not None:
+            lease = reservation.claim()
+            self._consumer_lease_reservation = None
+        else:
+            lease = (
+                owner.acquire_consumer_lease(self._coherence_instances)
+                if owner is not None
+                else _LocalConsumerLease()
+            )
+        self._active_consumer_leases += 1
+        return TensorConsumerLease(self, lease)
+
+    def _reserve_consumer_lease(self) -> None:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                "cannot reserve a consumer lease for invalid data."
+            )
+        owner = self._consumer_lease_owner
+        if owner is None or not self._coherence_instances:
+            raise CoherenceStateTransitionError(
+                "coherence-bound tensor has no consumer lease owner."
+            )
+        if self._consumer_lease_reservation is not None:
+            raise CoherenceStateTransitionError(
+                "tensor already has a consumer lease reservation."
+            )
+        self._consumer_lease_reservation = owner.reserve_consumer_lease(
+            self._coherence_instances
+        )
+
+    def _cancel_consumer_lease_reservation(self) -> None:
+        reservation = self._consumer_lease_reservation
+        if reservation is None:
+            return
+        self._consumer_lease_reservation = None
+        reservation.cancel()
+
+    def _release_consumer_lease(self) -> None:
+        if self._active_consumer_leases <= 0:
+            raise CoherenceStateTransitionError(
+                "tensor consumer lease count underflow."
+            )
+        self._active_consumer_leases -= 1
+        if self._active_consumer_leases == 0 and self._release_requested:
+            self._release_runtime_payload()
+
+    def _bind_consumer_lease_owner(self, owner: _ConsumerLeaseOwner) -> None:
+        if (
+            self._consumer_lease_owner is not None
+            and self._consumer_lease_owner is not owner
+        ):
+            raise CoherenceStateTransitionError(
+                "tensor consumer lease owner is already bound."
+            )
+        self._consumer_lease_owner = owner
+
     def _set_runtime_access_intent(self, intent: TensorAccessIntent) -> None:
         if not isinstance(intent, TensorAccessIntent):
             raise TypeError(
@@ -474,6 +674,9 @@ class TransportTensor:
         if self._runtime_state is TensorRuntimeState.RELEASED:
             raise CoherenceStateTransitionError("tensor payload was already released.")
         self._runtime_state = TensorRuntimeState.INVALIDATED
+        self._cancel_consumer_lease_reservation()
+        if self._active_consumer_leases:
+            self._release_requested = True
 
     def _release_runtime_payload(self) -> None:
         if self._runtime_state is TensorRuntimeState.VALID:
@@ -482,7 +685,10 @@ class TransportTensor:
             )
         if self._runtime_state is TensorRuntimeState.RELEASED:
             raise CoherenceStateTransitionError("tensor payload was already released.")
-        self._payload = TensorPayload(_RELEASED_PAYLOAD)
+        if self._active_consumer_leases:
+            self._release_requested = True
+            return
+        self._payload = TensorPayload(_RELEASED_PAYLOAD, PhysicalMutability.UNKNOWN)
         self._layout = TensorLayout((), None, self._routing_axes)
         self._flat_values = _RELEASED_PAYLOAD
         self._nested_splits.clear()
@@ -492,6 +698,7 @@ class TransportTensor:
         self._origin_indices = None
         self._receipt = None
         self._coherence_instances = ()
+        self._consumer_lease_reservation = None
         self._routing_indices_materialize_cache = None
         self._origin_indices_materialize_cache = None
         self._allocation_descriptor = None
@@ -949,6 +1156,7 @@ class TransportTensor:
                 [],
                 routing_indices=new_indices,
                 origin_indices=new_origin_indices,
+                global_shape=self._global_shape,
                 receipt=(
                     self._receipt[start : start + size_tensor]
                     if self._receipt
@@ -1078,6 +1286,7 @@ class TransportTensor:
                 new_nested_splits,
                 routing_indices=new_indices,
                 origin_indices=new_origin_indices,
+                global_shape=self._global_shape,
                 receipt=self._receipt[s:e] if self._receipt else None,
                 routing_axes=self._routing_axes,
             )
@@ -1193,6 +1402,7 @@ class TransportTensor:
             new_nested_splits,
             routing_indices=new_indices,
             origin_indices=new_origin_indices,
+            global_shape=self._global_shape,
             receipt=self._receipt[start:end] if self._receipt else None,
             routing_axes=self._routing_axes,
         )
@@ -1242,6 +1452,8 @@ class TransportTensor:
                 new_values,
                 self._nested_splits,
                 routing_indices=self._routing_indices,
+                origin_indices=self._origin_indices,
+                global_shape=self._global_shape,
                 routing_axes=self._routing_axes,
             )
         return self
@@ -1282,6 +1494,7 @@ class TransportTensor:
                 new_splits,
                 routing_indices=new_routing_indices,
                 origin_indices=new_origin_indices,
+                global_shape=self._global_shape,
                 receipt=self._receipt[idx_flat] if self._receipt else None,
                 routing_axes=self._routing_axes,
             )
@@ -1344,6 +1557,7 @@ class TransportTensor:
             new_splits,
             routing_indices=new_routing_indices,
             origin_indices=new_origin_indices,
+            global_shape=self._global_shape,
             routing_axes=self._routing_axes,
         )
 

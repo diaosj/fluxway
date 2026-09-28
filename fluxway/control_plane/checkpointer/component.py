@@ -178,13 +178,6 @@ class CheckpointComponentRegistration:
             raise ValueError(
                 "object cleanup capability requires object lifecycle capability"
             )
-        if any(
-            checkpoint_object.retention.retain_last is not None
-            for checkpoint_object in self.descriptor.checkpoint_objects
-        ) and (self.object_lifecycle is None or self.object_cleanup is None):
-            raise ValueError(
-                "finite checkpoint retention requires object lifecycle and object cleanup capabilities"
-            )
 
 
 class CheckpointComponentRegistry:

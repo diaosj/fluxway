@@ -16,6 +16,7 @@ import pytest
 
 from fluxway.common.tensor_backend import set_backend
 from fluxway.common.decorators import data_type, operator, operator_context, spmd
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.types.tensor import TransportTensor
 
 # ---------------------------------------------------------------------------
@@ -307,10 +308,15 @@ def test_embedding_update_modifies_params():
     """EmbeddingOp.update applies gradient descent; verified by observing changed lookup output."""
     ids = jnp.array([200, 201], dtype=jnp.int32)
     tt = TransportTensor(ids, global_shape=(2,))
+    instance_container = OperatorInstanceContainer()
 
     # Step 0 forward: record baseline embeddings
     with operator_context(
-        static_args={}, rank=0, world_size=1, operator_ctx=_ctx(step=0)
+        static_args={},
+        rank=0,
+        world_size=1,
+        operator_ctx=_ctx(step=0),
+        instance_container=instance_container,
     ):
         out_before = _ItemTable.lookup(tt)
 
@@ -319,14 +325,22 @@ def test_embedding_update_modifies_params():
     # Step 0 backward: apply uniform gradient of 0.5
     grads = TransportTensor(jnp.ones((2, 4), dtype=jnp.float32) * 0.5)
     with operator_context(
-        static_args={}, rank=0, world_size=1, operator_ctx=_ctx(step=0)
+        static_args={},
+        rank=0,
+        world_size=1,
+        operator_ctx=_ctx(step=0),
+        instance_container=instance_container,
     ):
         _ItemTable.update(grads)
 
     # Step 1 forward: lookup the same IDs again — embeddings must differ by -lr*grad effect
     tt2 = TransportTensor(ids, global_shape=(2,))
     with operator_context(
-        static_args={}, rank=0, world_size=1, operator_ctx=_ctx(step=1)
+        static_args={},
+        rank=0,
+        world_size=1,
+        operator_ctx=_ctx(step=1),
+        instance_container=instance_container,
     ):
         out_after = _ItemTable.lookup(tt2)
         # Clear step-1 cache to avoid polluting update tests

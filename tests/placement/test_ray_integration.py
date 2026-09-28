@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import ExitStack
 
 import pytest
 import ray
@@ -17,6 +18,13 @@ from fluxway.placement import (
 from fluxway.control_plane.scheduler import Scheduler
 from fluxway.control_plane.scheduler.pg_manager import PGManager
 from .test_planner import placement_graph, placement_inventory
+from tests.ray_cluster_process import local_ray_cluster
+
+
+@pytest.fixture
+def ray_cluster():
+    with ExitStack() as stack:
+        yield lambda **options: stack.enter_context(local_ray_cluster(**options))
 
 
 class RayIntegrationSPMD: ...
@@ -36,10 +44,8 @@ class CPUBlocker:
         return True
 
 
-def test_plain_ray_cluster_materializes_recipe() -> None:
-    started = not ray.is_initialized()
-    if started:
-        ray.init(num_cpus=2, include_dashboard=False)
+def test_plain_ray_cluster_materializes_recipe(ray_cluster) -> None:
+    ray_cluster(num_cpus=2)
     scheduler = None
     try:
         graph = placement_graph(
@@ -88,21 +94,18 @@ def test_plain_ray_cluster_materializes_recipe() -> None:
     finally:
         if scheduler is not None and scheduler.allocation_report is not None:
             scheduler.pg_manager.release_job_pg()
-        if started:
-            ray.shutdown()
 
 
-def test_plain_ray_cluster_materializes_multiple_accelerator_resources() -> None:
-    started = not ray.is_initialized()
-    if started:
-        ray.init(
-            num_cpus=1,
-            resources={
-                "accelerator_type:H100": 1,
-                "accelerator_type:TPU": 1,
-            },
-            include_dashboard=False,
-        )
+def test_plain_ray_cluster_materializes_multiple_accelerator_resources(
+    ray_cluster,
+) -> None:
+    ray_cluster(
+        num_cpus=1,
+        resources={
+            "accelerator_type:H100": 1,
+            "accelerator_type:TPU": 1,
+        },
+    )
     scheduler = None
     try:
         resources = {
@@ -153,14 +156,10 @@ def test_plain_ray_cluster_materializes_multiple_accelerator_resources() -> None
     finally:
         if scheduler is not None and scheduler.allocation_report is not None:
             scheduler.pg_manager.release_job_pg()
-        if started:
-            ray.shutdown()
 
 
-def test_plain_ray_cluster_surfaces_real_pg_timeout() -> None:
-    started = not ray.is_initialized()
-    if started:
-        ray.init(num_cpus=1, include_dashboard=False)
+def test_plain_ray_cluster_surfaces_real_pg_timeout(ray_cluster) -> None:
+    ray_cluster(num_cpus=1)
     blocker = None
     manager = PGManager()
     try:
@@ -208,5 +207,3 @@ def test_plain_ray_cluster_surfaces_real_pg_timeout() -> None:
     finally:
         if blocker is not None:
             ray.kill(blocker)  # type: ignore[arg-type]
-        if started:
-            ray.shutdown()

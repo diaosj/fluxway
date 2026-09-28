@@ -22,7 +22,6 @@ class _AsyncRemoteMethod:
 async def test_stop_spmd_releases_driver_without_force_kill():
     manager = SPMDManager()
     handle = SPMDHandle("dense")
-    handle.set_initialized(True)
 
     stop_method = _AsyncRemoteMethod()
     driver_handle = SimpleNamespace(stop=stop_method)
@@ -33,14 +32,12 @@ async def test_stop_spmd_releases_driver_without_force_kill():
 
     assert stop_method.calls == [((False,), {})]
     assert handle.driver_handle is None
-    assert handle.is_initialized is False
 
 
 @pytest.mark.asyncio
 async def test_stop_spmd_can_preserve_driver_reference_during_terminal_reclaim():
     manager = SPMDManager()
     handle = SPMDHandle("dense")
-    handle.set_initialized(True)
 
     stop_method = _AsyncRemoteMethod()
     driver_handle = SimpleNamespace(stop=stop_method)
@@ -51,14 +48,12 @@ async def test_stop_spmd_can_preserve_driver_reference_during_terminal_reclaim()
 
     assert stop_method.calls == [((False,), {})]
     assert handle.driver_handle is driver_handle
-    assert handle.is_initialized is False
 
 
 @pytest.mark.asyncio
 async def test_stop_spmd_propagates_driver_shutdown_failure_after_state_reclaim():
     manager = SPMDManager()
     handle = SPMDHandle("metrics")
-    handle.set_initialized(True)
 
     stop_method = _AsyncRemoteMethod()
     stop_method._result = AsyncMock(side_effect=RuntimeError("drain failed"))
@@ -70,4 +65,3 @@ async def test_stop_spmd_propagates_driver_shutdown_failure_after_state_reclaim(
         await manager.stop_spmd("metrics", save_checkpoint=False)
 
     assert handle.driver_handle is None
-    assert handle.is_initialized is False

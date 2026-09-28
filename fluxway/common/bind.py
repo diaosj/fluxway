@@ -97,6 +97,7 @@ def bind_spmd(
         (cls,),
         {"__module__": cls.__module__, "__qualname__": cls.__qualname__},
     )
+    source_descriptor: Any | None = None
 
     for op_name, op_cfg in operator_configs.items():
         original_method = getattr(cls, op_name, None)
@@ -119,6 +120,14 @@ def bind_spmd(
                     f"Source SPMD operator {op_name!r} cannot set is_source=False"
                 )
             effective_op_config["is_source"] = True
+            configured_source = effective_op_config.get("source")
+            if configured_source is not None:
+                if source_descriptor is None:
+                    source_descriptor = configured_source
+                elif configured_source is not source_descriptor:
+                    raise ValueError(
+                        "source SPMD operators must share one source descriptor"
+                    )
         decorated = operator(name=op_name, **effective_op_config)(raw_func)
         setattr(dynamic_cls, op_name, decorated)
 
@@ -129,6 +138,7 @@ def bind_spmd(
             mesh_axis_shapes=mesh_axis_shapes,
             interleaved=interleaved,
             interleave_unit_size=interleave_unit_size,
+            source=source_descriptor,
             runtime_env=runtime_env,
             driver_runtime_env=driver_runtime_env,
             checkpoint_components=checkpoint_components,

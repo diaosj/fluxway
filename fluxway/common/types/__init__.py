@@ -21,6 +21,7 @@ from .configs import (
     # Driver and Worker Status Types
     DriverStatus,
     WorkerStatus,
+    CheckpointActivityPhase,
     ControllerState,
     ControllerEvent,
     DriverState,
@@ -39,8 +40,13 @@ from .configs import (
     Control,
     DataFlow,
     ControlFlow,
+    # Source Control Types
+    SourceControlConfig,
+    DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS,
     # Checkpoint Types
     CheckpointConfig,
+    DEFAULT_SNAPSHOT_TIMEOUT_SECS,
+    DEFAULT_INACTIVITY_TIMEOUT_SECS,
 )
 
 # Sharding types: algebraic layer
@@ -86,7 +92,9 @@ from .checkpoint import (
     CheckpointComponentSpec,
     CheckpointCommitPermit,
     CommitAuthority,
+    CheckpointDeadline,
     CheckpointSaveState,
+    CheckpointTransactionState,
     CheckpointRestoreSpec,
     CheckpointSaveScope,
     CheckpointSaveSpec,
@@ -129,6 +137,7 @@ __all__ = [
     "NodeType",
     "DriverStatus",
     "WorkerStatus",
+    "CheckpointActivityPhase",
     "ControllerState",
     "ControllerEvent",
     "DriverState",
@@ -145,7 +154,11 @@ __all__ = [
     "Control",
     "DataFlow",
     "ControlFlow",
+    "SourceControlConfig",
+    "DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS",
     "CheckpointConfig",
+    "DEFAULT_SNAPSHOT_TIMEOUT_SECS",
+    "DEFAULT_INACTIVITY_TIMEOUT_SECS",
     "PartitionSpec",
     "P",
     "PartitionStrategy",
@@ -178,7 +191,9 @@ __all__ = [
     "CheckpointComponentSpec",
     "CheckpointCommitPermit",
     "CommitAuthority",
+    "CheckpointDeadline",
     "CheckpointSaveState",
+    "CheckpointTransactionState",
     "CheckpointRestoreSpec",
     "CheckpointSaveScope",
     "CheckpointSaveSpec",

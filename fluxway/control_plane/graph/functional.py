@@ -2,6 +2,7 @@ from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from typing import Any, Optional
 
+from fluxway.common.transfer import UnitRouting
 from fluxway.common.types import Graph
 from fluxway.control_plane.graph.builder import Builder
 
@@ -72,6 +73,7 @@ class NodeProxy:
             *args: OpHandle,
             condition_fn: Callable[..., bool | Awaitable[bool]] | None = None,
             local: bool = False,
+            unit_routing: UnitRouting | None = None,
             **kwargs,
         ) -> OpHandle:
             # Fetch target arguments to map positional args
@@ -139,6 +141,7 @@ class NodeProxy:
                     source_output=inferred_source_output,
                     target_input=target_input,
                     local_only=local,
+                    unit_routing=unit_routing,
                 )
 
             # Register edges for keyword arguments (with explicit target mapping)
@@ -175,6 +178,7 @@ class NodeProxy:
                     source_output=inferred_source_output,
                     target_input=target_arg,
                     local_only=local,
+                    unit_routing=unit_routing,
                 )
 
             return OpHandle(self.node_id, op_name, self._graph)

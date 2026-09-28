@@ -47,7 +47,7 @@ epoch. `FRAME_STEP` remains scheduler/delivery metadata. No mutable second epoch
 global directory, sibling holder list or cross-level broadcast exists.
 
 For each logical tensor, child slots are assigned by sorting its finite set of
-`(artifact_spmd_id, artifact_rank)` endpoints. The mapping is bijective and projections never
+`(target_spmd_id, target_rank)` endpoints. The mapping is bijective and projections never
 renumber an existing slot.
 
 ## Extended State And Invariants
@@ -121,11 +121,12 @@ propagation. The common path therefore stays below the asynchronous scheduling b
 conflicts still suspend without blocking the event loop.
 
 The worker closes an intent only after every frame-build result and local-only payload for that
-epoch has synchronously registered a ROB ticket. Closing is the admission cut, not delivery
-completion: once all tickets are registered, `close_intent()` releases the ordered retire path;
-admission, delegation, enqueue, send, and delivery then complete the tickets. This ordering avoids
-the cycle in which a worker waits for delivery before closing the intent while delivery waits for
-the intent to close.
+epoch has synchronously registered its publication or local-only ROB ticket. A publication ticket
+owns the complete target-batch fanout for that local step; target batches are not separate tickets.
+Closing is the admission cut, not delivery completion: once all publication and local-only tickets
+are registered, `close_intent()` releases the ordered retire path; admission, delegation, enqueue,
+send, and delivery then complete those tickets. This ordering avoids the cycle in which a worker
+waits for delivery before closing the intent while delivery waits for the intent to close.
 
 Cross-subject tickets are checked for a wait-for cycle only at the sealed drain boundary. The ready
 path never rebuilds a global dependency graph; if all active intents are sealed and no lane-head ticket
@@ -309,6 +310,38 @@ scheduling waits with downstream alias consumers while Directory quiescence guar
 Worker shutdown and failure fences track and await all active background release tasks; scheduling the
 task does not mean that the input lifecycle has already completed.
 
+### Delivery and retirement completion ownership
+
+Delivery completion and coherence retirement are separate typed proofs. The
+delivery runtime owns the transport proof; the coherence sequencer owns the
+ordered retirement proof. A coherence batch may await these proofs concurrently,
+but it publishes one aggregate completion through its retirement owner. A caller
+must not release or expose the payload after observing only one proof.
+
+`CoherenceBatchRetireRuntime.retire_publication()` is the single owner of one
+sealed publication's full child fanout. It admits the publication's immutable
+instance set once, registers each unique direct-child receipt once, and starts
+all target-local enqueues concurrently. `CoherenceSequencer` orders subject
+epochs and terminal retirement; it must not introduce an edge merely because
+two readonly child deliveries reference the same instance.
+
+Its `_ChildDeliveryReceipts` registry performs reverse-order success or failure
+completion exactly once. Delegation, all target enqueues, sibling cancellation,
+and completion use the same registry, so cleanup has neither parallel
+implementations nor competing token counters. One failed target cancels every
+unfinished sibling and finalizes every registered child receipt as failed.
+
+Receiver acceptance is carrier-specific. For the current CPU/Ray remote carrier,
+frame admission and mailbox deposit produce a validated
+`ReceiverAcceptanceReceipt` carrying publication ID, instance, child slot,
+target rank and batch sequence. A transport return without this receipt is not
+a child completion fact. Acceptance does not mean the user operator has
+finished reading and does not replace the later `GrantReturn` / quiescence
+requirement. `PayloadLifetime` owns outbound references and invokes
+`PayloadRecycler.release()` exactly once after every receipt, transport-retention
+token and local `ConsumerLease` is complete. A raw address, a fresh allocation,
+or an RPC timeout is never a payload-release proof.
+
 For both remote grants and local-only grants, the phases are fixed:
 
 1. release each local access token exactly once;
@@ -318,7 +351,8 @@ For both remote grants and local-only grants, the phases are fixed:
 4. begin, send, and complete grouped `GRANT_RETURN` routes when a direct parent exists;
 5. release tensor payloads;
 6. consume the epoch-scoped returned-instance proof, or require the current-entry retirement
-   proof, before retiring the allocation and advancing its watermark.
+   proof, before detaching the allocation identity binding. Physical payload release is handled
+   independently by `PayloadLifetime`; it never advances a directory or allocation watermark.
 
 `InputCoherenceReleasePlan` derives parent routes from grant metadata and validates the direct
 parent handler before any transport action. A revoked grant has no second return route. Missing
@@ -326,6 +360,15 @@ entries, old epochs, absent returned-instance proof, and live retirement state a
 errors and raise; they are never treated as successful cleanup. Local-only input uses the same
 phases with an empty parent-route set, so releasing a local read token does not bypass alias or
 descendant quiescence.
+
+When a `TENSOR_TRANSFER` entry is marked `TensorEntryKind.ROUTING_MISS` (e.g., in content-addressable
+or dynamic modulo routing where a receiver rank has zero elements assigned in the step), the wire
+frame carries `CoherenceAction.BUS_RD` to preserve uniform frame transport contracts. The receiver
+admits a local read grant (`_InputCoherenceGrant`) with `parent_return_required = False`. This satisfies
+the receiver's local operator input binding (`_prepare_tensor_bindings`) without fabricating fake
+parent delegations. During input release, the local read token is released in the endpoint directory,
+and upstream `GRANT_RETURN` transmission is bypassed because the sender only records child delegations
+for `TensorEntryKind.TENSOR`.
 
 GrantReturn clears either a share bit or a dirty ownership child according to the parent's
 authoritative entry. A share return may leave the parent's valid bytes E. A dirty ownership
@@ -355,11 +398,11 @@ EXACT requires the same root and byte span. OVERLAP and unsupported identities r
 becomes invalid; raw aliases outside Fluxway access paths are UB (Undefined Behavior). Cross-endpoint copied payloads
 are new allocations, even when the logical graph routes the new SSA (Static Single Assignment) tensor back to an earlier node.
 
-Each subject has a monotonic endpoint-local retirement watermark. A retired record can be removed
-only if it has no local reader/writer, ownership child, child bit, delivery, parent authority,
-pending continuation or live allocation binding. The retirement queue processes candidates only;
-it does not scan the directory. An active record below the watermark raises
-`RetirementInvariantError`; watermark never substitutes for authority proof.
+`AllocationRegistry` is an identity and exact-handoff directory. A binding is detached only after
+the directory retirement proof; it does not own a payload lifetime and cannot release a buffer by
+advancing a watermark. `PayloadLifetime` is the sole physical release owner and fences on missing
+receipts, duplicate terminal transitions or a failed recycler call. No registry watermark or raw
+address lookup can make a handle reusable.
 
 ## Safety, Progress And Fencing
 

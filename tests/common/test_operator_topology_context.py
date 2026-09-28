@@ -1,9 +1,12 @@
+import pytest
+
 from fluxway.common.decorators import (
+    _STATIC_CONTEXT_ATTR_NAMES,
     get_current_context,
-    get_instance_storage,
     operator,
     operator_context,
 )
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.mesh import DeviceMesh
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
@@ -51,8 +54,6 @@ class RayComponentLimitsAwareOperator:
 
 
 def _clear_operator_instance():
-    storage, _ = get_instance_storage()
-    storage.pop(id(TopologyAwareOperator), None)
     TopologyAwareOperator.seen_in_init = None
 
 
@@ -100,8 +101,6 @@ def test_operator_context_exposes_ray_component_limits_in_eager_execution():
 
 
 def test_preinstantiate_operator_exposes_compiled_ray_component_limits():
-    storage, _ = get_instance_storage()
-    storage.pop(id(RayComponentLimitsAwareOperator), None)
     RayComponentLimitsAwareOperator.seen_in_init = None
     operator_spec = RayComponentLimitsAwareOperator.inspect_ray_component_limits._fluxway_operator_spec.updated(
         owner=RayComponentLimitsAwareOperator
@@ -119,7 +118,10 @@ def test_preinstantiate_operator_exposes_compiled_ray_component_limits():
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     worker_cls = cls.modified_class if cls else SPMDWorker
 
-    worker_cls._pre_instantiate_operators(config, 0, static_args={})
+    container = OperatorInstanceContainer()
+    worker_cls._pre_instantiate_operators(
+        config, 0, static_args={}, instance_container=container
+    )
 
     assert RayComponentLimitsAwareOperator.seen_in_init is profile.ray_component_limits
 
@@ -144,6 +146,7 @@ def test_operator_wrapper_sets_topology_fields_on_instance():
 def test_preinstantiate_operator_sets_topology_fields_in_init():
     _clear_operator_instance()
     config = _topology_config()
+    container = OperatorInstanceContainer()
 
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     worker_cls = cls.modified_class if cls else SPMDWorker
@@ -151,14 +154,14 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
         config,
         3,
         static_args={},
+        instance_container=container,
         local_rank=1,
         local_world_size=4,
         node_rank=0,
         num_nodes=2,
     )
 
-    storage, _ = get_instance_storage()
-    instance = storage[id(TopologyAwareOperator)]
+    instance = container.require(TopologyAwareOperator)
 
     assert TopologyAwareOperator.seen_in_init == (3, 8, 1, 4, 0, 2)
 
@@ -195,6 +198,7 @@ def test_operator_manager_execute_preserves_topology_fields():
         rank=3,
         spmd_id="spmd-a",
         static_args={},
+        instance_container=OperatorInstanceContainer(),
         local_rank=1,
         local_world_size=4,
         node_rank=0,
@@ -234,3 +238,47 @@ def test_operator_wrapper_resolves_local_classes():
         result = LocalClass.inspect_local()
 
     assert result == 5
+
+
+def test_operator_wrapper_surfaces_descriptor_conflict_as_error():
+    class ConflictingDescriptorOperator:
+        @property
+        def rank(self) -> int:
+            return 999
+
+        @operator(name="conflicting_op")
+        def conflicting_op(self):
+            return self.rank
+
+    with pytest.raises(AttributeError):
+        with operator_context(
+            static_args={},
+            rank=3,
+            world_size=4,
+        ):
+            ConflictingDescriptorOperator.conflicting_op()
+
+
+def test_operator_wrapper_supports_slotted_owner():
+    seen = {}
+
+    class SlottedOperator:
+        __slots__ = tuple(_STATIC_CONTEXT_ATTR_NAMES) + ("extra",)
+
+        def __init__(self):
+            seen["rank"] = self.rank
+            seen["world_size"] = self.world_size
+
+        @operator(name="slotted_op")
+        def slotted_op(self):
+            return self.rank
+
+    with operator_context(
+        static_args={},
+        rank=7,
+        world_size=8,
+    ):
+        result = SlottedOperator.slotted_op()
+
+    assert result == 7
+    assert seen == {"rank": 7, "world_size": 8}

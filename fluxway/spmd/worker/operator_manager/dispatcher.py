@@ -1,16 +1,14 @@
-from abc import ABC, abstractmethod
-
-from fluxway.common.types.configs import OperatorContext
-from fluxway.common.operator_spec import OperatorSpec
-
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Any
 
+from fluxway.common.execution_layout import ExecutionGroup, ExecutionLayout
+from fluxway.common.mesh import DeviceMesh
+from fluxway.common.types.configs import OperatorContext
+from fluxway.common.types.sharding import PhysicalLayout, ShardingSpec
+
 
 class ExecutionStatus(Enum):
-    """Sentinels for operator execution status."""
-
     SUCCESS = auto()
     SKIPPED = auto()
     INACTIVE = auto()
@@ -21,90 +19,85 @@ class ExecutionStatus(Enum):
 
 @dataclass
 class ExecutionResult:
-    """Standardized result for operator execution."""
-
     status: ExecutionStatus
     data: Any = None
+    control_requests: tuple[Any, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, ExecutionStatus):
+            raise TypeError("execution result status must be an ExecutionStatus")
+        if not isinstance(self.control_requests, tuple):
+            raise TypeError("execution result control_requests must be a tuple")
+        if any(request is None for request in self.control_requests):
+            raise ValueError("execution result control_requests cannot contain None")
 
 
-class ExecutionDispatcher(ABC):
-    """
-    Abstract strategy for operator execution dispatching.
-    Decides whether an operator should run at a given step,
-    and computes the `OperatorContext` injected into the operator.
-    """
+class ExecutionDispatcher:
+    def __init__(self, layout: ExecutionLayout) -> None:
+        self.layout = layout
 
-    @abstractmethod
+    def _validate_world_size(self, world_size: int) -> None:
+        if world_size != self.layout.world_size:
+            raise ValueError(
+                "runtime world size disagrees with compiled execution layout"
+            )
+
+    def execution_cycle(self, physical_world_size: int) -> tuple[tuple[int, ...], ...]:
+        self._validate_world_size(physical_world_size)
+        return self.layout.cycle
+
+    def bind_execution_group(
+        self, mesh: DeviceMesh, physical_rank: int
+    ) -> ExecutionGroup:
+        self._validate_world_size(mesh.size)
+        return self.layout.group_for_rank(physical_rank)
+
     def should_execute(
         self, physical_rank: int, physical_world_size: int, step: int
     ) -> bool:
-        pass
+        self._validate_world_size(physical_world_size)
+        return self.layout.is_active(physical_rank, step)
 
-    @abstractmethod
+    def get_effective_source_layout(
+        self, mesh: DeviceMesh, routing: ShardingSpec
+    ) -> PhysicalLayout:
+        self._validate_world_size(mesh.size)
+        return routing.bind(self.layout.logical_mesh)
+
+    def resolve_active_producers(
+        self,
+        effective_layout: PhysicalLayout,
+        target_layout: PhysicalLayout,
+        target_rank: int,
+        step: int,
+        physical_world_size: int,
+    ) -> list[int]:
+        self._validate_world_size(physical_world_size)
+        group = self.layout.group_for_step(step)
+        return [
+            group.physical_rank(rank)
+            for rank in effective_layout.resolve_producers(target_layout, target_rank)
+        ]
+
     def get_logical_context(
-        self, physical_rank: int, physical_world_size: int, step: int
+        self,
+        physical_rank: int,
+        physical_world_size: int,
+        step: int,
+        batch_size: int = 1,
+        source_work_items: Any | None = None,
     ) -> OperatorContext:
-        pass
-
-
-class StandardDispatcher(ExecutionDispatcher):
-    """Standard execution: runs on every step, logical == physical."""
-
-    def should_execute(
-        self, physical_rank: int, physical_world_size: int, step: int
-    ) -> bool:
-        return True
-
-    def get_logical_context(
-        self, physical_rank: int, physical_world_size: int, step: int
-    ) -> OperatorContext:
+        self._validate_world_size(physical_world_size)
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        group = self.layout.group_for_rank(physical_rank)
         return OperatorContext(
             physical_rank=physical_rank,
             physical_world_size=physical_world_size,
-            logical_rank=physical_rank,
-            logical_world_size=physical_world_size,
+            logical_rank=group.logical_rank(physical_rank),
+            logical_world_size=group.logical_mesh.size,
             step=step,
-            is_interleaved=False,
+            global_source_offset=None,
+            is_interleaved=len(self.layout.groups) > 1,
+            source_work_items=source_work_items,
         )
-
-
-class InterleavedDispatcher(ExecutionDispatcher):
-    """
-    Interleaved execution (Virtual SPMD):
-    Only runs if the physical rank belongs to the active unit for the current step.
-    Each unit acts as an isolated world of size `interleave_unit_size`.
-    """
-
-    def __init__(self, interleave_unit_size: int):
-        self.interleave_unit_size = interleave_unit_size
-
-    def should_execute(
-        self, physical_rank: int, physical_world_size: int, step: int
-    ) -> bool:
-        unit_size = self.interleave_unit_size
-        stride = physical_world_size // unit_size
-        active_unit_idx = step % stride
-        my_unit_idx = physical_rank // unit_size
-        return my_unit_idx == active_unit_idx
-
-    def get_logical_context(
-        self, physical_rank: int, physical_world_size: int, step: int
-    ) -> OperatorContext:
-        logical_rank = physical_rank % self.interleave_unit_size
-        return OperatorContext(
-            physical_rank=physical_rank,
-            physical_world_size=physical_world_size,
-            logical_rank=logical_rank,
-            logical_world_size=self.interleave_unit_size,
-            step=step,
-            is_interleaved=True,
-        )
-
-
-def create_dispatcher(meta: OperatorSpec) -> ExecutionDispatcher:
-    """Factory to create dispatcher strategy based on operator metadata."""
-    if getattr(meta, "is_interleaved", False):
-        return InterleavedDispatcher(
-            interleave_unit_size=getattr(meta, "interleave_unit_size", 1)
-        )
-    return StandardDispatcher()

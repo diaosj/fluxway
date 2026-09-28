@@ -1,5 +1,4 @@
 import pytest
-import ray
 
 import fluxway
 from fluxway.common.mesh import DeviceMesh
@@ -10,13 +9,13 @@ from tests.spmd.interleaved_source_nodes import (
     ImmediatelyExhaustedInterleavedSource,
     InterleavedSourceSink,
 )
+from tests.ray_cluster_process import local_ray_cluster
 
 
 @pytest.fixture(scope="module", autouse=True)
 def ray_session():
-    if not ray.is_initialized():
-        ray.init(ignore_reinit_error=True, log_to_driver=True)
-    yield
+    with local_ray_cluster(num_cpus=8):
+        yield
 
 
 def _build_exhausted_source_graph():

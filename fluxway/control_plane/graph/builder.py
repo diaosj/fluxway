@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
+from fluxway.common.transfer import UnitRouting
 from fluxway.common.types import (
     Graph,
     Node,
@@ -287,6 +288,7 @@ class Builder:
         tensor_map: dict[str, str] | None = None,
         symmetric_to: tuple[str, str, str, str] | None = None,
         local_only: bool = False,
+        unit_routing: UnitRouting | None = None,
     ) -> "Builder":
         """
         Add a generic edge specifying source and target op names.
@@ -340,6 +342,7 @@ class Builder:
             tensor_map=tensor_map,
             symmetric_to=symmetric_to,
             local_only=local_only,
+            unit_routing=unit_routing,
         )
 
         self._merge_or_append_edge(dependency)
@@ -488,6 +491,7 @@ class Builder:
         tensor_map: dict[str, str] | None = None,
         symmetric_to: tuple[str, str, str, str] | None = None,
         local_only: bool = False,
+        unit_routing: UnitRouting | None = None,
     ) -> DependencySpec:
         ctx = f"edge {source_node}.{source_op} -> {target_node}.{target_op}"
         resolved_tensor_map = self._resolve_edge_tensor_map(
@@ -500,6 +504,8 @@ class Builder:
             ctx,
             tensor_map=tensor_map,
         )
+        if unit_routing is not None and (local_only or not resolved_tensor_map):
+            raise ValueError("unit routing requires non-local tensor transfers")
         return DependencySpec(
             source=OperatorKey(source_node, source_op),
             target=OperatorKey(target_node, target_op),
@@ -507,6 +513,7 @@ class Builder:
                 TensorTransfer(
                     source=ExecutionOperatorPort(name=source_name),
                     target=ExecutionOperatorPort(name=target_name),
+                    unit_routing=unit_routing,
                 )
                 for source_name, target_name in resolved_tensor_map.items()
             ),
@@ -682,7 +689,7 @@ class Builder:
                 f"Node {spmd_id!r} lacks a resource profile"
             )
             spmd_specs.append(
-                SPMDGraphSpec(
+                SPMDGraphSpec.create(
                     spmd_id=spmd_id,
                     spmd_class=self._nodes[spmd_id].spmd_class,
                     mesh=self._nodes[spmd_id].spmd_config.mesh,

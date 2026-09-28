@@ -42,7 +42,7 @@ class DeviceMesh:
                         If provided as a multi-dimensional array, device_shape will be inferred.
                         If provided as a 1D array and device_shape is given, it will be reshaped.
         """
-        object.__setattr__(self, "_frozen", False)
+        self._frozen = False
         self._axis_names = tuple(axis_names)
 
         # Determine device_ids and shape
@@ -104,7 +104,7 @@ class DeviceMesh:
     def __setattr__(self, name: str, value: Any) -> None:
         if getattr(self, "_frozen", False):
             raise AttributeError("frozen DeviceMesh cannot be modified")
-        object.__setattr__(self, name, value)
+        super().__setattr__(name, value)
 
     @property
     def is_frozen(self) -> bool:
@@ -129,7 +129,7 @@ class DeviceMesh:
         self.axis_map = MappingProxyType(dict(self.axis_map))
         self.size_map = MappingProxyType(dict(self.size_map))
         self._inverse_map = MappingProxyType(dict(self._inverse_map))
-        object.__setattr__(self, "_frozen", True)
+        self._frozen = True
         return self
 
     def __deepcopy__(self, memo: dict[int, Any]) -> DeviceMesh:
@@ -257,7 +257,7 @@ try:
     def _dm_unflatten(aux_data, children):
         # Reconstruct without invoking __init__ (avoids numpy conversion of Tracers)
         obj = object.__new__(DeviceMesh)
-        object.__setattr__(obj, "_frozen", False)
+        obj._frozen = False
         obj._shape, obj._axis_names = aux_data
         obj.device_ids = children[0]
 

@@ -8,7 +8,6 @@ from fluxway.common.allocation import (
 )
 from fluxway.common.coherence import (
     CoherenceSubject,
-    RetirementInvariantError,
     CoherenceInstance,
     UnsupportedAllocationHandoffError,
 )
@@ -69,16 +68,26 @@ def test_handoff_rejects_partial_overlap() -> None:
         registry.handoff(old, new, runtime_allocation_descriptor(values[1:]))
 
 
-def test_retirement_watermark_only_removes_unbound_retired_instances() -> None:
+def test_handoff_tombstone_requires_explicit_forget() -> None:
     values = np.arange(8, dtype=np.int64)
     instance = CoherenceInstance(CoherenceSubject(1, 0, 7), 3)
+    new = CoherenceInstance(CoherenceSubject(1, 0, 8), 3)
     registry = AllocationRegistry()
     registry.bind(instance, runtime_allocation_descriptor(values))
-    registry.retire(instance)
+    registry.handoff(instance, new, runtime_allocation_descriptor(values))
+    registry.forget_retired(instance)
+    assert registry.is_bound(new)
 
-    assert registry.advance_watermark(instance.subject, 4) == 1
-    with pytest.raises(RetirementInvariantError, match="regressed"):
-        registry.advance_watermark(instance.subject, 2)
+
+def test_forget_retired_removes_handoff_tombstone_without_watermark() -> None:
+    values = np.arange(8, dtype=np.int64)
+    old = CoherenceInstance(CoherenceSubject(1, 0, 7), 3)
+    new = CoherenceInstance(CoherenceSubject(1, 0, 8), 3)
+    registry = AllocationRegistry()
+    registry.bind(old, runtime_allocation_descriptor(values))
+    registry.handoff(old, new, runtime_allocation_descriptor(values))
+    registry.forget_retired(old)
+    assert registry.is_bound(new)
 
 
 def test_hybrid_backend_torch_allocation_descriptor() -> None:

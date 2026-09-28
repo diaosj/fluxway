@@ -143,7 +143,8 @@ def _make_pipeline_stub_with_profiler(
         _plan_tasks=set(),
         _send_tasks={},
         _drain_boundary=DrainBoundary(),
-        _source_operator_names=("op",),
+        _source_operator_names=(),
+        _source_control_operator_names=(),
         _source_maintenance_tasks={},
     )
     stub._mailbox.clear_step = AsyncMock()
@@ -168,6 +169,7 @@ def _make_pipeline_stub_with_profiler(
         raw_cls._send_local_plan_result, stub
     )
     stub._local_plan_commit = types.MethodType(raw_cls._local_plan_commit, stub)
+    stub._local_plan_await_send = types.MethodType(raw_cls._local_plan_await_send, stub)
     stub._spawn_send_task = types.MethodType(raw_cls._spawn_send_task, stub)
     stub._register_local_send = types.MethodType(raw_cls._register_local_send, stub)
     stub._step_transfer_cache_from_prepared_input = types.MethodType(
@@ -1196,6 +1198,7 @@ async def test_checkpoint_outbound_fence_ignores_parked_future_plans():
     future_plan = asyncio.create_task(parked.wait())
     stub._plan_tasks.add(future_plan)
     stub._delivery_runtime = types.SimpleNamespace(drain=AsyncMock())
+    stub._source_acknowledgements = types.SimpleNamespace(flush=AsyncMock())
     try:
         await asyncio.wait_for(
             _raw_worker_class()._drain_outbound_tasks(stub), timeout=0.1
@@ -1203,6 +1206,7 @@ async def test_checkpoint_outbound_fence_ignores_parked_future_plans():
         assert stub._input_prepare_runtime.is_pending("op", 2)
         assert not future_plan.done()
         stub._delivery_runtime.drain.assert_awaited_once_with("worker_drain_outbound")
+        stub._source_acknowledgements.flush.assert_awaited_once_with()
     finally:
         future_plan.cancel()
         await stub._input_prepare_runtime.cancel_pending()
@@ -1230,8 +1234,9 @@ async def test_local_barrier_waits_for_frame_build_task():
 
     stub._send_output = fake_send_output
 
-    start = time.perf_counter()
     send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    start = time.perf_counter()
+    await stub._local_plan_await_send(send_token)
     await stub._local_plan_commit("op", 0, send_token)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
 
@@ -1288,7 +1293,7 @@ async def test_local_barrier_observes_immediate_send_registration_failure():
     send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
     await asyncio.sleep(0)
     with pytest.raises(RuntimeError, match="frame build failed"):
-        await stub._local_plan_commit("op", 0, send_token)
+        await stub._local_plan_await_send(send_token)
 
 
 @pytest.mark.asyncio
@@ -1308,7 +1313,7 @@ async def test_local_barrier_propagates_late_send_failure():
 
     send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
     with pytest.raises(RuntimeError, match="late frame build failed"):
-        await stub._local_plan_commit("op", 0, send_token)
+        await stub._local_plan_await_send(send_token)
     assert stub._failure is not None
     assert stub._failure.phase == "SEND"
     assert stub._failure.message == "late frame build failed"
@@ -1389,6 +1394,7 @@ async def test_local_send_commit_profiler_spans_enqueue_wait_not_delivery_wait()
     stub._send_output = fake_send_output
 
     send_token = await stub._local_plan_send_output("op", 0, _prepared(), "payload")
+    await stub._local_plan_await_send(send_token)
     await stub._local_plan_commit("op", 0, send_token)
 
     recorder = stub._profiler_runtime.recorder

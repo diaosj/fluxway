@@ -16,6 +16,7 @@ from fluxway.common.compiled_graph import (
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.types.configs import SPMDConfig
 from fluxway.common.types.sharding import P, PartitionSpec, ShardingSpec
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
@@ -120,6 +121,7 @@ def _target_manager(graph, *, target_spmd_id: str) -> OperatorManager:
         rank=0,
         spmd_id=target_spmd_id,
         static_args={},
+        instance_container=OperatorInstanceContainer(),
     )
 
 
@@ -930,10 +932,78 @@ def test_receipt_rank_domain_comes_from_runtime_lineage(
             build()
 
 
+def test_receipt_redirects_values_despite_identical_static_geometry():
+    chunk = ShardingSpec.chunk(P("dp"))
+    mesh = DeviceMesh(("dp",), (2,))
+    upstream = OperatorSpec(
+        name="produce",
+        output_arguments={"data": ("value",)},
+        output_sharding={"value": chunk},
+    )
+    forward = OperatorSpec(
+        name="forward",
+        input_arguments={"data": ("value",)},
+        input_sharding={"value": chunk},
+        output_arguments={"data": ("result",)},
+        output_sharding={"result": ShardingSpec.follow("forward.value")},
+    )
+    consume = OperatorSpec(
+        name="consume",
+        input_arguments={"data": ("value",)},
+        input_sharding={"value": chunk},
+    )
+    graph = compile_graph(
+        name="receipt-precedence",
+        spmds=(
+            compiled_spmd_spec("upstream", mesh, {"produce": upstream}),
+            compiled_spmd_spec("source", mesh, {"forward": forward}),
+            compiled_spmd_spec("target", mesh, {"consume": consume}),
+        ),
+        dependencies=(
+            DependencySpec(
+                OperatorKey("upstream", "produce"),
+                OperatorKey("source", "forward"),
+                (TensorTransfer(OperatorPort("value"), OperatorPort("value")),),
+            ),
+            _dependency("forward", "consume", "result", "value"),
+        ),
+    )
+    view = graph.spmd("source")
+    plan = compile_send_plan(
+        graph_view=view,
+        source_op_id="forward",
+        rank=0,
+        successor_contexts=(SuccessorRouteContext(0, view.outgoing, 0),),
+        sender_spmd_code=2,
+        interleave_unit_size=None,
+    )
+    route = plan.successor_routes[0].tensor_routes[0]
+    assert route.receipt_routing is not None
+    assert route.direct_targets is None
+    values = np.arange(2)
+    reference = TransportTensor(
+        values,
+        receipt=SymmetryReceipt(2, np.array([1, 1], dtype=np.int32)),
+    )
+    frames = build_step_frame_groups(
+        compiled_plan=plan,
+        flat_results=[values],
+        step_transfer_cache={view.incoming[0].transfers[0].transfer_code: reference},
+        exec_step=0,
+    )
+    destinations = []
+    for _, (target, _, payloads) in frames:
+        if any(payload.size for payload in payloads):
+            destinations.append(target)
+            np.testing.assert_array_equal(payloads[0], values)
+    assert destinations == [1]
+
+
 def test_mirror_route_uses_exact_input_transfer_code_cache_key():
     compiled, input_transfer_code = _compile_mirror_send_plan()
     route = compiled.successor_routes[0].tensor_routes[0]
     assert route.receipt_routing is not None
+    assert route.direct_targets is None
     assert route.receipt_routing.input_transfer_code == input_transfer_code
     assert route.receipt_routing.reference_path == "lookup.unique_ids"
     assert route.receipt_routing.rank_count == 2
@@ -1140,7 +1210,7 @@ def test_sender_separates_mirror_outputs_with_distinct_receipts():
 def test_successor_context_rejects_mixed_peer_dependencies():
     replicated = ShardingSpec.chunk(PartitionSpec())
     compiled, dependencies = _compile_fanout_plan(second_target_sharding=replicated)
-    foreign = CompiledDependency(
+    foreign = CompiledDependency.create(
         code=99,
         spec=DependencySpec(
             source=dependencies[0].spec.source,
@@ -1153,6 +1223,9 @@ def test_successor_context_rejects_mixed_peer_dependencies():
         target_world_size=1,
         source_mesh=dependencies[0].source_mesh,
         target_mesh=dependencies[0].target_mesh,
+        _unit_relations=__import__(
+            "fluxway.common.frozen_mapping", fromlist=["freeze_mapping"]
+        ).freeze_mapping({}),
     )
 
     with pytest.raises(ValueError, match="target SPMD"):

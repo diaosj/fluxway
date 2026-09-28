@@ -1,22 +1,7 @@
-"""
-ControllerStateMachine for managing Controller lifecycle.
-
-State transitions (event-driven initialization):
-- INITIALIZING -> PENDING (on INIT_COMPLETE: resources allocated, SPMDs started)
-- PENDING -> TOPOLOGY_REGISTERING (on ALL_DRIVERS_READY: all drivers report workers_ready)
-    -> triggers topology registration
-- TOPOLOGY_REGISTERING -> RUNNING (on ALL_SPMDS_TOPOLOGY_READY: all workers running)
-    -> starts heartbeat timeout monitoring
-- INITIALIZING / PENDING / TOPOLOGY_REGISTERING / RUNNING -> FAILING (on DRIVER_ERROR)
-- FAILING -> FAILED
-- RUNNING -> COMPLETING -> COMPLETED
-
-Supports async callbacks for Ray Actor Controller.
-"""
+"""Local lifecycle transitions coordinated by ExecutionLifecycle."""
 
 import asyncio
-import inspect
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from fluxway.common.types import ControllerEvent, ControllerState, ExecutionFailure
 from fluxway.common.utils.logging import get_logger
@@ -25,9 +10,6 @@ if TYPE_CHECKING:
     from fluxway.control_plane.controller import ControllerActor
 
 logger = get_logger(__name__)
-
-_CONTROLLER_FAILURE_ID = "controller"
-_CONTROLLER_CLEANUP_PHASE = "CONTROLLER_CLEANUP"
 
 
 class ControllerStateMachine:
@@ -39,7 +21,9 @@ class ControllerStateMachine:
     """
 
     # State transition table: (current_state, event) -> next_state
-    _TRANSITIONS = {
+    _TRANSITIONS: ClassVar[
+        dict[tuple[ControllerState, ControllerEvent], ControllerState]
+    ] = {
         # --- Event-driven initialization flow ---
         (
             ControllerState.INITIALIZING,
@@ -60,7 +44,28 @@ class ControllerStateMachine:
         (
             ControllerState.READY,
             ControllerEvent.START,
+        ): ControllerState.ACTIVATING,
+        (
+            ControllerState.ACTIVATING,
+            ControllerEvent.ACTIVATION_COMPLETE,
         ): ControllerState.RUNNING,
+        (ControllerState.RUNNING, ControllerEvent.RESUME): ControllerState.RESUMING,
+        (
+            ControllerState.RESUMING,
+            ControllerEvent.ACTIVATION_COMPLETE,
+        ): ControllerState.RUNNING,
+        (
+            ControllerState.ACTIVATING,
+            ControllerEvent.DRIVER_ERROR,
+        ): ControllerState.FAILING,
+        (
+            ControllerState.RESUMING,
+            ControllerEvent.DRIVER_ERROR,
+        ): ControllerState.FAILING,
+        (
+            ControllerState.COMPLETING,
+            ControllerEvent.DRIVER_ERROR,
+        ): ControllerState.FAILING,
         # --- Normal operation ---
         (
             ControllerState.RUNNING,
@@ -105,6 +110,37 @@ class ControllerStateMachine:
         ): ControllerState.FAILING,
     }
 
+    _TRANSITIONS.update(
+        {
+            (state, ControllerEvent.CANCEL): ControllerState.CANCELLING
+            for state in (
+                ControllerState.INITIALIZING,
+                ControllerState.PENDING,
+                ControllerState.TOPOLOGY_REGISTERING,
+                ControllerState.READY,
+                ControllerState.ACTIVATING,
+                ControllerState.RESUMING,
+                ControllerState.RUNNING,
+            )
+        }
+    )
+    _TRANSITIONS.update(
+        {
+            (
+                ControllerState.CANCELLING,
+                ControllerEvent.CLEANUP_FINISHED,
+            ): ControllerState.CANCELLED,
+            (
+                ControllerState.CANCELLING,
+                ControllerEvent.CLEANUP_FAILED,
+            ): ControllerState.FAILED,
+            (
+                ControllerState.CANCELLING,
+                ControllerEvent.DRIVER_ERROR,
+            ): ControllerState.FAILING,
+        }
+    )
+
     def __init__(self, controller: "ControllerActor"):  # type: ignore
         """
         Initialize ControllerStateMachine.
@@ -139,6 +175,12 @@ class ControllerStateMachine:
         """
         async with self._lock:
             current = self._state
+            if (
+                current is ControllerState.FAILING
+                and event is ControllerEvent.DRIVER_ERROR
+            ):
+                self._record_driver_failure(kwargs)
+                return True
             key = (current, event)
 
             if key not in self._TRANSITIONS:
@@ -156,7 +198,11 @@ class ControllerStateMachine:
             # Perform state transition
             old_state = self._state
             self._state = next_state
-            if next_state in (ControllerState.COMPLETED, ControllerState.FAILED):
+            if next_state in (
+                ControllerState.COMPLETED,
+                ControllerState.FAILED,
+                ControllerState.CANCELLED,
+            ):
                 self._terminal_event.set()
             profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
             if profiler_runtime is not None and profiler_runtime.enabled:
@@ -169,51 +215,8 @@ class ControllerStateMachine:
                 f"State transition: {old_state} -> {next_state} (event: {event})"
             )
 
-        # Execute entry callback (outside lock to prevent deadlock)
-        notify = getattr(self._controller, "_notify_control_plane_components", None)
-        if notify is not None:
-            result = notify(next_state)
-            if inspect.isawaitable(result):
-                await result
-        await self._execute_entry_callback(next_state)
-
+        await self._controller._execution_lifecycle.enter_state(next_state)
         return True
-
-    async def _execute_entry_callback(self, state: ControllerState) -> None:
-        """Execute the entry callback for a state."""
-        callbacks = {
-            ControllerState.PENDING: self._on_enter_pending,
-            ControllerState.TOPOLOGY_REGISTERING: self._on_enter_topology_registering,
-            ControllerState.READY: self._on_enter_ready,
-            ControllerState.RUNNING: self._on_enter_running,
-            ControllerState.COMPLETING: self._on_enter_completing,
-            ControllerState.FAILING: self._on_enter_failing,
-            ControllerState.COMPLETED: self._on_enter_completed,
-            ControllerState.FAILED: self._on_enter_failed,
-        }
-
-        callback = callbacks.get(state)
-        if callback:
-            try:
-                profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
-                if profiler_runtime is not None and profiler_runtime.enabled:
-                    async with profiler_runtime.recorder.controller_fsm_entry_callback(
-                        state=state.name,
-                    ):
-                        await callback()
-                else:
-                    await callback()
-            except Exception as e:
-                logger.error(f"Error in entry callback for {state}: {e}")
-                if state in (ControllerState.COMPLETING, ControllerState.FAILING) and (
-                    self._state == state
-                ):
-                    await self.trigger_event(
-                        ControllerEvent.CLEANUP_FAILED,
-                        failure=self._reclaim_failure(e),
-                    )
-                    return
-                raise
 
     def get_state(self) -> ControllerState:
         """Get current state (alias for property)."""
@@ -225,7 +228,11 @@ class ControllerStateMachine:
 
     def is_completed(self) -> bool:
         """Check if controller has completed."""
-        return self.state in (ControllerState.COMPLETED, ControllerState.FAILED)
+        return self.state in (
+            ControllerState.COMPLETED,
+            ControllerState.FAILED,
+            ControllerState.CANCELLED,
+        )
 
     async def wait_until_terminal(
         self, timeout: float | None = None
@@ -236,7 +243,11 @@ class ControllerStateMachine:
             else:
                 await asyncio.wait_for(self._terminal_event.wait(), timeout=timeout)
         state = self.state
-        if state not in (ControllerState.COMPLETED, ControllerState.FAILED):
+        if state not in (
+            ControllerState.COMPLETED,
+            ControllerState.FAILED,
+            ControllerState.CANCELLED,
+        ):
             raise RuntimeError(f"Terminal event set in non-terminal state: {state}")
         return state
 
@@ -262,171 +273,12 @@ class ControllerStateMachine:
         failure = event_data.get("failure")
         if not isinstance(failure, ExecutionFailure):
             raise TypeError("CLEANUP_FAILED requires an ExecutionFailure.")
-        if (
-            failure.spmd_id != _CONTROLLER_FAILURE_ID
-            or failure.phase != _CONTROLLER_CLEANUP_PHASE
-        ):
+        if failure.spmd_id != "controller" or failure.phase != "CONTROLLER_CLEANUP":
             raise ValueError(
                 "CLEANUP_FAILED requires controller/CONTROLLER_CLEANUP identity."
             )
         self._failures[failure.spmd_id] = failure
         logger.error(f"Controller reclaim error: {failure}")
-
-    @staticmethod
-    def _reclaim_failure(error: BaseException) -> ExecutionFailure:
-        return ExecutionFailure.from_exception(
-            spmd_id=_CONTROLLER_FAILURE_ID,
-            rank=None,
-            phase=_CONTROLLER_CLEANUP_PHASE,
-            exception=error,
-        )
-
-    # =========================================================================
-    # State entry callbacks (async)
-    # =========================================================================
-
-    async def _on_enter_pending(self) -> None:
-        """Called when entering PENDING state.
-
-        Resources are allocated and SPMDs are started (fire-and-forget).
-        Waiting for all drivers to report workers_ready via heartbeat.
-        """
-        logger.debug(
-            "Controller entering PENDING state, waiting for all drivers to report workers_ready"
-        )
-
-    async def _on_enter_topology_registering(self) -> None:
-        """Called when entering TOPOLOGY_REGISTERING state.
-
-        All drivers have reported workers_ready.
-        Initiates topology registration on all SPMDs.
-        Workers will auto-start after handler registration.
-        """
-        logger.debug(
-            "Controller entering TOPOLOGY_REGISTERING state, initiating topology registration"
-        )
-
-        try:
-            await self._controller._initiate_topology_registration()
-        except Exception as e:
-            failure = ExecutionFailure.from_exception(
-                spmd_id="controller",
-                rank=None,
-                phase="TOPOLOGY_REGISTRATION",
-                exception=e,
-            )
-            await self.trigger_event(
-                ControllerEvent.DRIVER_ERROR,
-                spmd_id="controller",
-                failure=failure,
-            )
-            raise
-
-    async def _on_enter_ready(self) -> None:
-        """Called when entering READY state.
-
-        Topology registration is complete. Waiting for restore and start.
-        """
-        logger.debug("Controller entering READY state")
-        if hasattr(self._controller, "_ready_event"):
-            self._controller._ready_event.set()
-
-    async def _on_enter_running(self) -> None:
-        """Called when entering RUNNING state.
-
-        Starts heartbeat timeout monitoring.
-        """
-        logger.debug("Controller entering RUNNING state")
-
-        # Start heartbeat timeout monitoring now that system is fully initialized
-        try:
-            heartbeat_manager = getattr(self._controller, "_heartbeat_manager", None)
-            if heartbeat_manager is not None:
-                await heartbeat_manager.start_monitoring_async()
-                logger.debug("Heartbeat timeout monitoring started")
-        except Exception as e:
-            logger.error(f"Failed to start heartbeat monitoring: {e}")
-
-        # Prevent discarded events: Check if operations were already completed
-        # during restoration (PENDING state).  However, when a drain strategy is
-        # active, the drain→checkpoint→resume pipeline will detect max_steps and
-        # trigger ALL_DRIVERS_COMPLETED itself after the final checkpoint is
-        # persisted.  Firing the event here would race with that pipeline —
-        # reclaim would release placement groups while saves are in-flight.
-        if self._controller._async_step_manager.is_all_completed():
-            has_drain = self._controller._drain_strategy is not None
-            if has_drain:
-                logger.debug(
-                    "All operators completed upon entering RUNNING, but drain "
-                    "strategy is active — deferring completion to the "
-                    "drain→checkpoint→resume pipeline"
-                )
-            else:
-                logger.debug(
-                    "wait_for_completion detected all operators completed "
-                    "upon entering RUNNING, transitioning"
-                )
-                await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
-
-    async def _on_enter_completing(self) -> None:
-        """
-        Called when entering COMPLETING state.
-
-        Reclaims all SPMD resources and performs reclaim.
-        """
-        logger.debug("Controller entering COMPLETING state")
-
-        reclaim_error = None
-        try:
-            await self._controller._finalize_runtime(
-                export_profiler_trace=True,
-            )
-        except Exception as e:
-            logger.error(f"Failed to reclaim SPMDs: {e}")
-            reclaim_error = e
-        if reclaim_error is not None:
-            await self.trigger_event(
-                ControllerEvent.CLEANUP_FAILED,
-                failure=self._reclaim_failure(reclaim_error),
-            )
-            return
-        await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
-
-    async def _on_enter_failing(self) -> None:
-        """
-        Called when entering FAILING state.
-
-        Handles unrecoverable failures.
-        """
-        logger.error("Controller entering FAILING state")
-
-        failures = dict(self._failures)
-        logger.error(f"Execution failures: {failures}")
-
-        # Attempt to reclaim resources even on failure
-        reclaim_error = None
-        try:
-            await self._controller._finalize_runtime(
-                export_profiler_trace=False,
-            )
-        except Exception as e:
-            logger.error(f"Failed to reclaim SPMDs during failure handling: {e}")
-            reclaim_error = e
-        if reclaim_error is not None:
-            await self.trigger_event(
-                ControllerEvent.CLEANUP_FAILED,
-                failure=self._reclaim_failure(reclaim_error),
-            )
-            return
-        await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
-
-    async def _on_enter_completed(self) -> None:
-        """Called when entering COMPLETED state."""
-        logger.debug("Controller entering COMPLETED state")
-
-    async def _on_enter_failed(self) -> None:
-        """Called when entering FAILED state."""
-        logger.error("Controller entering FAILED state")
 
     async def reset(self) -> None:
         """Reset state machine to initial state."""

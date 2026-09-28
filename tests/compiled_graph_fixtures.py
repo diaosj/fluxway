@@ -35,7 +35,7 @@ def compiled_spmd_spec(
     spmd_class: type = CompiledGraphFixtureSPMD,
     resource_profile: ResourceProfile = COMPILED_GRAPH_FIXTURE_PROFILE,
 ) -> SPMDGraphSpec:
-    return SPMDGraphSpec(
+    return SPMDGraphSpec.create(
         spmd_id=spmd_id,
         spmd_class=spmd_class,
         mesh=mesh,

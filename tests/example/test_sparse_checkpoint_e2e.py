@@ -9,7 +9,6 @@ import sparse_embedding as se
 from sparse_embedding.checkpoint.spi import CheckpointConflictError
 
 from fluxway.common.types.checkpoint import (
-    CheckpointObjectCleanedUpError,
     CheckpointComponentCapability,
     CheckpointCommitPermit,
     CheckpointCut,
@@ -23,6 +22,8 @@ from fluxway.common.types.checkpoint import (
 from fluxway.common.types import DrainBoundary
 from fluxway.control_plane.checkpointer.component import CheckpointComponentRegistry
 from fluxway.control_plane.checkpointer.checkpoint import FluxwayCheckpointer
+from fluxway.control_plane.checkpointer.repository import CheckpointRepository
+from fluxway.common.types.checkpoint import CheckpointRetentionPolicy
 from fluxway.integrations.sparse_embedding.checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
@@ -66,6 +67,7 @@ class _LocalLanceController:
         permit,
         cut,
         repository_dir,
+        deadline=None,
     ):
         coordinator = _coordinator(repository_dir, 0, self.topology, self.owner)
         await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
@@ -89,7 +91,7 @@ class _LocalLanceController:
             },
         )
 
-    async def publish_snapshot(self, checkpoint_id, permit):
+    async def publish_snapshot(self, checkpoint_id, permit, deadline=None):
         coordinator = self._active.pop(checkpoint_id)
         await coordinator.publish_save()
         await coordinator.close()
@@ -100,7 +102,15 @@ class _LocalLanceController:
             await coordinator.rollback_active()
             await coordinator.close()
 
-    async def commit_checkpoint_state(self, step, framework_state):
+    def prepare_checkpoint_transaction(self, checkpoint_id, permit, cut, control_state):
+        return {}
+
+    def apply_prepared_checkpoint_transaction(
+        self, checkpoint_id, permit, cut, control_state, prepared
+    ):
+        return None
+
+    def abort_checkpoint_transaction(self, checkpoint_id, permit):
         return None
 
     async def restore_snapshot(self, checkpoint_id, manifest, repository_dir):
@@ -140,10 +150,11 @@ async def test_fluxway_restores_selected_step_from_exact_lance_version(tmp_path)
     control_component = SparseEmbeddingCheckpointComponent(
         modulo_partition, LocalLanceStorageFactory()
     )
-    checkpointer = FluxwayCheckpointer(
+    checkpointer = await FluxwayCheckpointer.create(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
+        retention_policy=CheckpointRetentionPolicy(retain_last=3),
         component_registries={
             "embedding": CheckpointComponentRegistry(
                 (control_component.registration(),)
@@ -176,13 +187,13 @@ async def test_fluxway_automatically_cleanups_sparse_versions(tmp_path):
     control_component = SparseEmbeddingCheckpointComponent(
         modulo_partition,
         LocalLanceStorageFactory(),
-        retain_last=1,
     )
     repository = tmp_path / "repository"
-    checkpointer = FluxwayCheckpointer(
+    checkpointer = await FluxwayCheckpointer.create(
         controller,
         str(repository),
         interval_steps=1,
+        retention_policy=CheckpointRetentionPolicy(retain_last=1),
         component_registries={
             "embedding": CheckpointComponentRegistry(
                 (control_component.registration(),)
@@ -193,6 +204,7 @@ async def test_fluxway_automatically_cleanups_sparse_versions(tmp_path):
     first = await checkpointer.save(SaveCheckpointRequest.for_step(1))
     owner.store = _store(np.asarray([2], dtype=np.uint64))
     await checkpointer.save(SaveCheckpointRequest.for_step(2))
+    await checkpointer.close()
 
     checkpoint_object = (
         first.spmds["embedding"]
@@ -200,24 +212,29 @@ async def test_fluxway_automatically_cleanups_sparse_versions(tmp_path):
         .shared_records[0]
         .checkpoint_objects[0]
     )
-    assert checkpointer.repository.is_checkpoint_object_cleaned_up(
-        "embedding", checkpoint_object
+    assert CheckpointRepository(
+        tmp_path / "repository"
+    ).is_checkpoint_object_cleaned_up("embedding", checkpoint_object)
+    next_checkpointer = await FluxwayCheckpointer.create(
+        controller,
+        str(repository),
+        interval_steps=1,
+        retention_policy=CheckpointRetentionPolicy(retain_last=1),
+        component_registries={
+            "embedding": CheckpointComponentRegistry(
+                (control_component.registration(),)
+            )
+        },
     )
-    with pytest.raises(CheckpointObjectCleanedUpError):
-        await checkpointer.restore(StepReference(1))
+    with pytest.raises(FileNotFoundError, match="checkpoint reference not found"):
+        await next_checkpointer.restore(StepReference(1))
+    await next_checkpointer.close()
 
     storage_root = (
         repository / "application-checkpoint_objects" / "embedding" / "embedding"
     )
     rows = lance.dataset(str(storage_root / "snapshot_manifest")).to_table().to_pylist()
-    old_version = next(
-        row["entries_lance_version"]
-        for row in rows
-        if row["checkpoint_name"] == first.checkpoint_id
-    )
-    with pytest.raises(Exception):
-        lance.dataset(str(storage_root / "entries"), version=old_version)
-    await checkpointer.close()
+    assert all(row["checkpoint_name"] != first.checkpoint_id for row in rows)
 
 
 @pytest.mark.asyncio
@@ -228,12 +245,12 @@ async def test_sparse_lease_blocks_automatic_cleanup_until_release(tmp_path):
     control_component = SparseEmbeddingCheckpointComponent(
         modulo_partition,
         LocalLanceStorageFactory(),
-        retain_last=1,
     )
-    checkpointer = FluxwayCheckpointer(
+    checkpointer = await FluxwayCheckpointer.create(
         controller,
         str(tmp_path / "repository"),
         interval_steps=1,
+        retention_policy=CheckpointRetentionPolicy(retain_last=1),
         component_registries={
             "embedding": CheckpointComponentRegistry(
                 (control_component.registration(),)
@@ -260,10 +277,10 @@ async def test_sparse_lease_blocks_automatic_cleanup_until_release(tmp_path):
         await checkpointer.save(SaveCheckpointRequest.for_step(2))
     await checkpointer.release_checkpoint_hold("embedding", lease)
     await checkpointer.save(SaveCheckpointRequest.for_step(2))
-    assert checkpointer.repository.is_checkpoint_object_cleaned_up(
-        "embedding", checkpoint_object
-    )
     await checkpointer.close()
+    assert CheckpointRepository(
+        tmp_path / "repository"
+    ).is_checkpoint_object_cleaned_up("embedding", checkpoint_object)
 
 
 @pytest.mark.asyncio

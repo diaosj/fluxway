@@ -11,6 +11,7 @@ from fluxway.common.types import (
     DriverHeartbeat,
     ExecutionFailure,
     HeartbeatConfig,
+    DEFAULT_INACTIVITY_TIMEOUT_SECS,
 )
 from fluxway.common.utils.logging import get_logger
 
@@ -29,12 +30,14 @@ class HeartbeatManager:
         get_driver_state: Callable[[], DriverState],
         get_driver_failure: Callable[[], ExecutionFailure | None],
         get_workers_ready: Callable[[], bool],
-        get_workers_running: Callable[[], bool],
+        get_topology_ready: Callable[[], bool],
         get_worker_heartbeat_times: Callable[[], dict[int, float]],
         controller_handle: Any | None,
         trigger_state_event: Callable[[DriverEvent, Any], Any],
         receive_worker_failure: Callable[[int, ExecutionFailure], Any],
         profiler_runtime: Any = None,
+        get_worker_heartbeats: Callable[[], dict[int, Any]] | None = None,
+        inactivity_timeout_s: float = DEFAULT_INACTIVITY_TIMEOUT_SECS,
     ):
         self.spmd_id = spmd_id
         self.num_workers = num_workers
@@ -43,12 +46,14 @@ class HeartbeatManager:
         self.get_driver_state = get_driver_state
         self.get_driver_failure = get_driver_failure
         self.get_workers_ready = get_workers_ready
-        self.get_workers_running = get_workers_running
+        self.get_topology_ready = get_topology_ready
         self.get_worker_heartbeat_times = get_worker_heartbeat_times
         self.controller_handle = controller_handle
         self.trigger_state_event = trigger_state_event
         self.receive_worker_failure = receive_worker_failure
         self._profiler_runtime = profiler_runtime
+        self.get_worker_heartbeats = get_worker_heartbeats
+        self._inactivity_timeout_s = inactivity_timeout_s
 
         self._heartbeat_running = False
         self._heartbeat_thread: threading.Thread | None = None
@@ -140,20 +145,30 @@ class HeartbeatManager:
         timed_out_rank: int | None = None
         timed_out_elapsed = 0.0
 
+        driver_state = self.get_driver_state()
+        timeout_limit = (
+            self._inactivity_timeout_s
+            if driver_state is DriverState.SNAPSHOTTING
+            else self._heartbeat_config.heartbeat_timeout
+        )
+
         worker_times = self.get_worker_heartbeat_times()
 
         for rank in range(self.num_workers):
             last_time = worker_times.get(rank, 0)
             elapsed = current_time - last_time
-            if elapsed < self._heartbeat_config.heartbeat_timeout:
+            if elapsed < timeout_limit:
                 healthy_count += 1
             elif timed_out_rank is None:
                 timed_out_rank = rank
                 timed_out_elapsed = elapsed
 
-        driver_state = self.get_driver_state()
-
         if timed_out_rank is not None and driver_state is not DriverState.INITIALIZING:
+            phase = (
+                "CHECKPOINT"
+                if driver_state is DriverState.SNAPSHOTTING
+                else "WORKER_HEARTBEAT"
+            )
             self.receive_worker_failure(
                 timed_out_rank,
                 ExecutionFailure(
@@ -161,16 +176,51 @@ class HeartbeatManager:
                     rank=timed_out_rank,
                     op_name=None,
                     step=None,
-                    phase="WORKER_HEARTBEAT",
+                    phase=phase,
                     exception_type="WorkerHeartbeatTimeout",
                     message=(
                         f"Worker heartbeat timed out after {timed_out_elapsed:.3f}s; "
-                        f"limit is {self._heartbeat_config.heartbeat_timeout:.3f}s."
+                        f"limit is {timeout_limit:.3f}s."
                     ),
                     traceback=None,
                 ),
             )
             driver_state = self.get_driver_state()
+
+        if (
+            driver_state == DriverState.SNAPSHOTTING
+            and self.get_worker_heartbeats is not None
+        ):
+            worker_hbs = self.get_worker_heartbeats()
+            for rank in range(self.num_workers):
+                hb = worker_hbs.get(rank)
+                if (
+                    hb is not None
+                    and hb.checkpoint_id is not None
+                    and hb.checkpoint_progress_timestamp is not None
+                    and hb.checkpoint_progress_timestamp > 0.0
+                ):
+                    inactivity = current_time - hb.checkpoint_progress_timestamp
+                    if inactivity > self._inactivity_timeout_s:
+                        self.receive_worker_failure(
+                            rank,
+                            ExecutionFailure(
+                                spmd_id=self.spmd_id,
+                                rank=rank,
+                                op_name=None,
+                                step=None,
+                                phase="CHECKPOINT",
+                                exception_type="WorkerCheckpointInactivityTimeout",
+                                message=(
+                                    f"Worker checkpoint activity stalled after {inactivity:.3f}s "
+                                    f"during snapshot {hb.checkpoint_id}; "
+                                    f"limit is {self._inactivity_timeout_s:.3f}s."
+                                ),
+                                traceback=None,
+                            ),
+                        )
+                        driver_state = self.get_driver_state()
+                        break
 
         if driver_state is DriverState.ERROR:
             status = DriverStatus.ERROR
@@ -190,7 +240,7 @@ class HeartbeatManager:
             num_workers=self.num_workers,
             healthy_num_workers=healthy_count,
             workers_ready=self.get_workers_ready(),
-            workers_running=self.get_workers_running(),
+            topology_ready=self.get_topology_ready(),
         )
 
         try:

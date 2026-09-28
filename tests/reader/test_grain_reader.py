@@ -2,7 +2,7 @@
 Unit tests for GrainReader.
 
 GrainReader.read() is a @operator-decorated staticmethod backed by a
-per-class thread-local instance (see decorators._instance_storage).
+per-owner instance within the worker-scoped operator container.
 Unit tests that need to exercise different rank configurations must
 instantiate GrainReader directly and call next_item() / _create_data_loader()
 rather than going through the staticmethod wrapper.
@@ -21,7 +21,9 @@ from dataclasses import dataclass
 from fluxway.common.decorators import data_type
 from fluxway.common.decorators import spmd_source
 from fluxway.reader.grain_reader import GrainReader, StridedIndexSampler
-from fluxway.spmd.worker.operator_manager.dispatcher import InterleavedDispatcher
+from fluxway.spmd.worker.operator_manager.dispatcher import ExecutionDispatcher
+from fluxway.common.execution_layout import compile_execution_layout
+from fluxway.common.mesh import DeviceMesh
 
 
 @data_type()
@@ -151,7 +153,9 @@ class TestGrainReaderSharding:
     def test_interleaved_readers_follow_global_batch_order(self):
         ds = MockDataSource(10)
         readers = [_make_reader(ds, rank=rank, world_size=2) for rank in range(2)]
-        dispatcher = InterleavedDispatcher(1)
+        dispatcher = ExecutionDispatcher(
+            compile_execution_layout(DeviceMesh(("worker",), (2,)), unit_size=1)
+        )
 
         actual = []
         for step in range(10):
@@ -168,7 +172,9 @@ class TestGrainReaderSharding:
     def test_interleaved_units_read_consecutive_logical_shards(self):
         ds = MockDataSource(12)
         readers = [_make_reader(ds, rank=rank, world_size=4) for rank in range(4)]
-        dispatcher = InterleavedDispatcher(2)
+        dispatcher = ExecutionDispatcher(
+            compile_execution_layout(DeviceMesh(("worker",), (4,)), unit_size=2)
+        )
 
         actual = []
         for step in range(6):
@@ -182,6 +188,33 @@ class TestGrainReaderSharding:
                 actual.append(int(batch.features[0]))
 
         assert actual == list(range(12))
+
+    def test_interleaved_num_logical_shards_mismatch_causes_duplicate_shards(self):
+        ds = MockDataSource(20)
+        # When num_logical_shards=2 < physical_world_size=4:
+        # rank 0 -> shard 0, rank 1 -> shard 1, rank 2 -> shard 0, rank 3 -> shard 1
+        readers = [
+            _make_reader(ds, rank=rank, world_size=4, num_logical_shards=2)
+            for rank in range(4)
+        ]
+        dispatcher = ExecutionDispatcher(
+            compile_execution_layout(DeviceMesh(("worker",), (4,)), unit_size=2)
+        )
+
+        # Step 0 (unit 0: ranks 0, 1) reads shard 0 and 1
+        owners_step0 = [
+            rank for rank in range(4) if dispatcher.should_execute(rank, 4, 0)
+        ]
+        items_step0 = [int(readers[r].next_item().features[0]) for r in owners_step0]
+
+        # Step 1 (unit 1: ranks 2, 3) reads shard 0 and 1 again
+        owners_step1 = [
+            rank for rank in range(4) if dispatcher.should_execute(rank, 4, 1)
+        ]
+        items_step1 = [int(readers[r].next_item().features[0]) for r in owners_step1]
+
+        # Demonstrates that misaligned num_logical_shards produces duplicate samples
+        assert items_step0 == items_step1 == [0, 1]
 
     def test_strided_reader_checkpoint_restores_local_cursor(self):
         ds = MockDataSource(10)

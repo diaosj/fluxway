@@ -5,6 +5,7 @@ import pytest
 
 import fluxway
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.decorators import (
     _is_worker_process_required,
     _validate_worker_process_marker,
@@ -110,5 +111,6 @@ def test_operator_preinstantiation_creates_each_owner_once_in_worker():
         config,
         rank=0,
         static_args={},
+        instance_container=OperatorInstanceContainer(),
     )
     assert sorted(created) == ["standard", "worker"]

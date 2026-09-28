@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Any, Protocol, cast, runtime_checkable
 
 from fluxway.common.types import CheckpointCut, ControllerState, DriverState
+from fluxway.common.driver_control import DriverComponentCapabilities
+from fluxway.common.metadata import metadata_digest
 
 type ComponentState = ControllerState | DriverState
 
@@ -31,6 +33,7 @@ class DriverComponentContext:
     world_size: int
     interleave_unit_size: int
     report_failure: Any
+    capabilities: DriverComponentCapabilities
 
 
 @runtime_checkable
@@ -96,6 +99,21 @@ class ControlPlaneComponent(Protocol):
         ...
 
 
+@runtime_checkable
+class TransactionalControlPlaneComponent(Protocol):
+    """Explicit Controller transaction capability."""
+
+    component_id: str
+
+    def prepare_checkpoint(
+        self, checkpoint_id: str, permit: Any, cut: CheckpointCut, state_digest: str
+    ) -> Any: ...
+
+    def apply_prepared(self, prepared_state: Any) -> None: ...
+
+    def abort_prepared(self, checkpoint_id: str, permit: Any) -> None: ...
+
+
 class _ComponentRegistry:
     def __init__(self) -> None:
         self._components: dict[str, ControlPlaneComponent] = {}
@@ -103,6 +121,15 @@ class _ComponentRegistry:
     @property
     def component_ids(self) -> tuple[str, ...]:
         return tuple(self._components)
+
+    def components_implementing(self, *names: str) -> tuple[Any, ...]:
+        if not names or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("component capability names must be non-empty strings")
+        return tuple(
+            component
+            for component in self._components.values()
+            if all(callable(getattr(component, name, None)) for name in names)
+        )
 
     def register(self, component: ControlPlaneComponent) -> None:
         component_id = getattr(component, "component_id", None)
@@ -115,7 +142,59 @@ class _ComponentRegistry:
                 raise TypeError(
                     f"control-plane component {component_id!r} must implement {name}"
                 )
+        transaction_names = (
+            "prepare_checkpoint",
+            "apply_prepared",
+            "abort_prepared",
+        )
+        transaction_methods = tuple(
+            callable(getattr(component, name, None)) for name in transaction_names
+        )
+        if any(transaction_methods) and not all(transaction_methods):
+            raise TypeError(
+                f"control-plane component {component_id!r} must implement the complete "
+                "transaction capability"
+            )
         self._components[component_id] = component
+
+    def register_transactional(
+        self, component: TransactionalControlPlaneComponent
+    ) -> None:
+        if not isinstance(component, TransactionalControlPlaneComponent):
+            raise TypeError(
+                f"control-plane component {component.component_id!r} must implement "
+                "the explicit transaction capability"
+            )
+        self.register(component)
+
+    async def dispatch_request(self, component_id: str, request: Any) -> object:
+        if not isinstance(component_id, str) or not component_id:
+            raise ValueError("component dispatch requires a component id")
+        try:
+            component = self._components[component_id]
+        except KeyError as error:
+            raise ValueError(
+                f"component dispatch references unknown component {component_id!r}"
+            ) from error
+        dispatch = getattr(component, "dispatch", None)
+        if not callable(dispatch):
+            raise TypeError(f"component {component_id!r} lacks dispatch capability")
+        result = dispatch(request)
+        if not inspect.isawaitable(result):
+            raise TypeError(f"component {component_id!r} dispatch must be awaitable")
+        return await result
+
+    async def dispatch_unaddressed_request(self, request: Any) -> object:
+        dispatchable = tuple(
+            component
+            for component in self._components.values()
+            if callable(getattr(component, "dispatch", None))
+        )
+        if len(dispatchable) != 1:
+            raise RuntimeError(
+                "unaddressed component dispatch requires exactly one dispatchable component"
+            )
+        return await self.dispatch_request(dispatchable[0].component_id, request)
 
     async def notify_state(self, state: ComponentState) -> None:
         for component in tuple(self._components.values()):
@@ -153,6 +232,76 @@ class _ComponentRegistry:
         for component_id, component in self._components.items():
             component.restore_state(state[component_id], cut)
 
+    def prepare_checkpoint_transaction(
+        self,
+        checkpoint_id: str,
+        permit: Any,
+        cut: CheckpointCut,
+        component_states: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(component_states, Mapping):
+            raise TypeError("component transaction states must be a mapping")
+        prepared: dict[str, Any] = {}
+        for component_id, component in self._components.items():
+            if not isinstance(component, TransactionalControlPlaneComponent):
+                continue
+            if component_id not in component_states:
+                raise ValueError(
+                    f"component transaction state is missing {component_id!r}"
+                )
+            state = component_states[component_id]
+            state_digest = metadata_digest(state)
+            result = component.prepare_checkpoint(
+                checkpoint_id, permit, cut, state_digest
+            )
+            if inspect.isawaitable(result):
+                raise TypeError(
+                    f"component {component_id!r} prepare_checkpoint must be synchronous"
+                )
+            prepared[component_id] = result
+        return prepared
+
+    def apply_prepared_checkpoint_transaction(
+        self,
+        checkpoint_id: str,
+        permit: Any,
+        cut: CheckpointCut,
+        component_states: Mapping[str, Any],
+        prepared: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(component_states, Mapping) or not isinstance(
+            prepared, Mapping
+        ):
+            raise TypeError(
+                "component transaction state and prepared values must be mappings"
+            )
+        for component_id, component in self._components.items():
+            if not isinstance(component, TransactionalControlPlaneComponent):
+                continue
+            component_prepared = prepared.get("components", prepared)
+            if (
+                component_id not in component_states
+                or component_id not in component_prepared
+            ):
+                raise ValueError(
+                    f"component transaction state is missing {component_id!r}"
+                )
+            result = component.apply_prepared(component_prepared[component_id])
+            if result is not None:
+                raise TypeError(
+                    f"component {component_id!r} apply_prepared must return None"
+                )
+
+    def abort_checkpoint_transaction(self, checkpoint_id: str, permit: Any) -> None:
+        for component_id, component in self._components.items():
+            if not isinstance(component, TransactionalControlPlaneComponent):
+                continue
+            result = component.abort_prepared(checkpoint_id, permit)
+            if inspect.isawaitable(result):
+                raise TypeError(
+                    f"component {component_id!r} abort_prepared must be synchronous"
+                )
+
 
 class ControlPlaneComponentRegistry(_ComponentRegistry):
     """Registry for global Controller-owned modules."""
@@ -168,6 +317,7 @@ def build_driver_component_registry(
     spmd_id: str,
     controller_handle: Any,
     report_failure: Any,
+    capabilities: DriverComponentCapabilities,
 ) -> DriverComponentRegistry:
     registry = DriverComponentRegistry()
     graph_view = config.require_graph_view()
@@ -193,6 +343,7 @@ def build_driver_component_registry(
             world_size=graph_view.world_size,
             interleave_unit_size=spec.interleave_unit_size,
             report_failure=report_failure,
+            capabilities=capabilities,
         )
         registry.register(cast(ControlPlaneComponent, build(context)))
     return registry

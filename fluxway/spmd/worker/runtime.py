@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
@@ -12,6 +13,7 @@ import inspect
 import queue
 import threading
 from typing import Any
+import weakref
 
 from fluxway.common import asyncio_runtime
 from fluxway.profiler.recorder import WORKER_OUTBOUND_TASK
@@ -19,6 +21,58 @@ from fluxway.profiler.recorder import WORKER_OUTBOUND_TASK
 
 WORKER_PROCESS_DEFAULT_EXECUTION_LANE = "__default__"
 ScheduleKey = tuple[int, int, int, str]
+
+
+class SourceAcknowledgementRuntime:
+    def __init__(self, *, capacity: int, send: Callable, spawn: Callable) -> None:
+        if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+            raise ValueError("source acknowledgement capacity must be positive")
+        self._capacity = capacity
+        self._send = send
+        self._spawn = spawn
+        self._queued: deque[tuple] = deque()
+        self._pending = 0
+        self._changed = asyncio.Event()
+        self._task: asyncio.Task | None = None
+        self._error: BaseException | None = None
+
+    async def submit(self, acknowledgements: tuple) -> None:
+        if not acknowledgements:
+            raise ValueError("source acknowledgement batch must be nonempty")
+        while self._pending >= self._capacity and self._error is None:
+            await self._changed.wait()
+        if self._error is not None:
+            raise self._error
+        self._queued.append(acknowledgements)
+        self._pending += 1
+        if self._task is None or self._task.done():
+            self._task = self._spawn(self._drain())
+
+    async def _drain(self) -> None:
+        try:
+            while self._queued:
+                count = len(self._queued)
+                batch = tuple(
+                    value for _ in range(count) for value in self._queued.popleft()
+                )
+                await self._send(batch)
+                self._pending -= count
+                self._notify_changed()
+        except BaseException as error:
+            self._error = error
+            self._notify_changed()
+            raise
+
+    def _notify_changed(self) -> None:
+        changed = self._changed
+        self._changed = asyncio.Event()
+        changed.set()
+
+    async def flush(self) -> None:
+        if self._task is not None:
+            await asyncio.shield(self._task)
+        if self._error is not None:
+            raise self._error
 
 
 @dataclass(order=True, slots=True)
@@ -45,6 +99,8 @@ class _PriorityThreadExecutor:
         self._closed = False
         self._sequence = 0
         self._workers: list[Future[Any]] = []
+        with _priority_thread_executors_lock:
+            _priority_thread_executors.add(self)
 
     def submit(self, schedule_key: ScheduleKey, fn: Callable[[], Any]) -> Future[Any]:
         if len(schedule_key) != 4:
@@ -123,6 +179,20 @@ class _PriorityThreadExecutor:
                     )
                 )
         self._executor.shutdown(wait=wait, cancel_futures=False)
+
+
+_priority_thread_executors: weakref.WeakSet[_PriorityThreadExecutor] = weakref.WeakSet()
+_priority_thread_executors_lock = threading.Lock()
+
+
+def _wake_priority_thread_executors_on_interpreter_exit() -> None:
+    with _priority_thread_executors_lock:
+        executors = tuple(_priority_thread_executors)
+    for executor in executors:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+threading._register_atexit(_wake_priority_thread_executors_on_interpreter_exit)
 
 
 class WorkerProcessCallRuntime:

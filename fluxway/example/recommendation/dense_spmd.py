@@ -15,6 +15,7 @@ from fluxway.common.tensor_components import (
     fill_nested_dense_inv_with_pad,
 )
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.types import SaveSession, RestoreSession
 from fluxway.control_plane.checkpointer import OrbaxCheckpointComponent
 from fluxway import ResourceProfile
@@ -62,29 +63,29 @@ def _dense_phase_schedule(phase: str) -> SchedulePolicy:
     )
 
 
-# Select array backend for JIT-external operations based on GPU availability.
-# When JAX uses GPU, CuPy provides zero-copy DLPack interop with JAX.
-# When JAX falls back to CPU, NumPy is the natural choice.
-_GPU_AVAILABLE = False
-cupyx = None  # type: ignore[assignment]
-try:
-    import cupy as cp  # type: ignore[no-redef]
-    import cupyx  # type: ignore[no-redef]
-
-    # Verify CUDA is actually usable (cupy may be installed without a GPU)
-    try:
-        _cc = cp.cuda.Device(0).compute_capability
-        _GPU_AVAILABLE = True
-    except Exception:
-        _GPU_AVAILABLE = False
-except ImportError:
-    _GPU_AVAILABLE = False
-    cp = None
-
-
 def _xp() -> Any:
-    """Return CuPy if GPU is available, otherwise NumPy."""
-    return cp if _GPU_AVAILABLE else np
+    platform = jax.default_backend()
+    if platform == "cpu":
+        return np
+    if platform == "gpu":
+        import cupy
+
+        return cupy
+    raise ValueError(f"unsupported Dense JAX platform {platform!r}")
+
+
+def _local_jax_to_native(value: jax.Array) -> Any:
+    if not isinstance(value, jax.Array):
+        raise TypeError("Dense export requires a JAX array")
+    shards = value.addressable_shards
+    if len(shards) != 1:
+        raise ValueError("Dense export requires exactly one addressable shard")
+    local = shards[0].data
+    platform = shards[0].device.platform
+    if platform not in ("cpu", "gpu"):
+        raise ValueError(f"unsupported Dense export platform {platform!r}")
+    device = "cuda" if platform == "gpu" else "cpu"
+    return get_backend().asarray(local, copy=False, device=device)
 
 
 def _place_gradient_like(gradient: jax.Array, reference: jax.Array) -> jax.Array:
@@ -238,7 +239,7 @@ def _gather_sparse_input(emb_flat, inv, batch_size, emb_dim, gname=""):
     zero_row = xp.zeros((1, emb_dim), dtype=emb_2d.dtype)
     emb_for_gather = xp.concatenate([emb_2d, zero_row], axis=0)
 
-    if _GPU_AVAILABLE:
+    if xp is not np:
         rec = emb_for_gather[inv_1d]
     else:
         rec = np.empty((inv_1d.shape[0], emb_dim), dtype=emb_2d.dtype)
@@ -288,8 +289,10 @@ def _scatter_add_grad(emb_2d, inv_1d, grad_local):
 
     g_unique = xp.zeros_like(emb_2d)
 
-    if _GPU_AVAILABLE:
-        cupyx.scatter_add(  # type: ignore[union-attr]
+    if xp is not np:
+        import cupyx
+
+        cupyx.scatter_add(
             g_unique,
             xp.asarray(inv_1d),
             grad_local,
@@ -408,7 +411,7 @@ class DenseSPMD:
         )
 
     def _checkpoint_state(self) -> dict:
-        return {"model_state": nnx.state(self.model), "grad_accum": self.grad_accum}
+        return {"model_state": nnx.state(self.model)}
 
     def finalize_checkpoint_state(self, context: SaveSession) -> None:
         if self._pending_accum_steps > 0:
@@ -433,7 +436,7 @@ class DenseSPMD:
 
     def restore_checkpoint_state(self, state: dict, context: RestoreSession) -> None:
         nnx.update(self.model, state["model_state"])
-        self.grad_accum = state["grad_accum"]
+        self.grad_accum = jtu.tree_map(jnp.zeros_like, nnx.state(self.model))
         self._pending_accum_steps = 0
 
     @operator(
@@ -656,19 +659,26 @@ class DenseSPMD:
         if self.diagnostic_step_delay_ms:
             time.sleep(self.diagnostic_step_delay_ms / 1000.0)
 
-        grad_f1_local = xp.asarray(grad_f1_global.addressable_shards[0].data)  # type: ignore
-        grad_f2_local = xp.asarray(grad_f2_global.addressable_shards[0].data)  # type: ignore
+        grad_f1_local = _local_jax_to_native(grad_f1_global)
+        grad_f2_local = _local_jax_to_native(grad_f2_global)
 
         dense_grad_leaves = jtu.tree_leaves(dense_param_grads)
-        dense_grad_flat = xp.concatenate(  # type: ignore
-            [xp.asarray(g).ravel() for g in dense_grad_leaves]  # type: ignore
+        if any(not gradient.is_fully_replicated for gradient in dense_grad_leaves):
+            raise ValueError(
+                "Dense parameter gradients must be replicated before export"
+            )
+        native_gradients = [
+            _local_jax_to_native(gradient) for gradient in dense_grad_leaves
+        ]
+        dense_grad_flat = xp.concatenate(
+            [gradient.ravel() for gradient in native_gradients]
         )
 
         print(
             f"[DenseSPMD.train_core] rank={self.rank} "
             f"f1_rec={f1_local.shape} f2_rec={f2_local.shape} "
             f"loss={float(loss_val):.4f} "
-            f"dense_grad_norms={[float(xp.linalg.norm(xp.asarray(g))) for g in dense_grad_leaves]}"  # type: ignore
+            f"dense_grad_norms={[float(xp.linalg.norm(gradient)) for gradient in native_gradients]}"
         )
 
         return {
@@ -742,12 +752,8 @@ class DenseSPMD:
             _pooled_grad_slots(inv2_arr, emb2_2d.shape[0], grad_f2_local),
         )[: emb2_2d.shape[0]]
 
-        if _GPU_AVAILABLE:
-            g1_nonzero_rows = int(cp.count_nonzero(cp.any(g1_unique != 0, axis=1)))  # type: ignore
-            g2_nonzero_rows = int(cp.count_nonzero(cp.any(g2_unique != 0, axis=1)))  # type: ignore
-        else:
-            g1_nonzero_rows = int(np.count_nonzero(np.any(g1_unique != 0, axis=1)))
-            g2_nonzero_rows = int(np.count_nonzero(np.any(g2_unique != 0, axis=1)))
+        g1_nonzero_rows = int(xp.count_nonzero(xp.any(g1_unique != 0, axis=1)))
+        g2_nonzero_rows = int(xp.count_nonzero(xp.any(g2_unique != 0, axis=1)))
         assert g1_nonzero_rows <= emb1_2d.shape[0], (
             f"[DenseSPMD] grad1 scatter-add non-zero rows {g1_nonzero_rows} "
             f"exceeds unique keys count {emb1_2d.shape[0]}"

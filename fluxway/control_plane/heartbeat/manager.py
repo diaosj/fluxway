@@ -52,7 +52,7 @@ class HeartbeatManager:
         self,
         config: HeartbeatConfig | None = None,
         on_all_ready: SyncCallback | AsyncCallback | None = None,
-        on_all_workers_running: SyncCallback | AsyncCallback | None = None,
+        on_all_topology_ready: SyncCallback | AsyncCallback | None = None,
         on_driver_error: SyncErrorCallback | AsyncErrorCallback | None = None,
         observer: HeartbeatObserver | None = None,
     ):
@@ -62,13 +62,13 @@ class HeartbeatManager:
         Args:
             config: Heartbeat configuration
             on_all_ready: Callback when all registered drivers are ready (workers_ready=True)
-            on_all_workers_running: Callback when all drivers report workers_running=True
+            on_all_topology_ready: Callback when all drivers report topology_ready=True
                 (after topology registration completes)
             on_driver_error: Callback when a driver has error (spmd_id, failure) (sync or async)
         """
         self._config = config or HeartbeatConfig()
         self._on_all_ready = on_all_ready
-        self._on_all_workers_running = on_all_workers_running
+        self._on_all_topology_ready = on_all_topology_ready
         self._on_driver_error = on_driver_error
         self._observer = observer
 
@@ -86,7 +86,7 @@ class HeartbeatManager:
 
         # Phase trigger flags (one-shot)
         self._all_ready_triggered = False
-        self._all_workers_running_triggered = False
+        self._all_topology_ready_triggered = False
         self._all_ready_event = asyncio.Event()
 
         # Lock for thread safety (asyncio.Lock for async context)
@@ -163,13 +163,13 @@ class HeartbeatManager:
                     should_trigger_ready = True
                     logger.heartbeat("All drivers ready workers_ready=True")
 
-            # Check if all workers are running (first time) — Phase 2
-            should_trigger_running = False
-            if self._all_ready_triggered and not self._all_workers_running_triggered:
-                if self._check_all_workers_running_internal():
-                    self._all_workers_running_triggered = True
-                    should_trigger_running = True
-                    logger.heartbeat("All workers running workers_running=True")
+            # Check topology readiness (first time) — Phase 2
+            should_trigger_topology = False
+            if self._all_ready_triggered and not self._all_topology_ready_triggered:
+                if self._check_all_topology_ready_internal():
+                    self._all_topology_ready_triggered = True
+                    should_trigger_topology = True
+                    logger.heartbeat("All worker topologies ready topology_ready=True")
 
         # Call callbacks outside lock to prevent deadlock
         if error_notification is not None:
@@ -178,8 +178,8 @@ class HeartbeatManager:
         if should_trigger_ready:
             await self._call_ready_callback()
 
-        if should_trigger_running:
-            await self._call_workers_running_callback()
+        if should_trigger_topology:
+            await self._call_topology_ready_callback()
 
         logger.heartbeat(
             f"Received heartbeat spmd_id={spmd_id} status={heartbeat.status.name} "
@@ -209,16 +209,16 @@ class HeartbeatManager:
         if asyncio.iscoroutine(result):
             await result
 
-    async def _call_workers_running_callback(self) -> None:
-        """Call the on_all_workers_running callback (handles sync and async)."""
-        if self._on_all_workers_running is None:
+    async def _call_topology_ready_callback(self) -> None:
+        """Call the on_all_topology_ready callback (handles sync and async)."""
+        if self._on_all_topology_ready is None:
             return
         try:
-            result = self._on_all_workers_running()
+            result = self._on_all_topology_ready()
             if asyncio.iscoroutine(result):
                 await result
         except Exception as e:
-            logger.error(f"Error in on_all_workers_running callback: {e}")
+            logger.error(f"Error in on_all_topology_ready callback: {e}")
 
     def _check_all_ready_internal(self) -> bool:
         """Check if all registered drivers are ready (must hold lock).
@@ -243,8 +243,8 @@ class HeartbeatManager:
 
         return True
 
-    def _check_all_workers_running_internal(self) -> bool:
-        """Check if all registered drivers report workers_running=True (must hold lock).
+    def _check_all_topology_ready_internal(self) -> bool:
+        """Check if all registered drivers report topology_ready=True (must hold lock).
 
         Phase 2 check: After topology registration, all workers should be running.
         """
@@ -255,7 +255,7 @@ class HeartbeatManager:
             heartbeat = self._heartbeats.get(spmd_id)
             if heartbeat is None:
                 return False
-            if not heartbeat.workers_running:
+            if not heartbeat.topology_ready:
                 return False
 
         return True
@@ -505,7 +505,7 @@ class HeartbeatManager:
             self._missed_counts.clear()
             self._error_drivers.clear()
             self._all_ready_triggered = False
-            self._all_workers_running_triggered = False
+            self._all_topology_ready_triggered = False
             self._all_ready_event = asyncio.Event()
             for spmd_id in self._registered_spmds:
                 self._missed_counts[spmd_id] = 0

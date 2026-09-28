@@ -118,6 +118,10 @@ class TransportPlanManifest:
     emission_mode: SenderEmissionMode
 
     def __post_init__(self) -> None:
+        if not isinstance(self.expected_senders_per_dst, tuple):
+            raise TypeError("expected_senders_per_dst must be a tuple")
+        if not isinstance(self.sender_has_data_per_dst, tuple):
+            raise TypeError("sender_has_data_per_dst must be a tuple")
         if len(self.expected_senders_per_dst) != len(self.sender_has_data_per_dst):
             raise ValueError(
                 "TransportPlanManifest expected_senders_per_dst and "
@@ -125,9 +129,8 @@ class TransportPlanManifest:
             )
         for value in self.expected_senders_per_dst:
             _as_i32(value, "expected_senders_per_dst entry")
-        object.__setattr__(
-            self, "emission_mode", SenderEmissionMode(int(self.emission_mode))
-        )
+        if not isinstance(self.emission_mode, SenderEmissionMode):
+            raise TypeError("emission_mode must be a SenderEmissionMode")
 
     @property
     def target_world_size(self) -> int:

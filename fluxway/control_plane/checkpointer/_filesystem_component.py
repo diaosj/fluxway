@@ -42,7 +42,6 @@ from fluxway.common.types.checkpoint import (
     RestoreTopologyMode,
     CheckpointCleanupBlocked,
     CheckpointHold,
-    CheckpointRetentionPolicy,
     CleanupReservation,
     CleanupReservationRequest,
     TopologyMismatchError,
@@ -93,13 +92,14 @@ class FilesystemCheckpointComponent(
         restore_state: Callable[[Any, Any, RestoreSession], Any],
         *,
         finalize_state: Callable[[Any, SaveSession], Any] | None = None,
-        retention: CheckpointRetentionPolicy,
+        retention_domain: str | None = None,
         restore_topology: RestoreTopologyMode,
     ) -> None:
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
             format_version=1,
-            checkpoint_objects=(CheckpointObjectSpec("state", retention),),
+            retention_domain=retention_domain,
+            checkpoint_objects=(CheckpointObjectSpec("state"),),
             save=CheckpointSaveSpec(
                 prepare_scope=CheckpointSaveScope.LEADER,
                 commit_scope=CheckpointSaveScope.LEADER,

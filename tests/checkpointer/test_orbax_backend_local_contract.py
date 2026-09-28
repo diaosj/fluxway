@@ -15,20 +15,20 @@ from fluxway.common.types.checkpoint import (
     TopologyMismatchError,
     TopologySnapshot,
 )
-from fluxway.control_plane.checkpointer.orbax_component import OrbaxCheckpointComponent
+from fluxway.control_plane.checkpointer import (
+    OrbaxCheckpointComponent,
+    WorkerLocalCheckpointComponent,
+)
 from fluxway.control_plane.checkpointer import orbax_component as orbax_module
 
 
 @pytest.mark.asyncio
-async def test_orbax_local_records_require_exact_topology(tmp_path):
+async def test_worker_local_records_require_exact_topology(tmp_path):
     async def save(module, context):
         return {"local": np.array([context.rank])}
 
     async def restore(module, state, context):
         return None
-
-    async def layout(module, context):
-        return {"local": np.array([0])}
 
     source = TopologySnapshot(1, (), (), "v1")
     changed = TopologySnapshot(2, ("data",), (2,), "v1")
@@ -41,7 +41,7 @@ async def test_orbax_local_records_require_exact_topology(tmp_path):
         spmd_id="train",
         rank=0,
         source_topology=source,
-        component_id="orbax",
+        component_id="local",
     )
     restore_context = RestoreSession(
         instance=None,
@@ -51,10 +51,10 @@ async def test_orbax_local_records_require_exact_topology(tmp_path):
         rank=0,
         saved_topology=source,
         restore_topology=changed,
-        component_id="orbax",
+        component_id="local",
         component_checkpoint=None,
     )
-    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    component = WorkerLocalCheckpointComponent("local", save, restore)
     await component.open(
         CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
     )
@@ -84,13 +84,13 @@ async def test_orbax_local_records_require_exact_topology(tmp_path):
 @pytest.mark.asyncio
 async def test_orbax_rollback_is_safe_when_cleanup_races(tmp_path, monkeypatch):
     async def save(module, context):
-        return {"local": np.array([context.rank])}
+        return {"weights": np.array([1.0])}
 
     async def restore(module, state, context):
         return None
 
     async def layout(module, context):
-        return {"local": np.array([0])}
+        return {"weights": np.array([1.0])}
 
     topology = TopologySnapshot(1, (), (), "v1")
     session = SaveSession(
@@ -108,7 +108,7 @@ async def test_orbax_rollback_is_safe_when_cleanup_races(tmp_path, monkeypatch):
     await component.open(
         CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
     )
-    staging = component._staging_path(session, "rank/0")
+    staging = component._staging_root(session) / "shared"
     staging.mkdir(parents=True)
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()

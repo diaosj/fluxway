@@ -498,11 +498,6 @@ SPMD_MANAGER_DRIVER_STOP = TraceEventSpec(
     "controller/spmd_manager",
     ("spmd_id",),
 )
-SPMD_MANAGER_BROADCAST = TraceEventSpec(
-    "spmd_manager.broadcast",
-    "controller/spmd_manager",
-    ("method_id", "spmd_count"),
-)
 DRIVER_INITIALIZE = TraceEventSpec(
     "driver.initialize",
     "driver/lifecycle",
@@ -1496,14 +1491,6 @@ class TraceRecorder:
         return self._async_span(
             SPMD_MANAGER_DRIVER_STOP,
             payload=(self.intern(spmd_id),),
-        )
-
-    def spmd_manager_broadcast(
-        self, *, method: str, spmd_count: int
-    ) -> AbstractAsyncContextManager[None]:
-        return self._async_span(
-            SPMD_MANAGER_BROADCAST,
-            payload=(self.intern(method), spmd_count),
         )
 
     def driver_initialize(

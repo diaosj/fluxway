@@ -77,6 +77,22 @@ class _LeaderStorage(CheckpointComponent, CheckpointComponentSave):
         return CheckpointComponentRegistration(component=self, save=self)
 
 
+class _FailingStorage(_LeaderStorage):
+    def __init__(self, events, component_id):
+        super().__init__(events)
+        self._descriptor = CheckpointComponentSpec(
+            component_id,
+            save=CheckpointSaveSpec(
+                prepare_scope=CheckpointSaveScope.ALL_RANKS,
+                commit_scope=CheckpointSaveScope.ALL_RANKS,
+            ),
+        )
+
+    async def prepare_save(self, session):
+        self._events.append(("prepare", session.rank, self.descriptor.component_id))
+        raise RuntimeError("storage prepare failed")
+
+
 def _coordinator(rank, registrations):
     return WorkerCheckpointCoordinator(
         components=registrations,
@@ -134,4 +150,19 @@ async def test_finalizer_failure_skips_storage_prepare_and_clears_transaction():
         await _prepare(worker)
 
     assert events == [("finalize", 0)]
+    assert worker.state is None
+
+
+@pytest.mark.asyncio
+async def test_prepare_failure_rolls_back_only_entered_save_capabilities():
+    events = []
+    first = _LeaderStorage(events)
+    failing = _FailingStorage(events, "failing")
+    worker = _coordinator(1, (first.registration(), failing.registration()))
+
+    with pytest.raises(RuntimeError, match="storage prepare failed"):
+        await _prepare(worker)
+
+    assert ("rollback", 1) in events
+    assert events.count(("rollback", 1)) == 1
     assert worker.state is None

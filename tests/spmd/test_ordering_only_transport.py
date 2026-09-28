@@ -13,6 +13,7 @@ from fluxway.common.compiled_graph import (
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.coherence import ExecutionFenceState
 from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
     SuccessorRouteContext,
@@ -167,7 +168,13 @@ def test_operator_manager_compiles_ordering_route_from_compiled_graph():
     builder.add_func_edge("pipeline", "before", "pipeline", "after", local_only=True)
     graph = builder.build("ordering-manager")
     config = graph.nodes["pipeline"].spmd_config
-    manager = OperatorManager(config, rank=0, spmd_id="pipeline", static_args={})
+    manager = OperatorManager(
+        config,
+        rank=0,
+        spmd_id="pipeline",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
 
     plan = graph.require_compiled_graph()
     assert plan is not None

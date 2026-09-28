@@ -7,7 +7,6 @@ EXAMPLE = REPOSITORY / "fluxway" / "example" / "recommendation"
 
 def test_recommendation_examples_register_components_at_spmd_boundary():
     expected = {
-        "reader.py": "StateCheckpointComponent",
         "dense_spmd.py": "OrbaxCheckpointComponent",
         "sparse_spmd.py": "SparseEmbeddingCheckpointComponent",
     }
@@ -30,3 +29,9 @@ def test_recommendation_examples_do_not_define_operator_checkpoint_hooks():
     source = "\n".join(path.read_text() for path in EXAMPLE.glob("*.py"))
     for hook in obsolete_hooks:
         assert hook not in source
+
+
+def test_recommendation_reader_uses_controller_owned_source_progress():
+    source = (EXAMPLE / "reader.py").read_text()
+    assert "StateCheckpointComponent" not in source
+    assert "RecommendationSourceDescriptor" in source

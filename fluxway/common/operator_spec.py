@@ -67,6 +67,7 @@ class OperatorSpec(BaseModel):
     source: Any | None = None
     is_interleaved: bool = False
     interleave_unit_size: int = Field(default=1, gt=0)
+    execution_groups: tuple[tuple[int, ...], ...] | None = None
     async_policy: AsyncPolicy = Field(default_factory=AsyncPolicy.sync)
     tensor_access: TensorAccessMap = Field(default_factory=dict)
     input_arguments: StringTupleMap = Field(default_factory=dict)
@@ -118,21 +119,32 @@ class OperatorSpec(BaseModel):
             for name, intent in value.items()
         }
 
-    @model_validator(mode="after")
-    def normalize_tensor_access(self) -> OperatorSpec:
-        data_ports = self.get_arguments(is_output=False, arg_type=ArgumentType.DATA)
-        declared = dict(self.tensor_access)
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_tensor_access(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        input_arguments = value.get("input_arguments") or {}
+        data_ports = tuple(input_arguments.get(ArgumentType.DATA.value, ()))
+        if not data_ports:
+            data_ports = tuple(value.get("input_sharding", {}))
+        declared = dict(value.get("tensor_access") or {})
         unknown = set(declared).difference(data_ports)
         if unknown:
             raise ValueError(
-                f"operator {self.name!r} tensor_access references unknown data "
+                f"operator {value.get('name')!r} tensor_access references unknown data "
                 f"ports: {sorted(unknown)}."
             )
         normalized = {
             port: declared.get(port, TensorAccessIntent.READONLY) for port in data_ports
         }
-        if normalized != declared:
-            object.__setattr__(self, "tensor_access", freeze_mapping(normalized))
+        return {**value, "tensor_access": normalized}
+
+    @model_validator(mode="after")
+    def validate_tensor_access_contract(self) -> OperatorSpec:
+        data_ports = self.get_arguments(is_output=False, arg_type=ArgumentType.DATA)
+        if set(self.tensor_access) != set(data_ports):
+            raise ValueError("operator tensor_access must cover every data port")
         return self
 
     @field_validator("input_sharding", "output_sharding", mode="before")
@@ -181,7 +193,7 @@ class OperatorSpec(BaseModel):
         return TreeSpec.from_runtime(value)
 
     def model_post_init(self, __context: Any) -> None:
-        object.__setattr__(self, "_runtime_policy", self.async_policy.compile())
+        self._runtime_policy = self.async_policy.compile()
 
     @model_validator(mode="after")
     def validate_source_descriptor(self) -> OperatorSpec:
@@ -193,11 +205,30 @@ class OperatorSpec(BaseModel):
             raise TypeError(
                 "operator source descriptor must implement build_component(context)"
             )
+        capability = getattr(self.source, "requires_source_control_runtime", None)
+        if not isinstance(capability, bool):
+            raise TypeError(
+                "operator source descriptor must declare boolean "
+                "requires_source_control_runtime"
+            )
+        if capability and not callable(
+            getattr(self.source, "build_reader_topology", None)
+        ):
+            raise TypeError(
+                "operator source descriptor with requires_source_control_runtime=True "
+                "must implement build_reader_topology(...)"
+            )
         return self
 
     @property
     def has_source_descriptor(self) -> bool:
         return self.source is not None
+
+    @property
+    def requires_source_control_runtime(self) -> bool:
+        if self.source is None:
+            return False
+        return self.source.requires_source_control_runtime
 
     @property
     def runtime_policy(self) -> CompiledAsyncPolicy:

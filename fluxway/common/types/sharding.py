@@ -947,27 +947,29 @@ class PhysicalLayout(FluxwayBaseSchema):
     def index_descriptor(self) -> IndexDescriptor | None:
         return self.spec.index_descriptor
 
-    def __init__(self, spec: ShardingSpec, mesh: DeviceMesh, **kwargs):
-        super().__init__(spec=spec, mesh=mesh, **kwargs)  # type: ignore
-
-    @model_validator(mode="after")
-    def _compute_replica_info(self) -> PhysicalLayout:
-        if self.spec.is_referential:
-            return self
-
+    @model_validator(mode="before")
+    @classmethod
+    def _compute_replica_info(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        spec = value.get("spec")
+        mesh = value.get("mesh")
+        if not isinstance(spec, ShardingSpec) or not isinstance(mesh, DeviceMesh):
+            return value
+        if spec.is_referential:
+            return value
         used = set()
-        for axes in self.spec.partitions.values():
-            used.update(ax for ax in axes if ax in self.mesh.axis_names)
+        for axes in spec.partitions.values():
+            used.update(ax for ax in axes if ax in mesh.axis_names)
 
-        all_axes = set(self.mesh.axis_names)
-        repl = sorted(all_axes - used, key=lambda x: self.mesh.axis_names.index(x))
-        if repl:
-            object.__setattr__(self, "replica_axes", tuple(repl))
-            size = 1
-            for ax in repl:
-                size *= self.mesh.shape[self.mesh.axis_names.index(ax)]
-            object.__setattr__(self, "replica_size", size)
-        return self
+        all_axes = set(mesh.axis_names)
+        repl = sorted(all_axes - used, key=lambda x: mesh.axis_names.index(x))
+        if not repl:
+            return value
+        size = 1
+        for ax in repl:
+            size *= mesh.shape[mesh.axis_names.index(ax)]
+        return {**value, "replica_axes": tuple(repl), "replica_size": size}
 
     def shard_size(self, dim: int) -> int:
         """Returns the effective size of the sub-mesh assigned to a given dimension."""
@@ -981,11 +983,8 @@ class PhysicalLayout(FluxwayBaseSchema):
 
     def get_shard_rank(self, physical_rank: int, dim: int) -> int:
         """Projects a physical mesh rank down to the logical 1D rank for a given dimension."""
+        coords = self.mesh.get_coordinate(physical_rank)
         if not self.spec.partitions or dim not in self.spec.partitions:
-            return 0
-        try:
-            coords = self.mesh.get_coordinate(physical_rank)
-        except ValueError:
             return 0
         sub_coords = []
         sub_sizes = []

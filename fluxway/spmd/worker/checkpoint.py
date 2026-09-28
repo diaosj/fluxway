@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, TypeVar
 
 from fluxway.common.types.checkpoint import (
     CheckpointComponentPublication,
@@ -24,6 +24,9 @@ from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
 )
+
+
+_PhaseResult = TypeVar("_PhaseResult")
 
 
 class WorkerCheckpointCoordinator:
@@ -53,6 +56,7 @@ class WorkerCheckpointCoordinator:
         self._permit: CheckpointCommitPermit | None = None
         self._cut: CheckpointCut | None = None
         self._state: CheckpointSaveState | None = None
+        self._entered_save_components: list[CheckpointComponentRegistration] = []
 
     @property
     def state(self) -> CheckpointSaveState | None:
@@ -80,7 +84,8 @@ class WorkerCheckpointCoordinator:
         self._permit = permit
         self._cut = cut
         self._state = CheckpointSaveState.FINALIZING
-        try:
+
+        async def operation() -> None:
             for component in self._registry:
                 finalizer = component.finalize
                 if finalizer is None:
@@ -88,12 +93,6 @@ class WorkerCheckpointCoordinator:
                 await finalizer.finalize_save(
                     self._session(component.descriptor.component_id)
                 )
-        except BaseException:
-            self._clear_transaction()
-            raise
-
-        attempted: list[CheckpointComponentRegistration] = []
-        try:
             for component in self._registry:
                 save = component.save
                 if save is None:
@@ -104,26 +103,20 @@ class WorkerCheckpointCoordinator:
                     and self._rank != 0
                 ):
                     continue
-                attempted.append(component)
+                self._entered_save_components.append(component)
                 await save.prepare_save(
                     self._session(component.descriptor.component_id)
                 )
             self._state = CheckpointSaveState.PREPARED
-        except BaseException as primary_error:
-            cleanup_errors = await self._rollback_components(tuple(reversed(attempted)))
-            self._clear_transaction()
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "checkpoint prepare_save and rollback failed",
-                    [primary_error, *cleanup_errors],
-                ) from None
-            raise
+
+        await self._run_phase(operation)
 
     async def save(self) -> Mapping[str, WorkerSaveResult]:
         self._require_state(CheckpointSaveState.PREPARED)
         self._state = CheckpointSaveState.SAVING
-        saved_results: dict[str, WorkerSaveResult] = {}
-        try:
+
+        async def operation() -> Mapping[str, WorkerSaveResult]:
+            saved_results: dict[str, WorkerSaveResult] = {}
             for component in self._registry:
                 save = component.save
                 if save is None:
@@ -131,48 +124,32 @@ class WorkerCheckpointCoordinator:
                 saved_results[component.descriptor.component_id] = await save.save(
                     self._session(component.descriptor.component_id)
                 )
-        except BaseException as primary_error:
-            cleanup_errors = await self._rollback_components(
-                tuple(reversed(tuple(self._registry)))
-            )
-            self._clear_transaction()
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "checkpoint save and rollback failed",
-                    [primary_error, *cleanup_errors],
-                ) from None
-            raise
-        self._state = CheckpointSaveState.SAVED
-        return dict(saved_results)
+            self._state = CheckpointSaveState.SAVED
+            return dict(saved_results)
+
+        return await self._run_phase(operation)
 
     async def finish_save(self) -> None:
         self._require_state(CheckpointSaveState.SAVED)
-        try:
+
+        async def operation() -> None:
             for component in self._registry:
                 save = component.save
                 if save is None:
                     continue
                 await save.finish_save(self._session(component.descriptor.component_id))
-        except BaseException as primary_error:
-            cleanup_errors = await self._rollback_components(
-                tuple(reversed(tuple(self._registry)))
-            )
-            self._clear_transaction()
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "checkpoint finish_save and rollback failed",
-                    [primary_error, *cleanup_errors],
-                ) from None
-            raise
-        self._state = CheckpointSaveState.FINISHED
+            self._state = CheckpointSaveState.FINISHED
+
+        await self._run_phase(operation)
 
     async def commit_save(
         self,
         gathered_records: Mapping[str, Mapping[int, WorkerSaveResult]],
     ) -> Mapping[str, CheckpointComponentPublication]:
         self._require_state(CheckpointSaveState.FINISHED)
-        publications: dict[str, CheckpointComponentPublication] = {}
-        try:
+
+        async def operation() -> Mapping[str, CheckpointComponentPublication]:
+            publications: dict[str, CheckpointComponentPublication] = {}
             for component in self._registry:
                 save = component.save
                 if save is None:
@@ -203,19 +180,10 @@ class WorkerCheckpointCoordinator:
                         worker_results=gathered,
                     )
                 )
-        except BaseException as primary_error:
-            cleanup_errors = await self._rollback_components(
-                tuple(reversed(tuple(self._registry)))
-            )
-            self._clear_transaction()
-            if cleanup_errors:
-                raise BaseExceptionGroup(
-                    "checkpoint commit_save and rollback failed",
-                    [primary_error, *cleanup_errors],
-                ) from None
-            raise
-        self._state = CheckpointSaveState.COMMITTED
-        return publications
+            self._state = CheckpointSaveState.COMMITTED
+            return publications
+
+        return await self._run_phase(operation)
 
     async def publish_save(self) -> None:
         self._require_state(CheckpointSaveState.COMMITTED)
@@ -229,7 +197,9 @@ class WorkerCheckpointCoordinator:
     async def rollback_save(self) -> None:
         if self._state is None:
             raise RuntimeError("worker has no active checkpoint transaction")
-        errors = await self._rollback_components(tuple(reversed(tuple(self._registry))))
+        errors = await self._rollback_components(
+            tuple(reversed(self._entered_save_components))
+        )
         self._clear_transaction()
         self._raise_errors("checkpoint rollback_save failed", errors)
 
@@ -309,6 +279,23 @@ class WorkerCheckpointCoordinator:
                 errors.append(error)
         return errors
 
+    async def _run_phase(
+        self, operation: Callable[[], Awaitable[_PhaseResult]]
+    ) -> _PhaseResult:
+        try:
+            return await operation()
+        except BaseException as primary_error:
+            cleanup_errors = await self._rollback_components(
+                tuple(reversed(self._entered_save_components))
+            )
+            self._clear_transaction()
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "checkpoint phase and rollback failed",
+                    [primary_error, *cleanup_errors],
+                ) from None
+            raise
+
     def _session(self, component_id: str) -> SaveSession:
         if (
             self._checkpoint_id is None
@@ -349,6 +336,7 @@ class WorkerCheckpointCoordinator:
         self._permit = None
         self._cut = None
         self._state = None
+        self._entered_save_components.clear()
 
     @staticmethod
     def _raise_errors(message: str, errors: list[BaseException]) -> None:

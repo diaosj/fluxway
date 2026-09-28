@@ -84,7 +84,9 @@ class TransportShardView:
 
     def _payload_view(self, index: int) -> Any:
         backend = get_backend()
-        payload = backend.adopt(self._unwrap(self.payloads[index]))
+        payload = backend.asarray(
+            self._unwrap(self.payloads[index]), device=backend.default_device
+        )
         count = self.counts[index]
         if backend.shape(payload):
             return payload[:count]

@@ -1,3 +1,4 @@
+import asyncio
 import types
 from typing import Any
 
@@ -5,6 +6,7 @@ import numpy as np
 import pytest
 
 from fluxway.common.decorators import operator, spmd
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.control_plane.graph.builder import Builder
 from fluxway.profiler import ProfilerConfig, ProfilerRuntimeFactory
@@ -117,6 +119,7 @@ def _only_expected_transfer_code(op_manager, op_name):
 
 
 def _bind_direct_local_fast_path(stub, raw_cls):
+    stub._background_tasks = set()
     stub._assemble_plan_cache = {}
     stub._direct_local_input_slots = {}
     stub._direct_local_ready_steps = {"produce": set(), "consume": set()}
@@ -130,6 +133,9 @@ def _bind_direct_local_fast_path(stub, raw_cls):
         "_deposit_local_only_dependency_decisions",
         "_prepare_local_only_outputs",
         "_prepare_local_only_outputs_impl",
+        "_spawn_background_task",
+        "_create_supervised_task",
+        "_on_background_task_done",
     ):
         setattr(stub, name, types.MethodType(getattr(raw_cls, name), stub))
     stub._coherence_output_intents = {}
@@ -171,7 +177,13 @@ def _bind_direct_local_fast_path(stub, raw_cls):
 def test_local_only_successor_uses_direct_worker_data_plane():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
-    op_manager = OperatorManager(config, rank=0, spmd_id="A", static_args={})
+    op_manager = OperatorManager(
+        config,
+        rank=0,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
     stub = types.SimpleNamespace(
         spmd_id="A",
         rank=0,
@@ -215,7 +227,13 @@ def test_local_only_successor_uses_direct_worker_data_plane():
 
 def test_conditional_local_only_input_uses_mailbox_causal_barrier():
     config = _local_only_config(condition_fn=lambda _result: True)
-    op_manager = OperatorManager(config, rank=0, spmd_id="A", static_args={})
+    op_manager = OperatorManager(
+        config,
+        rank=0,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     stub = types.SimpleNamespace(
         spmd_id="A",
@@ -245,7 +263,7 @@ def test_local_only_batch_rejects_non_local_rank():
         tensor_routes=(),
         local_only=True,
     )
-    plan = CompiledSendPlan(
+    plan = CompiledSendPlan.create(
         op_name="produce",
         source_spmd_id="A",
         rank=0,
@@ -271,7 +289,13 @@ def test_local_only_batch_rejects_non_local_rank():
 async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
-    op_manager = OperatorManager(config, rank=1, spmd_id="A", static_args={})
+    op_manager = OperatorManager(
+        config,
+        rank=1,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
     mailbox = WorkerMailbox()
     stub = types.SimpleNamespace(
         spmd_id="A",
@@ -338,13 +362,21 @@ async def test_local_only_direct_deposit_preserves_transport_tensor_receipt():
     assert stored.receipt is not None
     assert stored.receipt.world_size == 7
     assert int(stored.receipt.sender_rank_tags) == 4
+    stored.acquire_consumer_lease().release()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
 async def test_local_only_fanout_uses_distinct_zero_copy_aliases():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_fanout_config()
-    op_manager = OperatorManager(config, rank=0, spmd_id="A", static_args={})
+    op_manager = OperatorManager(
+        config,
+        rank=0,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
     mailbox = WorkerMailbox()
     stub = types.SimpleNamespace(
         spmd_id="A",
@@ -404,13 +436,24 @@ async def test_local_only_fanout_uses_distinct_zero_copy_aliases():
         == second.flat_values.__array_interface__["data"][0]
         == original.flat_values.__array_interface__["data"][0]
     )
+    first_lease = first.acquire_consumer_lease()
+    second_lease = second.acquire_consumer_lease()
+    first_lease.release()
+    second_lease.release()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
 async def test_send_output_all_local_only_returns_no_background_tasks_with_profiler():
     raw_cls = SPMDWorker.__ray_actor_class__  # pyrefly: ignore [missing-attribute]
     config = _local_only_config()
-    op_manager = OperatorManager(config, rank=1, spmd_id="A", static_args={})
+    op_manager = OperatorManager(
+        config,
+        rank=1,
+        spmd_id="A",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
     profiler_runtime = ProfilerRuntimeFactory.from_config(
         ProfilerConfig(
             trace_dir="/tmp/fluxway_test_send_output_all_local_only",
@@ -475,6 +518,8 @@ async def test_send_output_all_local_only_returns_no_background_tasks_with_profi
     stored = stub._direct_local_input_slots["consume"][0][transfer_code].tensor
     assert send_tasks == ()
     assert isinstance(stored, TransportTensor)
+    stored.acquire_consumer_lease().release()
+    await asyncio.sleep(0)
 
 
 def test_transport_send_context_is_compiled_once_for_mixed_local_routes():
@@ -502,7 +547,7 @@ def test_transport_send_context_is_compiled_once_for_mixed_local_routes():
             ),
         ),
     )
-    plan = CompiledSendPlan(
+    plan = CompiledSendPlan.create(
         op_name="source",
         source_spmd_id="source",
         rank=0,
@@ -548,7 +593,7 @@ def test_transport_send_context_reuses_all_remote_plan():
         effective_rank=0,
         tensor_routes=(),
     )
-    plan = CompiledSendPlan(
+    plan = CompiledSendPlan.create(
         op_name="source",
         source_spmd_id="source",
         rank=0,

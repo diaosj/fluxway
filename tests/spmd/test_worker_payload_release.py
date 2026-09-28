@@ -68,6 +68,8 @@ async def test_completed_step_releases_frame_payload_without_manual_cleanup():
         _spawn_background_task=asyncio.create_task,
         _mailbox=SimpleNamespace(clear_step=clear_mailbox),
         _advance_step=lambda _op, *, result: asyncio.sleep(0),
+        _source_operator_names=(),
+        _source_control_operator_names=(),
     )
     await raw_worker._commit_finished_steps(worker, "op")
     await asyncio.sleep(0)

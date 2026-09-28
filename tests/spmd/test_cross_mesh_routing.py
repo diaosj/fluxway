@@ -17,12 +17,15 @@ Test scenarios
 from __future__ import annotations
 
 import unittest
+import jax
+import pytest
+from fluxway.common.tensor_backend import use_backend
 from types import SimpleNamespace
 
 import jax.numpy as jnp
 import numpy as np
 
-from fluxway.common.tensor_backend import get_backend, use_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.index_descriptor import ExplicitIndex
 from fluxway.common.compiled_graph import (
@@ -48,6 +51,14 @@ from fluxway.spmd.worker.worker import (
 from fluxway.spmd.worker.assembly import CompiledAssemblePlan
 
 SPMDWorker = getattr(RaySPMDWorker, "__ray_actor_class__", RaySPMDWorker)  # type: ignore
+
+
+@pytest.fixture(autouse=True)
+def cpu_transport_backend():
+    with use_backend("hybrid"), jax.default_device(jax.devices("cpu")[0]):
+        yield
+
+
 # ─── Helper: build a minimal TransportTensor ─────────────────────────────────
 
 

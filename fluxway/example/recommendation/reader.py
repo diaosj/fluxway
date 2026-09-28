@@ -2,34 +2,11 @@ import numpy as np
 from typing import Any
 
 from fluxway.common.decorators import spmd_source, operator, requires_worker_process
-from fluxway.common.index_descriptor import ContinuousIndex
 from fluxway.common.operator_policy import AsyncPolicy
-from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.types import RestoreTopologyMode
-from fluxway.control_plane.checkpointer import StateCheckpointComponent
-from fluxway.reader import GrainReader
+from fluxway.example.recommendation.source_adapter import RecommendationSourceDescriptor
+from fluxway.reader import BaseReader
 from fluxway import ResourceProfile
 from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
-
-
-def _row_partitioned_int_tensor(
-    rows: list[list[int]],
-    *,
-    global_shape: tuple[int, int],
-    origin_indices: Any,
-) -> TransportTensor:
-    flat = [value for row in rows for value in row]
-    splits = [0]
-    offset = 0
-    for row in rows:
-        offset += len(row)
-        splits.append(offset)
-    return TransportTensor(
-        flat_values=np.asarray(flat, dtype=np.int64),
-        nested_splits=[np.asarray(splits, dtype=np.int32)],
-        global_shape=global_shape,
-        origin_indices=origin_indices,
-    )
 
 
 @requires_worker_process
@@ -38,18 +15,9 @@ def _row_partitioned_int_tensor(
     mesh_axis_names=("worker",),
     interleaved=True,
     interleave_unit_size=1,
-    checkpoint_components=(
-        StateCheckpointComponent(
-            "reader",
-            lambda owner, context: owner.save_state(context),
-            lambda owner, state, context: owner.restore_checkpoint_state(
-                state, context
-            ),
-            restore_topology=RestoreTopologyMode.GLOBAL_RESHARD,
-        ).registration(),
-    ),
+    source=RecommendationSourceDescriptor(),
 )
-class RecommendationReader(GrainReader):
+class RecommendationReader(BaseReader):
     rank: int
     world_size: int
     """
@@ -59,14 +27,11 @@ class RecommendationReader(GrainReader):
 
     def __init__(self, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
+        self._data_source = self._create_data_source(self.static_args)
 
-    def _create_data_loader(
+    def _create_data_source(
         self,
         static_args: dict[str, Any],
-        rank: int,
-        world_size: int,
-        shard_index: int | None = None,
-        shard_count: int | None = None,
     ):
         if "data_source" not in static_args:
             # Synthesize a recommendation corpus whose item / user popularity
@@ -124,14 +89,8 @@ class RecommendationReader(GrainReader):
                     }
                 )
 
-            static_args["data_source"] = data
-            static_args.setdefault("batch_size", 24)
-            static_args.setdefault("num_epochs", 1)
-            static_args.setdefault("shuffle", False)
-
-        super()._create_data_loader(
-            static_args, rank, world_size, shard_index, shard_count
-        )
+            return data
+        return static_args["data_source"]
 
     @staticmethod
     def _zipf_probs(
@@ -163,38 +122,18 @@ class RecommendationReader(GrainReader):
         },
     )
     async def read(self) -> UserBatch | None:
-        static_args = getattr(self, "static_args", {})
-        batch_size = static_args.get("batch_size", 24)
-
-        # -- Invariants on configuration --
-        assert isinstance(batch_size, int) and batch_size > 0, (
-            f"[Reader] batch_size must be a positive int, got {batch_size!r}"
-        )
-
-        samples = []
-        for _ in range(batch_size):
-            item = self.next_item()
-            if item is None:
-                break
-            samples.append(item)
-
-        if not samples:
-            return None
-
-        sample_count = len(samples)
-        logical_world = self.world_size if hasattr(self, "world_size") else 1
-        global_batch_size = sample_count * logical_world
-        g_shape = (global_batch_size,)
-        g_shape_one_sparse = (global_batch_size, 1)
-        g_shape_item_sparse = (
-            global_batch_size,
-            int(static_args.get("max_seq_len", 5)) + 1,
-        )
-        g_shape_hist_sparse = (
-            global_batch_size,
-            int(static_args.get("max_seq_len", 5)),
-        )
-        origins = ContinuousIndex.chunk(0, global_batch_size)
+        if self.ctx is None:
+            raise RuntimeError(
+                "RecommendationReader.read requires an active OperatorContext"
+            )
+        work = self.ctx.source_work_items
+        if not work:
+            raise RuntimeError("RecommendationReader requires acquired source work")
+        samples = [
+            self._data_source[index % len(self._data_source)]
+            for item in work
+            for index in range(item.logical_start, item.logical_end)
+        ]
 
         # -- Invariants on per-sample structure --
         required_keys = (
@@ -225,42 +164,35 @@ class RecommendationReader(GrainReader):
             assert s["is_click"][0] in (0, 1), (
                 f"[Reader] sample {i} is_click must be 0 or 1, got {s['is_click'][0]}"
             )
-        g_shape_stats = (global_batch_size, stats_dim)
 
         active = ActiveFeatures(
-            user_id=_row_partitioned_int_tensor(
-                [[s["user_id"][0]] for s in samples],
-                global_shape=g_shape_one_sparse,
-                origin_indices=origins,
+            user_id=self.create_row_sparse_tensor(
+                [[s["user_id"][0]] for s in samples], width=1, dtype=np.int32
             ),
-            user_age_level=TransportTensor.from_lists(
+            user_age_level=self.create_tensor(
                 [s["user_age_level"][0] for s in samples],
                 dtype=np.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                uniform_dense_partition=True,
             ),
-            request_hour=TransportTensor.from_lists(
+            request_hour=self.create_tensor(
                 [s["request_hour"][0] for s in samples],
                 dtype=np.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                uniform_dense_partition=True,
             ),
-            hist_click_item_seq=TransportTensor.from_lists(
+            hist_click_item_seq=self.create_row_sparse_tensor(
                 [s["hist_click_item_seq"] for s in samples],
+                width=self.static_args.get("max_seq_len", 5),
                 dtype=np.int32,
-                global_shape=g_shape_hist_sparse,
-                origin_indices=origins,
             ),
-            hist_seq_length=TransportTensor.from_lists(
+            hist_seq_length=self.create_tensor(
                 [s["hist_seq_length"][0] for s in samples],
                 dtype=np.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                uniform_dense_partition=True,
             ),
         )
 
         passive = PassiveFeatures(
-            target_target_id=_row_partitioned_int_tensor(
+            target_target_id=self.create_row_sparse_tensor(
                 [
                     [
                         s["target_target_id"][0],
@@ -268,29 +200,26 @@ class RecommendationReader(GrainReader):
                     ]
                     for s in samples
                 ],
-                global_shape=g_shape_item_sparse,
-                origin_indices=origins,
+                width=self.static_args.get("max_seq_len", 5) + 1,
+                dtype=np.int32,
             ),
-            target_item_category=TransportTensor.from_lists(
+            target_item_category=self.create_tensor(
                 [s["target_item_category"][0] for s in samples],
                 dtype=np.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                uniform_dense_partition=True,
             ),
-            target_item_stats=TransportTensor.from_lists(
+            target_item_stats=self.create_tensor(
                 [s["target_item_stats"] for s in samples],
                 dtype=np.float32,
-                global_shape=g_shape_stats,
-                origin_indices=origins,
+                uniform_dense_partition=True,
             ),
         )
 
         labels = LabelFeatures(
-            is_click=TransportTensor.from_lists(
+            is_click=self.create_tensor(
                 [s["is_click"][0] for s in samples],
                 dtype=np.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                uniform_dense_partition=True,
             )
         )
 

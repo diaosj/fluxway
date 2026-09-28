@@ -10,7 +10,12 @@ from fluxway.profiler.clock import AxonNativeHlcBridge, RayFluxwayHlcBridge
 from fluxway.profiler.record import TraceCarrier
 from fluxway.profiler.recorder import TraceRecorder
 from fluxway.profiler.user_api import activate_user_profiler
-from fluxway.rpc.protocol import AxonDataPlane, DataPlaneCallable, RayActorDataPlane
+from fluxway.rpc.protocol import (
+    AxonDataPlane,
+    DataPlaneCallable,
+    RayActorDataPlane,
+    ReceiverIngressCompletion,
+)
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
 from fluxway.transport.manifest import (
     FRAME_ENTRY_COUNT,
@@ -43,7 +48,7 @@ class TracingDataPlaneCallable(DataPlaneCallable):
     async def receive_transport_frames(
         self,
         frames: tuple[Any, ...],
-    ) -> Any:
+    ) -> ReceiverIngressCompletion:
         if not frames:
             raise ValueError("receive_transport_frames requires at least one frame.")
         carrier = self._recorder.root_carrier.child(
@@ -72,7 +77,7 @@ class TracingDataPlaneCallable(DataPlaneCallable):
                 )
             else:
                 result = await self._delegate.receive_transport_frames(frames)
-        self._record_receive_clock(carrier, result)
+        self._record_receive_clock(carrier, result.result)
         return result
 
     async def receive_control(

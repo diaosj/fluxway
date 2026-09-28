@@ -265,7 +265,7 @@ async def test_axon_data_plane_validates_and_invokes_flat_payload_iovs():
         (TransportFrameEnvelope(header=header, payload_segments=payload_segments),)
     )
 
-    assert result is True
+    assert result.result is True
     assert handle.args is not None
     assert handle.args[0][0].header is header
     assert handle.args[1] == "cpu"

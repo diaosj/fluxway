@@ -1,22 +1,35 @@
 import asyncio
+from types import SimpleNamespace
 
 from fluxway.profiler.record import RECORD_WIDTH, TraceArena
 from fluxway.profiler.recorder import TraceRecorder
 from fluxway.profiler.user_api import activate_user_profiler
 from fluxway.resources import ResourceProfile
-from fluxway.spmd.worker.operator_manager.dispatcher import StandardDispatcher
-from fluxway.spmd.worker.operator_manager.operator_manager import OperatorManager
+from fluxway.common.operator_spec import OperatorSpec
+from fluxway.spmd.worker.operator_manager.dispatcher import ExecutionDispatcher
+from fluxway.common.execution_layout import compile_execution_layout
+from fluxway.common.mesh import DeviceMesh
+from fluxway.spmd.worker.operator_manager.operator_manager import (
+    OperatorInstanceContainer,
+    OperatorManager,
+)
 
 
 def _bare_manager(name: str, fn, *, coroutine_function: bool) -> OperatorManager:
     manager = object.__new__(OperatorManager)
     manager._operators = {name: fn}
+    manager._compiled_operators = {name: SimpleNamespace(spec=OperatorSpec(name=name))}
     manager._operator_is_coroutine_function = {name: coroutine_function}
-    manager._dispatchers = {name: StandardDispatcher()}
+    manager._dispatchers = {
+        name: ExecutionDispatcher(
+            compile_execution_layout(DeviceMesh(("worker",), (1,)))
+        )
+    }
     manager._static_args = {}
     manager._spmd_id = "test"
     manager._control_plane_handle = None
     manager._ray_component_limits = ResourceProfile(base={}).ray_component_limits
+    manager._instance_container = OperatorInstanceContainer()
     manager._rank = 0
     manager._world_size = 1
     manager._local_rank = 0

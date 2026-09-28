@@ -2,10 +2,13 @@ import pytest
 import numpy as np
 from fluxway.common.tensor_backend import (
     JaxBackend,
+    as_native_zerocopy,
     get_backend,
     prepare_dlpack_input,
     use_backend,
 )
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.coherence import CoherenceStateTransitionError
 
 
 def test_prepare_dlpack_input_preserves_readonly_zero_copy_storage():
@@ -24,13 +27,89 @@ def test_prepare_dlpack_input_preserves_readonly_zero_copy_storage():
 def test_jax_dlpack_import_preserves_uint64_with_local_scope():
     source = np.array([2**40], dtype=np.uint64)
 
-    adopted = JaxBackend().adopt(source)
+    adopted = JaxBackend().asarray(source, copy=None)
 
     assert adopted.dtype == np.uint64
     assert int(adopted[0]) == 2**40
 
 
-def test_jax_adopt_propagates_broken_dlpack_error():
+def test_jax_readonly_coherence_alias_imports_without_copy():
+    source = np.arange(32, dtype=np.float32)
+    tensor = TransportTensor(source).zero_copy_readonly_alias()
+
+    result = JaxBackend().asarray(tensor, copy=False)
+
+    np.testing.assert_array_equal(np.asarray(result), source)
+    assert not tensor.flat_values.flags.writeable
+    exported = tensor.dlpack_values_for_consumer()
+    assert exported.flags.writeable
+    assert (
+        exported.__array_interface__["data"][0] == source.__array_interface__["data"][0]
+    )
+
+
+def test_jax_readonly_foreign_array_requires_explicit_copy_policy():
+    source = np.arange(32, dtype=np.float32)
+    source.flags.writeable = False
+
+    with pytest.raises(BufferError, match="Cannot export readonly array"):
+        JaxBackend().asarray(source, copy=False)
+
+    result = JaxBackend().asarray(source, copy=None)
+    np.testing.assert_array_equal(np.asarray(result), source)
+
+
+def test_jax_copy_true_creates_distinct_allocation():
+    source = np.arange(1024, dtype=np.float32)
+
+    result = JaxBackend().asarray(source, copy=True)
+
+    np.testing.assert_array_equal(np.asarray(result), source)
+    source[0] = -1
+    assert float(result[0]) == 0.0
+
+
+def test_jax_unknown_readonly_transport_requires_copy_for_zero_copy_policy():
+    source = np.arange(32, dtype=np.float32)
+    source.flags.writeable = False
+    tensor = TransportTensor(source).zero_copy_readonly_alias()
+
+    with pytest.raises(CoherenceStateTransitionError, match="physically writable"):
+        JaxBackend().asarray(tensor, copy=False)
+
+    result = JaxBackend().asarray(tensor, copy=None)
+    np.testing.assert_array_equal(np.asarray(result), source)
+
+
+def test_jax_readonly_jax_payload_keeps_native_zero_copy_identity():
+    import jax.numpy as jnp
+
+    source = jnp.arange(32, dtype=jnp.float32)
+    tensor = TransportTensor(source).zero_copy_readonly_alias()
+
+    result = JaxBackend().asarray(tensor, copy=False)
+
+    assert result is source
+
+
+def test_jax_dlpack_export_rejects_invalidated_and_released_tensor():
+    invalidated = TransportTensor(
+        np.arange(8, dtype=np.float32)
+    ).zero_copy_readonly_alias()
+    invalidated._invalidate_runtime_access()
+    with pytest.raises(CoherenceStateTransitionError, match="invalidated"):
+        JaxBackend().asarray(invalidated, copy=False)
+
+    released = TransportTensor(
+        np.arange(8, dtype=np.float32)
+    ).zero_copy_readonly_alias()
+    released._invalidate_runtime_access()
+    released._release_runtime_payload()
+    with pytest.raises(CoherenceStateTransitionError, match="released"):
+        JaxBackend().asarray(released, copy=None)
+
+
+def test_jax_asarray_propagates_broken_dlpack_error():
     class BrokenDLPackTensor:
         dtype = np.dtype(np.float32)
         shape = (1,)
@@ -42,7 +121,7 @@ def test_jax_adopt_propagates_broken_dlpack_error():
             return (1, 0)
 
     with pytest.raises(RuntimeError, match="broken DLPack exporter"):
-        JaxBackend().adopt(BrokenDLPackTensor())
+        JaxBackend().asarray(BrokenDLPackTensor(), copy=False)
 
 
 def test_jax_dlpack_slice_multidim():
@@ -202,3 +281,76 @@ def test_contiguous_view_jax_wrapper_array_interface():
     iface = wrapper.__array_interface__
     assert iface["shape"] == (20,), iface["shape"]
     assert iface["typestr"] == arr.dtype.str
+
+
+def test_as_native_zerocopy_numba_cuda():
+    try:
+        from numba import cuda
+        import cupy as cp
+
+        if not cuda.is_available():
+            pytest.skip("CUDA not available for Numba")
+    except Exception:
+        pytest.skip("Numba or CuPy not available")
+
+    nb_arr = cuda.to_device(np.arange(16, dtype=np.float32))
+    native = as_native_zerocopy(nb_arr)
+
+    assert isinstance(native, cp.ndarray)
+    assert nb_arr.device_ctypes_pointer.value == native.data.ptr
+    np.testing.assert_array_equal(cp.asnumpy(native), np.arange(16))
+
+
+def test_jax_asarray_transport_tensor_and_numba_zero_copy():
+    try:
+        import jax
+        import cupy as cp
+        from numba import cuda
+        from fluxway.common.types.tensor import TransportTensor
+
+        if not cuda.is_available():
+            pytest.skip("CUDA not available")
+    except Exception:
+        pytest.skip("JAX, CuPy, or Numba not available")
+
+    with use_backend("jax"):
+        b = get_backend()
+
+        # CuPy TransportTensor unwrapping
+        cp_arr = cp.arange(16, dtype=cp.float32)
+        tt_cp = TransportTensor(flat_values=cp_arr)
+        jax_cp = b.asarray(tt_cp, copy=False)
+        assert isinstance(jax_cp, jax.Array)
+        assert jax_cp.unsafe_buffer_pointer() == cp_arr.data.ptr
+
+        # Numba TransportTensor unwrapping
+        nb_arr = cuda.to_device(np.arange(16, dtype=np.float32))
+        tt_nb = TransportTensor(flat_values=nb_arr)
+        jax_nb = b.asarray(tt_nb, copy=False)
+        assert isinstance(jax_nb, jax.Array)
+        assert jax_nb.unsafe_buffer_pointer() == nb_arr.device_ctypes_pointer.value
+
+        # Non-contiguous GPU array
+        sliced_cp = cp_arr[::2]
+        jax_sliced = b.asarray(sliced_cp, copy=None)
+        assert isinstance(jax_sliced, jax.Array)
+        np.testing.assert_array_equal(
+            np.asarray(jax.device_get(jax_sliced)), np.arange(16)[::2]
+        )
+
+
+def test_backend_asarray_tree():
+    with use_backend("jax"):
+        b = get_backend()
+        tree = {
+            "a": np.arange(5),
+            "b": [np.arange(3), np.arange(4)],
+            "c": (np.arange(2),),
+        }
+        res = b.asarray_tree(tree, copy=None)
+        import jax
+
+        assert isinstance(res["a"], jax.Array)
+        assert isinstance(res["b"][0], jax.Array)
+        assert isinstance(res["b"][1], jax.Array)
+        assert isinstance(res["c"][0], jax.Array)

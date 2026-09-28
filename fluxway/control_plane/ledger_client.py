@@ -1,83 +1,57 @@
-"""Public interface for topology-independent ordered control streams."""
+"""Typed client protocol for logical source assignments."""
 
 from __future__ import annotations
 
-import copy
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
 
+from ray.actor import ActorHandle
 
-class ControlStreamExhausted(EOFError):
-    """The requested position is at or beyond a sealed stream boundary."""
-
-
-@dataclass(frozen=True, slots=True, init=False)
-class ControlRecord:
-    stream_id: str
-    position: int
-    _payload: dict[str, Any]
-
-    def __init__(
-        self,
-        *,
-        stream_id: str,
-        position: int,
-        payload: Mapping[str, Any],
-    ) -> None:
-        if not isinstance(stream_id, str) or not stream_id:
-            raise ValueError("control stream_id must be non-empty")
-        if not isinstance(position, int) or isinstance(position, bool) or position < 0:
-            raise ValueError("control position must be a non-negative integer")
-        if not isinstance(payload, Mapping):
-            raise TypeError("control payload must be a mapping")
-        object.__setattr__(self, "stream_id", stream_id)
-        object.__setattr__(self, "position", position)
-        object.__setattr__(self, "_payload", copy.deepcopy(dict(payload)))
-
-    @property
-    def payload(self) -> dict[str, Any]:
-        return copy.deepcopy(self._payload)
-
-    @property
-    def key(self) -> tuple[str, int]:
-        return self.stream_id, self.position
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> ControlRecord:
-        if not isinstance(value, Mapping):
-            raise TypeError("serialized control record must be a mapping")
-        expected = {"stream_id", "position", "payload"}
-        if set(value) != expected:
-            raise ValueError(
-                "serialized control record fields do not match: "
-                f"expected={sorted(expected)} actual={sorted(value)}"
-            )
-        return cls(
-            stream_id=value["stream_id"],
-            position=value["position"],
-            payload=value["payload"],
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "stream_id": self.stream_id,
-            "position": self.position,
-            "payload": self.payload,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class StreamProgress:
-    durable_cut: int
-    published_end: int
-    sealed_end: int | None
+from fluxway.common.ingestion.segment import (
+    CompiledSegment,
+    SourceWorkAcknowledgement,
+    SourceWorkLease,
+)
 
 
 @runtime_checkable
-class ControlLedgerClient(Protocol):
-    async def append(self, records: Sequence[ControlRecord]) -> None: ...
-    async def try_append(self, records: Sequence[ControlRecord]) -> bool: ...
-    async def receive(self, stream_id: str, position: int) -> ControlRecord: ...
-    async def seal(self, stream_id: str) -> None: ...
-    async def progress(self, stream_id: str) -> StreamProgress: ...
+class SourceWorkClient(Protocol):
+    async def acquire_source_work(
+        self, epoch: int, segments: Sequence[CompiledSegment]
+    ) -> tuple[SourceWorkLease, ...]: ...
+
+    async def acknowledge_source_work(
+        self, acknowledgements: Sequence[SourceWorkAcknowledgement]
+    ) -> None: ...
+
+
+class ControlPlaneClient:
+    def __init__(self, handle: Any) -> None:
+        if isinstance(handle, ActorHandle):
+            self._acquire_source_work = handle.acquire_source_work.remote
+            self._acknowledge_source_work = handle.acknowledge_source_work.remote
+        elif isinstance(handle, SourceWorkClient):
+            self._acquire_source_work = handle.acquire_source_work
+            self._acknowledge_source_work = handle.acknowledge_source_work
+        else:
+            raise TypeError(
+                "control-plane handle must be a Ray actor or SourceWorkClient"
+            )
+
+    async def acquire_source_work(
+        self, epoch: int, segments: Sequence[CompiledSegment]
+    ) -> tuple[SourceWorkLease, ...]:
+        result = await self._acquire_source_work(epoch, tuple(segments))
+        if not isinstance(result, tuple) or any(
+            not isinstance(value, SourceWorkLease) for value in result
+        ):
+            raise TypeError("controller returned invalid source work leases")
+        return result
+
+    async def acknowledge_source_work(
+        self, acknowledgements: Sequence[SourceWorkAcknowledgement]
+    ) -> None:
+        values = tuple(acknowledgements)
+        if any(not isinstance(value, SourceWorkAcknowledgement) for value in values):
+            raise TypeError("source work acknowledgements must be typed")
+        await self._acknowledge_source_work(values)

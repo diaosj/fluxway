@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
 
+from fluxway.common.types.drain import DrainAdmission
 from fluxway.common.types import (
     CheckpointComponentPublication,
     CheckpointCommitPermit,
@@ -45,6 +46,8 @@ class SnapshotOrchestrator:
         self._profiler_runtime = profiler_runtime
         self._component_registry = component_registry
         self._notify_component_state = notify_component_state
+        self._admission: DrainAdmission | None = None
+        self._admission_application: asyncio.Task[None] | None = None
         self._pending_checkpoint_id: str | None = None
         self._pending_attempt_id: str | None = None
         self._pending_permit: CheckpointCommitPermit | None = None
@@ -53,52 +56,42 @@ class SnapshotOrchestrator:
         self._pending_snapshot: SpmdCheckpoint | None = None
         self._published = False
         self._rollback_task: asyncio.Task[None] | None = None
+        self._failed_checkpoint_id: str | None = None
         self._drained_component_notification: asyncio.Task[None] | None = None
 
-    async def request_drain(
-        self,
-        step_count: int,
-        terminal_cut: int | None = None,
-        reason: str = "",
-    ) -> None:
-        del reason
-        entered_draining = self.state_machine.admit_drain()
-        if self._profiler_runtime.enabled:
-            async with self._profiler_runtime.recorder.driver_drain(
-                target_step=step_count,
-                worker_count=len(self.executor.get_worker_handles()),
-            ):
-                await self._request_drain_unprofiled(
-                    step_count, terminal_cut, entered_draining
-                )
+    async def request_drain(self, admission: DrainAdmission) -> None:
+        if not admission.supersedes(self._admission):
+            if self._admission_application is None:
+                raise RuntimeError("accepted admission has no application task")
+            await asyncio.shield(self._admission_application)
             return
-        await self._request_drain_unprofiled(step_count, terminal_cut, entered_draining)
-
-    async def _request_drain_unprofiled(
-        self, step_count: int, terminal_cut: int | None, entered_draining: bool
-    ) -> None:
-        if entered_draining:
-            await self._notify_component_state(DriverState.DRAINING)
-        if terminal_cut is not None:
-            self.synchronizer.apply_boundary_event(
-                DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, terminal_cut)
-            )
-        await self.executor.set_drain_boundary(step_count, terminal_cut)
-        if not self.synchronizer.is_draining:
-            self.synchronizer.drain_to_step_count(
-                step_count=step_count, on_drained=self._on_drain_complete
-            )
-            return
-        current = self.synchronizer.drain_step_count
-        if current is None:
-            raise RuntimeError("active synchronizer drain is missing its target")
-        if step_count > current:
-            return
-        if step_count == current:
-            return
-        self.synchronizer.shorten_drain_to_step_count(
-            step_count, on_drained=self._on_drain_complete
+        entered = self.state_machine.admit_drain()
+        self._admission = admission
+        self._admission_application = asyncio.create_task(
+            self._apply_admission(admission, entered)
         )
+        await asyncio.shield(self._admission_application)
+
+    async def _apply_admission(self, admission: DrainAdmission, entered: bool) -> None:
+        if entered:
+            await self._notify_component_state(DriverState.DRAINING)
+        if self._admission != admission:
+            return
+        if admission.terminal_cut is not None:
+            self.synchronizer.apply_boundary_event(
+                DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, admission.terminal_cut)
+            )
+        await self.executor.set_drain_boundary(admission)
+        if self._admission != admission:
+            return
+
+        def callback() -> None:
+            self._on_drain_complete(admission)
+
+        if not self.synchronizer.is_draining:
+            self.synchronizer.drain_to_step_count(admission.target, callback)
+        else:
+            self.synchronizer.shorten_drain_to_step_count(admission.target, callback)
 
     async def prepare_snapshot(
         self,
@@ -147,9 +140,12 @@ class SnapshotOrchestrator:
         self._pending_snapshot = None
         self._published = False
         self._rollback_task = None
+        self._failed_checkpoint_id = None
         await self._persist_worker_states()
 
-    def _on_drain_complete(self) -> None:
+    def _on_drain_complete(self, admission: DrainAdmission) -> None:
+        if admission != self._admission:
+            raise ValueError("completion belongs to a superseded Driver admission")
         if self.state_machine.state is DriverState.DRAINING:
             self.state_machine.require_transition(DriverEvent.DRAIN_COMPLETE)
         elif self.state_machine.state is not DriverState.DRAINED:
@@ -161,7 +157,7 @@ class SnapshotOrchestrator:
             DriverState.DRAINED
         )
         if self.controller_handle is not None:
-            self.controller_handle.report_driver_drained.remote(self.spmd_id)
+            self.controller_handle.report_driver_drained.remote(self.spmd_id, admission)
 
     async def _persist_worker_states(self) -> None:
         checkpoint_id = self._pending_checkpoint_id
@@ -219,13 +215,13 @@ class SnapshotOrchestrator:
             self._fail_snapshot_state()
             return
         self.controller_handle.receive_snapshot_metadata.remote(
-            self.spmd_id, checkpoint_id, snapshot
+            self.spmd_id, checkpoint_id, snapshot, self._pending_permit
         )
 
     def capture_driver_components(
         self, checkpoint_id: str, cut: CheckpointCut
     ) -> SpmdCheckpoint:
-        self._require_pending_snapshot(checkpoint_id)
+        self._require_assembled_snapshot(checkpoint_id)
         snapshot = self._pending_snapshot
         if snapshot is None:
             raise RuntimeError("snapshot transaction has no prepared image")
@@ -243,7 +239,7 @@ class SnapshotOrchestrator:
     async def publish_save(
         self, checkpoint_id: str, permit: CheckpointCommitPermit
     ) -> None:
-        self._require_pending_snapshot(checkpoint_id)
+        self._require_assembled_snapshot(checkpoint_id)
         if permit != self._pending_permit:
             raise PermissionError("snapshot publication permit is stale")
         if self._published:
@@ -254,7 +250,7 @@ class SnapshotOrchestrator:
     async def rollback_save(
         self, checkpoint_id: str, permit: CheckpointCommitPermit
     ) -> None:
-        self._require_pending_snapshot(checkpoint_id)
+        self._require_assembled_snapshot(checkpoint_id)
         if permit != self._pending_permit:
             raise PermissionError("snapshot rollback_save permit is stale")
         if self._published:
@@ -264,11 +260,14 @@ class SnapshotOrchestrator:
         await self._rollback_save_once()
         self._reset_checkpoint_transaction(preserve_checkpoint_id=True)
 
-    def _require_pending_snapshot(self, checkpoint_id: str) -> None:
+    def _require_attempt(self, checkpoint_id: str) -> None:
         if checkpoint_id != self._pending_checkpoint_id:
             raise ValueError(
                 f"snapshot transaction does not match Driver state: {checkpoint_id!r}"
             )
+
+    def _require_assembled_snapshot(self, checkpoint_id: str) -> None:
+        self._require_attempt(checkpoint_id)
         if self._pending_snapshot is None:
             raise RuntimeError("snapshot transaction has no committed publication")
 
@@ -297,13 +296,12 @@ class SnapshotOrchestrator:
 
     def _fail_snapshot_state(self) -> None:
         self.synchronizer.clear_drain()
-        self.executor.clear_drain_boundary()
         if (
             self.controller_handle is not None
             and self._pending_checkpoint_id is not None
         ):
             self.controller_handle.report_snapshot_failed.remote(
-                self.spmd_id, self._pending_checkpoint_id
+                self.spmd_id, self._pending_checkpoint_id, self._pending_permit
             )
         if self.state_machine.state is DriverState.SNAPSHOTTING:
             self.state_machine.require_transition(DriverEvent.SNAPSHOT_FAILED)
@@ -315,14 +313,21 @@ class SnapshotOrchestrator:
             self._rollback_task = task
         await asyncio.shield(task)
 
+    async def _cleanup_attempt_once(self, checkpoint_id: str) -> None:
+        self._require_attempt(checkpoint_id)
+        await self._rollback_save_once()
+
     async def fail_snapshot(self, checkpoint_id: str) -> None:
-        if checkpoint_id != self._pending_checkpoint_id:
-            raise ValueError(
-                f"snapshot transaction does not match Driver state: {checkpoint_id!r}"
-            )
+        if (
+            checkpoint_id == self._failed_checkpoint_id
+            and self._pending_checkpoint_id is None
+        ):
+            return
+        self._require_attempt(checkpoint_id)
         if not self._published:
-            await self._rollback_save_once()
+            await self._cleanup_attempt_once(checkpoint_id)
         self._fail_snapshot_state()
+        self._failed_checkpoint_id = checkpoint_id
         self._reset_checkpoint_transaction()
 
     async def resume(self) -> None:
@@ -336,7 +341,6 @@ class SnapshotOrchestrator:
         if self._pending_snapshot is not None and not self._published:
             raise RuntimeError("Driver cannot resume before checkpoint publication")
         self.synchronizer.clear_drain()
-        self.executor.clear_drain_boundary()
         self.state_machine.require_transition(DriverEvent.RESUME)
         await self._notify_component_state(DriverState.RUNNING)
         self._reset_checkpoint_transaction()

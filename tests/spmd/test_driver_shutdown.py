@@ -6,7 +6,7 @@ import pytest
 from fluxway import OperatorSpec
 from fluxway.common.compiled_graph import compile_graph
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types import SPMDConfig
+from fluxway.common.types import SPMDConfig, DriverEvent
 from fluxway.spmd.driver.driver import SPMDDriver
 from fluxway.spmd.driver.executor import ray_executor
 from tests.compiled_graph_fixtures import compiled_spmd_spec
@@ -211,7 +211,7 @@ def test_driver_ignores_worker_callbacks_while_stopping():
 
     heartbeat = MagicMock()
 
-    driver._stopping = True
+    driver.state_machine.require_transition(DriverEvent.STOP)
     driver.spmd_synchronizer.report_worker_op_completed = MagicMock()
 
     driver.receive_worker_heartbeat(0, heartbeat)

@@ -250,7 +250,7 @@ def test_condition_frame_is_header_only_dependency_outcome():
 
 def test_compiled_send_plan_rejects_condition_without_decision_route():
     with pytest.raises(ValueError, match="without decision routes"):
-        CompiledSendPlan(
+        CompiledSendPlan.create(
             op_name="produce",
             source_spmd_id="source",
             rank=0,
@@ -346,7 +346,7 @@ async def test_independent_async_conditions_are_evaluated_concurrently():
         await release.wait()
         return True
 
-    plan = CompiledSendPlan(
+    plan = CompiledSendPlan.create(
         op_name="source",
         source_spmd_id="source",
         rank=0,

@@ -1,5 +1,6 @@
 import asyncio
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -10,7 +11,7 @@ from fluxway.common.mesh import DeviceMesh
 from fluxway.common.tensor_backend import (
     HybridBackend,
     get_backend,
-    set_backend,
+    use_backend,
     set_hybrid_device,
 )
 from fluxway.common.types.sharding import P, ShardingSpec
@@ -30,8 +31,8 @@ from fluxway.transport.coherence import entry_layout_state
 
 @pytest.fixture(autouse=True)
 def use_hybrid_backend():
-    set_backend("hybrid")
-    yield
+    with use_backend("hybrid"), jax.default_device(jax.devices("cpu")[0]):
+        yield
 
 
 async def _capture(local_rank, local_data, source, target, **kwargs):

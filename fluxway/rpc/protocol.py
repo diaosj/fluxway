@@ -21,6 +21,21 @@ class TransportFrameEnvelope:
     payload_segments: tuple[DLPackTensor, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ReceiverIngressCompletion:
+    """Carrier proof that receiver ingress completed for one frame batch."""
+
+    result: Any
+    receiver_accepted: bool = True
+    producer_retention_released: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.receiver_accepted) is not bool:
+            raise TypeError("receiver_accepted must be bool.")
+        if type(self.producer_retention_released) is not bool:
+            raise TypeError("producer_retention_released must be bool.")
+
+
 class PayloadDeviceClass(str, Enum):
     CPU = "cpu"
     CUDA = "cuda"
@@ -122,8 +137,8 @@ class DataPlaneCallable(ABC):
     async def receive_transport_frames(
         self,
         frames: tuple[TransportFrameEnvelope, ...],
-    ) -> Any:
-        """Data Plane: batched host metadata headers plus tensor payload buffers."""
+    ) -> ReceiverIngressCompletion:
+        """Send a batch and return the carrier's receiver-ingress proof."""
         pass
 
     @abstractmethod
@@ -152,7 +167,7 @@ class RayActorDataPlane(DataPlaneCallable):
     async def receive_transport_frames(
         self,
         frames: tuple[TransportFrameEnvelope, ...],
-    ) -> Any:
+    ) -> ReceiverIngressCompletion:
         return await self.receive_transport_frames_profiled(
             frames, profiler_recorder=None
         )
@@ -162,7 +177,7 @@ class RayActorDataPlane(DataPlaneCallable):
         frames: tuple[TransportFrameEnvelope, ...],
         *,
         profiler_recorder: Any | None,
-    ) -> Any:
+    ) -> ReceiverIngressCompletion:
         if not frames:
             raise ValueError("receive_transport_frames requires at least one frame.")
         payload_count = sum(len(frame.payload_segments) for frame in frames)
@@ -181,7 +196,8 @@ class RayActorDataPlane(DataPlaneCallable):
 
         if profiler_recorder is None:
             cpu_frames = serialize_frames()
-            return await self._handle.receive_transport_frames.remote(cpu_frames)
+            result = await self._handle.receive_transport_frames.remote(cpu_frames)
+            return ReceiverIngressCompletion(result)
 
         with profiler_recorder.data_plane_ray_payload_serialize(
             frame_count=len(frames),
@@ -191,7 +207,7 @@ class RayActorDataPlane(DataPlaneCallable):
         with profiler_recorder.data_plane_ray_rpc_submit(frame_count=len(frames)):
             ref = self._handle.receive_transport_frames.remote(cpu_frames)
         async with profiler_recorder.data_plane_ray_rpc_wait(frame_count=len(frames)):
-            return await ref
+            return ReceiverIngressCompletion(await ref)
 
     async def receive_control(
         self, op_name: str, step: int, names: list[str], values: list[Any]
@@ -220,7 +236,7 @@ class LocalWorkerDataPlane(DataPlaneCallable):
     async def receive_transport_frames(
         self,
         frames: tuple[TransportFrameEnvelope, ...],
-    ) -> Any:
+    ) -> ReceiverIngressCompletion:
         if not frames:
             raise ValueError("receive_transport_frames requires at least one frame.")
         validated_frames = tuple(
@@ -235,7 +251,7 @@ class LocalWorkerDataPlane(DataPlaneCallable):
             raise TypeError(
                 "LocalWorkerDataPlane receive_transport_frames must return an awaitable."
             )
-        return await result
+        return ReceiverIngressCompletion(await result)
 
     async def receive_control(
         self, op_name: str, step: int, names: list[str], values: list[Any]
@@ -285,7 +301,7 @@ class AxonDataPlane(DataPlaneCallable):
     async def receive_transport_frames(
         self,
         frames: tuple[TransportFrameEnvelope, ...],
-    ) -> Any:
+    ) -> ReceiverIngressCompletion:
         if not frames:
             raise ValueError("receive_transport_frames requires at least one frame.")
         validated_frames = tuple(
@@ -309,7 +325,7 @@ class AxonDataPlane(DataPlaneCallable):
         assert payload_class is not None, (
             "payload_class must not be None when expected_device_class is provided"
         )
-        return await _await_required(
+        result = await _await_required(
             invoke(
                 validated_frames,
                 payload_class.value,
@@ -317,6 +333,7 @@ class AxonDataPlane(DataPlaneCallable):
             ),
             "invoke_transport_frames",
         )
+        return ReceiverIngressCompletion(result)
 
     async def receive_control(
         self, op_name: str, step: int, names: list[str], values: list[Any]

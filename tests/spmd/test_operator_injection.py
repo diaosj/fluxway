@@ -2,6 +2,7 @@ import unittest
 
 from fluxway import OperatorSpec
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from tests.compiled_graph_fixtures import single_spmd_config
@@ -37,7 +38,11 @@ class TestOperatorInjection(unittest.TestCase):
 
         # Instantiate OperatorManager
         manager = OperatorManager(
-            config=config, spmd_id="test_spmd", rank=0, static_args={}
+            config=config,
+            spmd_id="test_spmd",
+            rank=0,
+            static_args={},
+            instance_container=OperatorInstanceContainer(),
         )
 
         # OperatorManager should find DummyNode.step and wrap it with _OperatorWrapper
@@ -56,7 +61,11 @@ class TestOperatorInjection(unittest.TestCase):
         config = _operator_config("async_step")
 
         manager = OperatorManager(
-            config=config, spmd_id="test_spmd", rank=0, static_args={}
+            config=config,
+            spmd_id="test_spmd",
+            rank=0,
+            static_args={},
+            instance_container=OperatorInstanceContainer(),
         )
 
         self.assertTrue(manager.operator_is_coroutine_function("async_step"))

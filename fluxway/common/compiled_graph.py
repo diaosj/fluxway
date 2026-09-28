@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
-from math import prod
 from typing import Any, Literal, cast
 from uuid import uuid4
 
 from fluxway.common.frozen_mapping import freeze_mapping
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.execution_layout import ExecutionLayout, compile_execution_layout
+from fluxway.common.transfer import UnitRouting, TransferRelation
 from fluxway.common.operator_policy import ArgumentType
 from fluxway.common.coherence import TensorAccessIntent
 from fluxway.common.operator_spec import OperatorSpec
@@ -45,6 +46,7 @@ class OperatorPort:
 class TensorTransfer:
     source: OperatorPort
     target: OperatorPort
+    unit_routing: UnitRouting | None = None
 
     def __post_init__(self) -> None:
         if self.source.kind != "data" or self.target.kind != "data":
@@ -114,6 +116,24 @@ class SPMDGraphSpec:
     resource_profile: ResourceProfile
     operators: Mapping[str, OperatorSpec]
 
+    @classmethod
+    def create(
+        cls,
+        *,
+        spmd_id: str,
+        spmd_class: type,
+        mesh: DeviceMesh,
+        resource_profile: ResourceProfile,
+        operators: Mapping[str, OperatorSpec],
+    ) -> SPMDGraphSpec:
+        return cls(
+            spmd_id=spmd_id,
+            spmd_class=spmd_class,
+            mesh=mesh.frozen_copy(),
+            resource_profile=resource_profile,
+            operators=freeze_mapping(operators),
+        )
+
     def __post_init__(self) -> None:
         if not self.spmd_id:
             raise ValueError("SPMDGraphSpec requires a non-empty spmd_id.")
@@ -125,8 +145,10 @@ class SPMDGraphSpec:
             raise ValueError("SPMDGraphSpec.mesh must contain at least one worker.")
         if not isinstance(self.resource_profile, ResourceProfile):
             raise TypeError("SPMDGraphSpec.resource_profile must be a ResourceProfile.")
-        object.__setattr__(self, "mesh", self.mesh.copy().freeze())
-        object.__setattr__(self, "operators", freeze_mapping(self.operators))
+        if not self.mesh.is_frozen:
+            raise TypeError("SPMDGraphSpec.mesh must be frozen")
+        if self.operators.__class__.__name__ != "FrozenMap":
+            raise TypeError("SPMDGraphSpec.operators must be frozen")
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +157,15 @@ class CompiledSPMDDeclaration:
     spmd_class: type
     mesh: DeviceMesh
     resource_profile: ResourceProfile
+
+    @classmethod
+    def from_spec(cls, spec: SPMDGraphSpec) -> CompiledSPMDDeclaration:
+        return cls(
+            spmd_id=spec.spmd_id,
+            spmd_class=spec.spmd_class,
+            mesh=spec.mesh,
+            resource_profile=spec.resource_profile,
+        )
 
     def __post_init__(self) -> None:
         if not self.spmd_id:
@@ -151,11 +182,12 @@ class CompiledSPMDDeclaration:
             raise TypeError(
                 "CompiledSPMDDeclaration.resource_profile must be a ResourceProfile."
             )
-        object.__setattr__(self, "mesh", self.mesh.frozen_copy())
+        if not self.mesh.is_frozen:
+            raise TypeError("CompiledSPMDDeclaration.mesh must be frozen")
 
     @property
     def world_size(self) -> int:
-        return int(self.mesh.size)
+        return self.mesh.size
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,10 +203,10 @@ class _CompiledOperatorFacts:
     output_signature_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "input_sharding", freeze_mapping(self.input_sharding))
-        object.__setattr__(
-            self, "output_sharding", freeze_mapping(self.output_sharding)
-        )
+        if self.input_sharding.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled operator input_sharding must be frozen")
+        if self.output_sharding.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled operator output_sharding must be frozen")
 
     def get_arguments(self, is_output: bool, arg_type: ArgumentType) -> list[str]:
         if is_output and arg_type is ArgumentType.CONTROL:
@@ -188,14 +220,42 @@ class _CompiledOperatorFacts:
 @dataclass(frozen=True, slots=True)
 class CompiledOperator(_CompiledOperatorFacts):
     effective_input_sharding: Mapping[str, ShardingSpec]
+    execution_layout: ExecutionLayout
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        key: OperatorKey,
+        spec: OperatorSpec,
+        input_sharding: Mapping[str, ShardingSpec],
+        output_sharding: Mapping[str, ShardingSpec],
+        output_uuids: Sequence[int],
+        output_state_names: Sequence[str],
+        function_id: str,
+        input_signature_id: str,
+        output_signature_id: str,
+        effective_input_sharding: Mapping[str, ShardingSpec],
+        execution_layout: ExecutionLayout,
+    ) -> CompiledOperator:
+        return cls(
+            key=key,
+            spec=spec,
+            input_sharding=freeze_mapping(input_sharding),
+            output_sharding=freeze_mapping(output_sharding),
+            output_uuids=tuple(output_uuids),
+            output_state_names=tuple(output_state_names),
+            function_id=function_id,
+            input_signature_id=input_signature_id,
+            output_signature_id=output_signature_id,
+            effective_input_sharding=freeze_mapping(effective_input_sharding),
+            execution_layout=execution_layout,
+        )
 
     def __post_init__(self) -> None:
         _CompiledOperatorFacts.__post_init__(self)
-        object.__setattr__(
-            self,
-            "effective_input_sharding",
-            freeze_mapping(self.effective_input_sharding),
-        )
+        if self.effective_input_sharding.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled operator effective sharding must be frozen")
         if set(self.effective_input_sharding) != set(self.input_sharding):
             raise ValueError(
                 f"Operator {self.key!r} effective input sharding ports differ "
@@ -536,6 +596,8 @@ class CompiledDependency:
     source_mesh: DeviceMesh
     target_mesh: DeviceMesh
 
+    _unit_relations: Mapping[int, TransferRelation] = field(repr=False, compare=False)
+
     def __post_init__(self) -> None:
         transfer_codes = {transfer.transfer_code for transfer in self.transfers}
         if len(transfer_codes) != len(self.transfers):
@@ -547,6 +609,75 @@ class CompiledDependency:
                 f"Dependency code {self.code} owns a transfer with a different "
                 "dependency code."
             )
+        if self._unit_relations.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled dependency unit relations must be frozen")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        code: int,
+        spec: DependencySpec,
+        source_operator: CompiledOperator,
+        target_operator: CompiledOperator,
+        transfers: tuple[CompiledTensorTransfer, ...]
+        | Sequence[CompiledTensorTransfer],
+        source_world_size: int,
+        target_world_size: int,
+        source_mesh: DeviceMesh,
+        target_mesh: DeviceMesh,
+        _unit_relations: Mapping[int, TransferRelation] | None = None,
+    ) -> CompiledDependency:
+        canonical_transfers = tuple(transfers)
+        if _unit_relations is not None:
+            unit_relations = freeze_mapping(_unit_relations)
+        else:
+            relations: dict[int, TransferRelation] = {}
+            for transfer in canonical_transfers:
+                routing = transfer.spec.unit_routing
+                if routing is None:
+                    continue
+                if spec.local_only:
+                    raise ValueError("whole-unit routing is not a local-only transfer")
+                if transfer.uses_receipt_routing:
+                    raise ValueError(
+                        "whole-unit and receipt routing cannot share a transfer"
+                    )
+                relation = routing.bind(
+                    source_operator.execution_layout.logical_mesh.size,
+                    target_world_size,
+                )
+                if (
+                    relation.source_count
+                    != source_operator.execution_layout.logical_mesh.size
+                    or len(relation.producers_by_target) != target_world_size
+                ):
+                    raise ValueError("unit routing changed the compiled rank domains")
+                if any(not targets for targets in relation.consumers_by_source):
+                    raise ValueError("unit routing requires complete producer coverage")
+                if any(
+                    len(producers) != 1 for producers in relation.producers_by_target
+                ):
+                    raise ValueError(
+                        "whole-unit targets require exactly one producer per execution"
+                    )
+                relations[transfer.transfer_code] = relation
+            unit_relations = freeze_mapping(relations)
+        return cls(
+            code=code,
+            spec=spec,
+            source_operator=source_operator,
+            target_operator=target_operator,
+            transfers=canonical_transfers,
+            source_world_size=source_world_size,
+            target_world_size=target_world_size,
+            source_mesh=source_mesh,
+            target_mesh=target_mesh,
+            _unit_relations=unit_relations,
+        )
+
+    def unit_relation(self, transfer_code: int) -> TransferRelation | None:
+        return self._unit_relations.get(transfer_code)
 
     @property
     def key(self) -> DependencyKey:
@@ -556,15 +687,7 @@ class CompiledDependency:
     def source_participating_count(self) -> int:
         if self.spec.local_only:
             return 1
-        if self.source_operator.spec.is_interleaved:
-            count = self.source_operator.spec.interleave_unit_size
-            if count <= 0 or count > self.source_world_size:
-                raise ValueError(
-                    f"Dependency {self.key!r} has invalid interleave unit size "
-                    f"{count} for source world size {self.source_world_size}."
-                )
-            return count
-        return self.source_world_size
+        return self.source_operator.execution_layout.logical_mesh.size
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,28 +700,20 @@ class SPMDGraphView:
     logical_tensors: tuple[CompiledLogicalTensor, ...]
     incoming: tuple[CompiledDependency, ...]
     outgoing: tuple[CompiledDependency, ...]
-    operator_ids: tuple[str, ...] = field(default=(), init=False)
+    operator_ids: tuple[str, ...]
     _operators_by_id: Mapping[str, CompiledOperator] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
     _dependencies_by_code: Mapping[int, CompiledDependency] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
     _transfers_by_code: Mapping[int, CompiledTensorTransfer] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
     _logical_tensors_by_tuuid: Mapping[int, CompiledLogicalTensor] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
@@ -611,30 +726,87 @@ class SPMDGraphView:
         operators = {operator.key.op_id: operator for operator in self.operators}
         if len(operators) != len(self.operators):
             raise ValueError(f"SPMD {self.spmd_id!r} has duplicate operators.")
-        dependencies = _index_dependencies_by_code(
-            (*self.incoming, *self.outgoing),
-            owner=f"SPMD {self.spmd_id!r}",
+        if self.operator_ids != tuple(operators):
+            raise ValueError("SPMD operator_ids are inconsistent")
+        if self._operators_by_id.__class__.__name__ != "FrozenMap":
+            raise TypeError("SPMD operator index must be frozen")
+        if self._dependencies_by_code.__class__.__name__ != "FrozenMap":
+            raise TypeError("SPMD dependency index must be frozen")
+        if self._transfers_by_code.__class__.__name__ != "FrozenMap":
+            raise TypeError("SPMD transfer index must be frozen")
+        if self._logical_tensors_by_tuuid.__class__.__name__ != "FrozenMap":
+            raise TypeError("SPMD logical tensor index must be frozen")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        graph_id: str,
+        generation: int,
+        name: str,
+        declaration: CompiledSPMDDeclaration,
+        operators: Sequence[CompiledOperator],
+        logical_tensors: Sequence[CompiledLogicalTensor],
+        incoming: Sequence[CompiledDependency],
+        outgoing: Sequence[CompiledDependency],
+        operator_ids: Sequence[str] | None = None,
+        _operators_by_id: Mapping[str, CompiledOperator] | None = None,
+        _dependencies_by_code: Mapping[int, CompiledDependency] | None = None,
+        _transfers_by_code: Mapping[int, CompiledTensorTransfer] | None = None,
+        _logical_tensors_by_tuuid: Mapping[int, CompiledLogicalTensor] | None = None,
+    ) -> SPMDGraphView:
+        canonical_operators = tuple(operators)
+        canonical_logical_tensors = tuple(logical_tensors)
+        canonical_incoming = tuple(incoming)
+        canonical_outgoing = tuple(outgoing)
+
+        operators_map = (
+            freeze_mapping(_operators_by_id)
+            if _operators_by_id is not None
+            else freeze_mapping({op.key.op_id: op for op in canonical_operators})
         )
-        transfers = _index_transfers_by_code(
-            tuple(dependencies.values()),
-            owner=f"SPMD {self.spmd_id!r}",
+        canonical_operator_ids = (
+            tuple(operator_ids)
+            if operator_ids is not None
+            else tuple(operators_map.keys())
         )
-        logical_tensors = _index_logical_tensors(
-            self.logical_tensors,
-            owner=f"SPMD {self.spmd_id!r}",
+        dependencies_map = (
+            freeze_mapping(_dependencies_by_code)
+            if _dependencies_by_code is not None
+            else freeze_mapping(
+                _index_dependencies_by_code(
+                    (*canonical_incoming, *canonical_outgoing), owner="SPMD"
+                )
+            )
         )
-        object.__setattr__(self, "operator_ids", tuple(operators))
-        object.__setattr__(self, "_operators_by_id", freeze_mapping(operators))
-        object.__setattr__(
-            self,
-            "_dependencies_by_code",
-            freeze_mapping(dependencies),
+        transfers_map = (
+            freeze_mapping(_transfers_by_code)
+            if _transfers_by_code is not None
+            else freeze_mapping(
+                _index_transfers_by_code(tuple(dependencies_map.values()), owner="SPMD")
+            )
         )
-        object.__setattr__(self, "_transfers_by_code", freeze_mapping(transfers))
-        object.__setattr__(
-            self,
-            "_logical_tensors_by_tuuid",
-            freeze_mapping(logical_tensors),
+        logical_tensors_map = (
+            freeze_mapping(_logical_tensors_by_tuuid)
+            if _logical_tensors_by_tuuid is not None
+            else freeze_mapping(
+                _index_logical_tensors(canonical_logical_tensors, owner="SPMD")
+            )
+        )
+        return cls(
+            graph_id=graph_id,
+            generation=generation,
+            name=name,
+            declaration=declaration,
+            operators=canonical_operators,
+            logical_tensors=canonical_logical_tensors,
+            incoming=canonical_incoming,
+            outgoing=canonical_outgoing,
+            operator_ids=canonical_operator_ids,
+            _operators_by_id=operators_map,
+            _dependencies_by_code=dependencies_map,
+            _transfers_by_code=transfers_map,
+            _logical_tensors_by_tuuid=logical_tensors_map,
         )
 
     @property
@@ -699,14 +871,10 @@ class CompiledGraph:
     spmds: tuple[SPMDGraphView, ...]
     dependencies: tuple[CompiledDependency, ...]
     _spmds_by_id: Mapping[str, SPMDGraphView] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
     _logical_tensors_by_tuuid: Mapping[int, CompiledLogicalTensor] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
@@ -773,11 +941,49 @@ class CompiledGraph:
             self.dependencies,
             owner="CompiledGraph",
         )
-        object.__setattr__(self, "_spmds_by_id", freeze_mapping(spmds))
-        object.__setattr__(
-            self,
-            "_logical_tensors_by_tuuid",
-            freeze_mapping(logical_tensors),
+        if self._spmds_by_id.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled graph SPMD index must be frozen")
+        if self._logical_tensors_by_tuuid.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled graph logical tensor index must be frozen")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        graph_id: str,
+        generation: int,
+        name: str,
+        logical_tensors: Sequence[CompiledLogicalTensor],
+        spmds: Sequence[SPMDGraphView],
+        dependencies: Sequence[CompiledDependency],
+        _spmds_by_id: Mapping[str, SPMDGraphView] | None = None,
+        _logical_tensors_by_tuuid: Mapping[int, CompiledLogicalTensor] | None = None,
+    ) -> CompiledGraph:
+        canonical_logical_tensors = tuple(logical_tensors)
+        canonical_spmds = tuple(spmds)
+        canonical_dependencies = tuple(dependencies)
+
+        spmds_map = (
+            freeze_mapping(_spmds_by_id)
+            if _spmds_by_id is not None
+            else freeze_mapping({spmd.spmd_id: spmd for spmd in canonical_spmds})
+        )
+        logical_tensors_map = (
+            freeze_mapping(_logical_tensors_by_tuuid)
+            if _logical_tensors_by_tuuid is not None
+            else freeze_mapping(
+                _index_logical_tensors(canonical_logical_tensors, owner="CompiledGraph")
+            )
+        )
+        return cls(
+            graph_id=graph_id,
+            generation=generation,
+            name=name,
+            logical_tensors=canonical_logical_tensors,
+            spmds=canonical_spmds,
+            dependencies=canonical_dependencies,
+            _spmds_by_id=spmds_map,
+            _logical_tensors_by_tuuid=logical_tensors_map,
         )
 
     def spmd(self, spmd_id: str) -> SPMDGraphView:
@@ -808,6 +1014,18 @@ class CompiledGraph:
         return tuple(spmd_id for spmd_id in self._spmds_by_id if spmd_id not in targets)
 
     @property
+    def source_control_spmd_ids(self) -> tuple[str, ...]:
+        """SPMDs whose source descriptor owns ordered publication windows."""
+        return tuple(
+            spmd_id
+            for spmd_id in self.spmd_ids
+            if any(
+                operator.spec.requires_source_control_runtime
+                for operator in self.spmd(spmd_id).operators
+            )
+        )
+
+    @property
     def sink_spmd_ids(self) -> tuple[str, ...]:
         sources = {dependency.spec.source.spmd_id for dependency in self.dependencies}
         return tuple(spmd_id for spmd_id in self._spmds_by_id if spmd_id not in sources)
@@ -815,6 +1033,17 @@ class CompiledGraph:
     @property
     def dependency_specs(self) -> tuple[DependencySpec, ...]:
         return tuple(dependency.spec for dependency in self.dependencies)
+
+    @property
+    def requires_source_control_runtime(self) -> bool:
+        """Whether a descriptor-backed source needs global source control.
+
+        This is true for a source operator that publishes windows through a
+        source descriptor. Such operators require ordered control records,
+        admission leases, and drain-boundary retention; it is not a generic
+        test for every source operator or for data-plane ordering.
+        """
+        return bool(self.source_control_spmd_ids)
 
 
 def _index_dependencies_by_code(
@@ -969,7 +1198,6 @@ class GraphCompiler:
         spmd_by_id = _index_spmds(spmds)
         declarations = _compile_spmd_declarations(spmd_by_id)
         specs_by_key = _index_operator_specs(spmds)
-        _validate_interleaved_source_topologies(declarations, specs_by_key)
         self._validate_generation(name, declarations, specs_by_key, dependencies)
         port_tuuids, output_uuids = _allocate_tuuids(
             specs_by_key,
@@ -994,6 +1222,7 @@ class GraphCompiler:
         compiled_operators = _compile_operators(
             operator_facts,
             sharding_resolver,
+            declarations,
         )
         dependency_codes = _allocate_dependency_codes(
             ordered_dependencies,
@@ -1029,7 +1258,7 @@ class GraphCompiler:
         graph_id = self._graph_id
         generation = self._generation
         spmd_views = tuple(
-            SPMDGraphView(
+            SPMDGraphView.create(
                 graph_id=graph_id,
                 generation=generation,
                 name=name,
@@ -1057,7 +1286,7 @@ class GraphCompiler:
             )
             for spmd in spmds
         )
-        return CompiledGraph(
+        return CompiledGraph.create(
             graph_id=graph_id,
             generation=generation,
             name=name,
@@ -1144,12 +1373,7 @@ def _compile_spmd_declarations(
     spmds: Mapping[str, SPMDGraphSpec],
 ) -> dict[str, CompiledSPMDDeclaration]:
     return {
-        spmd_id: CompiledSPMDDeclaration(
-            spmd_id=spmd_id,
-            spmd_class=spmd.spmd_class,
-            mesh=spmd.mesh,
-            resource_profile=spmd.resource_profile,
-        )
+        spmd_id: CompiledSPMDDeclaration.from_spec(spmd)
         for spmd_id, spmd in spmds.items()
     }
 
@@ -1181,30 +1405,6 @@ def _index_operator_specs(
                 )
             indexed[OperatorKey(spmd.spmd_id, op_id)] = spec
     return indexed
-
-
-def _validate_interleaved_source_topologies(
-    declarations: Mapping[str, CompiledSPMDDeclaration],
-    specs_by_key: Mapping[OperatorKey, OperatorSpec],
-) -> None:
-    for key, spec in specs_by_key.items():
-        if not spec.is_source or not spec.is_interleaved:
-            continue
-        world_size = declarations[key.spmd_id].world_size
-        unit_size = spec.interleave_unit_size
-        if world_size % unit_size != 0:
-            raise ValueError(
-                f"interleaved source {key.spmd_id}.{key.op_id} mesh size "
-                f"{world_size} must be divisible by interleave_unit_size "
-                f"{unit_size}."
-            )
-        trailing_mesh_size = prod(declarations[key.spmd_id].mesh.shape[1:])
-        if unit_size % trailing_mesh_size != 0:
-            raise ValueError(
-                f"interleaved source {key.spmd_id}.{key.op_id} "
-                f"interleave_unit_size {unit_size} must be divisible by "
-                f"trailing mesh size {trailing_mesh_size}."
-            )
 
 
 def _allocate_tuuids(
@@ -1436,8 +1636,8 @@ def _compile_operator_facts(
         compiled[key] = _CompiledOperatorFacts(
             key=key,
             spec=spec,
-            input_sharding=input_sharding,
-            output_sharding=output_sharding,
+            input_sharding=freeze_mapping(input_sharding),
+            output_sharding=freeze_mapping(output_sharding),
             output_uuids=output_uuids[key],
             output_state_names=output_state_names[key],
             function_id=_function_id(spec),
@@ -1450,9 +1650,10 @@ def _compile_operator_facts(
 def _compile_operators(
     operator_facts: Mapping[OperatorKey, _CompiledOperatorFacts],
     sharding_resolver: _ShardingReferenceResolver,
+    declarations: Mapping[str, CompiledSPMDDeclaration],
 ) -> dict[OperatorKey, CompiledOperator]:
     return {
-        key: CompiledOperator(
+        key: CompiledOperator.create(
             key=facts.key,
             spec=facts.spec,
             input_sharding=facts.input_sharding,
@@ -1466,6 +1667,13 @@ def _compile_operators(
                 port: sharding_resolver.resolve_target(operator=key, port=port)
                 for port in facts.input_sharding
             },
+            execution_layout=compile_execution_layout(
+                declarations[key.spmd_id].mesh,
+                unit_size=facts.spec.interleave_unit_size
+                if facts.spec.is_interleaved
+                else None,
+                groups=facts.spec.execution_groups,
+            ),
         )
         for key, facts in operator_facts.items()
     }
@@ -1487,24 +1695,21 @@ def _resolve_port_tuuid(
             target_operator = candidate_key
             field_name = candidate_field
     other_direction: Literal["in", "out"] = "out" if primary_direction == "in" else "in"
-    matches = {
-        port_tuuids[slot]
-        for slot in (
-            (
-                target_operator.spmd_id,
-                target_operator.op_id,
-                primary_direction,
-                field_name,
-            ),
-            (
-                target_operator.spmd_id,
-                target_operator.op_id,
-                other_direction,
-                field_name,
-            ),
-        )
-        if slot in port_tuuids
-    }
+    candidate_slots: tuple[PortSlot, PortSlot] = (
+        (
+            target_operator.spmd_id,
+            target_operator.op_id,
+            primary_direction,
+            field_name,
+        ),
+        (
+            target_operator.spmd_id,
+            target_operator.op_id,
+            other_direction,
+            field_name,
+        ),
+    )
+    matches = {port_tuuids[slot] for slot in candidate_slots if slot in port_tuuids}
     if len(matches) > 1:
         raise ValueError(
             f"Referential path {path!r} is ambiguous for operator {operator!r}."
@@ -1544,7 +1749,7 @@ def _compile_dependencies(
         source_spmd = declarations[dependency.source.spmd_id]
         target_spmd = declarations[dependency.target.spmd_id]
         compiled.append(
-            CompiledDependency(
+            CompiledDependency.create(
                 code=code,
                 spec=dependency,
                 source_operator=source,
@@ -1604,8 +1809,8 @@ def _compile_transfer(
 def _function_id(spec: OperatorSpec) -> str:
     owner = spec.owner
     if owner is None:
-        return str(spec.method_name)
-    return f"{owner.__module__}.{owner.__qualname__}.{str(spec.method_name)}"
+        return spec.method_name
+    return f"{owner.__module__}.{owner.__qualname__}.{spec.method_name}"
 
 
 def _signature_id(arguments: Mapping[str, tuple[str, ...]]) -> str:

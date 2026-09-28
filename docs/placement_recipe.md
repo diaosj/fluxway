@@ -33,5 +33,12 @@ Use `workers`, `support`, `equal`, `lexicographic`, `max_min`, and
 mapping in a recipe. The controller owns the placement group; managers and
 drivers borrow the resulting rank-to-bundle mapping.
 
+Each resolved NodeID receives a composite placement-group bundle pinned by Ray's
+`ray.io/node-id` label selector. IP addresses do not substitute for node identity.
+The materializer preserves the planner's CPU, GPU and custom accelerator resources;
+Workers attest their actual node against the plan. Describe hardware differences
+through resource profiles and recipe constraints. Use compatible software on every
+node and shared checkpoint storage for recoverable multi-node jobs.
+
 See [placement_mathematics.md](placement_mathematics.md) for solver semantics
 and the Chinese companion for the complete parallel explanation.

@@ -12,7 +12,7 @@ from fluxway.common.tensor_components import (
     select_destination_content_index_source,
     select_source_geometry_index_source,
 )
-from fluxway.common.types.sharding import PhysicalLayout
+from fluxway.common.types.sharding import PhysicalLayout, ChunkPartition
 from fluxway.common.types.tensor import SymmetryReceipt, TransportTensor
 from fluxway.transport.planner import DestinationAssignment
 
@@ -141,7 +141,7 @@ def receipt_destination_assignment(
             )
     else:
         backend = get_backend()
-        ranks = backend.adopt(receipt.sender_rank_tags)
+        ranks = backend.asarray(receipt.sender_rank_tags, device=backend.default_device)
         padding_count = capacity - entity_count
         if padding_count:
             padding = backend.full(
@@ -155,3 +155,41 @@ def receipt_destination_assignment(
         entity_count=entity_count,
         target_rank_count=receipt.world_size,
     )
+
+
+def compile_complete_shard_target(
+    source: PhysicalLayout | None,
+    target: PhysicalLayout | None,
+    local_rank: int,
+) -> int | None:
+    if source is None or target is None:
+        return None
+    if source.is_content_addressable or target.is_content_addressable:
+        return None
+    if source.is_referential or target.is_referential:
+        return None
+    if not source.is_static or not target.is_static:
+        return None
+    if not source.partitions or not target.partitions:
+        return None
+    if not isinstance(source.spec.strategy, ChunkPartition):
+        return None
+    if not isinstance(target.spec.strategy, ChunkPartition):
+        return None
+    dimensions = tuple(sorted(set(source.partitions) | set(target.partitions)))
+    if any(source.shard_size(dim) != target.shard_size(dim) for dim in dimensions):
+        return None
+    if source.replica_size != 1 or target.replica_size != 1:
+        return None
+    source_coordinate = tuple(
+        source.get_shard_rank(local_rank, dim) for dim in dimensions
+    )
+    targets = tuple(
+        rank
+        for rank in range(target.mesh.size)
+        if tuple(target.get_shard_rank(rank, dim) for dim in dimensions)
+        == source_coordinate
+    )
+    if len(targets) != 1:
+        return None
+    return targets[0]

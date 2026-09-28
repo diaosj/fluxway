@@ -7,10 +7,12 @@ from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types import CheckpointCut, ControllerState
 from fluxway.control_plane.components import (
     ControlPlaneComponentRegistry,
+    DriverComponentRegistry,
     DriverComponentContext,
     build_driver_component_registry,
     driver_component_id,
 )
+from fluxway.common.driver_control import DriverComponentCapabilities
 
 
 class _Component:
@@ -38,6 +40,8 @@ class _Component:
 
 def test_source_descriptor_is_operator_metadata_only():
     class Descriptor:
+        requires_source_control_runtime = False
+
         def build_component(self, context):
             return _Component()
 
@@ -90,6 +94,8 @@ def test_driver_registry_uses_compiled_source_descriptor_and_canonical_id():
     component = _Component()
 
     class Descriptor:
+        requires_source_control_runtime = False
+
         def build_component(self, context):
             assert isinstance(context, DriverComponentContext)
             component.component_id = context.component_id
@@ -121,6 +127,9 @@ def test_driver_registry_uses_compiled_source_descriptor_and_canonical_id():
         spmd_id="reader",
         controller_handle=object(),
         report_failure=lambda error: None,
+        capabilities=DriverComponentCapabilities(
+            worker_control=SimpleNamespace(dispatch=lambda request: None)
+        ),
     )
 
     assert registry.component_ids == ("reader:read",)
@@ -132,3 +141,50 @@ def test_driver_component_id_is_the_canonical_identity_constructor():
         driver_component_id("", "read")
     with pytest.raises(ValueError, match="operator_name"):
         driver_component_id("reader", "")
+
+
+@pytest.mark.asyncio
+async def test_driver_registry_dispatches_only_explicit_component_capability():
+    class Dispatchable(_Component):
+        component_id = "reader:read"
+
+        async def dispatch(self, request):
+            return (self.component_id, request)
+
+    registry = DriverComponentRegistry()
+    component = Dispatchable()
+    registry.register(component)
+
+    assert await registry.dispatch_request("reader:read", {"epoch": 1}) == (
+        "reader:read",
+        {"epoch": 1},
+    )
+    with pytest.raises(ValueError, match="unknown component"):
+        await registry.dispatch_request("reader:missing", object())
+
+    plain = _Component()
+    plain.component_id = "plain"
+    registry.register(plain)
+    with pytest.raises(TypeError, match="dispatch capability"):
+        await registry.dispatch_request("plain", object())
+
+
+@pytest.mark.asyncio
+async def test_controller_registry_routes_one_unaddressed_typed_notice():
+    class Dispatchable(_Component):
+        component_id = "ledger"
+
+        async def dispatch(self, request):
+            return request
+
+    registry = ControlPlaneComponentRegistry()
+    marker = object()
+    registry.register(Dispatchable())
+    assert await registry.dispatch_unaddressed_request(marker) is marker
+
+    class AnotherDispatchable(Dispatchable):
+        component_id = "another"
+
+    registry.register(AnotherDispatchable())
+    with pytest.raises(RuntimeError, match="exactly one"):
+        await registry.dispatch_unaddressed_request(marker)

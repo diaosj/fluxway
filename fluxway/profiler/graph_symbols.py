@@ -65,8 +65,6 @@ class GraphTraceSymbols:
     transfers: Mapping[int, TransferTraceSymbol]
     logical_tensors: Mapping[int, LogicalTensorTraceSymbol]
     _operators_by_spmd_and_id: Mapping[tuple[str, str], OperatorTraceSymbol] = field(
-        default_factory=dict,
-        init=False,
         repr=False,
         compare=False,
     )
@@ -108,16 +106,41 @@ class GraphTraceSymbols:
             transfers=self.transfers,
             logical_tensors=self.logical_tensors,
         )
-        operators = freeze_mapping(self.operators)
-        transfers = freeze_mapping(self.transfers)
-        logical_tensors = freeze_mapping(self.logical_tensors)
-        operator_index = freeze_mapping(
-            {(key.spmd_id, key.op_id): symbol for key, symbol in operators.items()}
+        if self.operators.__class__.__name__ != "FrozenMap":
+            raise TypeError("graph trace operators must be frozen")
+        if self.transfers.__class__.__name__ != "FrozenMap":
+            raise TypeError("graph trace transfers must be frozen")
+        if self.logical_tensors.__class__.__name__ != "FrozenMap":
+            raise TypeError("graph trace logical tensors must be frozen")
+        if self._operators_by_spmd_and_id.__class__.__name__ != "FrozenMap":
+            raise TypeError("graph trace operator index must be frozen")
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        graph_id: str,
+        generation: int,
+        operators: Mapping[OperatorKey, OperatorTraceSymbol],
+        transfers: Mapping[int, TransferTraceSymbol],
+        logical_tensors: Mapping[int, LogicalTensorTraceSymbol],
+    ) -> GraphTraceSymbols:
+        frozen_operators = freeze_mapping(operators)
+        frozen_transfers = freeze_mapping(transfers)
+        frozen_logical_tensors = freeze_mapping(logical_tensors)
+        return cls(
+            graph_id=graph_id,
+            generation=generation,
+            operators=frozen_operators,
+            transfers=frozen_transfers,
+            logical_tensors=frozen_logical_tensors,
+            _operators_by_spmd_and_id=freeze_mapping(
+                {
+                    (key.spmd_id, key.op_id): symbol
+                    for key, symbol in frozen_operators.items()
+                }
+            ),
         )
-        object.__setattr__(self, "operators", operators)
-        object.__setattr__(self, "transfers", transfers)
-        object.__setattr__(self, "logical_tensors", logical_tensors)
-        object.__setattr__(self, "_operators_by_spmd_and_id", operator_index)
 
     @classmethod
     def from_compiled_graph(cls, graph: CompiledGraph) -> GraphTraceSymbols:
@@ -175,7 +198,7 @@ class GraphTraceSymbols:
                     ),
                     symbol_kind="transfer",
                 )
-        return cls(
+        return cls.create(
             graph_id=graph.graph_id,
             generation=graph.generation,
             operators=operators,

@@ -14,9 +14,7 @@ come from compiled declarations; recipes do not maintain a second class-to-
 resource mapping. Unsupported expressions, missing declarations, and invalid
 topology relations raise directly.
 
-Executable examples remain in this document so the documentation test can
-compile them. See [placement_recipe.md](placement_recipe.md) for the user
-workflow and the Chinese companion for the complete mathematical exposition.
+The following sections provide executable API examples for common placement workflows. See [placement_recipe.md](placement_recipe.md) for detailed step-by-step guidance.
 
 <!-- test:placement-controller-entry -->
 ```python

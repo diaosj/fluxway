@@ -89,8 +89,8 @@ def test_compile_phase_schedule_ignores_non_phase_policies():
 
 
 def test_compiled_phase_relations_are_derived_from_runtime_gates():
-    schedule = CompiledPhaseSchedule(
-        gates={"after": PhaseGate(predecessors=(("before", 0),))},
+    schedule = CompiledPhaseSchedule.from_mapping(
+        {"after": PhaseGate(predecessors=(("before", 0),))}
     )
 
     assert schedule.relations == (("before", "after", 0),)

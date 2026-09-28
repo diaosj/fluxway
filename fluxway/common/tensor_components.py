@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,8 @@ from fluxway.common.index_descriptor import (
     IndexDescriptor,
     IndexPattern,
 )
+from fluxway.common.coherence import PhysicalMutability
+from fluxway.common.numba_runtime import call_numba_cached
 from fluxway.common.tensor_backend import force_writable
 from fluxway.common.types.sharding import (
     IdentityIndices,
@@ -22,10 +25,18 @@ from fluxway.common.types.sharding import (
 @dataclass(frozen=True, slots=True)
 class TensorPayload:
     values: Any
+    physical_mutability: PhysicalMutability
 
     @classmethod
     def create(cls, values: Any) -> "TensorPayload":
-        return cls(force_writable(values))
+        flags = getattr(values, "flags", None)
+        if flags is None or not hasattr(flags, "writeable"):
+            mutability = PhysicalMutability.UNKNOWN
+        elif flags.writeable:
+            mutability = PhysicalMutability.PROVEN_WRITABLE
+        else:
+            mutability = PhysicalMutability.READONLY
+        return cls(values, mutability)
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,7 +289,7 @@ def padded_literal_values(
     valid_length: int | None,
     backend: Any,
 ) -> Any:
-    tensor = backend.adopt(values)
+    tensor = backend.asarray(values, copy=True)
     shape = backend.shape(tensor)
     if len(shape) != 1:
         raise ValueError(f"Literal routing values must be 1-D, got shape={shape}.")
@@ -495,7 +506,20 @@ def dense_path_strides(widths: tuple[int, ...]) -> np.ndarray:
     return strides
 
 
-@njit(parallel=True, nogil=True, cache=True)
+def _numba_kernel(**options: Any):
+    def decorate(function):
+        dispatcher = njit(**options)(function)
+
+        @wraps(function)
+        def call(*args):
+            return call_numba_cached(dispatcher, *args)
+
+        return call
+
+    return decorate
+
+
+@_numba_kernel(parallel=True, nogil=True, cache=True)
 def nested_global_positions_kernel(
     local_rows: np.ndarray,
     path_offsets: np.ndarray,
@@ -510,7 +534,7 @@ def nested_global_positions_kernel(
         out[i] = slot
 
 
-@njit(parallel=True, nogil=True, cache=True)
+@_numba_kernel(parallel=True, nogil=True, cache=True)
 def scatter_inv_local_kernel(
     global_positions: np.ndarray,
     inv_1d: np.ndarray,
@@ -521,7 +545,7 @@ def scatter_inv_local_kernel(
         out[i] = global_positions[inv_1d[i]] - global_start
 
 
-@njit(nogil=True, cache=True)
+@_numba_kernel(nogil=True, cache=True)
 def fill_nested_dense_inv_kernel(
     flat_to_unique_local: np.ndarray,
     nested_splits: tuple[np.ndarray, ...],
@@ -543,7 +567,7 @@ def fill_nested_dense_inv_kernel(
         out.flat[dense_slot] = flat_to_unique_local[flat_index]
 
 
-@njit(nogil=True, cache=True)
+@_numba_kernel(nogil=True, cache=True)
 def fill_nested_dense_inv_with_pad_kernel(
     flat_to_unique_local: np.ndarray,
     nested_splits: tuple[np.ndarray, ...],
@@ -566,7 +590,7 @@ def fill_nested_dense_inv_with_pad_kernel(
         out.flat[dense_slot] = flat_to_unique_local[flat_index]
 
 
-@njit(parallel=True, nogil=True, cache=True)
+@_numba_kernel(parallel=True, nogil=True, cache=True)
 def fill_single_level_dense_inv_with_pad_kernel(
     flat_to_unique_local: np.ndarray,
     splits: np.ndarray,

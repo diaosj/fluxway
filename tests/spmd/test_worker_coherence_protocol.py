@@ -25,8 +25,12 @@ from fluxway.spmd.worker.coherence_runtime import (
     CoherenceAdmissionRuntime,
     CoherenceBatchRetireRuntime,
     ParentGrantReturnRuntime,
+    _ChildDeliveryReceipts,
     _delegated_reads,
 )
+from fluxway.spmd.worker.data_plane import InstancePublication, PublicationBatch
+from fluxway.rpc.protocol import ReceiverIngressCompletion
+from fluxway.spmd.worker.coherence_sequencer import CoherenceSequencer
 from fluxway.spmd.worker.data_plane import build_coherence_frame
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionResult,
@@ -59,6 +63,13 @@ def _bind(worker, *names):
     ):
         worker._coherence_admission_runtime = CoherenceAdmissionRuntime(
             worker._coherence_directory
+        )
+    if hasattr(worker, "_coherence_directory") and not hasattr(
+        worker, "_coherence_sequencer"
+    ):
+        worker._coherence_sequencer = CoherenceSequencer(
+            lambda _instances, _payload: asyncio.sleep(0),
+            lambda _instance: asyncio.sleep(0),
         )
     for name in names:
         value = getattr(raw_cls, name)
@@ -272,6 +283,10 @@ async def test_operator_tensor_access_defaults_to_readonly_and_rejects_missing_g
         _coherence_input_intents={},
         _coherence_input_bindings={},
         _local_input_origins={},
+        _coherence_sequencer=CoherenceSequencer(
+            lambda _instances, _payload: asyncio.sleep(0),
+            lambda _instance: asyncio.sleep(0),
+        ),
         config=types.SimpleNamespace(
             require_graph_view=lambda: types.SimpleNamespace(
                 operator=lambda _op_name: operator
@@ -469,6 +484,10 @@ async def test_write_intent_suspends_for_rfo_and_retires_dirty_parent_copy(
         _allocation_registry=AllocationRegistry(),
         _predecessor_handlers={},
         _local_spmd_code=child_code,
+        _coherence_sequencer=CoherenceSequencer(
+            lambda _instances, _payload: asyncio.sleep(0),
+            lambda _instance: asyncio.sleep(0),
+        ),
         rank=0,
         _world_size=1,
         config=types.SimpleNamespace(
@@ -1006,6 +1025,10 @@ async def test_cancelled_batch_delegation_rolls_back_prior_child_grants() -> Non
         rank=0,
         coherence_logical_tuuid=lambda code: 10 if code == 1 else 11,
         coherence_child_slot=lambda _code, _rank: 0,
+        describe_publication=lambda batches: PublicationBatch(
+            tuple(batches),
+            (InstancePublication(CoherenceInstance(first, 7), (0,)),),
+        ),
     )
     batch = TransportFrameBatch(
         context_index=0,
@@ -1017,7 +1040,10 @@ async def test_cancelled_batch_delegation_rolls_back_prior_child_grants() -> Non
             TransportDelegationDescriptor(2, 7),
         ),
     )
-    task = asyncio.create_task(runtime._delegate_batch_reads(plan, batch))
+    receipts = _ChildDeliveryReceipts(directory)
+    task = asyncio.create_task(
+        runtime._delegate_publication_reads(plan, (batch,), receipts)
+    )
     await asyncio.sleep(0)
 
     task.cancel()
@@ -1045,6 +1071,10 @@ async def test_delivery_failure_rolls_back_but_success_retentions_child_grant(
             subject, epoch
         ),
         coherence_child_slot=lambda transfer_code, target_rank: 0,
+        describe_publication=lambda batches: PublicationBatch(
+            tuple(batches),
+            (InstancePublication(CoherenceInstance(subject, 7), (0,)),),
+        ),
     )
     batch = TransportFrameBatch(
         context_index=0,
@@ -1057,8 +1087,11 @@ async def test_delivery_failure_rolls_back_but_success_retentions_child_grant(
     async def delivery():
         if delivery_fails:
             raise RuntimeError("delivery failed")
+        return ReceiverIngressCompletion(None)
 
-    task = asyncio.create_task(runtime.retire(plan, batch, delivery))
+    task = asyncio.create_task(
+        runtime.retire_publication(plan, (batch,), lambda _batch: delivery())
+    )
     await asyncio.gather(task, return_exceptions=True)
     await asyncio.sleep(0)
 
@@ -1074,8 +1107,9 @@ def test_delegated_reads_preserve_batch_order_and_drop_duplicates() -> None:
         coherence_instance=lambda transfer_code, epoch: CoherenceInstance(
             CoherenceSubject(7, 1, transfer_code + 100), epoch
         ),
-        coherence_child_slot=lambda transfer_code, target_rank: target_rank
-        + transfer_code,
+        coherence_child_slot=lambda transfer_code, target_rank: (
+            target_rank + transfer_code
+        ),
     )
     batch = TransportFrameBatch(
         context_index=0,
@@ -1114,6 +1148,10 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
             subject, epoch
         ),
         coherence_child_slot=lambda transfer_code, target_rank: 0,
+        describe_publication=lambda batches: PublicationBatch(
+            tuple(batches),
+            (InstancePublication(CoherenceInstance(subject, 7), (0,)),),
+        ),
     )
     batch = TransportFrameBatch(
         context_index=0,
@@ -1129,10 +1167,14 @@ async def test_late_delivery_failure_cannot_revoke_overlapping_success() -> None
         raise RuntimeError("first delivery failed")
 
     async def second_delivery():
-        return None
+        return ReceiverIngressCompletion(None)
 
-    first_task = asyncio.create_task(runtime.retire(plan, batch, first_delivery))
-    second_task = asyncio.create_task(runtime.retire(plan, batch, second_delivery))
+    first_task = asyncio.create_task(
+        runtime.retire_publication(plan, (batch,), lambda _batch: first_delivery())
+    )
+    second_task = asyncio.create_task(
+        runtime.retire_publication(plan, (batch,), lambda _batch: second_delivery())
+    )
     await second_task
     await asyncio.sleep(0)
     fail_first.set()

@@ -8,7 +8,6 @@ import contextvars
 import functools
 import inspect
 import logging
-import threading
 from contextlib import contextmanager
 from decimal import Decimal
 from dataclasses import dataclass, field
@@ -17,6 +16,7 @@ from collections.abc import Callable, Mapping
 from fluxway.common.operator_initialization import operator_initialization_arguments
 from fluxway.common.utils.tree import tree_flatten_type, _is_fluxway_data_type
 from fluxway.resources import FrozenResourceVector, normalize_resource_vector
+from fluxway.common.operator_instances import OperatorInstanceContainer
 
 logger = logging.getLogger(__name__)
 
@@ -38,31 +38,9 @@ class _OperatorContextState:
     ray_component_limits: Mapping[str, Decimal] = field(
         default_factory=lambda: FrozenResourceVector({})
     )
-
-
-class _PicklableLock:
-    """A threading.Lock wrapper that survives pickle (Ray serialization).
-
-    On deserialization a fresh lock is created in the new process.
-    This is correct because _instance_storage is per-process, so each
-    process needs its own lock — not a shared one.
-    """
-
-    def __init__(self):
-        self._lock = threading.Lock()
-
-    def __enter__(self):
-        self._lock.acquire()
-        return self
-
-    def __exit__(self, *args):
-        self._lock.release()
-
-    def __getstate__(self):
-        return {}
-
-    def __setstate__(self, state):
-        self._lock = threading.Lock()
+    instance_container: OperatorInstanceContainer = field(
+        default_factory=OperatorInstanceContainer
+    )
 
 
 _DEFAULT_CONTEXT_STATE = _OperatorContextState()
@@ -70,15 +48,6 @@ _DEFAULT_CONTEXT_STATE = _OperatorContextState()
 _operator_context_var: contextvars.ContextVar[_OperatorContextState] = (
     contextvars.ContextVar("operator_context", default=_DEFAULT_CONTEXT_STATE)
 )
-
-_instance_storage_lock = _PicklableLock()
-_instance_storage: dict[int, Any] = {}
-
-
-def get_instance_storage() -> tuple[dict[int, Any], Any]:
-    import fluxway.common.decorators as fd
-
-    return fd._instance_storage, fd._instance_storage_lock
 
 
 @contextmanager
@@ -96,6 +65,7 @@ def operator_context(
     num_nodes: int = 1,
     rank0_address: str | None = None,
     ray_component_limits: Mapping[str, Decimal] | None = None,
+    instance_container: OperatorInstanceContainer | None = None,
 ):
     """Context manager to inject operator runtime context into current coroutine/thread.
 
@@ -123,6 +93,11 @@ def operator_context(
         num_nodes=num_nodes,
         rank0_address=rank0_address,
         ray_component_limits=normalized_ray_component_limits,
+        instance_container=(
+            OperatorInstanceContainer()
+            if instance_container is None
+            else instance_container
+        ),
     )
     token = _operator_context_var.set(state)
     try:
@@ -562,27 +537,21 @@ class _OperatorWrapper:
             owner._fluxway_ctx_injected = True
 
         def _get_or_create_instance():
-            instance_key = id(owner)
-            storage, lock = get_instance_storage()
-            if instance_key not in storage:
-                with lock:
-                    if instance_key not in storage:
-                        ctx = get_current_context()
-                        # Write static attributes directly into inst.__dict__
-                        # BEFORE __init__ so that self.rank / self.world_size
-                        # etc. are available as plain instance attributes
-                        # throughout the object's lifetime, including in
-                        # lifecycle hooks like save_state / restore_state that
-                        # run outside any active operator context.
-                        inst = owner.__new__(owner)
-                        for attr in _STATIC_CONTEXT_ATTR_NAMES:
-                            inst.__dict__[attr] = getattr(ctx, attr)
-                        init_kwargs = operator_initialization_arguments(
-                            owner, ctx.static_args or {}
-                        )
-                        inst.__init__(**init_kwargs)
-                        storage[instance_key] = inst
-            return storage[id(owner)]
+            ctx = get_current_context()
+
+            def factory() -> Any:
+                # Write static attributes BEFORE __init__ so lifecycle hooks
+                # can use them without a context.
+                inst = owner.__new__(owner)
+                for attr in _STATIC_CONTEXT_ATTR_NAMES:
+                    setattr(inst, attr, getattr(ctx, attr))
+                init_kwargs = operator_initialization_arguments(
+                    owner, ctx.static_args or {}
+                )
+                inst.__init__(**init_kwargs)
+                return inst
+
+            return ctx.instance_container.get_or_create(owner, factory)
 
         if inspect.iscoroutinefunction(self.func):
 
@@ -948,7 +917,6 @@ def spmd(
 
         original_new = cls.__new__
 
-        @functools.wraps(original_new)
         def __new__(cls_obj, *args, **kwargs):
             from fluxway.control_plane.graph.functional import FunctionalGraph
 
@@ -1022,6 +990,8 @@ def spmd_source(
     mesh_axis_shapes: tuple[int, ...] | None = None,
     interleaved: bool = False,
     interleave_unit_size: int = 1,
+    execution_groups: tuple[tuple[int, ...], ...] | None = None,
+    source: Any | None = None,
     runtime_env: dict[str, Any] | None = None,
     driver_runtime_env: dict[str, Any] | None = None,
     checkpoint_components: tuple[Any, ...] = (),
@@ -1055,6 +1025,8 @@ def spmd_source(
                         "is_source": True,
                         "is_interleaved": interleaved,
                         "interleave_unit_size": interleave_unit_size,
+                        "execution_groups": execution_groups,
+                        "source": source,
                     }
                 )
                 for name, spec in config.operator_specs.items()

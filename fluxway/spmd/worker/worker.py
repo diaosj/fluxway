@@ -41,13 +41,19 @@ from fluxway.common.tensor_backend import (
 from fluxway.common.decorators import (
     operator_context,
     get_current_context,
-    get_instance_storage,
     _inject_context_properties,
     _STATIC_CONTEXT_ATTR_NAMES,
     _validate_worker_process_marker,
 )
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.execution import compile
 from fluxway.common.compiled_graph import CompiledDependency
+from fluxway.common.ingestion import (
+    SourceWorkAcknowledgement,
+    SourceWorkItem,
+    SourceWorkLease,
+)
+from fluxway.common.ingestion.segment import CompiledSegment
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.types import (
     CheckpointComponentPublication,
@@ -60,6 +66,7 @@ from fluxway.common.types import (
     TopologySnapshot,
     WorkerHeartbeat,
     WorkerStatus,
+    CheckpointActivityPhase,
     DrainBoundary,
     DrainEvent,
     DrainEventKind,
@@ -90,6 +97,7 @@ from fluxway.common.types.tensor import (
     TransportTensor,
     runtime_allocation_descriptor,
 )
+from fluxway.control_plane.ledger_client import ControlPlaneClient
 from fluxway.common.types.sharding import (
     ShardingSpec,
     PhysicalLayout,
@@ -122,13 +130,18 @@ from fluxway.transport.coherence import entry_coherence_action, entry_tensor_kin
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.utils.logging import get_logger
 from fluxway.common.utils.tree import tree_flatten, tree_unflatten
+from fluxway.diagnostics import register_system_signal_metadata
 from fluxway.rpc.protocol import (
     DataPlaneCallable,
     LocalWorkerDataPlane,
     TransportFrameEnvelope,
 )
 from fluxway.spmd.worker.mailbox import WorkerMailbox
+from fluxway.spmd.worker.mailbox.mailbox import TransportShardView
 from fluxway.spmd.worker.checkpoint import WorkerCheckpointCoordinator
+from fluxway.spmd.worker.checkpoint_activity import (
+    CheckpointActivity,
+)
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
     DependencyDecisions,
@@ -169,6 +182,7 @@ from fluxway.spmd.worker.user_callable_executor import (
     UserCallableSpec,
 )
 from fluxway.spmd.worker.runtime import (
+    SourceAcknowledgementRuntime,
     LocalInputPrepareRuntime,
     OutboundDeliveryRuntime,
     WorkerProcessCallRuntime,
@@ -181,6 +195,8 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
     ExecutionResult,
 )
+from fluxway.spmd.worker.source_scope import SourceExecutionScope
+from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle, WorkerPhase
 from fluxway.spmd.worker.admission import AdmissionAction, StepAdmissionState
 from fluxway.spmd.worker.source_maintenance import SourcePipelineMaintenance
 from fluxway.profiler import ProfilerRuntimeFactory
@@ -203,14 +219,17 @@ from fluxway.profiler.recorder import (
     WORKER_QUEUE_ENQUEUE,
     WORKER_RUN_LOOP,
 )
+from fluxway.common.types.drain import DrainAdmission
 from typing import Any, Optional, get_type_hints, cast
 
 _WAIT_INPUTS_CALLABLE = "__fluxway_wait_inputs__"
 _CALL_USER_OP_CALLABLE = "__fluxway_call_user_op__"
 _SEND_OUTPUT_CALLABLE = "__fluxway_send_output__"
+_AWAIT_SEND_CALLABLE = "__fluxway_await_send__"
 _COMMIT_STEP_CALLABLE = "__fluxway_commit_step__"
 _WAIT_INPUTS_RESOURCE = -1
 _SEND_OUTPUT_RESOURCE = -1
+_AWAIT_SEND_RESOURCE = -1
 _COMMIT_STEP_RESOURCE_SALT = "__fluxway_commit_step_resource__"
 _EXECUTION_DEFAULT_LANE = USER_CALLABLE_DEFAULT_OPERATOR_LANE
 _EXECUTION_STOP_OP = "__stop__"
@@ -471,6 +490,7 @@ class _PreparedOperatorInput:
     value: Any
     step_transfer_cache: dict[int, Any]
     tensor_bindings: tuple["_PreparedTensorBinding", ...] = ()
+    source_work_items: tuple[SourceWorkItem, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -596,8 +616,9 @@ class SPMDWorker:
         self.config = config
         self.rank = rank
         self.spmd_id = spmd_id or ""
+        register_system_signal_metadata(spmd_id=self.spmd_id, rank=self.rank)
         self._tensor_device = tensor_device
-        self._running = False
+        self._execution_lifecycle = WorkerExecutionLifecycle()
         self._graph_view = config.require_graph_view()
         self._operator_specs = {
             op_id: config.operator_specs[op_id]
@@ -627,6 +648,13 @@ class SPMDWorker:
         self.rank0_address: str | None = None
 
         self._op_manager: OperatorManager | None = None
+        self._source_scope = SourceExecutionScope(
+            acquire=self._acquire_source_work,
+            spawn=self._spawn_background_task,
+            completed=lambda operator: self._completed_step_count[operator],
+            depth=self._operator_pipeline_depth,
+        )
+        self._instance_container = OperatorInstanceContainer()
         operator_names = self._graph_view.operator_ids
 
         # Completed step counters {op_name: count} - tracks how many steps were executed
@@ -769,6 +797,7 @@ class SPMDWorker:
         self._heartbeat_interval: float = self.config.heartbeat_interval_s
         self._heartbeat_running: bool = False
         self._heartbeat_task: asyncio.Task | None = None
+        self._checkpoint_activity = CheckpointActivity()
 
         # State tracking
         self._failure: ExecutionFailure | None = None
@@ -777,7 +806,6 @@ class SPMDWorker:
         self._last_stall_warning_timestamp: float | None = None
 
         # Run loop synchronization
-        self._start_event = asyncio.Event()  # Signals when to start execution
         self._run_task: asyncio.Task | None = None
         self._lane_run_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
@@ -859,7 +887,24 @@ class SPMDWorker:
         self._source_operator_names = tuple(
             op_name for op_name, spec in self._operator_specs.items() if spec.is_source
         )
+        self._source_control_operator_names = tuple(
+            op_name
+            for op_name, spec in self._operator_specs.items()
+            if spec.is_source and spec.requires_source_control_runtime
+        )
+        self._source_acknowledgements = SourceAcknowledgementRuntime(
+            capacity=max(
+                1,
+                sum(
+                    self._operator_pipeline_depth(name)
+                    for name in self._source_control_operator_names
+                ),
+            ),
+            send=self._send_source_acknowledgements,
+            spawn=self._spawn_background_task,
+        )
         self._drain_boundary = DrainBoundary()
+        self._admission: DrainAdmission | None = None
         self._pending_terminal_observation: tuple[str, int] | None = None
 
         # Drain-to-step state
@@ -871,7 +916,7 @@ class SPMDWorker:
             # Block at step 0 until Controller issues the initial drain target!
             self._drain_step_count = 0
 
-        # Expected topology counts for auto-start detection
+        # Expected topology counts for topology readiness
         # Initialize to None to strictly wait for registration from driver
         self._expected_predecessor_count: int | None = None
         self._expected_successor_count: int | None = None
@@ -896,6 +941,7 @@ class SPMDWorker:
         rank: int,
         *,
         static_args: dict[str, Any],
+        instance_container: OperatorInstanceContainer,
         local_rank: int | None = None,
         local_world_size: int | None = None,
         node_rank: int | None = None,
@@ -917,6 +963,9 @@ class SPMDWorker:
         graph_view = config.require_graph_view()
         world_size = graph_view.world_size
 
+        if not isinstance(instance_container, OperatorInstanceContainer):
+            raise TypeError("operator prewarm requires an OperatorInstanceContainer")
+        container = instance_container
         seen: set = set()
         with operator_context(
             static_args=static_args,
@@ -928,9 +977,9 @@ class SPMDWorker:
             node_rank=0 if node_rank is None else node_rank,
             num_nodes=1 if num_nodes is None else num_nodes,
             rank0_address=rank0_address,
+            instance_container=container,
             ray_component_limits=config.require_graph_view().resource_profile.ray_component_limits,
         ):
-            storage, lock = get_instance_storage()
             for op_id in graph_view.operator_ids:
                 try:
                     op_meta = config.operator_specs[op_id]
@@ -946,7 +995,7 @@ class SPMDWorker:
                 if id(cls) in seen:
                     continue
                 seen.add(id(cls))
-                if id(cls) in storage:
+                if container.get(cls) is not None:
                     continue
 
                 init_kwargs = operator_initialization_arguments(cls, static_args)
@@ -955,7 +1004,7 @@ class SPMDWorker:
                 _inject_context_properties(cls)
                 ctx = get_current_context()
                 for _attr in _STATIC_CONTEXT_ATTR_NAMES:
-                    instance.__dict__[_attr] = getattr(ctx, _attr)
+                    setattr(instance, _attr, getattr(ctx, _attr))
                 logger.debug(
                     "operator_init_begin owner_class=%s rank=%s",
                     cls.__qualname__,
@@ -981,7 +1030,7 @@ class SPMDWorker:
                     cls.__qualname__,
                     rank,
                 )
-                storage[id(cls)] = instance
+                container.get_or_create(cls, lambda instance=instance: instance)
 
     # =========================================================================
     # Driver Handle Management
@@ -1047,6 +1096,22 @@ class SPMDWorker:
             max_depth = max(max_depth, depth)
         return max_depth
 
+    async def acquire_source_operator_work(
+        self, operator_name: str, step: int
+    ) -> tuple[SourceWorkLease, ...]:
+        return await self._source_scope.take(operator_name, step)
+
+    async def _acquire_source_work(
+        self, epoch: int, segments: tuple[CompiledSegment, ...]
+    ) -> tuple[SourceWorkLease, ...]:
+        if self._control_plane_handle is None:
+            raise RuntimeError(
+                "source work acquisition requires a control-plane handle"
+            )
+        return await ControlPlaneClient(self._control_plane_handle).acquire_source_work(
+            epoch, segments
+        )
+
     def setup_and_start(
         self,
         local_rank: int,
@@ -1076,6 +1141,7 @@ class SPMDWorker:
 
             preinstantiate_kwargs = {
                 "static_args": static_args,
+                "instance_container": self._instance_container,
                 "local_rank": local_rank,
                 "local_world_size": local_world_size,
                 "node_rank": node_rank,
@@ -1094,6 +1160,7 @@ class SPMDWorker:
             )
             manager_kwargs = dict(
                 static_args=static_args,
+                instance_container=self._instance_container,
                 local_rank=local_rank,
                 local_world_size=local_world_size,
                 node_rank=node_rank,
@@ -1127,6 +1194,11 @@ class SPMDWorker:
             if self._driver_handle is not None:
                 self._start_heartbeat()
             self._start_run_loop()
+            logger.info(
+                "setup_and_start_completed spmd_id=%s rank=%s",
+                self.spmd_id,
+                self.rank,
+            )
             logger.debug(
                 "setup_and_start_runtime_started spmd_id=%s rank=%s",
                 self.spmd_id,
@@ -1237,8 +1309,8 @@ class SPMDWorker:
             f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
-        # Check if all handlers are registered for auto-start
-        self._check_and_auto_start()
+        # Update topology readiness from registered handlers
+        self._check_topology_ready()
 
     def register_successor_handlers(
         self, spmd_id: str, handlers: dict[int, DataPlaneCallable]
@@ -1262,14 +1334,14 @@ class SPMDWorker:
             f"ranks={list(handlers.keys())} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
-        # Check if all handlers are registered for auto-start
-        self._check_and_auto_start()
+        # Update topology readiness from registered handlers
+        self._check_topology_ready()
 
     def set_expected_topology(
         self, predecessor_count: int, successor_count: int
     ) -> None:
         """
-        Set expected predecessor/successor counts for auto-start detection.
+        Set expected predecessor/successor counts for topology readiness.
 
         Called by driver before topology registration begins.
 
@@ -1284,20 +1356,9 @@ class SPMDWorker:
             f"successor_count={successor_count} spmd_id={self.spmd_id} rank={self.rank}"
         )
 
-        # If both are 0 (source node with no successors), auto-start immediately
-        if predecessor_count == 0 and successor_count == 0:
-            self._auto_start()
-        else:
-            # Check if handlers are already registered
-            self._check_and_auto_start()
+        self._check_topology_ready()
 
-    def _check_and_auto_start(self) -> None:
-        """
-        Check if all expected handlers are registered and auto-start if ready.
-        """
-        if self._running:
-            return  # Already running
-
+    def _check_topology_ready(self) -> None:
         if (
             self._expected_predecessor_count is None
             or self._expected_successor_count is None
@@ -1324,24 +1385,16 @@ class SPMDWorker:
 
         if pred_registered and succ_registered:
             logger.debug(
-                f"All handlers registered auto-starting "
+                f"Topology handlers ready "
                 f"pred={len(self._predecessor_handlers)}/{self._expected_predecessor_count} "
                 f"succ={len(self._successor_handlers)}/{self._expected_successor_count} "
                 f"spmd_id={self.spmd_id} rank={self.rank}"
             )
-            self._auto_start()
+            self._execution_lifecycle.topology_ready()
 
-    def _auto_start(self) -> None:
-        """Internal auto-start method."""
-        logger.debug(
-            f"_auto_start called running={self._running} spmd_id={self.spmd_id} rank={self.rank}"
-        )
-        if self._running:
+    def activate_execution(self) -> None:
+        if not self._execution_lifecycle.activate():
             return
-
-        self._running = True
-        self._start_event.set()
-        logger.debug(f"Worker auto-started spmd_id={self.spmd_id} rank={self.rank}")
 
         if self.config.auto_start_source_operators:
             self._spawn_background_task(self._trigger_source_operators())
@@ -1405,7 +1458,7 @@ class SPMDWorker:
             exception=exception,
         )
         self._failure = failure
-        self._running = False
+        self._execution_lifecycle.fail()
         self._fence_state = ExecutionFenceState.CLOSING
 
         for execution_queue in self._execution_queues.values():
@@ -1438,6 +1491,7 @@ class SPMDWorker:
                 continue
             break
         await self._delivery_runtime.drain("worker_drain_outbound")
+        await self._source_acknowledgements.flush()
         if self._failure is not None:
             raise RuntimeError(f"Worker execution failed: {self._failure}")
 
@@ -1532,6 +1586,39 @@ class SPMDWorker:
             op_name, step=step, names=names, values=values
         )
 
+    async def dispatch_control(self, request: Any) -> object:
+        from fluxway.common.driver_control import IngestionLayoutActivationRequest
+        from fluxway.common.ingestion import (
+            IngestionLayoutActivation,
+            IngestionLayoutReceiver,
+            ingestion_worker_id,
+        )
+
+        if not isinstance(request, IngestionLayoutActivationRequest):
+            raise TypeError("worker control requires a registered request")
+        op_name = request.operator_name
+        activation = request.activation
+        if not isinstance(activation, IngestionLayoutActivation):
+            raise TypeError("worker ingestion activation requires layout metadata")
+        spec = self.op_manager.get_operator_spec(op_name)
+        if spec.is_source is not True:
+            raise ValueError("ingestion activation target must be a source operator")
+        expected_worker_id = ingestion_worker_id(self.spmd_id, op_name, self.rank)
+        if activation.descriptor.worker_id != expected_worker_id:
+            raise ValueError(
+                "ingestion activation worker identity does not match target rank"
+            )
+        owner = self.op_manager.require_operator_instance(op_name)
+        if not isinstance(owner, IngestionLayoutReceiver):
+            raise TypeError(
+                f"source operator {op_name!r} does not implement "
+                "activate_ingestion_layout"
+            )
+        await self._source_scope.activate(
+            op_name, activation, owner.activate_ingestion_layout
+        )
+        return None
+
     async def receive_transport_frames(
         self,
         frames: tuple[TransportFrameEnvelope, ...],
@@ -1606,18 +1693,18 @@ class SPMDWorker:
             state_flags = int(entry[ENTRY_STATE_FLAGS])
             action = entry_coherence_action(state_flags)
             tensor_kind = TensorEntryKind(entry_tensor_kind(state_flags))
+            sender_rank = int(frame.frame_i32[FRAME_SENDER_RANK])
+            epoch = int(entry[ENTRY_AUX])
             op_name = self.op_manager.get_transfer_target_op(transfer_code)
             if (
-                tensor_kind is TensorEntryKind.TENSOR
+                tensor_kind in (TensorEntryKind.TENSOR, TensorEntryKind.ROUTING_MISS)
                 and action is CoherenceAction.BUS_RD
             ):
-                sender_rank = int(frame.frame_i32[FRAME_SENDER_RANK])
                 subject = self._coherence_subject(
                     sender_spmd_code,
                     sender_rank,
                     transfer_code,
                 )
-                epoch = int(entry[ENTRY_AUX])
                 grants = self._coherence_input_grants.setdefault((op_name, step), {})
                 identity = (
                     sender_id,
@@ -1644,6 +1731,7 @@ class SPMDWorker:
                         route_code=transfer_code,
                         epoch=epoch,
                         local_access_token=local_read.token,
+                        parent_return_required=(tensor_kind is TensorEntryKind.TENSOR),
                     )
                     grants[grant.identity] = grant
             op_to_entry_indices.setdefault(op_name, []).append(entry_index)
@@ -2527,9 +2615,9 @@ class SPMDWorker:
             else None
         )
         effective_rank = (
-            self.rank
-            if interleave_unit_size is None
-            else self.rank % interleave_unit_size
+            self.op_manager.get_dispatcher(op_name)
+            .bind_execution_group(self._graph_view.mesh, self.rank)
+            .logical_rank(self.rank)
         )
         successor_contexts: list[_SuccessorSendContext] = []
         for context_index, key in enumerate(sorted(grouped_dependencies)):
@@ -2652,7 +2740,7 @@ class SPMDWorker:
         logger.debug(
             f"Waiting for start signal spmd_id={self.spmd_id} rank={self.rank}"
         )
-        await self._start_event.wait()
+        await self._execution_lifecycle.wait_for_activation()
 
         logger.debug(f"Execution loop started spmd_id={self.spmd_id} rank={self.rank}")
         profiler_recorder = (
@@ -2728,8 +2816,9 @@ class SPMDWorker:
                 break
 
     async def stop(self) -> None:
-        """Stop the execution loop gracefully."""
-        self._running = False
+        await self._execution_lifecycle.close(self._shutdown)
+
+    async def _shutdown(self) -> None:
         self._fence_state = ExecutionFenceState.CLOSING
         self._driver_handle = None
         # Wake any worker blocked on drain condition
@@ -2893,7 +2982,7 @@ class SPMDWorker:
             submit_delivery=self._delivery_submitter(op_name, step),
             delivery_schedule_key=self._effective_schedule_key(op_name, step),
             batch_submit=partial(
-                self._coherence_batch_retire_runtime.retire,
+                self._coherence_batch_retire_runtime.retire_publication,
                 send_context.compiled_plan,
             ),
             dependency_decisions=dependency_decisions,
@@ -2937,7 +3026,7 @@ class SPMDWorker:
             submit_delivery=self._delivery_submitter(op_name, step),
             delivery_schedule_key=self._effective_schedule_key(op_name, step),
             batch_submit=partial(
-                self._coherence_batch_retire_runtime.retire,
+                self._coherence_batch_retire_runtime.retire_publication,
                 send_context.compiled_plan,
             ),
             dependency_decisions=dependency_decisions,
@@ -2946,7 +3035,10 @@ class SPMDWorker:
         return tuple(tasks)
 
     def _operator_pipeline_depth(self, op_name: str) -> int:
-        meta = self.op_manager.get_operator_spec(op_name)
+        try:
+            meta = self._operator_specs[op_name]
+        except KeyError as error:
+            raise KeyError(f"unknown operator pipeline depth: {op_name!r}") from error
         depth = meta.runtime_policy.pipeline_depth
         if depth <= 0:
             raise ValueError(
@@ -3130,23 +3222,26 @@ class SPMDWorker:
                 int(LocalStepNodeKind.WAIT),
                 int(LocalStepNodeKind.CALL),
                 int(LocalStepNodeKind.SEND),
+                int(LocalStepNodeKind.AWAIT_SEND),
                 int(LocalStepNodeKind.BARRIER),
             ),
             callable_ids=(
                 _WAIT_INPUTS_CALLABLE,
                 _CALL_USER_OP_CALLABLE,
                 _SEND_OUTPUT_CALLABLE,
+                _AWAIT_SEND_CALLABLE,
                 _COMMIT_STEP_CALLABLE,
             ),
             resource_ids=(
                 _WAIT_INPUTS_RESOURCE,
                 self._state_resource_id(op_name),
                 _SEND_OUTPUT_RESOURCE,
+                _AWAIT_SEND_RESOURCE,
                 self._commit_resource_id(op_name),
             ),
-            dependency_offsets=(0, 0, 1, 3, 4),
-            dependencies=(0, 0, 1, 2),
-            result_node=3,
+            dependency_offsets=(0, 0, 1, 3, 4, 5),
+            dependencies=(0, 0, 1, 2, 3),
+            result_node=4,
         )
 
     async def _run_local_step_plan(self, op_name: str, step: int) -> ExecutionResult:
@@ -3212,6 +3307,11 @@ class SPMDWorker:
                             op_name, step, result
                         ),
                     )
+                if callable_id == _AWAIT_SEND_CALLABLE:
+                    return LocalNodeSpec(
+                        callable_id=callable_id,
+                        fn=worker_self._local_plan_await_send,
+                    )
                 raise KeyError(f"Unknown local plan callable_id {callable_id!r}.")
 
         return OperatorLocalNodeRegistry()
@@ -3255,7 +3355,12 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
         if recorder is None:
-            spec = self._operator_user_callable_spec(op_name, step, operator_input)
+            spec = self._operator_user_callable_spec(
+                op_name,
+                step,
+                operator_input,
+                source_work_items=input_data.source_work_items,
+            )
             result = (
                 await self._local_step_plan_executor.user_callable_executor.execute(
                     spec
@@ -3267,7 +3372,12 @@ class SPMDWorker:
                 op_name=op_name,
                 step=step,
             ):
-                spec = self._operator_user_callable_spec(op_name, step, operator_input)
+                spec = self._operator_user_callable_spec(
+                    op_name,
+                    step,
+                    operator_input,
+                    source_work_items=input_data.source_work_items,
+                )
                 result = (
                     await self._local_step_plan_executor.user_callable_executor.execute(
                         spec
@@ -3300,6 +3410,8 @@ class SPMDWorker:
                 for grant in binding.grants:
                     selected_grants[grant.identity] = grant
         self._coherence_input_tensors.setdefault((op_name, step), set()).update(intents)
+        for tensor in intents:
+            tensor._bind_consumer_lease_owner(self._coherence_sequencer)
         if requires_ownership:
             if not selected_grants:
                 raise CoherenceStateTransitionError(
@@ -3678,6 +3790,22 @@ class SPMDWorker:
             DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, terminal_step),
         )
 
+    async def _forward_control_requests(self, requests: tuple[Any, ...]) -> None:
+        if not isinstance(requests, tuple):
+            raise TypeError("worker control requests must be a tuple")
+        if not requests:
+            return
+        driver = self._driver_handle
+        if driver is None:
+            raise RuntimeError(
+                f"Worker {self.spmd_id!r} rank {self.rank} has no Driver handle "
+                "for control requests"
+            )
+        for request in requests:
+            if request is None:
+                raise ValueError("worker control requests cannot contain None")
+            await driver.forward_control_plane_request.remote(request)
+
     async def _local_plan_send_output(
         self,
         op_name: str,
@@ -4053,33 +4181,39 @@ class SPMDWorker:
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
         if recorder is None:
-            await self._await_send_registration(send_token)
-            self._observe_local_send_registration(send_token)
             return await self._commit_local_plan_result(
                 op_name,
                 step,
                 send_token.result,
             )
+        async with recorder.local_step_node(
+            spec=LOCAL_STEP_COMMIT, op_name=op_name, step=step
+        ):
+            return await self._commit_local_plan_result(
+                op_name, step, send_token.result
+            )
+
+    async def _local_plan_await_send(
+        self, send_token: LocalSendToken
+    ) -> LocalSendToken:
+        recorder = (
+            self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
+        )
+        if recorder is None:
+            await self._await_send_registration(send_token)
+            self._observe_local_send_registration(send_token)
+            return send_token
         source_spmd_code = self._require_local_spmd_code()
         async with recorder.local_step_node(
             spec=LOCAL_STEP_AWAIT_SEND,
-            op_name=op_name,
-            step=step,
+            op_name=send_token.op_name,
+            step=send_token.step,
             source_spmd_code=source_spmd_code,
             source_rank=self.rank,
         ):
             await self._await_send_registration(send_token)
             self._observe_local_send_registration(send_token)
-        async with recorder.local_step_node(
-            spec=LOCAL_STEP_COMMIT,
-            op_name=op_name,
-            step=step,
-        ):
-            return await self._commit_local_plan_result(
-                op_name,
-                step,
-                send_token.result,
-            )
+        return send_token
 
     async def _await_send_registration(
         self,
@@ -4139,15 +4273,45 @@ class SPMDWorker:
             self._barriers_declared.pop((op_name, step), None)
             return ExecutionResult(status=ExecutionStatus.INACTIVE)
 
+        meta = self.config.require_graph_view().operator(op_name).spec
+        source_work_items: tuple[SourceWorkItem, ...] | None = None
+        if meta.is_source is True and meta.requires_source_control_runtime:
+            leases = await self.acquire_source_operator_work(op_name, step)
+            source_work_items = tuple(lease.item for lease in leases)
+
         if self._uses_direct_local_input_fast_path(op_name):
             if not self._direct_local_slots_ready(op_name, step):
                 raise ValueError(
                     "Direct local input fast path selected but inputs are not ready: "
                     f"op={op_name} step={step}."
                 )
-            return self._assemble_direct_local_input(op_name, step)
+            prepared = self._assemble_direct_local_input(op_name, step)
+            if isinstance(prepared, _PreparedOperatorInput):
+                import dataclasses
 
-        return await self._assemble_input(op_name, step)
+                prepared = dataclasses.replace(
+                    prepared,
+                    source_work_items=source_work_items,
+                )
+            return prepared
+
+        prepared = await self._assemble_input(op_name, step)
+        if isinstance(prepared, _PreparedOperatorInput):
+            import dataclasses
+
+            prepared = dataclasses.replace(
+                prepared,
+                source_work_items=source_work_items,
+            )
+        return prepared
+
+    async def _send_source_acknowledgements(
+        self, acknowledgements: tuple[SourceWorkAcknowledgement, ...]
+    ) -> None:
+        if self._control_plane_handle is None:
+            raise RuntimeError("source acknowledgement requires a control-plane handle")
+        client = ControlPlaneClient(self._control_plane_handle)
+        await client.acknowledge_source_work(acknowledgements)
 
     async def _commit_local_plan_result(
         self, op_name: str, step: int, result: ExecutionResult
@@ -4172,7 +4336,19 @@ class SPMDWorker:
             await self._mailbox.clear_step(op_name, step)
             self._clear_direct_local_step(op_name, step)
             self._barriers_declared.pop((op_name, step), None)
+            if (
+                result.status is ExecutionStatus.SUCCESS
+                and op_name in self._source_control_operator_names
+            ):
+                leases = self._source_scope.finish(op_name, step)
+                await self._source_acknowledgements.submit(
+                    tuple(
+                        SourceWorkAcknowledgement(lease.item.key, lease.lease_id)
+                        for lease in leases
+                    )
+                )
             if result.status is ExecutionStatus.SOURCE_EXHAUSTED:
+                await self._forward_control_requests(result.control_requests)
                 self._record_source_terminal(op_name, step)
                 self._discard_source_pipeline(op_name, step)
                 self._notify_source_terminal()
@@ -4274,7 +4450,11 @@ class SPMDWorker:
         ).complete()
 
     def _operator_user_callable_spec(
-        self, op_name: str, step: int, input_data: Any
+        self,
+        op_name: str,
+        step: int,
+        input_data: Any,
+        source_work_items: tuple[SourceWorkItem, ...] | None = None,
     ) -> UserCallableSpec:
         graph_view = self.config.require_graph_view()
         compiled_operator = graph_view.operator(op_name)
@@ -4288,12 +4468,16 @@ class SPMDWorker:
         operator_is_coroutine_function = self.op_manager.operator_is_coroutine_function(
             op_name
         )
+        source_kwargs: dict[str, Any] = {}
+        if source_work_items is not None:
+            source_kwargs["source_work_items"] = source_work_items
 
         def execute_regular_operator() -> Any:
             return self.op_manager.execute(
                 op_name,
                 step,
                 *operator_args,
+                **source_kwargs,
                 **operator_kwargs,
             )
 
@@ -4302,6 +4486,7 @@ class SPMDWorker:
                 op_name,
                 step,
                 *operator_args,
+                **source_kwargs,
                 **operator_kwargs,
             )
 
@@ -4629,12 +4814,12 @@ class SPMDWorker:
         )
 
     def _get_values(self, obj: Any) -> Any:
-        if hasattr(obj, "flat_values"):
+        if isinstance(obj, (TransportTensor, TransportShardView)):
             return obj.flat_values
         return obj
 
     def _get_routing_indices(self, obj: Any) -> Any | None:
-        if hasattr(obj, "routing_indices_materialized"):
+        if isinstance(obj, (TransportTensor, TransportShardView)):
             return obj.routing_indices_materialized
         return None
 
@@ -5256,9 +5441,9 @@ class SPMDWorker:
             merged_receipt = self._maybe_merge_receipts(shard_list)
 
         first_shard = shard_list[0]
-        global_shape = (
-            first_shard.global_shape if hasattr(first_shard, "global_shape") else None
-        )
+        if not isinstance(first_shard, (TransportTensor, TransportShardView)):
+            raise TypeError("assembled shard must be a typed transport shard")
+        global_shape = first_shard.global_shape
 
         return TransportTensor(
             merged_values,
@@ -6039,18 +6224,10 @@ class SPMDWorker:
                         f"Duplicate control dependency code {dependency.code}."
                     )
                 seen_codes.add(dependency.code)
-                source_spec = dependency.source_operator.spec
-                leader_group_size = (
-                    source_spec.interleave_unit_size
-                    if source_spec.is_interleaved
-                    else dependency.source_world_size
+                group = dependency.source_operator.execution_layout.group_for_step(
+                    exec_step
                 )
-                if leader_group_size <= 0:
-                    raise ValueError(
-                        f"Dependency code {dependency.code} has invalid control "
-                        f"leader group size {leader_group_size}."
-                    )
-                if self.rank % leader_group_size != 0:
+                if self.rank != group.physical_rank(0):
                     continue
                 if dependency.spec.condition is not None:
                     if (
@@ -6118,7 +6295,7 @@ class SPMDWorker:
                     dependency_decisions
                 ),
                 batch_submit=partial(
-                    self._coherence_batch_retire_runtime.retire,
+                    self._coherence_batch_retire_runtime.retire_publication,
                     transport.compiled_plan,
                 ),
             )
@@ -6250,6 +6427,7 @@ class SPMDWorker:
                     tensor_route.transfer_code,
                 )
                 output_instance = CoherenceInstance(output_subject, exec_step)
+                deposit_complete = asyncio.get_running_loop().create_future()
 
                 async def retire_local_output(
                     *,
@@ -6257,51 +6435,81 @@ class SPMDWorker:
                     output_subject=output_subject,
                     output_instance=output_instance,
                     tensor_route=tensor_route,
+                    deposit_complete=deposit_complete,
                 ) -> None:
-                    output_entry = self._coherence_directory.admit(output_instance)
-                    if output_entry.state is CoherenceState.INVALID:
-                        self._coherence_directory.publish_local_payload(
-                            output_subject,
-                            exec_step,
-                        )
-                    if leaf_tensor._coherence_instances:
-                        if leaf_tensor._coherence_instances != (output_instance,):
-                            raise CoherenceStateTransitionError(
-                                "local-only output has a conflicting coherence identity: "
-                                f"expected={output_instance} "
-                                f"actual={leaf_tensor._coherence_instances}."
+                    try:
+                        output_entry = self._coherence_directory.admit(output_instance)
+                        if output_entry.state is CoherenceState.INVALID:
+                            self._coherence_directory.publish_local_payload(
+                                output_subject,
+                                exec_step,
                             )
-                    else:
-                        leaf_tensor._bind_coherence_instances((output_instance,))
-                    target_op = tensor_route.target_op
-                    if self._uses_direct_local_input_fast_path(target_op):
-                        self._deposit_direct_local_input(
-                            op_name=target_op,
-                            transfer_code=tensor_route.transfer_code,
-                            step=exec_step,
-                            sender_id=self.spmd_id,
-                            rank=self.rank,
-                            tensor=leaf_tensor,
+                        if leaf_tensor._coherence_instances:
+                            if leaf_tensor._coherence_instances != (output_instance,):
+                                raise CoherenceStateTransitionError(
+                                    "local-only output has a conflicting coherence identity: "
+                                    f"expected={output_instance} "
+                                    f"actual={leaf_tensor._coherence_instances}."
+                                )
+                        else:
+                            leaf_tensor._bind_coherence_instances((output_instance,))
+                        leaf_tensor._bind_consumer_lease_owner(
+                            self._coherence_sequencer
                         )
-                    else:
-                        self._ensure_step_declared(target_op, exec_step)
-                        await self._mailbox.deposit_local_tensor(
-                            target_op,
-                            tensor_route.transfer_code,
-                            exec_step,
-                            self.spmd_id,
-                            self.rank,
-                            leaf_tensor,
-                        )
+                        leaf_tensor._reserve_consumer_lease()
+                        target_op = tensor_route.target_op
+                        if self._uses_direct_local_input_fast_path(target_op):
+                            self._deposit_direct_local_input(
+                                op_name=target_op,
+                                transfer_code=tensor_route.transfer_code,
+                                step=exec_step,
+                                sender_id=self.spmd_id,
+                                rank=self.rank,
+                                tensor=leaf_tensor,
+                            )
+                        else:
+                            self._ensure_step_declared(target_op, exec_step)
+                            await self._mailbox.deposit_local_tensor(
+                                target_op,
+                                tensor_route.transfer_code,
+                                exec_step,
+                                self.spmd_id,
+                                self.rank,
+                                leaf_tensor,
+                            )
+                        if not deposit_complete.done():
+                            deposit_complete.set_result(None)
+                    except BaseException as error:
+                        leaf_tensor._cancel_consumer_lease_reservation()
+                        if not deposit_complete.done():
+                            deposit_complete.set_exception(error)
+                        raise
 
-                deliveries.append(
-                    asyncio.create_task(
-                        self._coherence_sequencer.commit_payload(
-                            (output_instance,),
-                            retire_local_output,
-                        )
+                retirement_task = self._spawn_background_task(
+                    self._coherence_sequencer.commit_payload(
+                        (output_instance,),
+                        retire_local_output,
                     )
                 )
+
+                def complete_deposit(
+                    done_task: asyncio.Task[Any],
+                    deposit_complete=deposit_complete,
+                ) -> None:
+                    if done_task.cancelled():
+                        if not deposit_complete.done():
+                            deposit_complete.set_exception(asyncio.CancelledError())
+                        return
+                    error = done_task.exception()
+                    if error is not None and not deposit_complete.done():
+                        deposit_complete.set_exception(error)
+
+                retirement_task.add_done_callback(complete_deposit)
+
+                async def await_deposit(deposit_complete=deposit_complete) -> None:
+                    await asyncio.shield(deposit_complete)
+
+                deliveries.append(asyncio.create_task(await_deposit()))
         return tuple(deliveries)
 
     async def _deposit_local_only_dependency_decisions(
@@ -6560,6 +6768,7 @@ class SPMDWorker:
         )
 
     def _execution_diagnostic_snapshot(self) -> dict[str, Any]:
+        checkpoint_activity = self._checkpoint_activity.snapshot()
         active_plan_steps = {
             op_name: sorted(steps)
             for op_name, steps in sorted(self._running_plan_steps.items())
@@ -6586,6 +6795,17 @@ class SPMDWorker:
         pending_plan_tasks = sum(1 for task in self._plan_tasks if not task.done())
         pending_send_tasks = sum(1 for task in self._send_tasks if not task.done())
         pending_input_prepare_tasks = self._input_prepare_runtime.pending_count()
+        pending_admission = any(
+            steps
+            for pending_by_op in (
+                self._pending_blocked,
+                self._pending_future_steps,
+                self._pending_async_lag_steps,
+                self._pending_phase_order_steps,
+                self._ready_pending_pipeline_steps,
+            )
+            for steps in pending_by_op.values()
+        ) or any(self._mailbox_ready_steps.values())
         if active_plan_steps or pending_plan_tasks:
             stall_reason = "operator_plan"
         elif pending_send_tasks:
@@ -6594,6 +6814,8 @@ class SPMDWorker:
             stall_reason = "input_prepare"
         elif any(queue_sizes.values()):
             stall_reason = "execution_queue"
+        elif pending_admission:
+            stall_reason = "admission_wait"
         else:
             stall_reason = "completion_barrier_or_driver_wait"
         return {
@@ -6630,6 +6852,10 @@ class SPMDWorker:
                 for op_name, steps in sorted(self._pending_async_lag_steps.items())
                 if steps
             },
+            "checkpoint_phase": checkpoint_activity.phase.value,
+            "checkpoint_id": checkpoint_activity.checkpoint_id,
+            "checkpoint_progress_timestamp": checkpoint_activity.progress_timestamp,
+            "checkpoint_completed_units": checkpoint_activity.completed_units,
             "stall_reason": stall_reason,
         }
 
@@ -6642,18 +6868,34 @@ class SPMDWorker:
         failure = self._failure
         if failure is not None:
             status = WorkerStatus.ERROR
-        elif any(not event.is_set() for event in self._op_runnable.values()):
+        elif self._execution_lifecycle.phase is WorkerPhase.READY:
+            status = WorkerStatus.READY
+        elif self._execution_lifecycle.phase is WorkerPhase.RESTORING:
+            status = WorkerStatus.RESTORING
+        elif self._execution_lifecycle.phase in (
+            WorkerPhase.CLOSING,
+            WorkerPhase.CLOSED,
+        ):
+            status = WorkerStatus.STOPPED
+        elif self._running and any(
+            not event.is_set() for event in self._op_runnable.values()
+        ):
             status = WorkerStatus.BLOCKED
         elif self._running:
             status = WorkerStatus.RUNNING
         else:
             status = WorkerStatus.INITIALIZING
 
+        checkpoint_activity = self._checkpoint_activity.snapshot()
         heartbeat = WorkerHeartbeat(
             rank=self.rank,
             timestamp=time.time(),
             status=status,
             failure=failure,
+            checkpoint_phase=checkpoint_activity.phase,
+            checkpoint_progress_timestamp=checkpoint_activity.progress_timestamp,
+            checkpoint_id=checkpoint_activity.checkpoint_id,
+            checkpoint_completed_units=checkpoint_activity.completed_units,
         )
 
         try:
@@ -6674,12 +6916,10 @@ class SPMDWorker:
                 f"Operator {op_name} not found in config "
                 f"spmd_id={self.spmd_id} rank={self.rank}"
             )
-        cls = op_meta.owner
-        if cls is None:
+        owner_cls = op_meta.owner
+        if owner_cls is None:
             return None
-        storage, lock = get_instance_storage()
-        with lock:
-            instance = storage.get(id(cls))
+        instance = self._instance_container.get(owner_cls)
         if instance is None:
             raise RuntimeError(
                 f"Operator {op_name} instance is not initialized "
@@ -6729,16 +6969,28 @@ class SPMDWorker:
         permit: CheckpointCommitPermit,
         cut: CheckpointCut,
     ) -> None:
-        await self._drain_outbound_tasks()
-        coordinator = self._get_checkpoint_coordinator(repository_root)
-        await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
+        self._checkpoint_activity.begin(checkpoint_id)
+        try:
+            await self._drain_outbound_tasks()
+            coordinator = self._get_checkpoint_coordinator(repository_root)
+            await coordinator.prepare_save(checkpoint_id, attempt_id, permit, cut)
+            self._checkpoint_activity.phase(CheckpointActivityPhase.CAPTURING)
+        except BaseException:
+            self._checkpoint_activity.failed()
+            raise
 
     async def checkpoint_save(
         self,
     ) -> tuple[dict[str, Any], Mapping[str, WorkerSaveResult]]:
-        await self._drain_outbound_tasks()
-        coordinator = self._require_checkpoint_coordinator()
-        records = await coordinator.save()
+        try:
+            await self._drain_outbound_tasks()
+            coordinator = self._require_checkpoint_coordinator()
+            records = await coordinator.save()
+            self._checkpoint_activity.phase(CheckpointActivityPhase.STAGING)
+            self._checkpoint_activity.unit_completed()
+        except BaseException:
+            self._checkpoint_activity.failed()
+            raise
         snapshot_boundary = self._drain_boundary
         if self._drain_step_count is not None:
             snapshot_cut = self._drain_step_count
@@ -6766,24 +7018,44 @@ class SPMDWorker:
         return runtime_state, records
 
     async def checkpoint_finish_save(self) -> None:
-        await self._drain_outbound_tasks()
-        await self._require_checkpoint_coordinator().finish_save()
+        try:
+            await self._drain_outbound_tasks()
+            await self._require_checkpoint_coordinator().finish_save()
+            self._checkpoint_activity.phase(CheckpointActivityPhase.COMMITTING)
+        except BaseException:
+            self._checkpoint_activity.failed()
+            raise
 
     async def checkpoint_commit_save(
         self,
         gathered_records: Mapping[str, Mapping[int, WorkerSaveResult]],
     ) -> Mapping[str, CheckpointComponentPublication]:
-        await self._drain_outbound_tasks()
-        return await self._require_checkpoint_coordinator().commit_save(
-            gathered_records
-        )
+        try:
+            await self._drain_outbound_tasks()
+            result = await self._require_checkpoint_coordinator().commit_save(
+                gathered_records
+            )
+            self._checkpoint_activity.unit_completed()
+            return result
+        except BaseException:
+            self._checkpoint_activity.failed()
+            raise
 
     async def checkpoint_rollback_save(self) -> None:
-        await self._drain_outbound_tasks()
-        await self._require_checkpoint_coordinator().rollback_active()
+        try:
+            await self._drain_outbound_tasks()
+            await self._require_checkpoint_coordinator().rollback_active()
+        finally:
+            if self._checkpoint_activity.snapshot().checkpoint_id is not None:
+                self._checkpoint_activity.failed()
 
     async def checkpoint_publish_save(self) -> None:
-        await self._require_checkpoint_coordinator().publish_save()
+        try:
+            await self._require_checkpoint_coordinator().publish_save()
+            self._checkpoint_activity.published()
+        except BaseException:
+            self._checkpoint_activity.failed()
+            raise
 
     async def checkpoint_restore(
         self,
@@ -6795,30 +7067,33 @@ class SPMDWorker:
         runtime_state: Mapping[str, Any],
         publications: Mapping[str, CheckpointComponentPublication],
     ) -> None:
-        await self._drain_outbound_tasks()
-        self._restore_checkpoint_runtime_state(runtime_state)
-        await self._clear_restore_drain_target()
-        coordinator = self._get_checkpoint_coordinator(repository_root)
-        await coordinator.restore(
-            checkpoint_id,
-            cut,
-            publications,
-            source_topology,
-            current_topology,
-        )
-
-    async def _clear_restore_drain_target(self) -> None:
-        async with self._drain_cond:
-            self._drain_step_count = None
-            self._drain_cond.notify_all()
+        self._execution_lifecycle.begin_restore()
+        try:
+            await self._drain_outbound_tasks()
+            self._restore_checkpoint_runtime_state(runtime_state)
+            coordinator = self._get_checkpoint_coordinator(repository_root)
+            await coordinator.restore(
+                checkpoint_id,
+                cut,
+                publications,
+                source_topology,
+                current_topology,
+            )
+            self._execution_lifecycle.finish_restore()
+        except BaseException as error:
+            self._record_failure(error, phase="RESTORE")
+            raise
 
     def _restore_checkpoint_runtime_state(
         self, runtime_state: Mapping[str, Any]
     ) -> None:
+        self._execution_lifecycle.require_restore()
+        self._source_scope.require_unactivated()
         committed_cut = checkpoint_position(runtime_state)
         boundary_state = runtime_state["drain_boundary"]
         DrainBoundary.from_mapping(boundary_state)
         self._drain_boundary = DrainBoundary.from_committed_cut(committed_cut)
+        self._drain_step_count = committed_cut
         for op_name in self._completed_step_count:
             self._completed_step_count[op_name] = committed_cut
             self._scheduled_step_count[op_name] = committed_cut
@@ -7018,6 +7293,10 @@ class SPMDWorker:
         """Get this worker's rank."""
         return self.rank
 
+    @property
+    def _running(self) -> bool:
+        return self._execution_lifecycle.active
+
     def is_running(self) -> bool:
         """Check if worker is running."""
         return self._running
@@ -7084,6 +7363,12 @@ class SPMDWorker:
         if terminal_cut is None:
             return execution_step
         return min(execution_step, terminal_cut)
+
+    async def install_admission(self, admission: DrainAdmission) -> None:
+        if not admission.supersedes(self._admission):
+            return
+        self._admission = admission
+        await self._set_drain_boundary(admission.target, admission.terminal_cut)
 
     async def set_drain_boundary(
         self, step_count: int, terminal_cut: int | None = None

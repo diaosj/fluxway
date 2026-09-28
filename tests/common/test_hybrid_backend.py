@@ -11,6 +11,10 @@ import numpy as np
 import pytest
 
 from fluxway.common.tensor_backend import HybridBackend
+from fluxway.common.tensor_components import (
+    dense_path_strides,
+    nested_global_positions_kernel,
+)
 
 # ============================================================
 # Fixtures
@@ -50,6 +54,35 @@ def test_hybrid_backend_rejects_unknown_default_device():
 
 class TestCPUNumbaJIT:
     """Verify CPU path uses Numba JIT for hot operations, not pure NumPy."""
+
+    def test_cpu_jit_and_layout_lowering_survive_numba_cuda_initialization(
+        self, cpu_backend
+    ):
+        from numba import cuda
+
+        cuda.is_available()
+
+        counts = cpu_backend.bincount(
+            np.array([2, 0, 2, 1], dtype=np.int64), minlength=4
+        )
+        offsets = cpu_backend.cumsum(np.array([2, 1, 0, 3], dtype=np.int64))
+        taken = cpu_backend.take(
+            np.array([10, 20, 30, 40], dtype=np.float32),
+            np.array([3, 1, 0], dtype=np.int32),
+        )
+        positions = np.empty(2, dtype=np.int64)
+        nested_global_positions_kernel(
+            np.array([0, 1], dtype=np.int32),
+            np.array([[0, 0], [1, 0]], dtype=np.int32),
+            np.array([0, 1], dtype=np.int64),
+            dense_path_strides((2, 2)),
+            positions,
+        )
+
+        np.testing.assert_array_equal(counts, np.array([1, 1, 2, 0]))
+        np.testing.assert_array_equal(offsets, np.array([2, 3, 3, 6]))
+        np.testing.assert_array_equal(taken, np.array([40, 20, 10], dtype=np.float32))
+        np.testing.assert_array_equal(positions, np.array([0, 6], dtype=np.int64))
 
     def test_bincount_sparse_routing(self, cpu_backend):
         """Real scenario: count how many features route to each worker."""

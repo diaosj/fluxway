@@ -7,9 +7,12 @@ import logging
 from typing import Any, Protocol
 
 from fluxway.common.allocation import AllocationRegistry
+from fluxway.common.payload_lifetime import PayloadLifetime, payload_handle
+from fluxway.rpc.protocol import ReceiverIngressCompletion
 from fluxway.common.coherence import (
     CoherenceDirectory,
     CoherenceSubject,
+    CoherenceStateTransitionError,
     GrantToken,
     RetirementInvariantError,
     CoherenceInstance,
@@ -33,6 +36,7 @@ class ParentReturnRoute:
 
 
 ParentReturnSender = Callable[[tuple[ParentReturnRoute, ...]], Awaitable[None]]
+BatchEnqueue = Callable[[TransportFrameBatch], Awaitable[Any]]
 
 
 class InputGrant(Protocol):
@@ -63,8 +67,35 @@ CoherenceDependency = CoherenceInstance
 logger = logging.getLogger(__name__)
 
 
+class _ChildDeliveryReceipts:
+    __slots__ = ("_completed", "_directory", "_tokens")
+
+    def __init__(self, directory: CoherenceDirectory) -> None:
+        self._directory = directory
+        self._tokens: list[GrantToken] = []
+        self._completed = False
+
+    def add(self, token: GrantToken) -> None:
+        if self._completed:
+            raise RuntimeError("cannot register a child delivery after completion.")
+        self._tokens.append(self._directory.register_child_delivery(token))
+
+    def succeed(self) -> None:
+        self._complete(delivered=True)
+
+    def fail(self) -> None:
+        self._complete(delivered=False)
+
+    def _complete(self, *, delivered: bool) -> None:
+        if self._completed:
+            raise RuntimeError("child delivery receipts completed twice.")
+        self._completed = True
+        for token in reversed(self._tokens):
+            self._directory.complete_child_delivery(token, delivered=delivered)
+
+
 class CoherenceBatchRetireRuntime:
-    """Adapts ordered coherence retirement to a pure data-plane enqueue."""
+    """Owns one admitted publication's complete target fanout."""
 
     def __init__(
         self,
@@ -74,85 +105,169 @@ class CoherenceBatchRetireRuntime:
         self._directory = directory
         self._admission_runtime = CoherenceAdmissionRuntime(directory)
         self._sequencer = sequencer
+        self._next_publication_id = 1
 
-    def retire(
+    def retire_publication(
         self,
         compiled_plan: CompiledSendPlan,
-        batch: TransportFrameBatch,
-        enqueue: Callable[[], Awaitable[Any]],
+        batches: Iterable[TransportFrameBatch],
+        enqueue: BatchEnqueue,
     ) -> Coroutine[Any, Any, Any]:
-        instances = self._batch_instances(compiled_plan, batch)
+        publication_batches = tuple(batches)
+        if not publication_batches:
+            raise ValueError("coherence publication requires at least one batch.")
+        publication = compiled_plan.describe_publication(publication_batches)
+        instances = tuple(item.instance for item in publication.publications)
+        publication_id = self._next_publication_id
+        self._next_publication_id += 1
+        expected_children = tuple(
+            (
+                instance,
+                _instance_child_slot(compiled_plan, batch, instance),
+                batch.context_index,
+                batch.target_rank,
+                batch.batch_seq,
+            )
+            for batch in publication_batches
+            for instance in _batch_instances(compiled_plan, batch)
+        )
+        if len(set(expected_children)) != len(expected_children):
+            raise CoherenceStateTransitionError(
+                "coherence publication contains duplicate target batch identities."
+            )
+        handles = _publication_payload_handles(publication_batches)
+        lifetime = (
+            PayloadLifetime(publication_id, handles, expected_children)
+            if expected_children
+            else None
+        )
 
         async def admitted_delivery() -> Any:
-            tokens = await self._delegate_batch_reads(compiled_plan, batch)
-            completed = False
-
-            def complete(*, delivered: bool) -> None:
-                nonlocal completed
-                if completed:
-                    return
-                completed = True
-                for token in reversed(tokens):
-                    self._directory.complete_child_delivery(
-                        token,
-                        delivered=delivered,
-                    )
-
+            receipts = _ChildDeliveryReceipts(self._directory)
             try:
-                result = await enqueue()
-            except BaseException:
-                complete(delivered=False)
+                await self._delegate_publication_reads(
+                    compiled_plan,
+                    publication_batches,
+                    receipts,
+                )
+                result = await _await_all_or_cancel(
+                    tuple(enqueue(batch) for batch in publication_batches)
+                )
+                for completion in result:
+                    if not isinstance(completion, ReceiverIngressCompletion):
+                        raise TypeError(
+                            "coherence publication enqueue must return "
+                            "ReceiverIngressCompletion."
+                        )
+                    if not completion.receiver_accepted:
+                        raise CoherenceStateTransitionError(
+                            "receiver ingress completion was not accepted."
+                        )
+                    if not completion.producer_retention_released:
+                        raise CoherenceStateTransitionError(
+                            "carrier retained producer payload without a release proof."
+                        )
+                for batch in publication_batches:
+                    for instance in _batch_instances(compiled_plan, batch):
+                        child_slot = _instance_child_slot(
+                            compiled_plan, batch, instance
+                        )
+                        if lifetime is None:
+                            raise CoherenceStateTransitionError(
+                                "coherence batch lifetime is missing for an instance."
+                            )
+                        lifetime.accept_child(
+                            batch.context_index,
+                            batch.target_rank,
+                            batch.batch_seq,
+                            child_slot,
+                            instance,
+                        )
+                if lifetime is not None:
+                    lifetime.release_transport_retention()
+            except BaseException as error:
+                if lifetime is not None:
+                    lifetime.fence(error)
+                receipts.fail()
                 raise
-            complete(delivered=True)
-            return result
+            receipts.succeed()
+            return tuple(completion.result for completion in result)
 
         if not instances:
             return admitted_delivery()
 
         return self._sequencer.commit_payload(instances, admitted_delivery)
 
-    @staticmethod
-    def _batch_instances(
-        compiled_plan: CompiledSendPlan,
-        batch: TransportFrameBatch,
-    ) -> tuple[CoherenceInstance, ...]:
-        return tuple(
-            dict.fromkeys(
-                compiled_plan.coherence_instance(
-                    item.transfer_code,
-                    item.epoch,
-                )
-                for item in batch.delegations
-            )
-        )
-
-    async def _delegate_batch_reads(
+    async def _delegate_publication_reads(
         self,
         compiled_plan: CompiledSendPlan,
-        batch: TransportFrameBatch,
-    ) -> tuple[GrantToken, ...]:
-        tokens: list[GrantToken] = []
-        try:
+        batches: tuple[TransportFrameBatch, ...],
+        receipts: _ChildDeliveryReceipts,
+    ) -> None:
+        seen: set[tuple[CoherenceSubject, int, int]] = set()
+        delegation_tasks: list[Coroutine[Any, Any, None]] = []
+        for batch in batches:
             for subject, epoch, child_slot in _delegated_reads(compiled_plan, batch):
-                result = self._directory.delegate_local_payload(
-                    subject, epoch, child_slot
+                key = (subject, epoch, child_slot)
+                if key in seen:
+                    continue
+                seen.add(key)
+                delegation_tasks.append(
+                    self._delegate_read(subject, epoch, child_slot, receipts)
                 )
-                if isinstance(result, GrantReady):
-                    tokens.append(self._directory.register_child_delivery(result.token))
-                elif isinstance(result, GrantPending):
-                    token = await self._admission_runtime.await_grant(result)
-                    tokens.append(self._directory.register_child_delivery(token))
-                elif isinstance(result, GrantRejected):
-                    raise result.error
-                else:
-                    raise TypeError(
-                        f"unsupported grant result={type(result).__name__}."
-                    )
-        except BaseException:
-            for token in reversed(tokens):
-                self._directory.complete_child_delivery(token, delivered=False)
-            raise
-        return tuple(tokens)
+        if delegation_tasks:
+            await _await_all_or_cancel(tuple(delegation_tasks))
+
+    async def _delegate_read(
+        self,
+        subject: CoherenceSubject,
+        epoch: int,
+        child_slot: int,
+        receipts: _ChildDeliveryReceipts,
+    ) -> None:
+        result = self._directory.delegate_local_payload(subject, epoch, child_slot)
+        if isinstance(result, GrantReady):
+            token = result.token
+        elif isinstance(result, GrantPending):
+            token = await self._admission_runtime.await_grant(result)
+        elif isinstance(result, GrantRejected):
+            raise result.error
+        else:
+            raise TypeError(f"unsupported grant result={type(result).__name__}.")
+        receipts.add(token)
+
+
+async def _await_all_or_cancel(
+    awaitables: tuple[Awaitable[Any], ...],
+) -> tuple[Any, ...]:
+    if not awaitables:
+        raise ValueError("coherence publication requires at least one enqueue.")
+    tasks = tuple(asyncio.create_task(awaitable) for awaitable in awaitables)
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        failures: list[BaseException] = []
+        for task in done:
+            if task.cancelled():
+                raise asyncio.CancelledError()
+            error = task.exception()
+            if error is not None:
+                failures.append(error)
+        if failures:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if len(failures) == 1:
+                raise failures[0]
+            raise BaseExceptionGroup("coherence publication enqueue failed", failures)
+        if pending:
+            await asyncio.gather(*pending)
+        return tuple(task.result() for task in tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 class CoherenceAdmissionRuntime:
@@ -263,6 +378,51 @@ def _delegated_reads(
     return tuple(reads)
 
 
+def _instance_child_slot(
+    compiled_plan: CompiledSendPlan,
+    batch: TransportFrameBatch,
+    instance: CoherenceInstance,
+) -> int:
+    slots = {
+        compiled_plan.coherence_child_slot(item.transfer_code, batch.target_rank)
+        for item in batch.delegations
+        if compiled_plan.coherence_instance(item.transfer_code, item.epoch) == instance
+    }
+    if len(slots) != 1:
+        raise CoherenceStateTransitionError(
+            "one instance in a transport batch must map to exactly one child slot."
+        )
+    return next(iter(slots))
+
+
+def _batch_instances(
+    compiled_plan: CompiledSendPlan,
+    batch: TransportFrameBatch,
+) -> tuple[CoherenceInstance, ...]:
+    return tuple(
+        dict.fromkeys(
+            compiled_plan.coherence_instance(item.transfer_code, item.epoch)
+            for item in batch.delegations
+        )
+    )
+
+
+def _publication_payload_handles(
+    batches: tuple[TransportFrameBatch, ...],
+) -> tuple[Any, ...]:
+    seen: set[int] = set()
+    handles = []
+    for batch in batches:
+        for _header, segments in batch.frames:
+            for segment in segments:
+                marker = id(segment)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                handles.append(payload_handle(segment))
+    return tuple(handles)
+
+
 def _ordered_dependencies(
     dependencies: Iterable[CoherenceDependency],
 ) -> tuple[CoherenceDependency, ...]:
@@ -314,11 +474,14 @@ def _parent_return_routes_for(
     parent_handlers: Mapping[str, Mapping[int, object]],
 ) -> tuple[ParentReturnRoute, ...]:
     routes: list[ParentReturnRoute] = []
+    seen_instances: set[CoherenceInstance] = set()
     for grant in grants:
         if not grant.parent_return_required:
             continue
         instance = CoherenceInstance(grant.subject, grant.epoch)
         if instance in revoked_instances:
+            continue
+        if instance in seen_instances:
             continue
         parent_spmd_id = grant.parent_spmd_id
         if parent_spmd_id is None:
@@ -340,6 +503,7 @@ def _parent_return_routes_for(
                 parent_rank=grant.parent_rank,
             )
         )
+        seen_instances.add(instance)
     return tuple(routes)
 
 
@@ -442,11 +606,7 @@ class InputCoherenceRelease:
             else:
                 self.directory.require_current_entry_retirement(instance)
             if not self.allocation_registry.is_bound(instance):
+                self.allocation_registry.forget_retired(instance)
                 continue
-            self.allocation_registry.retire(instance)
-            target_watermark = instance.epoch + 1
-            if target_watermark > self.allocation_registry.watermark(instance.subject):
-                self.allocation_registry.advance_watermark(
-                    instance.subject,
-                    target_watermark,
-                )
+            self.allocation_registry.detach(instance)
+            self.allocation_registry.forget_retired(instance)

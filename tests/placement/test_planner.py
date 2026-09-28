@@ -92,7 +92,7 @@ def placement_graph(
     compiled_graph = compile_graph(
         name=name,
         spmds=tuple(
-            SPMDGraphSpec(
+            SPMDGraphSpec.create(
                 spmd_id=spmd_id,
                 spmd_class=node.spmd_class,
                 mesh=node.spmd_config.mesh,

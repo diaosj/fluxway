@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 
@@ -244,3 +245,67 @@ async def test_commit_payload_deferred_await_after_drain_retirement() -> None:
     # 4. Await coro after retirement is already finished
     result = await asyncio.wait_for(coro, timeout=1.0)
     assert result == "OK_payload_0"
+
+
+@pytest.mark.asyncio
+async def test_consumer_lease_reservation_transfers_ownership_before_retirement() -> (
+    None
+):
+    subject = CoherenceSubject(1, 0, 10)
+    instance = _instance(subject, 0)
+    retired: list[str] = []
+    reservation_ready = asyncio.Event()
+    release = asyncio.Event()
+    reservations = []
+
+    async def retire(_instances, payload):
+        reservations.append(sequencer.reserve_consumer_lease((instance,)))
+        reservation_ready.set()
+        await release.wait()
+        retired.append(payload)
+
+    async def admit(_instance):
+        return None
+
+    sequencer = CoherenceSequencer(retire, admit)
+    sequencer.issue_intent(instance)
+    delivery = asyncio.create_task(sequencer.commit_payload((instance,), "payload"))
+    sequencer.close_intent(instance)
+    await reservation_ready.wait()
+    assert not delivery.done()
+    assert retired == []
+
+    lease = reservations[0].claim()
+    lease.release()
+    release.set()
+    await delivery
+    assert retired == ["payload"]
+
+
+@pytest.mark.asyncio
+async def test_consumer_lease_release_from_worker_thread_is_non_blocking() -> None:
+    subject = CoherenceSubject(1, 0, 12)
+    instance = _instance(subject, 0)
+    reservation_ready = asyncio.Event()
+    release_callback = asyncio.Event()
+    reservations = []
+
+    async def retire(instances, _payload):
+        reservations.append(sequencer.reserve_consumer_lease(instances))
+        reservation_ready.set()
+        await release_callback.wait()
+
+    async def admit(_instance):
+        return None
+
+    sequencer = CoherenceSequencer(retire, admit)
+    sequencer.issue_intent(instance)
+    delivery = asyncio.create_task(sequencer.commit_payload((instance,), "payload"))
+    sequencer.close_intent(instance)
+    await reservation_ready.wait()
+    lease = reservations[0].claim()
+    thread = threading.Thread(target=lease.release)
+    thread.start()
+    thread.join()
+    release_callback.set()
+    await delivery

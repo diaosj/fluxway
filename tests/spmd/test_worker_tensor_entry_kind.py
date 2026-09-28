@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from fluxway.common.allocation import AllocationRegistry
-from fluxway.common.coherence import CoherenceDirectory
+from fluxway.common.coherence import CoherenceDirectory, ExecutionFenceState
 from fluxway.common.compiled_graph import (
     CompiledLogicalTensor,
     CompiledTensorTransfer,
@@ -23,10 +23,12 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
 from fluxway.spmd.worker.operator_manager.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
 from fluxway.transport.manifest import (
+    CoherenceAction,
     PayloadRole,
     TensorEntryKind,
     TransportFrameBuilder,
 )
+from fluxway.rpc.protocol import TransportFrameEnvelope
 
 
 _TEST_SHARDING = ShardingSpec.chunk(PartitionSpec())
@@ -65,6 +67,10 @@ class FakeOpManager:
             spmd_id="Input",
             local_only=False,
         )
+
+    def get_transfer_target_op(self, transfer_code):
+        assert transfer_code == 52
+        return "lookup"
 
     def get_transfer_source_layout(self, op_name, transfer_code):
         return SimpleNamespace(is_content_addressable=True)
@@ -158,9 +164,34 @@ def _worker(mailbox):
     worker._local_input_origins = {}
     worker._coherence_input_intents = {}
     worker._coherence_input_tensors = {}
+    worker._predecessor_handlers = {}
+    worker._parent_grant_return_runtime = None
     worker._coherence_directory = worker._coherence_directory
     worker._local_spmd_code = 1
     worker._allocation_registry = AllocationRegistry()
+    return worker
+
+
+def _receive_worker(mailbox):
+    worker = _worker(mailbox)
+    worker._coherence_input_grants = {}
+    worker._coherence_directory = CoherenceDirectory()
+    worker._coherence_alias_dependencies = {}
+    worker._coherence_revocations = set()
+    worker._coherence_input_tensors = {}
+    from fluxway.spmd.worker.coherence_runtime import CoherenceAdmissionRuntime
+
+    worker._coherence_admission_runtime = CoherenceAdmissionRuntime(
+        worker._coherence_directory
+    )
+    worker._spmd_id_by_code = {0: "Input"}
+    worker._graph_view = SimpleNamespace(
+        transfer=lambda code: SimpleNamespace(logical_tuuid=code)
+    )
+    worker._fence_state = ExecutionFenceState.OPEN
+    worker._barriers_declared = {}
+    worker._barriers_declared["lookup", 2] = True
+    mailbox.declare_step("lookup", 2, {52: 2}, [])
     return worker
 
 
@@ -241,3 +272,92 @@ async def test_routing_miss_protocol_error_names_canonical_logical_tensor():
                 },
             },
         )
+
+
+@pytest.mark.asyncio
+async def test_receive_routing_miss_bus_rd_creates_non_returning_grants():
+    mailbox = WorkerMailbox()
+    worker = _receive_worker(mailbox)
+
+    for rank in range(2):
+        builder = TransportFrameBuilder(
+            step=2,
+            sender_spmd_code=0,
+            sender_rank=rank,
+            sender_world_size=2,
+        )
+        entry_index = builder.add_tensor_transfer_entry(
+            transfer_code=52,
+            layout_state=0,
+            tensor_kind=TensorEntryKind.ROUTING_MISS,
+            expected_count=2,
+            global_shape=(768,),
+            coherence_epoch=2,
+            coherence_action=CoherenceAction.BUS_RD,
+        )
+        builder.add_payload(
+            entry_index,
+            PayloadRole.VALUES,
+            np.empty((0,), dtype=np.float32),
+            0,
+        )
+        frame = builder.build()
+        await worker._receive_transport_frame_envelope(
+            TransportFrameEnvelope(
+                header=frame.header,
+                payload_segments=frame.payload_segments,
+            )
+        )
+
+    grants = worker._coherence_input_grants[("lookup", 2)]
+    assert len(grants) == 2
+    assert all(not grant.parent_return_required for grant in grants.values())
+
+    prepared = await worker._assemble_input("lookup", 2)
+    assert prepared.value["value"].flat_values.shape == (0,)
+    assert len(prepared.tensor_bindings) == 1
+    assert len(prepared.tensor_bindings[0].grants) == 2
+
+    await worker._return_input_coherence("lookup", 2)
+    assert ("lookup", 2) not in worker._coherence_input_grants
+
+
+@pytest.mark.asyncio
+async def test_receive_mixed_tensor_and_routing_miss_bus_rd_preserves_lease_semantics():
+    mailbox = WorkerMailbox()
+    worker = _receive_worker(mailbox)
+
+    for rank, tensor_kind in enumerate(
+        (TensorEntryKind.TENSOR, TensorEntryKind.ROUTING_MISS)
+    ):
+        builder = TransportFrameBuilder(
+            step=2,
+            sender_spmd_code=0,
+            sender_rank=rank,
+            sender_world_size=2,
+        )
+        entry_index = builder.add_tensor_transfer_entry(
+            transfer_code=52,
+            layout_state=0,
+            tensor_kind=tensor_kind,
+            expected_count=2,
+            global_shape=(768,),
+            coherence_epoch=2,
+            coherence_action=CoherenceAction.BUS_RD,
+        )
+        builder.add_payload(
+            entry_index,
+            PayloadRole.VALUES,
+            np.empty((0,), dtype=np.float32),
+            0,
+        )
+        frame = builder.build()
+        await worker._receive_transport_frame_envelope(
+            TransportFrameEnvelope(
+                header=frame.header,
+                payload_segments=frame.payload_segments,
+            )
+        )
+
+    grants = worker._coherence_input_grants[("lookup", 2)]
+    assert {grant.parent_return_required for grant in grants.values()} == {True, False}

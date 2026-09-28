@@ -19,7 +19,6 @@ from fluxway.common.types.checkpoint import (
     SaveSession,
     RestoreSession,
     RestoreTopologyMode,
-    CheckpointRetentionPolicy,
 )
 from fluxway.control_plane.checkpointer._filesystem_component import (
     FilesystemCheckpointComponent,
@@ -36,15 +35,14 @@ class SafeTensorsCheckpointComponent(FilesystemCheckpointComponent):
         component_id: str,
         save_state,
         restore_state,
-        *,
-        retention: CheckpointRetentionPolicy = CheckpointRetentionPolicy(),
+        retention_domain: str | None = None,
     ) -> None:
         super().__init__(
             component_id,
             save_state,
             restore_state,
-            retention=retention,
             restore_topology=RestoreTopologyMode.EXACT_TOPOLOGY,
+            retention_domain=retention_domain,
         )
 
     async def _write_state(

@@ -1,5 +1,6 @@
 import asyncio
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.coherence import CoherenceSubject, CoherenceInstance
 from fluxway.common.ragged import ragged_level_count
-from fluxway.common.tensor_backend import set_backend
+from fluxway.common.tensor_backend import use_backend
 from fluxway.common.types.sharding import P, ShardingSpec
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
@@ -33,8 +34,8 @@ from fluxway.transport.manifest import (
 
 @pytest.fixture(autouse=True)
 def use_jax_backend():
-    set_backend("jax")
-    yield
+    with use_backend("jax"), jax.default_device(jax.devices("cpu")[0]):
+        yield
 
 
 async def _capture_frame(distributor, **kwargs):
@@ -197,7 +198,7 @@ def test_late_aggregation_preserves_expected_count_per_transfer(order) -> None:
             source = ShardingSpec.chunk(P("dp")).bind(source_mesh)
             target = ShardingSpec.chunk(P("dp")).bind(target_mesh)
             tensor = TransportTensor(
-                np.asarray([10, 11], dtype=np.int64),
+                jnp.asarray([10, 11], dtype=jnp.int32),
                 global_shape=(16,),
                 source_step=0,
             )
@@ -208,7 +209,7 @@ def test_late_aggregation_preserves_expected_count_per_transfer(order) -> None:
             source = ShardingSpec.chunk(P()).bind(source_mesh)
             target = ShardingSpec.chunk(P()).bind(target_mesh)
             tensor = TransportTensor(
-                np.asarray(16, dtype=np.int32), global_shape=(), source_step=0
+                jnp.asarray(16, dtype=jnp.int32), global_shape=(), source_step=0
             )
             tensor._bind_coherence_instances(
                 (CoherenceInstance(CoherenceSubject(1, 0, transfer_code), 0),)

@@ -51,7 +51,7 @@ from .directory import (
 )
 from .inline import StateCheckpointComponent
 from .orbax_component import OrbaxCheckpointComponent
-from .pickle_component import PickleCheckpointComponent
+from .pickle_component import WorkerLocalCheckpointComponent
 from .repository import CheckpointRepository
 from .retention import CheckpointRetentionCoordinator
 from .safetensors_component import SafeTensorsCheckpointComponent
@@ -94,7 +94,7 @@ __all__ = [
     "NameReference",
     "OrbaxCheckpointComponent",
     "PartitionRecord",
-    "PickleCheckpointComponent",
+    "WorkerLocalCheckpointComponent",
     "RestoreRequest",
     "RestoreTopologyMode",
     "CheckpointHold",

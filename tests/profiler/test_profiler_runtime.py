@@ -55,7 +55,7 @@ from fluxway.profiler.wrappers import (
 )
 from fluxway.profiler.snapshots import merge_profiler_snapshots
 from fluxway.profiler.filtering import filter_steady_state_records
-from fluxway.rpc.protocol import DataPlaneCallable
+from fluxway.rpc.protocol import DataPlaneCallable, ReceiverIngressCompletion
 from fluxway.rpc.protocol import TransportFrameEnvelope
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 from fluxway.spmd.worker.mailbox import WorkerMailbox
@@ -660,7 +660,7 @@ async def test_tracing_data_plane_callable_delegates_and_records(tmp_path):
         (TransportFrameEnvelope(header=header, payload_segments=(np.ones(2),)),)
     )
 
-    assert result is True
+    assert result.result is True
     assert delegate.transport_calls == 1
     assert factory.recorder.arena.size >= 2
 
@@ -1048,7 +1048,7 @@ class _RayLikeDataPlane(DataPlaneCallable):
 
     async def receive_transport_frames(self, frames):
         self.transport_calls += 1
-        return True
+        return ReceiverIngressCompletion(True)
 
     async def receive_control(self, op_name, step, names, values):
         self.control_calls += 1

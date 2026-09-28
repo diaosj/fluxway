@@ -85,7 +85,7 @@ async def test_heartbeat_manager_rejects_missing_error_failure_invariant() -> No
         num_workers=0,
         healthy_num_workers=0,
         workers_ready=False,
-        workers_running=False,
+        topology_ready=False,
     )
 
     with pytest.raises(RuntimeError, match="ERROR invariant violated"):

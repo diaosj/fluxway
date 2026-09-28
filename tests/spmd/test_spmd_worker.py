@@ -11,6 +11,7 @@ Covers:
 import sys
 import os
 import asyncio
+from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle
 import numpy as np
 import pytest
 
@@ -25,10 +26,12 @@ from fluxway.common.compiled_graph import (
 )
 from fluxway.spmd.worker.mailbox.mailbox import StepBarrier, WorkerMailbox
 from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.spmd.worker.source_scope import SourceExecutionScope
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.common.types.configs import SPMDConfig
 from fluxway.common.types import DrainBoundary, DrainPhase
 from fluxway.common.operator_policy import ArgumentType, PeriodicBarrierConfig
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway import OperatorSpec
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.mesh import DeviceMesh
@@ -106,6 +109,13 @@ def _worker_cls():
 async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
     worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
     worker = worker_type.__new__(worker_type)
+    worker._execution_lifecycle = WorkerExecutionLifecycle()
+    worker._source_scope = SourceExecutionScope(
+        acquire=worker._acquire_source_work,
+        spawn=worker._spawn_background_task,
+        completed=lambda op: worker._completed_step_count[op],
+        depth=worker._operator_pipeline_depth,
+    )
     worker._completed_step_count = {"Reader": 0, "Dense": 0}
     worker._scheduled_step_count = {"Reader": 0, "Dense": 0}
     worker._drain_boundary = DrainBoundary()
@@ -130,6 +140,13 @@ async def test_checkpoint_restore_restores_scheduler_watermark() -> None:
 def test_checkpoint_restore_discards_transient_drain_boundary_state() -> None:
     worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
     worker = worker_type.__new__(worker_type)
+    worker._execution_lifecycle = WorkerExecutionLifecycle()
+    worker._source_scope = SourceExecutionScope(
+        acquire=worker._acquire_source_work,
+        spawn=worker._spawn_background_task,
+        completed=lambda op: worker._completed_step_count[op],
+        depth=worker._operator_pipeline_depth,
+    )
     worker._completed_step_count = {"Reader": 0}
     worker._scheduled_step_count = {"Reader": 0}
     worker._drain_boundary = DrainBoundary()
@@ -168,6 +185,13 @@ def test_checkpoint_restore_discards_transient_drain_boundary_state() -> None:
 def test_checkpoint_restore_rejects_duplicate_runtime_cursor() -> None:
     worker_type = SPMDWorker.__ray_actor_class__  # type: ignore[attr-defined]
     worker = worker_type.__new__(worker_type)
+    worker._execution_lifecycle = WorkerExecutionLifecycle()
+    worker._source_scope = SourceExecutionScope(
+        acquire=worker._acquire_source_work,
+        spawn=worker._spawn_background_task,
+        completed=lambda op: worker._completed_step_count[op],
+        depth=worker._operator_pipeline_depth,
+    )
     worker._completed_step_count = {"lookup": 0}
     worker._scheduled_step_count = {"lookup": 0}
     worker._drain_boundary = DrainBoundary()
@@ -354,6 +378,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
             spmd_id,
             *,
             static_args,
+            instance_container=None,
             local_rank=None,
             local_world_size=None,
             node_rank=0,
@@ -367,6 +392,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
                 local_world_size,
                 node_rank,
                 num_nodes,
+                instance_container,
             )
             calls["manager_static_args"] = static_args
 
@@ -412,6 +438,7 @@ def test_worker_setup_and_start_initializes_runtime(monkeypatch):
     assert rank == 2
     static_args = kwargs.pop("static_args")
     assert static_args == {}
+    assert kwargs.pop("instance_container") is worker._instance_container
     assert calls["manager_static_args"] is static_args
     assert kwargs == {
         "local_rank": 1,
@@ -993,7 +1020,12 @@ async def test_spmd_config_with_mesh():
 def test_operator_manager_mesh():
     mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
     config = _make_config(mesh, "compute", "optimize", "apply")
-    manager = OperatorManager(config, rank=0, static_args={})
+    manager = OperatorManager(
+        config,
+        rank=0,
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
     assert manager._mesh is config.require_graph_view().mesh
 
 
@@ -1043,7 +1075,12 @@ def test_replicate_operator_manager():
         ),
     )
     config = spmd_config_from_graph(graph, "target")
-    manager = OperatorManager(config, rank=0, static_args={})
+    manager = OperatorManager(
+        config,
+        rank=0,
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
+    )
 
     spec = manager.get_input_sharding("test_op")
     transfer_code = graph.dependencies[0].transfers[0].transfer_code
@@ -1093,6 +1130,7 @@ async def test_send_output_uses_compiled_mesh():
         rank=0,
         spmd_id="source",
         static_args={},
+        instance_container=OperatorInstanceContainer(),
     )
 
     class RecordingDataPlaneExecutor:

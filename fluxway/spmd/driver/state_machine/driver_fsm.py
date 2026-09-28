@@ -34,10 +34,11 @@ class DriverStateMachine:
         (DriverState.INITIALIZING, DriverEvent.INIT_FAILED): DriverState.ERROR,
         (DriverState.INITIALIZING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.INITIALIZING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.READY, DriverEvent.START): DriverState.RUNNING,
+        (DriverState.READY, DriverEvent.START): DriverState.ACTIVATING,
+        (DriverState.ACTIVATING, DriverEvent.ACTIVATION_COMPLETE): DriverState.RUNNING,
+        (DriverState.ACTIVATING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
+        (DriverState.ACTIVATING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
         (DriverState.READY, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
-        (DriverState.DRAINED, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
-        (DriverState.BLOCKED, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
         (DriverState.RESTORING, DriverEvent.RESTORE_COMPLETE): DriverState.READY,
         (DriverState.RESTORING, DriverEvent.RESTORE_FAILED): DriverState.ERROR,
         (DriverState.RESTORING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
@@ -68,6 +69,15 @@ class DriverStateMachine:
         (DriverState.SNAPSHOTTING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
         (DriverState.SNAPSHOTTING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
     }
+
+    _TRANSITIONS.update(
+        {
+            (state, DriverEvent.STOP): DriverState.STOPPING
+            for state in DriverState
+            if state not in (DriverState.STOPPING, DriverState.STOPPED)
+        }
+    )
+    _TRANSITIONS[DriverState.STOPPING, DriverEvent.STOPPED] = DriverState.STOPPED
 
     def __init__(self, driver: "Any"):
         """

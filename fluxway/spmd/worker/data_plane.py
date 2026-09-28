@@ -27,15 +27,16 @@ from fluxway.common.operator_policy import ArgumentType
 from fluxway.common.types.sharding import (
     PhysicalLayout,
     ReferentialRouting,
-    ShardingSpec,
 )
 from fluxway.common.types.tensor import TransportTensor
 from fluxway.transport.communication import (
     AsyncDataDistributor,
+    TransportFrameBatch,
     TransportFrameTemplateCache,
 )
 from fluxway.transport.routing import (
     SelectedRoutingSource,
+    compile_complete_shard_target,
     TransportRoutingMode,
     select_routing_source,
 )
@@ -184,6 +185,7 @@ class CompiledTensorRoute:
     tensor_name: str
     empty_targets: tuple[tuple[int, int], ...]
     child_slots: tuple[int, ...]
+    direct_targets: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if len(self.child_slots) != self.target_spec.mesh.size:
@@ -260,6 +262,86 @@ class CompiledCoherenceChild:
 
 
 @dataclass(frozen=True, slots=True)
+class InstancePublication:
+    instance: CoherenceInstance
+    child_slots: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.child_slots:
+            raise ValueError("instance publication requires at least one child slot.")
+        if len(set(self.child_slots)) != len(self.child_slots):
+            raise ValueError("instance publication child slots must be unique.")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationBatch:
+    batches: tuple[TransportFrameBatch, ...]
+    publications: tuple[InstancePublication, ...]
+
+    def __post_init__(self) -> None:
+        if not self.batches:
+            raise ValueError("publication batch requires at least one target batch.")
+
+
+def _build_send_plan_indices(
+    successor_routes: tuple[CompiledSuccessorRoute, ...],
+) -> tuple[
+    MappingProxyType[int, CompiledTensorRoute],
+    MappingProxyType[tuple[int, int], CompiledCoherenceChild],
+]:
+    tensor_routes = tuple(
+        route for context in successor_routes for route in context.tensor_routes
+    )
+    routes_by_code: dict[int, CompiledTensorRoute] = {}
+    for route in tensor_routes:
+        if route.transfer_code in routes_by_code:
+            raise ValueError("Compiled send plan has duplicate tensor transfer codes.")
+        routes_by_code[route.transfer_code] = route
+
+    endpoint_by_slot: dict[int, dict[int, tuple[str, int]]] = {}
+    slot_by_endpoint: dict[int, dict[tuple[str, int], int]] = {}
+    route_codes_by_endpoint: dict[tuple[int, str, int], list[int]] = {}
+    for route in tensor_routes:
+        for target_rank, child_slot in enumerate(route.child_slots):
+            endpoint = (route.target_spmd_id, target_rank)
+            logical_slots = endpoint_by_slot.setdefault(route.logical_tuuid, {})
+            existing_endpoint = logical_slots.get(child_slot)
+            if existing_endpoint is not None and existing_endpoint != endpoint:
+                raise ValueError(
+                    "Compiled coherence child slot maps multiple endpoints: "
+                    f"logical_tuuid={route.logical_tuuid} slot={child_slot}."
+                )
+            logical_endpoints = slot_by_endpoint.setdefault(route.logical_tuuid, {})
+            existing_slot = logical_endpoints.get(endpoint)
+            if existing_slot is not None and existing_slot != child_slot:
+                raise ValueError(
+                    "Compiled coherence endpoint maps to multiple child slots: "
+                    f"logical_tuuid={route.logical_tuuid} endpoint={endpoint}."
+                )
+            logical_slots[child_slot] = endpoint
+            logical_endpoints[endpoint] = child_slot
+            route_codes_by_endpoint.setdefault(
+                (route.logical_tuuid, route.target_spmd_id, target_rank),
+                [],
+            ).append(route.transfer_code)
+
+    coherence_children = {
+        (logical_tuuid, child_slot): CompiledCoherenceChild(
+            logical_tuuid=logical_tuuid,
+            child_slot=child_slot,
+            target_spmd_id=target_spmd_id,
+            target_rank=target_rank,
+            transfer_code=min(
+                route_codes_by_endpoint[(logical_tuuid, target_spmd_id, target_rank)]
+            ),
+        )
+        for logical_tuuid, slots in endpoint_by_slot.items()
+        for child_slot, (target_spmd_id, target_rank) in slots.items()
+    }
+    return MappingProxyType(routes_by_code), MappingProxyType(coherence_children)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CompiledSendPlan:
     op_name: str
     source_spmd_id: str
@@ -269,85 +351,61 @@ class CompiledSendPlan:
     successor_routes: tuple[CompiledSuccessorRoute, ...]
     output_count: int
     transfer_code_to_name: dict[int, str]
+    _tensor_routes_by_code: Mapping[int, CompiledTensorRoute] = field(
+        compare=False,
+        repr=False,
+    )
+    _coherence_children_by_slot: Mapping[tuple[int, int], CompiledCoherenceChild] = (
+        field(
+            compare=False,
+            repr=False,
+        )
+    )
     dependency_conditions: tuple[CompiledDependencyCondition, ...] = ()
     frame_template_cache: TransportFrameTemplateCache = field(
         default_factory=dict,
         compare=False,
         repr=False,
     )
-    _tensor_routes_by_code: Mapping[int, CompiledTensorRoute] = field(
-        init=False,
-        compare=False,
-        repr=False,
-    )
-    _coherence_children_by_slot: Mapping[tuple[int, int], CompiledCoherenceChild] = (
-        field(
-            init=False,
-            compare=False,
-            repr=False,
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        op_name: str,
+        source_spmd_id: str,
+        rank: int,
+        sender_spmd_code: int,
+        sender_world_size: int,
+        successor_routes: tuple[CompiledSuccessorRoute, ...],
+        output_count: int,
+        transfer_code_to_name: dict[int, str],
+        dependency_conditions: tuple[CompiledDependencyCondition, ...] = (),
+        frame_template_cache: TransportFrameTemplateCache | None = None,
+    ) -> CompiledSendPlan:
+        routes_by_code, coherence_children = _build_send_plan_indices(successor_routes)
+        return cls(
+            op_name=op_name,
+            source_spmd_id=source_spmd_id,
+            rank=rank,
+            sender_spmd_code=sender_spmd_code,
+            sender_world_size=sender_world_size,
+            successor_routes=successor_routes,
+            output_count=output_count,
+            transfer_code_to_name=transfer_code_to_name,
+            _tensor_routes_by_code=routes_by_code,
+            _coherence_children_by_slot=coherence_children,
+            dependency_conditions=dependency_conditions,
+            frame_template_cache=(
+                frame_template_cache if frame_template_cache is not None else {}
+            ),
         )
-    )
 
     def __post_init__(self) -> None:
-        tensor_routes = tuple(
-            route
-            for context in self.successor_routes
-            for route in context.tensor_routes
-        )
-        routes_by_code = {route.transfer_code: route for route in tensor_routes}
-        if len(routes_by_code) != len(tensor_routes):
-            raise ValueError("Compiled send plan has duplicate tensor transfer codes.")
-        endpoint_by_slot: dict[int, dict[int, tuple[str, int]]] = {}
-        slot_by_endpoint: dict[int, dict[tuple[str, int], int]] = {}
-        route_codes_by_endpoint: dict[tuple[int, str, int], list[int]] = {}
-        for route in tensor_routes:
-            for target_rank, child_slot in enumerate(route.child_slots):
-                endpoint = (route.target_spmd_id, target_rank)
-                logical_slots = endpoint_by_slot.setdefault(route.logical_tuuid, {})
-                existing_endpoint = logical_slots.get(child_slot)
-                if existing_endpoint is not None and existing_endpoint != endpoint:
-                    raise ValueError(
-                        "Compiled coherence child slot maps multiple endpoints: "
-                        f"logical_tuuid={route.logical_tuuid} slot={child_slot}."
-                    )
-                logical_endpoints = slot_by_endpoint.setdefault(route.logical_tuuid, {})
-                existing_slot = logical_endpoints.get(endpoint)
-                if existing_slot is not None and existing_slot != child_slot:
-                    raise ValueError(
-                        "Compiled coherence endpoint maps to multiple child slots: "
-                        f"logical_tuuid={route.logical_tuuid} endpoint={endpoint}."
-                    )
-                logical_slots[child_slot] = endpoint
-                logical_endpoints[endpoint] = child_slot
-                route_codes_by_endpoint.setdefault(
-                    (route.logical_tuuid, route.target_spmd_id, target_rank),
-                    [],
-                ).append(route.transfer_code)
-        object.__setattr__(
-            self,
-            "_tensor_routes_by_code",
-            MappingProxyType(routes_by_code),
-        )
-        coherence_children = {
-            (logical_tuuid, child_slot): CompiledCoherenceChild(
-                logical_tuuid=logical_tuuid,
-                child_slot=child_slot,
-                target_spmd_id=target_spmd_id,
-                target_rank=target_rank,
-                transfer_code=min(
-                    route_codes_by_endpoint[
-                        (logical_tuuid, target_spmd_id, target_rank)
-                    ]
-                ),
-            )
-            for logical_tuuid, slots in endpoint_by_slot.items()
-            for child_slot, (target_spmd_id, target_rank) in slots.items()
-        }
-        object.__setattr__(
-            self,
-            "_coherence_children_by_slot",
-            MappingProxyType(coherence_children),
-        )
+        if self._tensor_routes_by_code.__class__ is not MappingProxyType:
+            raise TypeError("compiled send tensor route index must be read-only")
+        if self._coherence_children_by_slot.__class__ is not MappingProxyType:
+            raise TypeError("compiled send coherence index must be read-only")
         condition_codes = tuple(
             condition.dependency_code for condition in self.dependency_conditions
         )
@@ -376,6 +434,24 @@ class CompiledSendPlan:
             raise ValueError(
                 f"Compiled send plan has no tensor transfer code {transfer_code}."
             ) from exc
+
+    def describe_publication(
+        self, batches: tuple[TransportFrameBatch, ...]
+    ) -> PublicationBatch:
+        if not batches:
+            raise ValueError("publication batch requires at least one target batch.")
+        by_instance: dict[CoherenceInstance, set[int]] = defaultdict(set)
+        for batch in batches:
+            for item in batch.delegations:
+                instance = self.coherence_instance(item.transfer_code, item.epoch)
+                by_instance[instance].add(
+                    self.coherence_child_slot(item.transfer_code, batch.target_rank)
+                )
+        publications = tuple(
+            InstancePublication(instance, tuple(sorted(child_slots)))
+            for instance, child_slots in by_instance.items()
+        )
+        return PublicationBatch(batches, publications)
 
     def coherence_logical_tuuid(self, transfer_code: int) -> int:
         return self.tensor_route(transfer_code).logical_tuuid
@@ -450,9 +526,14 @@ class CompiledSendPlan:
             for context in successor_routes
             for route in context.tensor_routes
         }
-        return replace(
-            self,
+        return self.create(
+            op_name=self.op_name,
+            source_spmd_id=self.source_spmd_id,
+            rank=self.rank,
+            sender_spmd_code=self.sender_spmd_code,
+            sender_world_size=self.sender_world_size,
             successor_routes=successor_routes,
+            output_count=self.output_count,
             transfer_code_to_name={
                 code: name
                 for code, name in self.transfer_code_to_name.items()
@@ -463,6 +544,7 @@ class CompiledSendPlan:
                 for condition in self.dependency_conditions
                 if condition.dependency_code in dependency_codes
             ),
+            frame_template_cache=self.frame_template_cache,
         )
 
 
@@ -489,6 +571,17 @@ def compile_send_plan(
         )
     if sender_spmd_code < 0:
         raise ValueError("sender_spmd_code must be non-negative.")
+    group = source_operator.execution_layout.group_for_rank(rank)
+    expected_unit = (
+        source_operator.spec.interleave_unit_size
+        if source_operator.spec.is_interleaved
+        else None
+    )
+    if interleave_unit_size != expected_unit:
+        raise ValueError("sender interleave size disagrees with compiled operator")
+    for context in successor_contexts:
+        if context.effective_rank != group.logical_rank(rank):
+            raise ValueError("sender logical rank disagrees with execution group")
     coherence_child_slots = _compile_coherence_child_slots(successor_contexts)
     input_bindings = _index_input_bindings(
         source_operator=source_operator,
@@ -569,14 +662,12 @@ def compile_send_plan(
                         transfer=transfer,
                         graph_view=graph_view,
                         source_operator=source_operator,
-                        source_mesh=source_mesh,
+                        source_mesh=group.logical_mesh,
                         target_mesh=context.target_mesh,
                         output_uuids=output_uuids,
                         output_index_by_name=output_index_by_name,
                         input_bindings=input_bindings,
-                        rank=rank,
                         effective_rank=context.effective_rank,
-                        interleave_unit_size=interleave_unit_size,
                         coherence_child_slots=coherence_child_slots,
                     )
                     existing_name = transfer_code_to_name.get(route.transfer_code)
@@ -608,7 +699,7 @@ def compile_send_plan(
                 local_only=context.local_only,
             )
         )
-    return CompiledSendPlan(
+    return CompiledSendPlan.create(
         op_name=source_operator.key.op_id,
         source_spmd_id=source_operator.key.spmd_id,
         rank=rank,
@@ -772,9 +863,7 @@ def _compile_tensor_route(
     output_uuids: tuple[int, ...],
     output_index_by_name: Mapping[str, int],
     input_bindings: Mapping[str, _InputBinding],
-    rank: int,
     effective_rank: int,
-    interleave_unit_size: int | None,
     coherence_child_slots: Mapping[tuple[int, str, int], int],
 ) -> CompiledTensorRoute:
     source_port = transfer.spec.source.name
@@ -791,23 +880,35 @@ def _compile_tensor_route(
             f"{transfer.logical_tuuid} does not match output {source_port!r} TUUID "
             f"{output_uuids[output_index]}."
         )
-    source_spec = _bind_source_spec(
-        source_logical=graph_view.logical_tensor(
-            transfer.logical_tuuid
-        ).require_effective_sharding(),
-        mesh=source_mesh,
-        rank=rank,
-        interleave_unit_size=interleave_unit_size,
+    source_spec = (
+        graph_view.logical_tensor(transfer.logical_tuuid)
+        .require_effective_sharding()
+        .bind(source_mesh)
     )
     target_spec = dependency.target_operator.effective_input_sharding[
         transfer.spec.target.name
     ].bind(target_mesh)
-    empty_targets = tuple(
-        (
-            target_rank,
-            len(source_spec.resolve_producers(target_spec, target_rank)),
+    unit_relation = dependency.unit_relation(transfer.transfer_code)
+    direct_targets = (
+        None
+        if unit_relation is None
+        else unit_relation.consumers_by_source[effective_rank]
+    )
+    if direct_targets is None and not transfer.uses_receipt_routing:
+        identity_target = compile_complete_shard_target(
+            source_spec, target_spec, effective_rank
         )
-        for target_rank in source_spec.resolve_consumers(target_spec, effective_rank)
+        if identity_target is not None:
+            direct_targets = (identity_target,)
+    empty_targets = (
+        tuple((target_rank, 1) for target_rank in direct_targets)
+        if direct_targets is not None
+        else tuple(
+            (target_rank, len(source_spec.resolve_producers(target_spec, target_rank)))
+            for target_rank in source_spec.resolve_consumers(
+                target_spec, effective_rank
+            )
+        )
     )
     for target_rank, expected_count in empty_targets:
         if expected_count <= 0:
@@ -841,6 +942,7 @@ def _compile_tensor_route(
         receipt_routing=receipt_routing,
         tensor_name=tensor_name,
         empty_targets=empty_targets,
+        direct_targets=direct_targets,
         child_slots=tuple(
             coherence_child_slots[
                 (
@@ -880,58 +982,6 @@ def _compile_receipt_routing(
         input_transfer_code=input_transfer.transfer_code,
         reference_path=routing.path,
         rank_count=target_rank_count,
-    )
-
-
-def _bind_source_spec(
-    *,
-    source_logical: ShardingSpec,
-    mesh: Any,
-    rank: int,
-    interleave_unit_size: int | None,
-) -> PhysicalLayout:
-    source_spec = source_logical.bind(mesh)
-    if interleave_unit_size is None:
-        return source_spec
-    if isinstance(interleave_unit_size, bool) or not isinstance(
-        interleave_unit_size, int
-    ):
-        raise TypeError("interleave_unit_size must be an integer or None.")
-    if interleave_unit_size <= 0:
-        raise ValueError("interleave_unit_size must be positive.")
-    if interleave_unit_size > source_spec.mesh.size:
-        raise ValueError(
-            f"interleave_unit_size {interleave_unit_size} exceeds source mesh size "
-            f"{source_spec.mesh.size}."
-        )
-    unit_idx = rank // interleave_unit_size
-    unit_ranks = list(
-        range(
-            unit_idx * interleave_unit_size,
-            (unit_idx + 1) * interleave_unit_size,
-        )
-    )
-    base_mesh = source_spec.mesh
-    other_dims_size = 1
-    for size in base_mesh.shape[1:]:
-        other_dims_size *= size
-    if interleave_unit_size % other_dims_size != 0:
-        raise ValueError(
-            f"interleave_unit_size {interleave_unit_size} is not divisible by "
-            f"the non-leading mesh size {other_dims_size}."
-        )
-    if unit_ranks[-1] >= base_mesh.size:
-        raise ValueError(
-            f"Rank {rank} selects an interleave unit outside source mesh size "
-            f"{base_mesh.size}."
-        )
-    first_axis_size = interleave_unit_size // other_dims_size
-    return source_logical.bind(
-        DeviceMesh(
-            device_shape=(first_axis_size,) + base_mesh.shape[1:],
-            axis_names=base_mesh.axis_names,
-            device_ids=unit_ranks,
-        )
     )
 
 
@@ -1005,7 +1055,7 @@ def build_step_frame_groups(
                 list[tuple[int, TransportTensor, SelectedRoutingSource]],
             ],
         ) -> None:
-            for (source_spec, target_spec, _), batch in batches.items():
+            for (source_spec, target_spec, _, direct_targets), batch in batches.items():
                 batch_transfer_codes = [item[0] for item in batch]
                 batch_transport_tensors = [item[1] for item in batch]
                 routing_source = batch[0][2]
@@ -1031,6 +1081,7 @@ def build_step_frame_groups(
                     routing_source=routing_source,
                     transfer_codes=batch_transfer_codes,
                     transfer_code_to_name=compiled_plan.transfer_code_to_name,
+                    direct_targets=direct_targets,
                 )
 
         if profiler_recorder is None:
@@ -1309,6 +1360,7 @@ def build_successor_batches(
                 route.source_spec,
                 route.target_spec,
                 routing_source.batch_key,
+                route.direct_targets,
             )
         ].append((route.transfer_code, leaf_tensor, routing_source))
     return batches

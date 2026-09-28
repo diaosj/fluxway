@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from math import prod
@@ -46,6 +48,50 @@ class CheckpointId(str):
         return cls(uuid.uuid4().hex)
 
 
+@dataclass(frozen=True, slots=True)
+class CheckpointDeadline:
+    """Canonical deadline manager for checkpoint transaction lifecycle."""
+
+    deadline_monotonic: float
+    total_timeout_s: float
+
+    @classmethod
+    def start(cls, timeout_s: float) -> CheckpointDeadline:
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+            raise TypeError("checkpoint timeout must be a float or int")
+        if timeout_s <= 0:
+            raise ValueError(f"checkpoint timeout must be positive, got {timeout_s}")
+        return cls(
+            deadline_monotonic=time.monotonic() + float(timeout_s),
+            total_timeout_s=float(timeout_s),
+        )
+
+    def remaining_s(self) -> float:
+        remaining = self.deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Checkpoint transaction exceeded deadline of {self.total_timeout_s:.1f}s"
+            )
+        return remaining
+
+    def is_expired(self) -> bool:
+        return (self.deadline_monotonic - time.monotonic()) <= 0
+
+    async def run_phase(self, phase_or_coro: Any, coro: Any = None) -> Any:
+        if coro is None:
+            awaitable = phase_or_coro
+        else:
+            awaitable = coro
+        remaining = self.remaining_s()
+        return await asyncio.wait_for(awaitable, timeout=remaining)
+
+    def run_transition[T](self, transition: Callable[..., T], *args: Any) -> T:
+        self.remaining_s()
+        result = transition(*args)
+        self.remaining_s()
+        return result
+
+
 class CheckpointRuntimeRole(StrEnum):
     CONTROL = "control"
     WORKER = "worker"
@@ -85,6 +131,13 @@ class CheckpointSaveState(StrEnum):
     COMMITTED = "committed"
 
 
+class CheckpointTransactionState(StrEnum):
+    STAGED = "staged"
+    COMMIT_DECIDED = "commit_decided"
+    COMMITTED = "committed"
+    ABANDONED = "abandoned"
+
+
 class CheckpointSaveScope(StrEnum):
     LEADER = "leader"
     ALL_RANKS = "all_ranks"
@@ -121,6 +174,15 @@ class CheckpointCut:
     @classmethod
     def for_step(cls, cut_id: str, step: int) -> CheckpointCut:
         return cls.for_position(cut_id, step)
+
+    def frozen_copy(self) -> CheckpointCut:
+        return CheckpointCut(
+            cut_id=self.cut_id,
+            position=self.position,
+            stream_cuts=copy.deepcopy(dict(self.stream_cuts)),
+            sealed_ends=copy.deepcopy(dict(self.sealed_ends)),
+            control_epoch=self.control_epoch,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,9 +314,6 @@ class CheckpointRestoreSpec:
 @dataclass(frozen=True, slots=True)
 class CheckpointObjectSpec:
     checkpoint_object_id: str = "state"
-    retention: CheckpointRetentionPolicy = field(
-        default_factory=CheckpointRetentionPolicy
-    )
     required_for_restore: bool = True
     cleanup_group: str | None = None
 
@@ -269,6 +328,7 @@ class CheckpointObjectSpec:
 class CheckpointComponentSpec:
     component_id: str
     format_version: int = 1
+    retention_domain: str | None = None
     save: CheckpointSaveSpec | None = None
     restore: CheckpointRestoreSpec | None = None
     checkpoint_objects: tuple[CheckpointObjectSpec, ...] = ()
@@ -276,6 +336,8 @@ class CheckpointComponentSpec:
     def __post_init__(self) -> None:
         if not self.component_id:
             raise ValueError("checkpoint component requires component_id")
+        if self.retention_domain is not None and not self.retention_domain:
+            raise ValueError("retention_domain must be non-empty when provided")
         if self.format_version <= 0:
             raise ValueError("component format_version must be positive")
         checkpoint_object_ids = [
@@ -669,27 +731,6 @@ class CheckpointHold:
 
 
 @dataclass(frozen=True, slots=True)
-class PendingCleanup:
-    checkpoint_id: str
-    spmd_id: str
-    component_id: str
-    reservation: CleanupReservation
-
-    def __post_init__(self) -> None:
-        if not self.checkpoint_id or not self.spmd_id or not self.component_id:
-            raise ValueError(
-                "pending cleanup requires snapshot, SPMD, and component IDs"
-            )
-        if any(
-            checkpoint_object.component_id != self.component_id
-            for checkpoint_object in self.reservation.claimed
-        ):
-            raise ValueError(
-                "pending cleanup checkpoint_object belongs to another component"
-            )
-
-
-@dataclass(frozen=True, slots=True)
 class CleanupReservationRequest:
     permit: CheckpointCommitPermit
     checkpoint_object_id: str
@@ -710,3 +751,53 @@ class CleanupReservation:
     checkpoint_object_id: str
     claimed: tuple[CheckpointObjectRef, ...]
     generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupReservationBinding:
+    artifact_id: str
+    spmd_id: str
+    component_id: str
+    reservation: CleanupReservation
+
+    def __post_init__(self) -> None:
+        if not self.artifact_id or not self.spmd_id or not self.component_id:
+            raise ValueError(
+                "cleanup reservation binding requires artifact, SPMD, and component IDs"
+            )
+        if any(
+            checkpoint_object.component_id != self.component_id
+            for checkpoint_object in self.reservation.claimed
+        ):
+            raise ValueError("cleanup reservation object belongs to another component")
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointCleanupIntent:
+    artifact_id: str
+    reservations: tuple[CleanupReservationBinding, ...]
+
+    def __post_init__(self) -> None:
+        if not self.artifact_id:
+            raise ValueError("checkpoint cleanup intent requires artifact ID")
+        if not self.reservations:
+            raise ValueError("checkpoint cleanup intent requires reservations")
+        keys = [
+            (
+                binding.artifact_id,
+                binding.spmd_id,
+                binding.component_id,
+                binding.reservation.checkpoint_object_id,
+            )
+            for binding in self.reservations
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError(
+                "checkpoint cleanup intent contains duplicate reservations"
+            )
+        if any(
+            binding.artifact_id != self.artifact_id for binding in self.reservations
+        ):
+            raise ValueError(
+                "checkpoint cleanup intent reservation belongs to another artifact"
+            )

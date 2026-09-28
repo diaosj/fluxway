@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from decimal import Decimal
 from typing import cast
 
 from ray.util.placement_group import (
@@ -18,7 +17,6 @@ from fluxway.placement.models import (
 from fluxway.placement.worker_group import SPMDWorkerGroup
 
 logger = logging.getLogger(__name__)
-RAY_NODE_MARKER_QUANTITY = Decimal("0.0001")
 
 
 class PGManager:
@@ -47,36 +45,24 @@ class PGManager:
         node_to_bundle = {node_id: index for index, node_id in enumerate(node_ids)}
         bundles = []
         for node_id in node_ids:
-            try:
-                node = snapshot_by_id[node_id]
-            except KeyError as error:
+            if node_id not in snapshot_by_id:
                 raise PlacementMaterializationError(
                     f"resolved node {node_id!r} is absent from the Ray snapshot"
-                ) from error
-            node_resources = [
-                resource
-                for resource in node.resources
-                if resource.startswith("node:")
-                and not resource.startswith("node:__internal_")
-            ]
-            if len(node_resources) != 1:
-                raise PlacementMaterializationError(
-                    f"Ray node {node_id!r} has {len(node_resources)} usable node resources"
                 )
             bundle = {
                 resource: float(quantity)
                 for resource, quantity in bundle_resources[node_id].items()
                 if quantity > 0
             }
-            node_resource = node_resources[0]
-            if node_resource in bundle:
-                raise PlacementMaterializationError(
-                    f"Recipe resources cannot request Ray node marker {node_resource!r}"
-                )
-            bundle[node_resource] = float(RAY_NODE_MARKER_QUANTITY)
             bundles.append(bundle)
         try:
-            pg = placement_group(bundles=bundles, strategy="STRICT_SPREAD")
+            pg = placement_group(
+                bundles=bundles,
+                strategy="STRICT_SPREAD",
+                bundle_label_selector=[
+                    {"ray.io/node-id": node_id} for node_id in node_ids
+                ],
+            )
         except Exception as error:
             raise PlacementMaterializationError(
                 f"Ray rejected placement group for recipe {plan.recipe_id}"
@@ -99,9 +85,11 @@ class PGManager:
             raise PlacementGroupTimeoutError(
                 f"placement group timed out after {timeout_s}s for recipe {plan.recipe_id}"
             ) from error
-        except Exception as error:
+        except BaseException as error:
             remove_placement_group(pg)
-            if isinstance(error, PlacementMaterializationError):
+            if not isinstance(error, Exception) or isinstance(
+                error, PlacementMaterializationError
+            ):
                 raise
             raise PlacementMaterializationError(
                 f"Ray failed to materialize placement group for recipe {plan.recipe_id}"

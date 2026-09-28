@@ -30,7 +30,14 @@ class CompiledPhaseSchedule:
     gates: Mapping[str, PhaseGate]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "gates", freeze_mapping(self.gates))
+        if not isinstance(self.gates, Mapping):
+            raise TypeError("compiled phase schedule gates must be a mapping")
+        if self.gates.__class__.__name__ != "FrozenMap":
+            raise TypeError("compiled phase schedule gates must be frozen")
+
+    @classmethod
+    def from_mapping(cls, gates: Mapping[str, PhaseGate]) -> CompiledPhaseSchedule:
+        return cls(gates=freeze_mapping(gates))
 
     @property
     def relations(self) -> tuple[PhaseRelation, ...]:
@@ -92,7 +99,7 @@ def compile_phase_schedule(
             gates[operator_id] = PhaseGate(
                 predecessors=predecessors,
             )
-    return CompiledPhaseSchedule(gates=gates)
+    return CompiledPhaseSchedule.from_mapping(gates)
 
 
 def _phase_order_relations(

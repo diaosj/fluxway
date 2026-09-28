@@ -47,6 +47,7 @@ def _running_fsm() -> tuple[DriverStateMachine, MagicMock]:
     fsm = DriverStateMachine(driver)
     assert fsm.trigger(DriverEvent.INIT_COMPLETE)
     assert fsm.trigger(DriverEvent.START)
+    assert fsm.trigger(DriverEvent.ACTIVATION_COMPLETE)
     assert fsm.state is DriverState.RUNNING
     return fsm, driver
 
@@ -71,6 +72,7 @@ def _driver() -> tuple[Any, MagicMock]:
     )
     assert driver.state_machine.trigger(DriverEvent.INIT_COMPLETE)
     assert driver.state_machine.trigger(DriverEvent.START)
+    assert driver.state_machine.trigger(DriverEvent.ACTIVATION_COMPLETE)
     return driver, controller
 
 
@@ -260,6 +262,23 @@ def test_running_worker_heartbeat_timeout_fails_immediately() -> None:
     assert heartbeat.failure is failure
 
 
+def test_snapshotting_worker_heartbeat_timeout_does_not_fail_driver() -> None:
+    driver, controller = _driver()
+    assert driver.state_machine.trigger(DriverEvent.DRAIN_REQUESTED)
+    assert driver.state_machine.trigger(DriverEvent.DRAIN_COMPLETE)
+    assert driver.state_machine.trigger(DriverEvent.SNAPSHOT_REQUESTED)
+    assert driver.state_machine.state is DriverState.SNAPSHOTTING
+    driver._worker_heartbeat_times[0] = (
+        time.time() - driver.heartbeat_manager._heartbeat_config.heartbeat_timeout - 1.0
+    )
+
+    driver.heartbeat_manager._send_heartbeat()
+
+    assert driver.state_machine.failure is None
+    assert driver.state_machine.state is DriverState.SNAPSHOTTING
+    controller.report_spmd_error.remote.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "live_state",
     (DriverState.READY, DriverState.BLOCKED),
@@ -306,7 +325,12 @@ def test_initializing_worker_heartbeat_age_is_governed_by_init_timeout() -> None
 
 
 @pytest.mark.asyncio
-async def test_driver_initialization_exception_preserves_exception_context() -> None:
+async def test_driver_initialization_exception_preserves_exception_context(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "ray.get_runtime_context", lambda: MagicMock(current_actor=None)
+    )
     driver, controller = _driver()
     driver.state_machine.reset()
     driver.executor.start_workers = AsyncMock(side_effect=RuntimeError("startup boom"))
@@ -352,3 +376,14 @@ def test_driver_initialization_timeout_is_a_named_structured_failure(
     assert "0/1 workers reported" in failure.message
     assert failure.traceback is None
     controller.report_spmd_error.remote.assert_called_once_with("dense", failure)
+
+
+def test_worker_heartbeat_reports_readiness_without_starting_execution() -> None:
+    driver, _ = _driver()
+    driver.state_machine._state = DriverState.READY
+    driver.receive_worker_heartbeat(
+        0, WorkerHeartbeat(rank=0, timestamp=1.0, status=WorkerStatus.RUNNING)
+    )
+    assert driver._workers_ready
+    assert driver._topology_ready
+    assert driver.state_machine.state is DriverState.READY

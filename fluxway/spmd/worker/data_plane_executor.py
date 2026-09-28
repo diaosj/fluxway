@@ -8,7 +8,10 @@ from dataclasses import dataclass
 import heapq
 from typing import Any
 
-from fluxway.rpc.protocol import DataPlaneCallable, TransportFrameEnvelope
+from fluxway.rpc.protocol import (
+    DataPlaneCallable,
+    TransportFrameEnvelope,
+)
 from fluxway.spmd.worker.data_plane import (
     CompiledSendPlan,
     DependencyDecisions,
@@ -22,8 +25,9 @@ from fluxway.profiler.recorder import TraceRecorder
 from fluxway.spmd.worker.runtime import ScheduleKey
 
 SubmitDelivery = Callable[[Awaitable[Any]], Awaitable[asyncio.Task[Any]]]
+BatchEnqueue = Callable[[TransportFrameBatch], Awaitable[Any]]
 BatchSubmit = Callable[
-    [TransportFrameBatch, Callable[[], Awaitable[Any]]],
+    [tuple[TransportFrameBatch, ...], BatchEnqueue],
     Awaitable[Any],
 ]
 
@@ -259,9 +263,8 @@ async def _build_and_send_frame_groups(
     batches = TransportBatchPlan.from_frame_groups(frame_groups).batches(
         batch_max_frames=batch_max_frames,
     )
-    delivery_tasks: list[asyncio.Task[Any]] = []
 
-    async def schedule_batch(batch: TransportFrameBatch) -> asyncio.Task[Any]:
+    async def enqueue_batch(batch: TransportFrameBatch) -> Any:
         route = compiled_plan.successor_routes[batch.context_index]
         target_spmd_id = route.spmd_id
         _validate_local_only_batch(route, compiled_plan, batch)
@@ -274,7 +277,7 @@ async def _build_and_send_frame_groups(
         )
         frames = _batch_envelopes(batch)
 
-        async def enqueue() -> Any:
+        async def send_batch() -> Any:
             async def send() -> Any:
                 return await batch_delivery_factory(
                     handler=handler,
@@ -292,43 +295,34 @@ async def _build_and_send_frame_groups(
             task = await submit_delivery(send())
             return await task
 
-        retirement = batch_submit(batch, enqueue)
-        return asyncio.ensure_future(retirement)
+        if profiler_recorder is None:
+            return await send_batch()
+        async with profiler_recorder.data_plane_enqueue_batch(
+            op_name=compiled_plan.op_name,
+            step=exec_step,
+            source_spmd_code=compiled_plan.sender_spmd_code,
+            source_rank=compiled_plan.rank,
+            target_spmd_id=target_spmd_id,
+            target_rank=batch.target_rank,
+            batch_seq=batch.batch_seq,
+            frame_count=len(frames),
+        ):
+            return await send_batch()
 
+    publication = batch_submit(tuple(batches), enqueue_batch)
+    publication_task = asyncio.ensure_future(publication)
     if profiler_recorder is None:
-        try:
-            for batch in batches:
-                delivery_tasks.append(await schedule_batch(batch))
-        except BaseException:
-            await _cancel_delivery_tasks(delivery_tasks)
-            raise
-        return delivery_tasks
-
+        return [publication_task]
     try:
         async with profiler_recorder.data_plane_frame_submit(
             source_rank=compiled_plan.rank,
             output_step=exec_step,
             frame_count=len(frame_groups),
         ):
-            for batch in batches:
-                route = compiled_plan.successor_routes[batch.context_index]
-                target_spmd_id = route.spmd_id
-                frames = _batch_envelopes(batch)
-                async with profiler_recorder.data_plane_enqueue_batch(
-                    op_name=compiled_plan.op_name,
-                    step=exec_step,
-                    source_spmd_code=compiled_plan.sender_spmd_code,
-                    source_rank=compiled_plan.rank,
-                    target_spmd_id=target_spmd_id,
-                    target_rank=batch.target_rank,
-                    batch_seq=batch.batch_seq,
-                    frame_count=len(frames),
-                ):
-                    delivery_tasks.append(await schedule_batch(batch))
+            return [publication_task]
     except BaseException:
-        await _cancel_delivery_tasks(delivery_tasks)
+        await _cancel_delivery_tasks((publication_task,))
         raise
-    return delivery_tasks
 
 
 async def _cancel_delivery_tasks(tasks: Iterable[asyncio.Task[Any]]) -> None:

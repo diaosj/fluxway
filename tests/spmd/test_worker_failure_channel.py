@@ -8,6 +8,14 @@ import pytest
 from fluxway.common.types import ExecutionFailure, WorkerStatus
 from fluxway.spmd.worker.worker import SPMDWorker, _EXECUTION_STOP_ITEM
 from fluxway.spmd.worker.admission import StepAdmissionState
+from fluxway.spmd.worker.checkpoint_activity import CheckpointActivity
+from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle
+
+
+class LifecycleWorkerStub(SimpleNamespace):
+    @property
+    def _running(self):
+        return self._execution_lifecycle.active
 
 
 def _raw_worker_class():
@@ -25,11 +33,11 @@ def _driver():
 
 def _worker():
     raw_class = _raw_worker_class()
-    worker = SimpleNamespace(
+    worker = LifecycleWorkerStub(
         spmd_id="training",
         rank=2,
         _failure=None,
-        _running=True,
+        _execution_lifecycle=WorkerExecutionLifecycle(),
         _driver_handle=_driver(),
         _execution_queues={
             "compute": asyncio.PriorityQueue(),
@@ -39,9 +47,12 @@ def _worker():
         _send_tasks={},
         _background_tasks=set(),
         _heartbeat_task=None,
+        _checkpoint_activity=CheckpointActivity(),
         _op_runnable={"op": asyncio.Event()},
     )
     worker._op_runnable["op"].set()
+    worker._execution_lifecycle.topology_ready()
+    worker._execution_lifecycle.activate()
     worker._record_failure = types.MethodType(raw_class._record_failure, worker)
     worker._send_heartbeat = types.MethodType(raw_class._send_heartbeat, worker)
     return worker

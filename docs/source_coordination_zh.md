@@ -1,273 +1,184 @@
-# Source Coordination
+# Source 协调
 
-Fluxway 将持续数据发现建模为 Driver-local control-plane component，而不是 Reader worker 的
-特殊执行分支。普通有限 source 不声明 descriptor，因此不会创建 coordinator。
+## Typed Layout Activation
 
-## 声明与宿主
+Source adapter 实现 `IngestionSourceAdapter.capture_view`，负责 immutable revision
+发现、locator 和 cursor 编码。自定义结构化 metadata 使用 canonical MessagePack。
+重放必须读取捕获的 revision/locator，不能替换成最新表状态。
 
-持续 source 在 operator metadata 上声明 descriptor：
+`IngestionLayoutPlanningComponent` 管理有序不可变编译窗口。Descriptor 构造和
+adapter capture 使用专用 `IOLane`，与心跳、payload 传输和 checkpoint 存储分离。
+纯布局编译使用持久的进程池，以 `spawn` 启动。线程隔离阻塞 I/O，但在 GIL 下
+不能提供 Python CPU 计算的并行执行。重复发布必须匹配已有 epoch，冲突直接失败。
+
+组件持有已接收的操作任务。取消调用者只停止其等待，不取消已接收的 observation
+或 publication。`close()` 拒绝新提交，等待已接收操作结束，在独立 lifecycle lane
+上等待编译进程退出，再关闭 adapter lane。并发调用者通过 `shield` 等待同一个
+清理任务。被取消的等待者未接收的操作异常在资源清理后报告；阻塞 adapter 必须
+最终返回，关闭才能完成。
+
+`AlgebraicLayoutCompiler` 只使用当前 observation 捕获到的 immutable units，先生成
+logical step assignment，再按当前 Worker 配额分配物理区间。一个 1,020 行 logical batch
+包含 historical 的 1,000 行和两个各 10 行
+追加文件，配额为 340/340/340 时，结果为：
+
+| Worker | 读取区间 | 行数 |
+| --- | --- | --- |
+| 0 | historical `[0,340)` | 340 |
+| 1 | historical `[340,680)` | 340 |
+| 2 | historical `[680,1000)`、append1 `[0,10)`、append2 `[0,10)` | 340 |
+
+这是区间规划，不是整文件分配。默认 lowering 会在满足精确 quota 和 canonical coverage
+的前提下，让每个 Reader 尽量连续消费自己的 unit 前缀并减少 physical unit 切换；adapter
+不需要知道未来文件。Compiler 也支持 byte cardinality；具体格式是否可以按 byte 区间
+读取由 adapter 保证。
+
+Source 可以在写入的同时读取。每次 `capture_view` 返回一个 immutable、有界 observation，
+只有该 observation 的 tuple 顺序具有排序语义。Fluxway 会保留不足一个 global batch 的
+pending tail；非 terminal observation 不发布 layout，也不推进 source cut，下一次 observation
+会继续拼接。未观测到的未来文件不会被推断或重排。
+
+Controller 发布 canonical epoch 并验证物理覆盖。Driver 通过已有
+`IngestionLayoutActivationComponent` 和 worker control 并发分发
+`WorkerLayoutDescriptor`。Worker 按活跃 step 索引已安装的 segment，以 operator
+pipeline depth 为上限分批申请；每次调用只通过 operator context 获得本 step 的区间任务。
+
+## 流式 Window
+
+`plan_adapter_window` 接受空的非终止 observation，不创建 epoch，也不推进 cut。
+不足一个 batch 的尾部保留并与下一 observation 拼接；完整 window 推进 epoch 和 step；
+空 terminal window 封闭流，不制造虚拟源记录。
+
+Planner checkpoint 保存 immutable request、待拼接尾部和编码 cursor。Restore
+要求提供当前 topology，并验证 logical batch cardinality 不变、canonical digest
+一致，再重新生成物理布局。此组件 API 本身不会运行持续 discovery loop 或激活 Worker。
+
+## Ownership 与 ACK
+
+`LogicalWorkLedger` 负责 interval lease、ACK 校验、candidate cut 和 committed cut。
+`SourceWorkKey` 使用 `(epoch, step, assignment_id)`；`receive(position)` 和 Worker
+本地 durable cursor 不再是 ownership API。
+
+同一 assignment 的物理分片具有不同 lease ID。只有完整区间覆盖才能完成 step。
+ACK 队列按 Worker pipeline 容量有界，纳入已有 outbound checkpoint drain。
+`SourceWorkRuntime` 缓存 Controller 授予的 lease，同一批次共享一个受监管的 fetch
+任务。Controller 返回当前信用窗口内非空、完整的 step 前缀；后续 step 等待额度
+不妨碍已有前缀消费。调用者取消后，Worker 后台任务仍监管 fetch。缓存不授予执行
+权限，也不独立分配 ownership；缓存未命中时仍需等待 Controller RPC。
+窗口耗尽后等待 committed checkpoint cut，checkpoint 周期必须允许窗口继续推进。
+
+编译完成后，publication 先校验 planner window 和 ledger binding，再在 Controller
+事件循环中不含 `await` 的区段安装 window、tail、cursor、observation identity 与
+ledger epoch。Acquire 和 ACK 协程不能在该区段内交错。Ledger 覆盖校验、descriptor
+解码和安装仍在 owner loop 上执行，其工作量随 window 规模增长。
+`SourceControlConfig.max_planning_units` 与 `max_planning_descriptor_bytes`
+限制 Controller 接受的布局发布；这些是接受条件，不是常数时间发布保证。
+
+旧分发 ledger 已删除，Driver activation 的 checkpoint 状态为空，物理布局仅为瞬态。
+Controller restore 先用当前 Reader topology 重建 canonical plan，发布重新绑定的
+segment，再恢复 logical ledger 的 committed cut。Driver activation 将结果描述符
+重新分发给新 Worker。
+
+Restore 要求新建 Worker，且发生在 source activation 之前。已经使用过的 Worker
+会在修改 scheduler 水位前拒绝 restore。普通 save/resume 保留同一 source 作用域和
+其中有效的后续授权。
+
+## 容错与动态伸缩保障 (Fault Tolerance & Elasticity)
+
+系统设计提供了以下核心保障：
+
+- **完备的边界处理**：原生支持空 Observation、跨 Revision 尾部无缝拼接、Terminal Window 的平滑终结。
+- **协议级健壮性**：支持乱序 ACK、Lease 隔离防重入以及 Canonical Planner 的精准状态恢复。
+- **动态并发伸缩**：支持在 Checkpoint 恢复期间任意缩容或扩容 Reader（例如从 6 个并发安全缩减至 3 个，或 3 个缩减至 2 个），只要逻辑 Batch 的基数不变，系统将重新分配物理区间而绝不会丢失数据或重复投递。
+- **Exact-Once 语义保障**：Controller 恢复时严格按照“先恢复 Canonical Plan、后恢复 Committed Ledger”的顺序，确保从 Work Item 派生的数据血缘（Provenance）稳定不变。
+
+Controller 启动激活一个 layout。Worker source scope 接受每个算子的连续不可变窗口；
+BaseReader 提供安装 hook，不重复维护 activation identity。自定义 adapter 可以表达 idle
+observation、pending tail 和 immutable revision。公开启动 API 不提供无界 source 的
+自动 discovery/refill。外部 publisher 集成需要独立验证 adapter 契约。
+
+Admission 下发使用既有 boundary revision，completion 校验 participant 身份。
+Driver RPC 和 source ACK coverage 等待不占用 Controller reducer 锁。
+Restore 将 Worker gate 保持在 committed cut，resume 不清除此 gate。
+Source ownership 与 payload 路由分层；后者使用[编译传输关系](transfer_planning_zh.md)。
+
+Acquire 和 ACK 队列有界。已提交的 planning window 和物理 binding history 保留用于
+canonical 重建；所占元数据随安装窗口数增长。工作负载容量规划需要包含这部分开销。
+
+`PlacementPolicy` 是 solver 的输入值对象，表达通用布局不变量和 locality 偏好，不是
+Parquet 专用的文件 owner API。默认 policy 保持 unit 顺序、连续 prefix、splittable-unit 支持，
+并尽量减少 physical transition。调用方在编译 placement plan 时可以传入经过校验的 policy，
+但 physical cost model 仍是 compiler 内部细节。Source adapter 只提供稳定 unit identity、
+split capability、locality metadata 和 cursor fence。亲和性和零拷贝仍需通过实际 placement/transport 验证；Compiler/ledger 测试
+不能代替 256 Input/768 Source 的吞吐、多机零拷贝结果。参见[正式协议](source_spmd_formal_protocol_zh.md)。
+
+普通 source 直接使用默认 policy：
 
 ```python
-@operator("read", is_source=True, source=descriptor)
-async def read(...):
-    ...
+from fluxway.control_plane.ingestion import PlacementPolicy
+
+policy = PlacementPolicy.default()
+request = observation.layout_request(
+    topology=topology,
+    tail_layout_mode="retain_pending",
+    placement_policy=policy,
+)
 ```
 
-compiled graph 是 descriptor 的唯一事实来源。对应 SPMD Driver 从 `OperatorSpec.source` 构造
-component，运行时 id 为 `spmd_id:operator_name`。Controller 不导入 source adapter，也不构造
-source component。
+只接受经过校验的 `PlacementPolicy`；不能关闭有序 source interval 或 splittable-unit 支持，
+因为这些是协议不变量。
 
-```text
-Controller
-└── ControlPlaneComponentRegistry
-    └── global control components
+Lowering 会记录当前 window 已经读取某个 physical identity 的 Reader，并优先复用这些 Reader；
+正在连续读取同一 physical unit 的 Reader 优先级更高。这是调度偏好，不是 durable ownership：
+restore 后 physical segment 和 Reader binding 会重建，canonical assignment ID 不变。若 quota
+强制切分，compiler 会把切分集中到约束允许的最少 Reader。
 
-SPMD Driver
-└── DriverComponentRegistry
-    └── source coordinator
+## PlacementPolicy 与物理 Worker 分配 (Owner-Affinity)
+
+`PlacementPolicy` 作为 Ingestion Solver 的不可变输入配置，控制着 Worker 物理分配和亲和性：
+- `require_sequential_order`
+- `affinity_contiguous_chunks`
+- `affinity_same_file`
+- `allow_unit_splitting`
+
+> [!NOTE]
+> 该策略不再支持 "ordered_prefix" 这样的字符串别名，现在纯粹是由配置组成的强类型 Value Object。同源的 `SourceWorkKey` Canonical Interval 不会被由于拓扑/资源变化引起的 Transient Binding (瞬时物理绑定) 污染。
+
+### Allocation 字典序评分函数
+
+给定一个物理分片 $P_i$，候选 Worker $w$ 的评分键（Allocation Key）被正式投射为：
+
+$$ Key(w, P_i) = \left( \mathbb{I}_{w.\text{prev} \neq P_i},\; \mathbb{I}_{w \notin \text{owners}(P_i)},\; \text{rank}(w, P_i),\; \text{cycle\_order}(w) \right) $$
+
+调度器通过选择字典序最小的 Worker 使得分配最优化：
+1. **$k_1 \in \{0, 1\}$ (Contiguous Prefix):** 优先选择当前仍在连续读取同一 physical identity 的 Reader。
+2. **$k_2 \in \{0, 1\} \times \mathbb{N}$ (Owner Set Reunion):** 其次复用当前 window 已经读取过该 physical identity 的 Reader。
+3. **$k_3 \in \mathbb{N}$ (Cycle Order):** 最后按 active-cycle 中的确定性顺序选择。
+4. 只有当配额耗尽时，才会切分到更多的 Reader。如果 `allow_unit_splitting=False`，切分则直接抛异常。
+
+### Streaming Source Contract 执行流
+
+```mermaid
+sequenceDiagram
+    participant Catalog
+    participant Compiler
+    participant Topology
+    participant Worker
+    
+    Catalog->>Compiler: 捕获 Immutable Observation
+    Note over Compiler: 忽略未来未观测文件<br/>(不参与排序)
+    Compiler->>Topology: 计算 Quota 与 Canonical Coverage
+    Topology-->>Compiler: 返回 Active-Cycle
+    Compiler->>Compiler: 根据 Owner-Affinity 决定字典序分配
+    
+    alt 正常分配
+        Compiler->>Worker: 下发 Transient Binding
+    else Quota 不足且 allow_unit_splitting=False
+        Compiler->>Compiler: 直接触发 Runtime 异常
+    end
+    
+    Note over Compiler: Nonterminal Incomplete Observation<br/>不推进 Cut, 仅保留 Pending Tail
 ```
 
-两个 registry 复用同一个内部实现。component 不定义独立 lifecycle enum；Controller component
-响应 `ControllerState`，Driver component 响应 `DriverState`。
-
-### ControlPlaneComponent 协议与运行机制
-
-所有控制面组件需实现 `ControlPlaneComponent` Protocol（定义于 `fluxway.control_plane.components`）：
-
-```python
-@runtime_checkable
-class ControlPlaneComponent(Protocol):
-    component_id: str
-
-    async def on_state(self, state: ComponentState) -> None: ...
-
-    def checkpoint_state(self) -> Mapping[str, Any]: ...
-
-    def restore_state(self, state: Mapping[str, Any]) -> None: ...
-```
-
-1. **唯一标识 (`component_id`)**：注册到 `_ComponentRegistry` 的唯一字符串标识符（如 Driver 端 `spmd_id:operator_name` 或 Controller 端全局标识）。
-2. **生命周期状态广播 (`on_state`)**：
-   - 宿主（`Controller` 或 `Driver`）状态机发生转换时，通过 `registry.notify_state(state)` 顺序异步调用每个组件的 `on_state`。
-   - `ComponentState` 为联合类型 `ControllerState | DriverState`：
-     - **Controller 宿主**：传递 `ControllerState`（如 `INITIALIZING`, `PENDING`, `TOPOLOGY_REGISTERING`, `READY`, `RUNNING`, `COMPLETING`, `FAILING`, `COMPLETED`, `FAILED`）。
-     - **Driver 宿主**：传递 `DriverState`（如 `INITIALIZING`, `READY`, `RUNNING`, `BLOCKED`, `DRAINING`, `DRAINED`, `SNAPSHOTTING`, `ERROR`, `COMPLETED`）。
-   - 组件在 `on_state` 回调中响应宿主生命周期变化（例如开启数据源发现、暂停调度或释放局部资源）。
-3. **状态快照与恢复 (`checkpoint_state` / `restore_state`)**：
-   - **保存**：宿主触发表干/快照时，调用 `checkpoint_state()` 导出组件内部状态（如 source cursor、控制记录等）。
-   - **恢复**：故障重启或恢复时，宿主通过 `restore_state(checkpoint_dict)` 将状态灌回对应组件。
-
-#### 组件示例
-
-```python
-class ExampleSourceCoordinator:
-    def __init__(self, component_id: str):
-        self.component_id = component_id
-        self.cursor = 0
-
-    async def on_state(self, state: ComponentState) -> None:
-        if state == DriverState.RUNNING:
-            # 宿主进入 RUNNING，启动数据发现与拉取
-            pass
-        elif state == DriverState.DRAINING:
-            # 宿主进入 DRAINING，暂停新数据发现
-            pass
-
-    def checkpoint_state(self) -> dict[str, Any]:
-        return {"cursor": self.cursor}
-
-    def restore_state(self, state: Mapping[str, Any]) -> None:
-        self.cursor = int(state["cursor"])
-```
-
-## Ordered Control Stream
-
-`ControlLedger` 是通用 ordered metadata ledger，只理解稳定身份：
-
-```text
-(stream_id, position)
-```
-
-- `position` 与 Fluxway operator logical step 属于同一序列；
-- virtual owner 由当前 interleave topology 推导，不进入 record 或 checkpoint；
-- payload 对 Fluxway 不透明；
-- ledger 不理解 Reader、Iceberg、source revision、文件 split_id（即全局物理切片标识符 `file_path:offset+length`，用于对非确定性 manifest/FileScanTask 进行确定性全序排序与状态唯一标识）或 executor lane。
-
-外部接口只有：
-
-```python
-append(records)
-try_append(records)
-receive(stream_id, position)
-seal(stream_id)
-progress(stream_id)
-```
-
-`GraphExecution.progress()` 只读取 Fluxway 原生 operator completion。ControlLedger 的
-`durable_cut`、`published_end` 和 `sealed_end` 属于 source-coordination 内部事实，不通过
-`GraphExecution` 暴露；它们不是 Driver FSM 的状态，也不承载 interleaved source 的 terminal
- observation。后者走 `Worker -> Driver -> Controller -> request_drain` 事件链。
-
-`append` 对整个参数 batch 原子且幂等。`try_append` 使用同一验证与提交路径，但容量不足时立即返回
-`False`，不新增 ownership 或状态语义；Driver component 用它在 ledger 满时停止 discovery，从而不让
-drain 等待一个背压中的 append。`receive` 在内部异步等待精确 position，并对同一 active
-virtual group 的多个 rank 返回同一 metadata。调用方不实现 `status -> acquire -> wait` 循环，也不
-调用 ack。
-
-Controller 的 `seal_control_stream()` 将 sealed end 原子固定为当前 published end。完成的
-source 在 sealed end 之后向 Reader 返回显式 EOF（`None`）。对于没有 control stream 的
-interleaved source，worker 将本地 EOF 作为 reducer observation 报告给 Driver，Driver 只在本地
-boundary 变小时转发给 Controller；同一 virtual source 的多个 physical rank 只是同一个终点的观测。
-Controller reducer 取这些 observation 的最小值，并通过与周期 drain 相同的 `request_drain`
-command 缩短全图 drain。这样某个 rank 在 step 14 发现数据不足时，其他 source 仍可正常完成
-step 13，checkpoint boundary 仍为 13。Controller 依据所有 compiled source 的一致 sealed end
-缩短现有 Driver drain，并在 terminal checkpoint 后触发既有
-`COMPLETING -> COMPLETED` 流程。sealed end 进入 ledger checkpoint；
-恢复 terminal checkpoint 时保持所有 SPMD blocked，恢复完 model/Driver state 后直接复用同一
-completion 路径，不重启 discovery。
-
-全图 completion 仍使用一个 global logical step，因此 control ledger 中 coordinated source 的
-sealed end 必须相同。不同 source 的 checkpoint cut 可以是向量；不同 sealed end 不能在 ledger
-语义中自动取最小值或最大值，否则分别会丢弃较长 source 的记录或要求较短 source 产生不存在的
-batch。worker 的 local EOF 不是另一个 ledger stream，而是对全图 terminal boundary 的单调
-上界观察，因此只在该事件通道中取最小值。
-独立图分支若要在不同位置结束，必须先定义 source position 到各 Driver clock 的显式映射。
-
-ledger 为每个 stream 独立保留 `[durable_cut, published_end)`。per-stream capacity 等于 checkpoint
-interval；容量耗尽时 append 等待 checkpoint commit notification，try_append 立即返回。独立容量避免快 stream 饿死其他
-stream。没有 checkpoint 时无法同时支持无限 control stream 与有界 retention，因此使用 control
-stream 会直接报错。
-
-完整代数模型与 topology independence 证明见
-[Source SPMD Formal Protocol](source_spmd_formal_protocol_zh.md)。
-
-## Exactly-Once Invariants
-
-对任意 stream：
-
-```text
-0 <= durable_cut <= published_end
-retained positions = [durable_cut, published_end)
-```
-
-`report_op_completed()` 只服务 Fluxway 原生调度和流控，不推进 durable cut。全图 drain cut 为 `C`
-时，Controller checkpoint 保存所有 `position >= C` 的 retained metadata。完整 checkpoint envelope
-原子发布成功后才令 `durable_cut := C`。
-
-```text
-applied(C) = {position | position < C}
-replay(C)  = {position | C <= position < published_end}
-applied(C) intersection replay(C) = empty
-```
-
-故 checkpoint 前的 logical position 不会重放，checkpoint 后已预取或读取的 position 可以重放。
-这保证 checkpoint-relative logical exactly-once，不声称对象存储物理读取或用户外部副作用
-exactly-once。
-
-## Drain 与 Checkpoint
-
-Source coordinator 复用 Driver 原有 drain/snapshot。普通周期 drain 与 terminal observation 使用
-同一个 `DrainBoundary` reducer 和 `DriverStateMachine`：
-
-Reducer 的阶段和事件含义如下：`OPEN` 表示无 active boundary；`OBSERVED` 表示已观察到
-terminal cut 但尚未完成 admission；`DRAINING` 表示 drain command 已广播并等待所有 rank；
-`DRAINED` 表示全图已到达 target；`SNAPSHOTTING` 表示 snapshot 正在进行；`COMPLETED`
-表示 terminal checkpoint 已原子提交。阶段只由 reducer 投影到宿主 FSM，不能由 Worker 或
-Driver 本地推进。
-
-周期请求 (`PERIODIC_REQUEST`)、source EOF (`TERMINAL_OBSERVATION`)、全图到达
-(`DRAIN_COMPLETE`)、开始快照 (`SNAPSHOT_BEGIN`)、原子提交 (`CHECKPOINT_COMMITTED`)、
-恢复 (`RESTORE`) 和迟到完成 (`LATE_COMPLETION`) 都进入同一个 reducer。最后一种事件只
-返回 clamp 后的报告值，不回写 execution cursor；terminal observation 只在尚未 commit 时
-收缩 boundary，commit 后更小 cut 必须失败。
-
-```text
-Controller RUNNING
-  -> periodic: request_drain(C)
-  -> terminal boundary event T: request_drain(min(C, T), terminal_cut=T)
-
-Driver RUNNING
-  -> DRAINING(target)
-  -> workers stop admitting step >= target
-  -> SPMDSynchronizer waits for every registered operator/rank
-  -> DRAINED
-  -> SNAPSHOTTING
-  -> RESUME -> RUNNING                 # 普通 checkpoint
-  -> Controller COMPLETING -> COMPLETED # terminal checkpoint
-```
-
-boundary command 的 Worker/Driver 语义是：
-
-```text
-execution_cursor >= target 允许存在
-committed_cut              = target only after atomic checkpoint publication
-checkpoint/runtime state    只保存 committed_cut
-source pipeline step >= target 直接丢弃
-```
-
-设置或收缩 boundary 不负责 source refill。Worker 先停止 cut 之后的 admission、取消或
-丢弃 speculative pipeline，再由唯一的 `_fill_source_pipeline()` 在后续正常调度点按
-terminal 状态、pipeline depth 和 `max_steps` 重新判断是否允许 enqueue；因此 drain cut
-不会被后台 refill 越过。
-
-terminal observation 只能收缩尚未 commit 的 drain。若已有已发布 checkpoint cut 大于该
-observation，reducer 直接抛出回退错误；不会回写 execution cursor 或伪造 durable progress。
-
-所以一个 virtual source 的 physical ranks 可以分别观察到 14 和 13；Controller 取 13，所有
-Driver 在同一 terminal barrier 上收敛，最终保存 logical step 13。
-
-具体保存路径为：
-
-```text
-request_drain
-  -> component DRAINING
-  -> metadata discovery quiesced
-  -> workers drain
-  -> Driver DRAINED
-  -> component checkpoint_state
-  -> worker registered SAVE capability save/finish_save/commit_save
-  -> Controller ControlLedger snapshot at cut C
-  -> retention reservation and atomic Manifest publish
-  -> commit in-memory durable cut
-```
-
-恢复走同一 Driver 生命周期：`READY → RESTORING → READY`。恢复尚未完成时 Driver 不能
-处理 `START`，因此 heartbeat 不会把 restore 中的 worker 误推进到运行态。
-
-Driver component checkpoint 只包含 source cursor、builder tail、至多一个尚未 append 的 control record、
-尚未展开成 batch 的紧凑 revision ranges 与 next chunk、
-source-domain lineage 和 terminal。Arrow、NumPy、`TransportTensor`、Ray handle 与 local prefetch
-payload 不进入 checkpoint。
-
-恢复时 Controller 先恢复 `ControlLedger`，Driver 再恢复 component metadata，最后通过各 component
-恢复 worker state。Dense/Orbax、sparse/Lance、reader cursor 和自定义格式都使用同一个
-`CheckpointContext` 与 capability-composed `CheckpointComponentRegistration` ABI。
-
-artifact transaction 按三层组合：Worker coordinator 回滚本进程已尝试的 component；Driver 在 save、
-finish_save 或 commit_save 失败时调用 worker rollback_save；全局 checkpointer 在 Manifest publish 前失败时 rollback
-所有 Driver 与 retention reservation。component 的 `rollback_save`、`cleanup`、`close` 语义互不替代；cleanup
-自身失败使用异常组同时保留主错误与 rollback 错误。只有完整 Manifest publish 后才 commit control
-ledger cut。
-
-## 同步与异步 Source
-
-同步 adapter 与异步 adapter 共用一个调用路径。`async def` 直接 await；阻塞的同步 catalog 或
-filesystem 方法通过 executor 执行。Reader hot path 只等待 exact-position record 和 materialization，
-不调用 catalog、`time.sleep()` 或 `Future.result()`。
-
-### EOF 的状态边界
-
-Fluxway 的 source ABI 不要求外部框架使用 `None` 表示耗尽。source component 应通过其
-typed source-result/terminal 适配层表达“有数据”或“已耗尽”；`None` 只允许存在于某个
-具体 Python iterator/reader adapter 的内部实现中，不能跨越 adapter 边界进入 Fluxway
-source contract。当前 Worker 对 interleaved source 的 `None` 兼容转换仅是旧适配路径，
-不应被新框架依赖，后续应收紧为显式 terminal result：
-
-- `SUCCESS` 表示一个真实数据 step，才允许发送 tensor frame 并推进 data watermark；
-- `SOURCE_EXHAUSTED` 是 typed source lifecycle 事件，不发送空 tensor/completion frame，也不推进 data
-  watermark；
-- Controller 只接受 source component 在 ControlLedger 上 seal 后产生的统一 terminal boundary，
-  再通过 terminal drain、checkpoint 和 `COMPLETING -> COMPLETED` 完成全图终止。
-
-因此 Worker-local EOF、ControlLedger sealed end 和 Controller global completion 各自只有一个
-事实来源，不能用 `None` 推断全局完成，也不能把 EOF 当作普通无 tensor 输出。
+> [!TIP]
+> 上述复杂的逻辑要求（包括 Quota、Canonical Coverage、Active-cycle 和 Owner-affinity）统一在相同的 Lowering 求解器中实现，避免多处硬编码。并且由于是 Transient Binding，系统可以在 Restore 后干净地重建分配，不打破 Canonical Source 规范。

@@ -33,15 +33,60 @@ from fluxway.common.types.sharding import (
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.profiler.user_api import function_scope
+from fluxway.common.operator_instances import OperatorInstanceContainer
+from fluxway.common.ingestion import SourceWorkItem
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionDispatcher,
-    create_dispatcher,
 )
 
 if TYPE_CHECKING:
     from fluxway.common.types import SPMDConfig
 
 logger = get_logger(__name__)
+
+
+def _validated_source_work_items(
+    op_name: str, step: int, values: Any | None
+) -> tuple[SourceWorkItem, ...]:
+    if not isinstance(values, tuple) or not values:
+        raise ValueError(
+            f"source-control operator {op_name!r} requires canonical source work"
+        )
+    if any(not isinstance(value, SourceWorkItem) for value in values):
+        raise TypeError(
+            f"source-control operator {op_name!r} requires SourceWorkItem values"
+        )
+    items = cast(tuple[SourceWorkItem, ...], values)
+    if any(item.key.step != step for item in items):
+        raise ValueError(
+            f"source-control operator {op_name!r} received work for another step"
+        )
+    assignment = items[0].assignment
+    signature = (
+        assignment.source_identity,
+        assignment.schema_digest,
+        assignment.global_batch_size,
+    )
+    if any(
+        (
+            item.assignment.source_identity,
+            item.assignment.schema_digest,
+            item.assignment.global_batch_size,
+        )
+        != signature
+        for item in items
+    ):
+        raise ValueError(
+            f"source-control operator {op_name!r} received incompatible work"
+        )
+    intervals = tuple(
+        (item.key, item.logical_start, item.logical_end) for item in items
+    )
+    if len(set(intervals)) != len(intervals):
+        raise ValueError(
+            f"source-control operator {op_name!r} received duplicate work intervals"
+        )
+    return items
 
 
 # =============================================================================
@@ -150,14 +195,6 @@ class ResolvedDependencyRoute:
         return self.dependency.spec.symmetric_to
 
     @property
-    def is_interleaved(self) -> bool:
-        return self.dependency.source_operator.spec.is_interleaved
-
-    @property
-    def interleave_unit_size(self) -> int:
-        return self.dependency.source_operator.spec.interleave_unit_size
-
-    @property
     def is_self_loop(self) -> bool:
         return (
             self.dependency.spec.source.spmd_id == self.dependency.spec.target.spmd_id
@@ -181,6 +218,7 @@ class OperatorManager:
         spmd_id: str = "",
         *,
         static_args: dict[str, Any],
+        instance_container: OperatorInstanceContainer,
         local_rank: int | None = None,
         local_world_size: int | None = None,
         node_rank: int = 0,
@@ -212,6 +250,9 @@ class OperatorManager:
         self._node_rank = node_rank
         self._num_nodes = num_nodes
         self._control_plane_handle = control_plane_handle
+        if not isinstance(instance_container, OperatorInstanceContainer):
+            raise TypeError("OperatorManager requires an OperatorInstanceContainer")
+        self._instance_container = instance_container
 
         self._operators: dict[str, Any] = {}
         self._compiled_operators: dict[str, CompiledOperator] = {}
@@ -287,6 +328,7 @@ class OperatorManager:
         # Performance Caches
         self._producer_cache: dict[tuple[int, int, int], list[int]] = {}
         self._source_layout_cache: dict[int, PhysicalLayout] = {}
+        self._source_dispatchers: dict[Any, ExecutionDispatcher] = {}
 
         self._compile_dependency_decisions()
         self._compile_ordering_dependencies()
@@ -314,34 +356,6 @@ class OperatorManager:
         self._target_layout_cache[transfer_code] = layout
         return layout
 
-    def _get_effective_layout(
-        self, routing: ShardingSpec, info: ResolvedDependencyRoute
-    ) -> PhysicalLayout:
-        mesh = info.mesh
-
-        if not info.is_interleaved:
-            return routing.bind(mesh)
-
-        # INTERLEAVED SOURCE ABSTRACTION:
-        # Override the data dimension to correctly represent the unit size.
-        unit_size = info.interleave_unit_size
-        other_dims_size = 1
-        for s in mesh.shape[1:]:
-            other_dims_size *= s
-
-        if unit_size % other_dims_size != 0:
-            raise ValueError(
-                f"[Fluxway Interleave Error] Topology '{info.spmd_id}' specifies interleave_unit_size={unit_size}, "
-                f"which is not divisible by the sub-mesh size {other_dims_size} (axes {mesh.axis_names[1:]}). "
-                "Ensure that the unit size is a multiple of the size of the non-sharded dimensions."
-            )
-
-        first_axis_size = unit_size // other_dims_size
-        new_shape = (first_axis_size,) + mesh.shape[1:]
-
-        sub_mesh = DeviceMesh(device_shape=new_shape, axis_names=mesh.axis_names)
-        return routing.bind(sub_mesh)
-
     def resolve_tensor_producers(
         self,
         op_name: str,
@@ -351,42 +365,35 @@ class OperatorManager:
     ) -> list[int]:
         route = self.get_predecessor_route(op_name, transfer_code)
 
-        step_mod = 0
-        if route.is_interleaved:
-            total_units = route.world_size // route.interleave_unit_size
-            if total_units <= 0:
-                raise ValueError(
-                    f"Transfer code {transfer_code} has invalid interleave topology."
-                )
-            step_mod = step % total_units
-
-        cache_key = (transfer_code, current_rank, step_mod)
+        source_key = route.dependency.source_operator.key
+        if source_key not in self._source_dispatchers:
+            self._source_dispatchers[source_key] = ExecutionDispatcher(
+                route.dependency.source_operator.execution_layout
+            )
+        source_dispatcher = self._source_dispatchers[source_key]
+        cycle = route.dependency.source_operator.execution_layout.cycle
+        cycle_index = step % len(cycle)
+        cache_key = (transfer_code, current_rank, cycle_index)
         if cache_key in self._producer_cache:
             return self._producer_cache[cache_key]
-
-        input_layout = self._get_target_layout(op_name, transfer_code)
-        effective_pre_layout = self._source_layout_cache.get(transfer_code)
-        if effective_pre_layout is None:
-            effective_pre_layout = self._get_effective_layout(
-                route.effective_source_sharding,
-                route,
+        unit_relation = route.dependency.unit_relation(transfer_code)
+        if unit_relation is not None:
+            producers = [
+                cycle[cycle_index][rank]
+                for rank in unit_relation.producers_by_target[current_rank]
+            ]
+        else:
+            input_layout = self._get_target_layout(op_name, transfer_code)
+            effective_pre_layout = self.get_transfer_source_layout(
+                op_name, transfer_code
             )
-            self._source_layout_cache[transfer_code] = effective_pre_layout
-
-        unit_base_rank = 0
-        if route.is_interleaved:
-            unit_base_rank = step_mod * route.interleave_unit_size
-
-        relative_producers = effective_pre_layout.resolve_producers(
-            input_layout,
-            current_rank,
-        )
-        unique_producers = {}
-        for rank in relative_producers:
-            identity = effective_pre_layout.get_logical_identity(rank)
-            if identity not in unique_producers:
-                unique_producers[identity] = rank + unit_base_rank
-        producers = list(unique_producers.values())
+            producers = source_dispatcher.resolve_active_producers(
+                effective_pre_layout,
+                input_layout,
+                current_rank,
+                cycle_index,
+                route.world_size,
+            )
 
         self._producer_cache[cache_key] = producers
         return producers
@@ -456,9 +463,8 @@ class OperatorManager:
         )
 
         for op_name in self._operators:
-            meta = self._get_operator_spec(op_name)
             compiled = self._get_compiled_operator(op_name)
-            self._dispatchers[op_name] = create_dispatcher(meta)
+            self._dispatchers[op_name] = ExecutionDispatcher(compiled.execution_layout)
             self._expected_control_arg_names[op_name] = compiled.get_arguments(
                 is_output=False,
                 arg_type=ArgumentType.CONTROL,
@@ -846,6 +852,17 @@ class OperatorManager:
     def get_operator_spec(self, op_name: str) -> OperatorSpec:
         return self._get_operator_spec(op_name)
 
+    def require_operator_instance(self, op_name: str) -> Any:
+        owner = self._get_operator_spec(op_name).owner
+        if owner is None:
+            raise RuntimeError(f"operator {op_name!r} has no owner class")
+        try:
+            return self._instance_container.require(owner)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"operator {op_name!r} has not been instantiated"
+            ) from error
+
     def operator_is_coroutine_function(self, op_name: str) -> bool:
         try:
             return self._operator_is_coroutine_function[op_name]
@@ -991,9 +1008,14 @@ class OperatorManager:
         cached = self._source_layout_cache.get(transfer_code)
         if cached is not None:
             return cached
-        layout = self._get_effective_layout(
-            route.effective_source_sharding,
-            route,
+        source_name = route.dependency.source_operator.key
+        if source_name not in self._source_dispatchers:
+            self._source_dispatchers[source_name] = ExecutionDispatcher(
+                route.dependency.source_operator.execution_layout
+            )
+        dispatcher = self._source_dispatchers[source_name]
+        layout = dispatcher.get_effective_source_layout(
+            route.mesh, route.effective_source_sharding
         )
         self._source_layout_cache[transfer_code] = layout
         return layout
@@ -1060,10 +1082,17 @@ class OperatorManager:
     # Execution
     # =========================================================================
 
-    def execute(self, op_name: str, step: int, *args: Any, **kwargs: Any) -> Any:
+    def execute(
+        self,
+        op_name: str,
+        step: int,
+        *args: Any,
+        source_work_items: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
         operator = self._operator_for_execution(op_name, coroutine_function=False)
         call_args, call_kwargs = self._operator_arguments(op_name, args, kwargs)
-        with self._operator_execution_context(op_name, step):
+        with self._operator_execution_context(op_name, step, source_work_items):
             with function_scope():
                 result = operator(*call_args, **call_kwargs)
         if _inspect.isawaitable(result):
@@ -1074,11 +1103,16 @@ class OperatorManager:
         return result
 
     async def execute_async(
-        self, op_name: str, step: int, *args: Any, **kwargs: Any
+        self,
+        op_name: str,
+        step: int,
+        *args: Any,
+        source_work_items: Any | None = None,
+        **kwargs: Any,
     ) -> Any:
         operator = self._operator_for_execution(op_name, coroutine_function=True)
         call_args, call_kwargs = self._operator_arguments(op_name, args, kwargs)
-        with self._operator_execution_context(op_name, step):
+        with self._operator_execution_context(op_name, step, source_work_items):
             with function_scope():
                 return await operator(*call_args, **call_kwargs)
 
@@ -1096,11 +1130,39 @@ class OperatorManager:
         return cast(Callable[..., Any], operator)
 
     @contextmanager
-    def _operator_execution_context(self, op_name: str, step: int) -> Iterator[None]:
+    def _operator_execution_context(
+        self,
+        op_name: str,
+        step: int,
+        source_work_items: Any | None = None,
+    ) -> Iterator[None]:
         from fluxway.common.decorators import operator_context
 
+        meta = self.get_operator_spec(op_name)
+        controlled_source = getattr(meta, "is_source", False) and getattr(
+            meta, "requires_source_control_runtime", False
+        )
+        if controlled_source:
+            source_work_items = _validated_source_work_items(
+                op_name, step, source_work_items
+            )
         dispatcher = self.get_dispatcher(op_name)
-        logical_ctx = dispatcher.get_logical_context(self._rank, self._world_size, step)
+        batch_size = 1
+        if isinstance(self._static_args, dict) and "batch_size" in self._static_args:
+            raw_batch_size = self._static_args["batch_size"]
+            if not isinstance(raw_batch_size, int) or raw_batch_size <= 0:
+                raise ValueError(
+                    f"batch_size in static_args must be a positive int, got {raw_batch_size!r}"
+                )
+            batch_size = raw_batch_size
+
+        logical_ctx = dispatcher.get_logical_context(
+            self._rank,
+            self._world_size,
+            step,
+            batch_size=batch_size,
+            source_work_items=source_work_items,
+        )
 
         with operator_context(
             static_args=self._static_args,
@@ -1115,6 +1177,7 @@ class OperatorManager:
             num_nodes=self._num_nodes,
             control_plane=self._control_plane_handle,
             ray_component_limits=self._ray_component_limits,
+            instance_container=self._instance_container,
         ):
             yield
 

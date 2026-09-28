@@ -18,7 +18,7 @@ class ProfilerConfig:
     max_clock_uncertainty_ns: int = 1_000_000
     fail_on_buffer_exhaustion: bool = True
     output_file: str | None = None
-    diagnostics: frozenset[ProfilerDiagnostic | str] = frozenset()
+    diagnostics: frozenset[ProfilerDiagnostic] = frozenset()
     skip_initial_steps: int = 0
     steady_state_only: bool = False
 
@@ -39,11 +39,12 @@ class ProfilerConfig:
             )
         if self.skip_initial_steps < 0:
             raise ValueError("ProfilerConfig.skip_initial_steps must be non-negative.")
-        object.__setattr__(
-            self,
-            "diagnostics",
-            frozenset(ProfilerDiagnostic(item) for item in self.diagnostics),
-        )
+        if not isinstance(self.diagnostics, frozenset):
+            raise TypeError("ProfilerConfig.diagnostics must be a frozenset")
+        if any(not isinstance(item, ProfilerDiagnostic) for item in self.diagnostics):
+            raise TypeError(
+                "ProfilerConfig.diagnostics must contain ProfilerDiagnostic values"
+            )
 
     @property
     def run_dir(self) -> Path:

@@ -187,6 +187,8 @@ def test_bind_spmd_as_source():
 
 def test_bind_spmd_source_descriptor_is_validated_with_source_trait():
     class Descriptor:
+        requires_source_control_runtime = False
+
         def build_component(self, context):
             raise AssertionError("descriptor construction is a Driver responsibility")
 

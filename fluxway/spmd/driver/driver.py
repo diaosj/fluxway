@@ -18,6 +18,7 @@ import time
 from typing import Any
 
 import ray
+from fluxway.common.types.drain import DrainAdmission
 from fluxway.common.types import (
     CheckpointCut,
     DriverEvent,
@@ -31,6 +32,7 @@ from fluxway.common.types import (
     DrainEvent,
 )
 from fluxway.common.utils import ensure_logging_configured
+from fluxway.common.driver_control import DriverComponentCapabilities
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.driver.credit import CreditUpdate, CreditWindow
 from fluxway.spmd.driver.state_machine import DriverStateMachine
@@ -95,10 +97,10 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         )
         self.monitor = SPMDMonitor(spmd_id)
 
-        # Worker ready/running tracking
+        # Worker readiness aggregation
         self._workers_ready: bool = False
-        self._workers_running: bool = False
-        self._stopping: bool = False
+        self._topology_ready: bool = False
+        self._shutdown_task: asyncio.Task[None] | None = None
 
         # Heartbeat tracking for HeartbeatManager to read
         self._worker_heartbeats: dict[int, WorkerHeartbeat] = {}
@@ -106,15 +108,6 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
 
         # Backpressure / Pause control
         self._is_paused = False
-        self._driver_components: DriverComponentRegistry = (
-            build_driver_component_registry(
-                config,
-                spmd_id=spmd_id,
-                controller_handle=controller_handle,
-                report_failure=self._report_component_failure,
-            )
-        )
-        self._driver_component_notification_tasks: set[asyncio.Task[None]] = set()
 
         profiler_config = getattr(config, "profiler_config", None)
         self._profiler_runtime = ProfilerRuntimeFactory.from_config(
@@ -131,6 +124,16 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             worker_resource=worker_resource,
             expected_node_ids=expected_node_ids,
         )
+        self._driver_components: DriverComponentRegistry = (
+            build_driver_component_registry(
+                config,
+                spmd_id=spmd_id,
+                controller_handle=controller_handle,
+                report_failure=self._report_component_failure,
+                capabilities=DriverComponentCapabilities(worker_control=self.executor),
+            )
+        )
+        self._driver_component_notification_tasks: set[asyncio.Task[None]] = set()
 
         self.snapshot_orchestrator = SnapshotOrchestrator(
             spmd_id=self.spmd_id,
@@ -154,7 +157,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             get_driver_state=lambda: self.state_machine.state,
             get_driver_failure=lambda: self.state_machine.failure,
             get_workers_ready=lambda: self._workers_ready,
-            get_workers_running=lambda: self._workers_running,
+            get_topology_ready=lambda: self._topology_ready,
             get_worker_heartbeat_times=lambda: self._worker_heartbeat_times,
             controller_handle=self.controller_handle,
             trigger_state_event=lambda e, failure: self.state_machine.trigger(
@@ -162,6 +165,8 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             ),
             receive_worker_failure=self.receive_worker_failure,
             profiler_runtime=self._profiler_runtime,
+            get_worker_heartbeats=lambda: self._worker_heartbeats,
+            inactivity_timeout_s=self.config.inactivity_timeout_s,
         )
 
         self.credit_manager = CreditManager(
@@ -309,16 +314,34 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         except Exception as e:
             logger.error(f"Failed to block workers error={e} spmd_id={self.spmd_id}")
 
-    async def stop(self, save_checkpoint: bool = True) -> None:
+    @property
+    def _stopping(self) -> bool:
+        return self.state_machine.state in (DriverState.STOPPING, DriverState.STOPPED)
+
+    async def stop(self, save_checkpoint: bool = False) -> None:
+        if save_checkpoint:
+            raise ValueError(
+                "Driver stop requires checkpoint coordination before shutdown"
+            )
+        if self._shutdown_task is None:
+            self.state_machine.require_transition(DriverEvent.STOP)
+            self._shutdown_task = asyncio.create_task(self._shutdown())
+            self._shutdown_task.add_done_callback(self._shutdown_finished)
+        await asyncio.shield(self._shutdown_task)
+
+    def _shutdown_finished(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _shutdown(self) -> None:
         logger.debug(f"Stopping spmd_id={self.spmd_id}")
-        self._stopping = True
         shutdown_errors: list[Exception] = []
         try:
             await self._wait_for_driver_component_notifications()
         except Exception as error:
             shutdown_errors.append(error)
         try:
-            await self._notify_driver_components(DriverState.COMPLETED)
+            await self._notify_driver_components(DriverState.STOPPING)
         except Exception as error:
             shutdown_errors.append(error)
         try:
@@ -326,8 +349,11 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         except Exception as error:
             shutdown_errors.append(error)
 
-        executor_errors = await self.executor.stop_workers()
-        shutdown_errors.extend(executor_errors)
+        try:
+            shutdown_errors.extend(await self.executor.stop_workers())
+        except Exception as error:
+            shutdown_errors.append(error)
+        self.state_machine.require_transition(DriverEvent.STOPPED)
 
         if shutdown_errors:
             raise ExceptionGroup(
@@ -339,14 +365,21 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
     # Snapshot Orchestration
     # =====================================================================
 
-    async def request_drain(
-        self,
-        target_count: int,
-        terminal_cut: int | None = None,
-        reason: str = "",
-    ) -> None:
-        await self.snapshot_orchestrator.request_drain(
-            target_count, terminal_cut, reason
+    async def request_drain(self, admission: DrainAdmission) -> None:
+        await self.snapshot_orchestrator.request_drain(admission)
+
+    async def dispatch_component_request(
+        self, component_id: str, request: object
+    ) -> object:
+        return await self._driver_components.dispatch_request(component_id, request)
+
+    async def forward_control_plane_request(self, request: object) -> object:
+        if self.controller_handle is None:
+            raise RuntimeError(
+                f"SPMD {self.spmd_id!r} cannot forward a control request without Controller"
+            )
+        return await self.controller_handle.dispatch_control_plane_request.remote(
+            request
         )
 
     async def prepare_snapshot(
@@ -427,20 +460,22 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                     self.state_machine.trigger(DriverEvent.INIT_COMPLETE)
                     logger.heartbeat(f"INIT_COMPLETE triggered spmd_id={self.spmd_id}")
 
-        if not self._workers_running and self._workers_ready:
+        if not self._topology_ready and self._workers_ready:
             from fluxway.common.types import WorkerStatus
 
-            all_running = all(
-                hb.status in (WorkerStatus.RUNNING, WorkerStatus.BLOCKED)
+            all_ready = all(
+                hb.status
+                in (
+                    WorkerStatus.READY,
+                    WorkerStatus.RESTORING,
+                    WorkerStatus.RUNNING,
+                    WorkerStatus.BLOCKED,
+                )
                 for hb in self._worker_heartbeats.values()
             )
-            if all_running and len(self._worker_heartbeats) >= self.config.num_workers:
-                self._workers_running = True
-                logger.heartbeat(
-                    f"All workers running triggering START spmd_id={self.spmd_id}"
-                )
-                if self.state_machine.state is DriverState.READY:
-                    self.state_machine.trigger(DriverEvent.START)
+            if all_ready and len(self._worker_heartbeats) >= self.config.num_workers:
+                self._topology_ready = True
+                logger.heartbeat(f"All worker runtimes ready spmd_id={self.spmd_id}")
 
     def receive_worker_failure(self, rank: int, failure: ExecutionFailure) -> None:
         if self._stopping:
@@ -647,11 +682,15 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
         logger.debug(f"Sources resumed spmd_id={self.spmd_id}")
         self.executor.resume_sources()
 
+    async def activate_execution(self) -> None:
+        self.state_machine.require_transition(DriverEvent.START)
+        await self.executor.activate_execution()
+        self.state_machine.require_transition(DriverEvent.ACTIVATION_COMPLETE)
+        self.spmd_synchronizer.unblock_all_ops()
+        await self._notify_driver_components(DriverState.RUNNING)
+
     async def start_source_operators(self) -> None:
-        started_from_ready = self.state_machine.state is DriverState.READY
-        if self.state_machine.state is DriverState.READY:
-            self.state_machine.require_transition(DriverEvent.START)
-        elif self.state_machine.state not in {
+        if self.state_machine.state not in {
             DriverState.RUNNING,
             DriverState.DRAINING,
             DriverState.DRAINED,
@@ -660,9 +699,6 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                 "source operators require a running Driver, got "
                 f"{self.state_machine.state.name} spmd_id={self.spmd_id}"
             )
-        if started_from_ready:
-            self.spmd_synchronizer.unblock_all_ops()
-        await self._notify_driver_components(DriverState.RUNNING)
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.driver_source_start(
                 worker_count=len(self.executor.get_worker_handles()),
