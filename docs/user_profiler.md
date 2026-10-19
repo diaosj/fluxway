@@ -53,6 +53,14 @@ Worker duration slices use this Perfetto hierarchy:
 
 ```text
 SPMDs/<spmd_id>/rank:<rank>/<subsystem>/<leaf>/lane:<lane>
+
+Controller lifecycle events use a sibling root branch:
+
+Controller/<subsystem>/<leaf>
+
+`Controller` and `SPMDs` are the two top-level execution owners. Controller
+records use a separate control-plane recorder entrypoint but share the same
+fixed-width recorder and export pipeline.
 ```
 
 Expand a rank to inspect its compute, transport, mailbox, and scheduler
@@ -117,9 +125,12 @@ name map.
 The recorder hot path continues to store only fixed-width integer records.
 Graph names are not copied into each event and no graph lookup happens while an
 operator runs. The frozen profiler symbol projection is built once from the
-current `CompiledGraph` during trace export. A missing operator, transfer, or
-logical tensor identity raises `MissingGraphTraceSymbol`; Fluxway does not emit
-an incomplete name as a fallback.
+current `CompiledGraph` during trace export. Events carrying an explicit
+operator, transfer, or logical-tensor identity must resolve it and raise
+`MissingGraphTraceSymbol` when it is absent. Lifecycle metadata such as
+`execution.phase` may intentionally carry an empty operator id; it is annotated
+as non-operator metadata and does not enter the compiled-operator index. Fluxway
+does not emit an incomplete name as a fallback.
 
 ## Rules
 

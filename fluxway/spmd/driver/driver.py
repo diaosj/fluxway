@@ -30,9 +30,15 @@ from fluxway.common.types import (
     SpmdCheckpoint,
     WorkerHeartbeat,
     DrainEvent,
+    RestoreOptionsByRank,
 )
 from fluxway.common.utils import ensure_logging_configured
 from fluxway.common.driver_control import DriverComponentCapabilities
+from fluxway.common.effect_scheduler import (
+    BoundedLifecycleEffectScheduler,
+    LifecycleEffectExecutionMode,
+    LifecycleEffectSubmission,
+)
 from fluxway.rpc.protocol import DataPlaneCallable
 from fluxway.spmd.driver.credit import CreditUpdate, CreditWindow
 from fluxway.spmd.driver.state_machine import DriverStateMachine
@@ -86,6 +92,10 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
 
         # State machine
         self.state_machine = DriverStateMachine(self)
+        self._effect_scheduler = BoundedLifecycleEffectScheduler(
+            queue_size=64, worker_count=4
+        )
+        self._driver_effect_outcomes: set[asyncio.Future] = set()
 
         self.spmd_synchronizer = SPMDSynchronizer(
             spmd_id=spmd_id,
@@ -183,6 +193,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
     # =====================================================================
 
     async def initialize(self, checkpoint_id: str | None = None) -> None:
+        await self._effect_scheduler.start()
         profiler_recorder = (
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
@@ -235,6 +246,8 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
                     exception=e,
                 ),
             )
+            await self._wait_for_driver_effects()
+            await self._effect_scheduler.close()
             raise
         finally:
             if span is not None:
@@ -307,12 +320,64 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
 
     def _block_all_workers(self) -> None:
         """Block all workers (internal method)."""
-        try:
-            ops = list(self.spmd_synchronizer.get_spmd_steps().keys())
-            for op_name in ops:
-                self.spmd_synchronizer.block_spmd_op(op_name)
-        except Exception as e:
-            logger.error(f"Failed to block workers error={e} spmd_id={self.spmd_id}")
+        ops = tuple(self.spmd_synchronizer.get_spmd_steps())
+        for op_name in ops:
+            self.spmd_synchronizer.block_spmd_op(op_name)
+
+    def _submit_driver_effect(
+        self,
+        operation: Any,
+        *,
+        args: tuple[Any, ...] = (),
+        effect_name: str,
+        state_revision: int,
+    ) -> None:
+        if not self._effect_scheduler.started:
+            raise RuntimeError("Driver effect scheduler is not started")
+        submission = LifecycleEffectSubmission(
+            operation=operation,
+            args=args,
+            ordering_key=f"driver:{self.spmd_id}",
+            state_revision=state_revision,
+            mode=LifecycleEffectExecutionMode.THREAD,
+        )
+        outcome = self._effect_scheduler.submit(submission)
+        self._driver_effect_outcomes.add(outcome)
+        outcome.add_done_callback(
+            lambda completed: self._driver_effect_finished(
+                completed, effect_name=effect_name
+            )
+        )
+
+    def _driver_effect_finished(
+        self,
+        outcome: asyncio.Future,
+        *,
+        effect_name: str,
+    ) -> None:
+        self._driver_effect_outcomes.discard(outcome)
+        if outcome.cancelled():
+            return
+        result = outcome.result()
+        if result.error is not None:
+            if result.state_revision != self.state_machine.state_revision:
+                logger.error(
+                    "Stale Driver effect failure state_revision=%s current=%s effect=%s: %s",
+                    result.state_revision,
+                    self.state_machine.state_revision,
+                    effect_name,
+                    result.error,
+                    exc_info=result.error,
+                )
+                return
+            self._report_component_failure(
+                RuntimeError(f"driver effect {effect_name} failed: {result.error}")
+            )
+
+    async def _wait_for_driver_effects(self) -> None:
+        outcomes = tuple(self._driver_effect_outcomes)
+        if outcomes:
+            await asyncio.gather(*outcomes)
 
     @property
     def _stopping(self) -> bool:
@@ -353,6 +418,11 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
             shutdown_errors.extend(await self.executor.stop_workers())
         except Exception as error:
             shutdown_errors.append(error)
+        try:
+            await self._wait_for_driver_effects()
+            await self._effect_scheduler.close()
+        except Exception as error:
+            shutdown_errors.append(error)
         self.state_machine.require_transition(DriverEvent.STOPPED)
 
         if shutdown_errors:
@@ -384,42 +454,47 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
 
     async def prepare_snapshot(
         self,
-        snapshot_id: str,
+        checkpoint_id: str,
         attempt_id: str,
         permit: Any,
         cut: CheckpointCut,
         repository_root: str,
     ) -> None:
         await self.snapshot_orchestrator.prepare_snapshot(
-            snapshot_id, attempt_id, permit, cut, repository_root
+            checkpoint_id, attempt_id, permit, cut, repository_root
         )
 
     async def capture_driver_components(
-        self, snapshot_id: str, cut: CheckpointCut
+        self, checkpoint_id: str, cut: CheckpointCut
     ) -> SpmdCheckpoint:
-        return self.snapshot_orchestrator.capture_driver_components(snapshot_id, cut)
+        return self.snapshot_orchestrator.capture_driver_components(checkpoint_id, cut)
 
     async def resume(self) -> None:
         await self.snapshot_orchestrator.resume()
 
-    async def publish_snapshot(self, snapshot_id: str, permit: Any) -> None:
-        await self.snapshot_orchestrator.publish_save(snapshot_id, permit)
+    async def publish_snapshot(self, checkpoint_id: str, permit: Any) -> bool:
+        return await self.snapshot_orchestrator.publish_save(checkpoint_id, permit)
 
-    async def rollback_snapshot(self, snapshot_id: str, permit: Any) -> None:
-        await self.snapshot_orchestrator.rollback_save(snapshot_id, permit)
+    async def rollback_snapshot(self, checkpoint_id: str, permit: Any) -> None:
+        await self.snapshot_orchestrator.rollback_save(checkpoint_id, permit)
 
-    async def fail_snapshot(self, snapshot_id: str) -> None:
-        await self.snapshot_orchestrator.fail_snapshot(snapshot_id)
+    async def fail_snapshot(self, checkpoint_id: str) -> None:
+        await self.snapshot_orchestrator.fail_snapshot(checkpoint_id)
 
     async def restore_from_manifest(
         self,
-        snapshot_id: str,
+        checkpoint_id: str,
         cut: CheckpointCut,
         snapshot: SpmdCheckpoint,
         repository_root: str,
+        restore_options_by_rank: RestoreOptionsByRank | None = None,
     ) -> None:
         await self.snapshot_orchestrator.restore_from_manifest(
-            snapshot_id, cut, snapshot, repository_root
+            checkpoint_id,
+            cut,
+            snapshot,
+            repository_root,
+            restore_options_by_rank,
         )
 
     # =====================================================================
@@ -618,12 +693,7 @@ class SPMDDriver:  # pyright: ignore[reportRedeclaration]
 
     def _report_completion(self) -> None:
         if self.controller_handle is not None:
-            try:
-                self.controller_handle.report_spmd_completed.remote(self.spmd_id)
-            except Exception as e:
-                logger.error(
-                    f"Failed to report completion error={e} spmd_id={self.spmd_id}"
-                )
+            self.controller_handle.report_spmd_completed.remote(self.spmd_id)
 
     def _report_error(self, failure: ExecutionFailure) -> None:
         if self.controller_handle is not None:

@@ -351,7 +351,6 @@ class LexicographicObjective(PlacementModel):
 
 class PlacementRecipe(PlacementModel):
     recipe_id: str = Field(min_length=1)
-    version: str = Field(min_length=1)
     constraints: tuple[ConstraintNode, ...]
     objective: LexicographicObjective
 
@@ -582,7 +581,7 @@ def lexicographic(*objectives: Objective) -> LexicographicObjective:
 
 
 _AFFINITY_RELATIONS = affinity_constraints()
-AFFINITY_FIRST_V1 = lexicographic(
+AFFINITY_FIRST = lexicographic(
     max_min(weighted_dominant_share(incident_spmds(_AFFINITY_RELATIONS))),
     max_min(weighted_dominant_share(isolated_spmds(_AFFINITY_RELATIONS))),
     minimize(cardinality(support(all_workers()))),

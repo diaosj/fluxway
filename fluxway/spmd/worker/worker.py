@@ -66,12 +66,14 @@ from fluxway.common.types import (
     TopologySnapshot,
     WorkerHeartbeat,
     WorkerStatus,
+    ExecutionWaitState,
     CheckpointActivityPhase,
     DrainBoundary,
     DrainEvent,
     DrainEventKind,
     DrainPhase,
     reduce_drain_boundary,
+    RestoreOptionsByComponent,
 )
 from fluxway.common.coherence import (
     CoherenceAction,
@@ -97,6 +99,12 @@ from fluxway.common.types.tensor import (
     TransportTensor,
     runtime_allocation_descriptor,
 )
+from fluxway.common.resource_registry import (
+    ResourceRegistry,
+    set_active_resource_registry,
+    reset_active_resource_registry,
+)
+from fluxway.common.logical_partition_binding import LogicalPartitionBinding
 from fluxway.control_plane.ledger_client import ControlPlaneClient
 from fluxway.common.types.sharding import (
     ShardingSpec,
@@ -195,7 +203,10 @@ from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionStatus,
     ExecutionResult,
 )
-from fluxway.spmd.worker.source_scope import SourceExecutionScope
+from fluxway.spmd.worker.source_scope import (
+    SourceExecutionScope,
+    SourceExhaustedError,
+)
 from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle, WorkerPhase
 from fluxway.spmd.worker.admission import AdmissionAction, StepAdmissionState
 from fluxway.spmd.worker.source_maintenance import SourcePipelineMaintenance
@@ -234,6 +245,34 @@ _COMMIT_STEP_RESOURCE_SALT = "__fluxway_commit_step_resource__"
 _EXECUTION_DEFAULT_LANE = USER_CALLABLE_DEFAULT_OPERATOR_LANE
 _EXECUTION_STOP_OP = "__stop__"
 _EXECUTION_STOP_ITEM = (999, 0, 0, _EXECUTION_STOP_OP)
+
+
+def _classify_execution_wait_state(
+    *,
+    execution_phase: str | None,
+    execution_phase_active: bool,
+    active_plan_steps: bool,
+    pending_plan_tasks: bool,
+    pending_send_tasks: bool,
+    pending_input_prepare_tasks: bool,
+    queued_work: bool,
+    pending_admission: bool,
+) -> ExecutionWaitState:
+    if execution_phase_active and execution_phase is not None:
+        if execution_phase.startswith("source_scope."):
+            return ExecutionWaitState.SOURCE_ADMISSION_WAIT
+        return ExecutionWaitState.OPERATOR_EXECUTION_ACTIVE
+    if active_plan_steps or pending_plan_tasks:
+        return ExecutionWaitState.OPERATOR_EXECUTION_ACTIVE
+    if pending_send_tasks:
+        return ExecutionWaitState.OUTBOUND_TRANSPORT_WAIT
+    if pending_input_prepare_tasks:
+        return ExecutionWaitState.INPUT_PREPARE_WAIT
+    if queued_work:
+        return ExecutionWaitState.EXECUTION_QUEUE_WAIT
+    if pending_admission:
+        return ExecutionWaitState.OPERATOR_ADMISSION_WAIT
+    return ExecutionWaitState.COMPLETION_BARRIER_OR_DRIVER_WAIT
 
 
 def _assemble_detail_span(
@@ -392,6 +431,35 @@ def _describe_layout_for_error(layout: ShardingSpec | PhysicalLayout | None) -> 
 
 
 logger = get_logger(__name__)
+
+
+def _resolve_logical_partition_bindings(
+    value: Any, logical_partition_id: int, logical_mesh: Any
+) -> Any:
+    if isinstance(value, LogicalPartitionBinding):
+        return value.resolve(logical_partition_id, logical_mesh=logical_mesh)
+    if isinstance(value, Mapping):
+        return {
+            key: _resolve_logical_partition_bindings(
+                item, logical_partition_id, logical_mesh
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(
+            _resolve_logical_partition_bindings(
+                item, logical_partition_id, logical_mesh
+            )
+            for item in value
+        )
+    if isinstance(value, list):
+        return [
+            _resolve_logical_partition_bindings(
+                item, logical_partition_id, logical_mesh
+            )
+            for item in value
+        ]
+    return value
 
 
 @dataclass(frozen=True)
@@ -617,8 +685,20 @@ class SPMDWorker:
         self.rank = rank
         self.spmd_id = spmd_id or ""
         register_system_signal_metadata(spmd_id=self.spmd_id, rank=self.rank)
+
+        self._resource_registry = ResourceRegistry()
+
         self._tensor_device = tensor_device
         self._execution_lifecycle = WorkerExecutionLifecycle()
+        self._execution_generation = 0
+        self._execution_epoch = 0
+        self._execution_sequence = 0
+        self._execution_operator: str | None = None
+        self._execution_step: int | None = None
+        self._execution_phase: str | None = None
+        self._execution_phase_active = False
+        self._execution_phase_started_timestamp = time.time()
+        self._last_execution_activity_timestamp = time.time()
         self._graph_view = config.require_graph_view()
         self._operator_specs = {
             op_id: config.operator_specs[op_id]
@@ -983,6 +1063,7 @@ class SPMDWorker:
             for op_id in graph_view.operator_ids:
                 try:
                     op_meta = config.operator_specs[op_id]
+                    compiled_op = graph_view.operator(op_id)
                 except KeyError as exc:
                     raise RuntimeError(
                         f"SPMDConfig {config.spmd_id!r} is missing active operator "
@@ -998,7 +1079,16 @@ class SPMDWorker:
                 if container.get(cls) is not None:
                     continue
 
-                init_kwargs = operator_initialization_arguments(cls, static_args)
+                execution_group = compiled_op.execution_layout.group_for_rank(rank)
+                logical_partition_id = execution_group.logical_rank(rank)
+                resolved_static_args = _resolve_logical_partition_bindings(
+                    static_args,
+                    logical_partition_id,
+                    execution_group.logical_mesh,
+                )
+                init_kwargs = operator_initialization_arguments(
+                    cls, resolved_static_args
+                )
 
                 instance = object.__new__(cls)
                 _inject_context_properties(cls)
@@ -1099,7 +1189,14 @@ class SPMDWorker:
     async def acquire_source_operator_work(
         self, operator_name: str, step: int
     ) -> tuple[SourceWorkLease, ...]:
-        return await self._source_scope.take(operator_name, step)
+        self._record_execution_phase(
+            "source_scope.wait", op_name=operator_name, step=step
+        )
+        leases = await self._source_scope.take(operator_name, step)
+        self._record_execution_phase(
+            "source_scope.take", op_name=operator_name, step=step
+        )
+        return leases
 
     async def _acquire_source_work(
         self, epoch: int, segments: tuple[CompiledSegment, ...]
@@ -1148,11 +1245,17 @@ class SPMDWorker:
                 "num_nodes": num_nodes,
                 "rank0_address": rank0_address,
             }
-            self._pre_instantiate_operators(
-                self.config,
-                self.rank,
-                **preinstantiate_kwargs,
+            resource_registry_token = set_active_resource_registry(
+                self._resource_registry
             )
+            try:
+                self._pre_instantiate_operators(
+                    self.config,
+                    self.rank,
+                    **preinstantiate_kwargs,
+                )
+            finally:
+                reset_active_resource_registry(resource_registry_token)
             logger.debug(
                 "setup_and_start_preinstantiate_complete spmd_id=%s rank=%s",
                 self.spmd_id,
@@ -1396,6 +1499,9 @@ class SPMDWorker:
         if not self._execution_lifecycle.activate():
             return
 
+        self._execution_generation = getattr(self, "_execution_generation", 0) + 1
+        self._record_execution_phase("execution.activate")
+
         if self.config.auto_start_source_operators:
             self._spawn_background_task(self._trigger_source_operators())
         for op_name, steps in self._mailbox_ready_steps.items():
@@ -1460,6 +1566,7 @@ class SPMDWorker:
         self._failure = failure
         self._execution_lifecycle.fail()
         self._fence_state = ExecutionFenceState.CLOSING
+        asyncio.create_task(self._source_scope.fail_all(exception))
 
         for execution_queue in self._execution_queues.values():
             execution_queue.put_nowait(_EXECUTION_STOP_ITEM)
@@ -1614,8 +1721,19 @@ class SPMDWorker:
                 f"source operator {op_name!r} does not implement "
                 "activate_ingestion_layout"
             )
+        self._execution_epoch = activation.epoch
+        self._record_execution_phase(
+            "activation.dispatch.begin",
+            op_name=op_name,
+            step=activation.start_position,
+        )
         await self._source_scope.activate(
             op_name, activation, owner.activate_ingestion_layout
+        )
+        self._record_execution_phase(
+            "activation.install.end",
+            op_name=op_name,
+            step=activation.end_position - 1,
         )
         return None
 
@@ -2730,6 +2848,13 @@ class SPMDWorker:
         await self._run_execution_lane_loop(_EXECUTION_DEFAULT_LANE)
 
     async def _run_execution_lane_loop(self, lane: str) -> None:
+        token = set_active_resource_registry(self._resource_registry)
+        try:
+            await self._run_execution_lane_loop_bound(lane)
+        finally:
+            reset_active_resource_registry(token)
+
+    async def _run_execution_lane_loop_bound(self, lane: str) -> None:
         """
         Internal main execution loop (async).
 
@@ -2821,6 +2946,7 @@ class SPMDWorker:
     async def _shutdown(self) -> None:
         self._fence_state = ExecutionFenceState.CLOSING
         self._driver_handle = None
+        await self._source_scope.cancel()
         # Wake any worker blocked on drain condition
         async with self._drain_cond:
             self._drain_step_count = None
@@ -3056,6 +3182,7 @@ class SPMDWorker:
             return
         self._declare_step_coherence_intents(op_name, step)
         self._record_local_plan_scheduled(op_name, step)
+        self._record_execution_phase("admission.accepted", op_name=op_name, step=step)
         self._running_plan_steps[op_name].add(step)
         task = asyncio.create_task(self._run_local_step_plan(op_name, step))
         self._plan_tasks.add(task)
@@ -3244,7 +3371,40 @@ class SPMDWorker:
             result_node=4,
         )
 
+    def _record_execution_phase(
+        self,
+        phase: str,
+        *,
+        op_name: str | None = None,
+        step: int | None = None,
+        epoch: int | None = None,
+    ) -> None:
+        """Record opaque execution metadata without interpreting a backend."""
+        now = time.time()
+        self._last_execution_activity_timestamp = now
+        self._execution_phase = phase
+        self._execution_phase_started_timestamp = now
+        self._execution_phase_active = phase.endswith((".begin", ".wait")) or (
+            phase == "admission.accepted"
+        )
+        self._execution_operator = op_name
+        self._execution_step = step
+        if epoch is not None:
+            self._execution_epoch = epoch
+        self._execution_sequence = getattr(self, "_execution_sequence", 0) + 1
+        if not getattr(self._profiler_runtime, "enabled", False):
+            return
+        self._profiler_runtime.recorder.execution_phase(
+            phase=phase,
+            op_name=op_name,
+            step=step,
+            epoch=getattr(self, "_execution_epoch", 0),
+            sequence=self._execution_sequence,
+            execution_generation=getattr(self, "_execution_generation", 0),
+        )
+
     async def _run_local_step_plan(self, op_name: str, step: int) -> ExecutionResult:
+        self._record_execution_phase("local_plan.begin", op_name=op_name, step=step)
         try:
             plan = self._local_step_plan_cache[op_name]
         except KeyError as exc:
@@ -3253,7 +3413,15 @@ class SPMDWorker:
             ) from exc
         registry = self._operator_local_node_registry(op_name, step)
         context = LocalStepContext(op_name=op_name, step=step)
-        return await self._local_step_plan_executor.execute(plan, registry, context)
+        try:
+            result = await self._local_step_plan_executor.execute(
+                plan, registry, context
+            )
+        except BaseException:
+            self._record_execution_phase("local_plan.error", op_name=op_name, step=step)
+            raise
+        self._record_execution_phase("local_plan.end", op_name=op_name, step=step)
+        return result
 
     def _operator_local_node_registry(
         self, op_name: str, step: int
@@ -3350,28 +3518,15 @@ class SPMDWorker:
                 f"metadata from WAIT; actual_type={type(input_data).__name__}."
             )
         operator_input = input_data.value
+        self._record_execution_phase(
+            "operator.invocation.begin", op_name=op_name, step=step
+        )
         await self._apply_operator_tensor_access(op_name, step, input_data)
         recorder = (
             self._profiler_runtime.recorder if self._profiler_runtime.enabled else None
         )
-        if recorder is None:
-            spec = self._operator_user_callable_spec(
-                op_name,
-                step,
-                operator_input,
-                source_work_items=input_data.source_work_items,
-            )
-            result = (
-                await self._local_step_plan_executor.user_callable_executor.execute(
-                    spec
-                )
-            )
-        else:
-            async with recorder.local_step_node(
-                spec=LOCAL_STEP_CALL_USER,
-                op_name=op_name,
-                step=step,
-            ):
+        try:
+            if recorder is None:
                 spec = self._operator_user_callable_spec(
                     op_name,
                     step,
@@ -3383,7 +3538,33 @@ class SPMDWorker:
                         spec
                     )
                 )
-        return self._normalize_interleaved_source_result(op_name, step, result)
+            else:
+                async with recorder.local_step_node(
+                    spec=LOCAL_STEP_CALL_USER,
+                    op_name=op_name,
+                    step=step,
+                ):
+                    spec = self._operator_user_callable_spec(
+                        op_name,
+                        step,
+                        operator_input,
+                        source_work_items=input_data.source_work_items,
+                    )
+                    result = await self._local_step_plan_executor.user_callable_executor.execute(
+                        spec
+                    )
+            normalized = self._normalize_interleaved_source_result(
+                op_name, step, result
+            )
+        except BaseException:
+            self._record_execution_phase(
+                "operator.invocation.error", op_name=op_name, step=step
+            )
+            raise
+        self._record_execution_phase(
+            "operator.invocation.end", op_name=op_name, step=step
+        )
+        return normalized
 
     async def _apply_operator_tensor_access(
         self,
@@ -4276,7 +4457,10 @@ class SPMDWorker:
         meta = self.config.require_graph_view().operator(op_name).spec
         source_work_items: tuple[SourceWorkItem, ...] | None = None
         if meta.is_source is True and meta.requires_source_control_runtime:
-            leases = await self.acquire_source_operator_work(op_name, step)
+            try:
+                leases = await self.acquire_source_operator_work(op_name, step)
+            except SourceExhaustedError:
+                return ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
             source_work_items = tuple(lease.item for lease in leases)
 
         if self._uses_direct_local_input_fast_path(op_name):
@@ -6093,6 +6277,7 @@ class SPMDWorker:
             op_name: Operation name
             step: Completed step number
         """
+        self._record_execution_phase("completion.report", op_name=op_name, step=step)
         if self._driver_handle is not None:
             logger.debug(
                 f"Reporting op completion op={op_name} step={step} "
@@ -6480,7 +6665,7 @@ class SPMDWorker:
                         if not deposit_complete.done():
                             deposit_complete.set_result(None)
                     except BaseException as error:
-                        leaf_tensor._cancel_consumer_lease_reservation()
+                        leaf_tensor._cleanup_consumer_lease_reservation_ref()
                         if not deposit_complete.done():
                             deposit_complete.set_exception(error)
                         raise
@@ -6748,8 +6933,9 @@ class SPMDWorker:
     def _warn_if_stalled(self) -> None:
         if self._failure is not None or not self._running:
             return
-        elapsed = time.time() - self._last_progress_timestamp
-        threshold = self.config.heartbeat_timeout_s
+        now = time.time()
+        elapsed = now - self._last_progress_timestamp
+        threshold = self.config.execution_progress_warning_s
         if elapsed < threshold:
             return
         if self._last_stall_warning_timestamp == self._last_progress_timestamp:
@@ -6757,10 +6943,15 @@ class SPMDWorker:
         self._last_stall_warning_timestamp = self._last_progress_timestamp
         diagnostics = self._execution_diagnostic_snapshot()
         logger.warning(
-            "Worker execution made no committed progress for %.3fs; "
+            "Worker execution has no committed progress for %.3fs; "
+            "wait_state=%s phase=%s phase_age=%.3fs activity_age=%.3fs "
             "stall_reason=%s. "
             "spmd_id=%s rank=%s diagnostics=%s",
             elapsed,
+            diagnostics.get("execution_wait_state", "unknown"),
+            diagnostics.get("execution_phase"),
+            diagnostics.get("execution_phase_age_s", 0.0),
+            diagnostics.get("execution_activity_age_s", 0.0),
             diagnostics["stall_reason"],
             self.spmd_id,
             self.rank,
@@ -6768,6 +6959,7 @@ class SPMDWorker:
         )
 
     def _execution_diagnostic_snapshot(self) -> dict[str, Any]:
+        now = time.time()
         checkpoint_activity = self._checkpoint_activity.snapshot()
         active_plan_steps = {
             op_name: sorted(steps)
@@ -6806,6 +6998,42 @@ class SPMDWorker:
             )
             for steps in pending_by_op.values()
         ) or any(self._mailbox_ready_steps.values())
+        execution_phase = getattr(self, "_execution_phase", None)
+        execution_phase_active = bool(getattr(self, "_execution_phase_active", False))
+        execution_phase_age_s = (
+            max(
+                0.0,
+                now
+                - getattr(
+                    self,
+                    "_execution_phase_started_timestamp",
+                    now,
+                ),
+            )
+            if execution_phase_active
+            else 0.0
+        )
+        execution_activity_age_s = max(
+            0.0,
+            now
+            - getattr(
+                self,
+                "_last_execution_activity_timestamp",
+                self._last_progress_timestamp,
+            ),
+        )
+        committed_progress_age_s = max(0.0, now - self._last_progress_timestamp)
+        execution_wait_state = _classify_execution_wait_state(
+            execution_phase=execution_phase,
+            execution_phase_active=execution_phase_active,
+            active_plan_steps=bool(active_plan_steps),
+            pending_plan_tasks=bool(pending_plan_tasks),
+            pending_send_tasks=bool(pending_send_tasks),
+            pending_input_prepare_tasks=bool(pending_input_prepare_tasks),
+            queued_work=any(queue_sizes.values()),
+            pending_admission=pending_admission,
+        )
+
         if active_plan_steps or pending_plan_tasks:
             stall_reason = "operator_plan"
         elif pending_send_tasks:
@@ -6819,6 +7047,17 @@ class SPMDWorker:
         else:
             stall_reason = "completion_barrier_or_driver_wait"
         return {
+            "execution_generation": getattr(self, "_execution_generation", 0),
+            "execution_operator": getattr(self, "_execution_operator", None),
+            "execution_step": getattr(self, "_execution_step", None),
+            "execution_epoch": getattr(self, "_execution_epoch", 0),
+            "execution_sequence": getattr(self, "_execution_sequence", 0),
+            "execution_in_flight": bool(active_plan_steps),
+            "execution_phase": execution_phase,
+            "execution_phase_age_s": execution_phase_age_s,
+            "execution_activity_age_s": execution_activity_age_s,
+            "committed_progress_age_s": committed_progress_age_s,
+            "execution_wait_state": execution_wait_state.value,
             "active_plan_steps": active_plan_steps,
             "pending_plan_steps": [
                 {"op_name": op_name, "step": step}
@@ -6887,6 +7126,33 @@ class SPMDWorker:
             status = WorkerStatus.INITIALIZING
 
         checkpoint_activity = self._checkpoint_activity.snapshot()
+        if self._running:
+            diagnostics = self._execution_diagnostic_snapshot()
+        else:
+            now = time.time()
+            committed_progress_timestamp = getattr(
+                self, "_last_progress_timestamp", now
+            )
+            execution_activity_timestamp = getattr(
+                self,
+                "_last_execution_activity_timestamp",
+                committed_progress_timestamp,
+            )
+            diagnostics = {
+                "execution_phase": getattr(self, "_execution_phase", None),
+                "execution_phase_age_s": 0.0,
+                "execution_activity_age_s": max(
+                    0.0, now - execution_activity_timestamp
+                ),
+                "committed_progress_age_s": max(
+                    0.0, now - committed_progress_timestamp
+                ),
+                "execution_wait_state": ExecutionWaitState.IDLE.value,
+            }
+        execution_phase = cast(str | None, diagnostics["execution_phase"])
+        execution_phase_age_s = cast(float, diagnostics["execution_phase_age_s"])
+        execution_activity_age_s = cast(float, diagnostics["execution_activity_age_s"])
+        committed_progress_age_s = cast(float, diagnostics["committed_progress_age_s"])
         heartbeat = WorkerHeartbeat(
             rank=self.rank,
             timestamp=time.time(),
@@ -6896,6 +7162,19 @@ class SPMDWorker:
             checkpoint_progress_timestamp=checkpoint_activity.progress_timestamp,
             checkpoint_id=checkpoint_activity.checkpoint_id,
             checkpoint_completed_units=checkpoint_activity.completed_units,
+            execution_generation=getattr(self, "_execution_generation", 0),
+            execution_operator=getattr(self, "_execution_operator", None),
+            execution_step=getattr(self, "_execution_step", None),
+            execution_epoch=getattr(self, "_execution_epoch", 0),
+            execution_sequence=getattr(self, "_execution_sequence", 0),
+            execution_in_flight=any(getattr(self, "_running_plan_steps", {}).values()),
+            execution_phase=execution_phase,
+            execution_phase_age_s=execution_phase_age_s,
+            execution_activity_age_s=execution_activity_age_s,
+            committed_progress_age_s=committed_progress_age_s,
+            execution_wait_state=ExecutionWaitState(
+                diagnostics["execution_wait_state"]
+            ),
         )
 
         try:
@@ -7049,10 +7328,11 @@ class SPMDWorker:
             if self._checkpoint_activity.snapshot().checkpoint_id is not None:
                 self._checkpoint_activity.failed()
 
-    async def checkpoint_publish_save(self) -> None:
+    async def checkpoint_publish_save(self) -> bool:
         try:
-            await self._require_checkpoint_coordinator().publish_save()
+            has_output = await self._require_checkpoint_coordinator().publish_save()
             self._checkpoint_activity.published()
+            return has_output
         except BaseException:
             self._checkpoint_activity.failed()
             raise
@@ -7066,6 +7346,7 @@ class SPMDWorker:
         current_topology: TopologySnapshot,
         runtime_state: Mapping[str, Any],
         publications: Mapping[str, CheckpointComponentPublication],
+        restore_options_by_component: RestoreOptionsByComponent | None = None,
     ) -> None:
         self._execution_lifecycle.begin_restore()
         try:
@@ -7078,6 +7359,7 @@ class SPMDWorker:
                 publications,
                 source_topology,
                 current_topology,
+                restore_options_by_component,
             )
             self._execution_lifecycle.finish_restore()
         except BaseException as error:
@@ -7148,7 +7430,6 @@ class SPMDWorker:
             world_size=self._world_size,
             mesh_axis_names=tuple(mesh.axis_names),
             mesh_axis_shapes=tuple(mesh.shape),
-            partition_scheme_version="fluxway-device-mesh-v1",
         )
 
     async def inspect_operator_state(self) -> dict[str, Any]:

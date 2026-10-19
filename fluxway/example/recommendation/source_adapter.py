@@ -2,28 +2,34 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+import json
 
-from fluxway.control_plane.components import DriverComponentContext
-from fluxway.common.metadata import pack_metadata, metadata_digest
+from fluxway.common.ingestion import (
+    LayoutUnitDescriptor,
+    SourceBindingIdentity,
+    ingestion_worker_id,
+)
+from fluxway.common.ingestion.source_scan import (
+    OpaqueSourceCursor,
+    SourceScanBudget,
+    SourceScanResult,
+    SourceScanStatus,
+)
+from fluxway.common.metadata import metadata_digest, pack_metadata
 from fluxway.common.types.configs import SPMDConfig
-from fluxway.common.ingestion import LayoutUnitDescriptor, ingestion_worker_id
+from fluxway.control_plane.components import DriverComponentContext
+from fluxway.control_plane.ingestion.activation import (
+    IngestionLayoutActivationComponent,
+)
+from fluxway.control_plane.ingestion.adapter import (
+    IngestionSourceAdapter,
+    SourceScanBinding,
+)
 from fluxway.control_plane.ingestion.compiler import (
-    TailLayoutMode,
-    LayoutCompileRequest,
-    AssignmentPolicy,
     RankDemand,
     ReaderGroupDemand,
     ReaderTopologyDescriptor,
-)
-from fluxway.control_plane.ingestion.adapter import (
-    CatalogCursor,
-    CatalogViewObservation,
-    IngestionSourceAdapter,
-)
-from fluxway.control_plane.ingestion.activation import (
-    IngestionLayoutActivationComponent,
+    TailLayoutMode,
 )
 
 
@@ -69,57 +75,106 @@ class RecommendationSourcePlanner:
 
 
 class RecommendationSourceAdapter(IngestionSourceAdapter):
-    """Source-neutral catalog view adapter backed by the canonical planner."""
+    """Bounded scan result adapter backed by the canonical planner."""
 
     def __init__(
-        self, *, source_identity: str = "recommendation", revision_id: int = 0
+        self,
+        *,
+        source_identity: str = "recommendation",
+        revision_id: int = 0,
     ) -> None:
         self._planner = RecommendationSourcePlanner(
             source_identity=source_identity, revision_id=revision_id
         )
 
-    def capture_view(
-        self, cursor: Mapping[str, Any], *, cardinality_limit: int
-    ) -> CatalogViewObservation:
-        if not isinstance(cursor, Mapping):
-            raise TypeError("recommendation cursor must be a mapping")
-        start = cursor["start"]
-        end = cursor["end"]
+    @property
+    def source_identity(self) -> str:
+        return self._planner.source_identity
+
+    @property
+    def revision_id(self) -> int:
+        return self._planner.revision_id
+
+    @staticmethod
+    def cursor(*, start: int, end: int, finite: bool) -> OpaqueSourceCursor:
         if (
             not isinstance(start, int)
             or not isinstance(end, int)
             or start < 0
             or end < start
+            or not isinstance(finite, bool)
         ):
+            raise ValueError("recommendation cursor fields are invalid")
+        payload = json.dumps(
+            {"end": end, "start": start, "finite": finite},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return OpaqueSourceCursor.from_payload(payload)
+
+    @staticmethod
+    def _decode_cursor(cursor: OpaqueSourceCursor) -> tuple[int, int, bool]:
+        try:
+            payload = json.loads(cursor.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("recommendation cursor payload is invalid") from error
+        if not isinstance(payload, dict):
+            raise TypeError("recommendation cursor payload must be an object")
+        start = payload["start"]
+        end = payload["end"]
+        finite = payload["finite"]
+        if type(start) is not int or type(end) is not int or start < 0 or end < start:
             raise ValueError("recommendation cursor interval is invalid")
-        if not isinstance(cardinality_limit, int) or cardinality_limit <= 0:
-            raise ValueError("recommendation cardinality limit must be positive")
-        units = self._planner.plan_units(start, end)
-        if sum(unit.cardinality for unit in units) > cardinality_limit:
-            raise ValueError("recommendation view exceeds cardinality limit")
-        return CatalogViewObservation(
+        if not isinstance(finite, bool):
+            raise TypeError("recommendation finite flag must be boolean")
+        return start, end, finite
+
+    def advance_cursor(
+        self, cursor: OpaqueSourceCursor, records: int
+    ) -> OpaqueSourceCursor:
+        start, end, finite = self._decode_cursor(cursor)
+        if type(records) is not int or not 0 <= records <= end - start:
+            raise ValueError("consumed records exceed recommendation interval")
+        return self.cursor(start=start + records, end=end, finite=finite)
+
+    def scan_next(
+        self, cursor: OpaqueSourceCursor, budget: SourceScanBudget
+    ) -> SourceScanResult:
+        if not isinstance(cursor, OpaqueSourceCursor):
+            raise TypeError("recommendation cursor must be opaque")
+        if not isinstance(budget, SourceScanBudget):
+            raise TypeError("recommendation scan result budget must be typed")
+        start, end, finite = self._decode_cursor(cursor)
+        scan_result_end = min(end, start + budget.max_records)
+        units = self._planner.plan_units(start, scan_result_end)
+        if len(units) > budget.max_units:
+            raise ValueError("recommendation scan result exceeds unit budget")
+        next_cursor = self.cursor(start=scan_result_end, end=end, finite=finite)
+        status = SourceScanStatus.from_scan(
+            records=scan_result_end - start,
+            exhausted=scan_result_end == end,
+            finite=finite,
+        )
+        return SourceScanResult(
             source_identity=self._planner.source_identity,
             view_identity=f"{self._planner.source_identity}:{self._planner.revision_id}",
-            schema_digest="recommendation-schema-v1",
+            schema_digest="recommendation-schema",
             lineage_digest=f"recommendation-revision:{self._planner.revision_id}",
             units=units,
-            terminal=bool(cursor.get("terminal", False)),
-            cursor=CatalogCursor(cursor),
+            unit_cursors=tuple(
+                self.cursor(start=unit.logical_start, end=end, finite=finite)
+                for unit in units
+            ),
+            records=sum(unit.cardinality for unit in units),
+            next_cursor=next_cursor,
+            status=status,
         )
-
-    def encode_cursor(self, cursor: Mapping[str, Any]) -> Mapping[str, Any]:
-        if not isinstance(cursor, Mapping):
-            raise TypeError("recommendation cursor must be a mapping")
-        return dict(cursor)
-
-    def decode_cursor(self, state: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self.encode_cursor(state)
 
 
 class RecommendationSourceDescriptor:
     requires_source_control_runtime = True
 
-    def build_reader_topology(
+    def _build_reader_topology(
         self,
         *,
         spmd_id: str,
@@ -161,21 +216,17 @@ class RecommendationSourceDescriptor:
             execution_cycle=cycle,
         )
 
-    def build_ingestion_plan(
+    def _build_source_scan_adapter(
         self,
         *,
         spmd_id: str,
         operator_name: str,
         config: SPMDConfig,
-    ) -> LayoutCompileRequest:
-        topology = self.build_reader_topology(
+    ) -> RecommendationSourceAdapter:
+        self._build_reader_topology(
             spmd_id=spmd_id, operator_name=operator_name, config=config
         )
-        num_samples = config.static_args.get("num_samples", 1000)
-        num_epochs = config.static_args.get("num_epochs", 1)
-        if num_samples <= 0 or num_epochs <= 0:
-            raise ValueError("recommendation dataset dimensions must be positive")
-        cardinality = num_samples * num_epochs
+        self._dataset_dimensions(config)
         revision = int(
             metadata_digest(
                 {
@@ -186,15 +237,71 @@ class RecommendationSourceDescriptor:
             )[:16],
             16,
         )
-        observation = RecommendationSourceAdapter(revision_id=revision).capture_view(
-            {"start": 0, "end": cardinality, "terminal": True},
-            cardinality_limit=cardinality,
+        return RecommendationSourceAdapter(
+            revision_id=revision,
         )
-        return observation.layout_request(
-            topology=topology,
-            tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
-            assignment_policy=AssignmentPolicy.default(),
+
+    @staticmethod
+    def _dataset_dimensions(config: SPMDConfig) -> tuple[int, int]:
+        num_samples = config.static_args.get("num_samples", 1000)
+        num_epochs = config.static_args.get("num_epochs", 1)
+        if (
+            not isinstance(num_samples, int)
+            or not isinstance(num_epochs, int)
+            or num_samples <= 0
+            or num_epochs <= 0
+        ):
+            raise ValueError("recommendation dataset dimensions must be positive")
+        return num_samples, num_epochs
+
+    def build_source_scan_binding(
+        self,
+        *,
+        spmd_id: str,
+        operator_name: str,
+        config: SPMDConfig,
+    ) -> SourceScanBinding:
+        adapter = self._build_source_scan_adapter(
+            spmd_id=spmd_id, operator_name=operator_name, config=config
         )
+        num_samples, num_epochs = self._dataset_dimensions(config)
+        initial_end = num_samples * num_epochs
+
+        def initial_cursor_factory() -> OpaqueSourceCursor:
+            return adapter.cursor(start=0, end=initial_end, finite=True)
+
+        return SourceScanBinding(
+            adapter=adapter,
+            identity=SourceBindingIdentity(
+                configuration_identity=metadata_digest(
+                    {
+                        "spmd_id": spmd_id,
+                        "operator_name": operator_name,
+                        "static_args": dict(config.static_args),
+                    }
+                ),
+                source_identity=adapter.source_identity,
+                mode_identity="finite",
+                native_identity=f"recommendation-revision:{adapter.revision_id}",
+            ),
+            initial_cursor_factory=initial_cursor_factory,
+            topology=self._build_reader_topology(
+                spmd_id=spmd_id, operator_name=operator_name, config=config
+            ),
+            tail_layout_mode=self._build_source_scan_tail_layout(
+                spmd_id=spmd_id, operator_name=operator_name, config=config
+            ),
+        )
+
+    def _build_source_scan_tail_layout(
+        self,
+        *,
+        spmd_id: str,
+        operator_name: str,
+        config: SPMDConfig,
+    ) -> TailLayoutMode:
+        del spmd_id, operator_name, config
+        return TailLayoutMode.DISCARD_REMAINDER
 
     def build_component(
         self, context: DriverComponentContext
@@ -203,7 +310,7 @@ class RecommendationSourceDescriptor:
 
 
 __all__ = [
-    "RecommendationSourcePlanner",
     "RecommendationSourceAdapter",
     "RecommendationSourceDescriptor",
+    "RecommendationSourcePlanner",
 ]

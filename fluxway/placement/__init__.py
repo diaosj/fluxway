@@ -1,5 +1,5 @@
 from .mathematics import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     AllocatedQuantaExpr,
     Constraint,
     LexicographicObjective,
@@ -67,7 +67,7 @@ from .planner import PlacementPlanner
 from .worker_group import SPMDWorkerGroup
 
 __all__ = [
-    "AFFINITY_FIRST_V1",
+    "AFFINITY_FIRST",
     "AllocatedQuantaExpr",
     "Constraint",
     "LexicographicObjective",

@@ -20,14 +20,8 @@ from fluxway.control_plane.ingestion.activation import (
     IngestionLayoutActivationComponent,
 )
 from fluxway.control_plane.ingestion.adapter import (
-    CatalogCursor,
-    CatalogViewObservation,
-    InMemoryIngestionSourceAdapter,
     IngestionSourceAdapter,
-)
-from fluxway.control_plane.ingestion.checkpoint import (
-    CatalogCheckpointImage,
-    IngestionCatalogCheckpointComponent,
+    SourceScanBinding,
 )
 from fluxway.control_plane.ingestion.compiler import (
     AlgebraicLayoutCompiler,
@@ -41,32 +35,28 @@ from fluxway.control_plane.ingestion.compiler import (
     WorkerCompiledLayout,
 )
 from fluxway.control_plane.ingestion.planning_component import (
-    IngestionPlacementContext,
     IngestionLayoutPlanningComponent,
+    SourcePlanningBudgetExceeded,
 )
 
 __all__ = [
     "AlgebraicLayoutCompiler",
     "CanonicalWorkInterval",
-    "CatalogCheckpointImage",
-    "CatalogCursor",
-    "CatalogViewObservation",
     "CompiledIngestionLayout",
     "CompiledSegment",
     "TailLayoutMode",
     "DirectIngestionSourceDescriptor",
     "EncodedWorkerLayoutDescriptor",
-    "InMemoryIngestionSourceAdapter",
-    "IngestionCatalogCheckpointComponent",
     "SourceLayoutCompletion",
     "IngestionLayoutActivation",
     "IngestionLayoutActivationComponent",
     "SourceLayoutActivation",
     "IngestionLayoutEpoch",
     "IngestionLayoutPlanningComponent",
-    "IngestionPlacementContext",
+    "SourcePlanningBudgetExceeded",
     "IngestionLayoutReceiver",
     "IngestionSourceAdapter",
+    "SourceScanBinding",
     "LayoutCompileRequest",
     "AssignmentPolicy",
     "LayoutUnitDescriptor",

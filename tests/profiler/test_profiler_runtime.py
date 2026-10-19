@@ -698,7 +698,7 @@ def test_trace_hierarchy_models_fluxway_abstractions():
     driver = TraceTrackHierarchy.from_track_name(
         "driver/InputProcessor/driver/checkpoint"
     )
-    controller = TraceTrackHierarchy.from_track_name("controller/controller/fsm")
+    controller = TraceTrackHierarchy.from_track_name("controller/fsm/transition")
     scheduler = TraceTrackHierarchy.from_track_name(
         "worker/InputProcessor/rank:0/scheduler/queue"
     )
@@ -715,8 +715,8 @@ def test_trace_hierarchy_models_fluxway_abstractions():
     assert worker.leaf_name == "send"
     assert driver.groups == ("SPMDs", "InputProcessor", "driver")
     assert driver.leaf_name == "checkpoint"
-    assert controller.groups == ("Control Plane", "controller")
-    assert controller.leaf_name == "fsm"
+    assert controller.groups == ("Controller", "fsm")
+    assert controller.leaf_name == "transition"
     assert scheduler.groups == (
         "SPMDs",
         "InputProcessor",
@@ -1053,3 +1053,43 @@ class _RayLikeDataPlane(DataPlaneCallable):
     async def receive_control(self, op_name, step, names, values):
         self.control_calls += 1
         return True
+
+
+@pytest.mark.asyncio
+async def test_driver_checkpoint_spans_record_canonical_checkpoint_id():
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=64 * 1024),
+        run_id="run",
+        process_name="driver/spmd/driver",
+    )
+    async with recorder.driver_snapshot(
+        checkpoint_id="chk_snap_test", target_step=42, worker_count=3
+    ):
+        pass
+    async with recorder.driver_restore(
+        checkpoint_id="chk_restore_test", worker_count=3
+    ):
+        pass
+
+    rows = recorder.arena.snapshot()
+    names = [recorder.metadata.name_for(int(row[4])) for row in rows]
+    assert names == ["driver.snapshot", "driver.restore"]
+
+    snap_row = rows[0]
+    snap_fields = recorder.metadata.payload_fields_for(int(snap_row[4]))
+    assert snap_fields == ("checkpoint_id", "target_step", "worker_count")
+    assert (
+        recorder.metadata.name_for(int(snap_row[PAYLOAD_START_COLUMN]))
+        == "chk_snap_test"
+    )
+    assert int(snap_row[PAYLOAD_START_COLUMN + 1]) == 42
+    assert int(snap_row[PAYLOAD_START_COLUMN + 2]) == 3
+
+    restore_row = rows[1]
+    restore_fields = recorder.metadata.payload_fields_for(int(restore_row[4]))
+    assert restore_fields == ("checkpoint_id", "worker_count")
+    assert (
+        recorder.metadata.name_for(int(restore_row[PAYLOAD_START_COLUMN]))
+        == "chk_restore_test"
+    )
+    assert int(restore_row[PAYLOAD_START_COLUMN + 1]) == 3

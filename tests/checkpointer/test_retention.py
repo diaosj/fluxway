@@ -86,12 +86,10 @@ def _multi_object_manifest(sequence: int) -> CheckpointManifest:
             checkpoint_object_id=checkpoint_object_id,
             version_id=f"{checkpoint_object_id}-{sequence}",
             storage_locator=f"opaque:{checkpoint_object_id}:{sequence}".encode(),
-            format_version=1,
         )
         for checkpoint_object_id in ("model_state", "optimizer_state")
     )
     return CheckpointManifest(
-        schema_version=1,
         checkpoint_id=f"checkpoint-{sequence}",
         attempt_id=f"attempt-{sequence}",
         coordinator_generation=1,
@@ -101,14 +99,13 @@ def _multi_object_manifest(sequence: int) -> CheckpointManifest:
         framework_state={},
         spmds={
             "train": SpmdCheckpoint(
-                source_topology=TopologySnapshot(1, (), (), "v1"),
+                source_topology=TopologySnapshot(1, (), ()),
                 runtime_state={
                     "drain_boundary": DrainBoundary(committed_cut=sequence).to_dict()
                 },
                 components={
                     "dense": CheckpointComponentPublication(
                         component_id="dense",
-                        format_version=1,
                         shared_records=(
                             CheckpointObjectRecord(checkpoint_objects=objects),
                         ),
@@ -152,7 +149,6 @@ async def test_retention_publication_failure_rolls_back_every_reservation(io_lan
                         "state",
                         "v1",
                         f"opaque:{component_id}".encode(),
-                        1,
                     ),
                 ),
                 1,

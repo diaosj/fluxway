@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from fluxway.common.ingestion import SourceWorkAcknowledgement, WorkerLayoutDescriptor
+from fluxway.common.types import CheckpointCut
 from fluxway.common.types.configs import SourceControlConfig
 from fluxway.control_plane.logical_work_ledger import LogicalWorkLedger
 from fluxway.control_plane.source_control import SourceControlRuntime
@@ -66,10 +67,8 @@ async def test_restore_preserves_committed_cut_and_allows_resharded_identity(
     assert rebound.work_epoch == compiled.work_epoch
 
 
-def test_source_runtime_has_no_ordered_stream_state() -> None:
+def test_source_runtime_checkpoints_only_the_shared_cut() -> None:
     runtime = SourceControlRuntime(SourceControlConfig(max_in_flight_steps=4))
-    assert set(runtime.logical_work_checkpoint_state()) == {
-        "version",
-        "committed_cut",
-        "epochs",
+    assert runtime.checkpoint_state(CheckpointCut.for_position("cut", 0)) == {
+        "committed_cut": 0,
     }

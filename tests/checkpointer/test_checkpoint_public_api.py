@@ -26,7 +26,7 @@ def test_save_session_builds_opaque_checkpoint_objects() -> None:
         cut=CheckpointCut.for_step("cut", 3),
         spmd_id="train",
         rank=0,
-        source_topology=TopologySnapshot(1, (), (), "v1"),
+        source_topology=TopologySnapshot(1, (), ()),
         component_id="embedding",
     )
     checkpoint_object = session.checkpoint_object_ref(

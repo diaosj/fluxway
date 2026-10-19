@@ -54,7 +54,7 @@ async def test_safetensors_component_uses_transaction_context(tmp_path):
     async def restore(module, state, context):
         restored.append(state)
 
-    topology = TopologySnapshot(1, (), (), "v1")
+    topology = TopologySnapshot(1, (), ())
     save_session = SaveSession(
         instance=None,
         attempt_id="tx",

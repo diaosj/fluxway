@@ -5,7 +5,7 @@ from pydantic import ValidationError
 import fluxway
 
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     PlacementRecipe,
     ClusterNode,
     ClusterSnapshot,
@@ -52,7 +52,6 @@ def test_recipe_preserves_direct_spmd_class_references() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="formal-placement",
-        version="1.0.0",
         constraints=constraints,
         objective=lexicographic(minimize(cardinality(support(s0)))),
     )
@@ -125,7 +124,7 @@ def test_cluster_snapshot_is_canonical_under_node_permutation() -> None:
 
 
 def test_standard_objective_is_a_typed_ast() -> None:
-    assert [objective.kind for objective in AFFINITY_FIRST_V1.objectives] == [
+    assert [objective.kind for objective in AFFINITY_FIRST.objectives] == [
         "max_min",
         "max_min",
         "minimize",
@@ -134,19 +133,15 @@ def test_standard_objective_is_a_typed_ast() -> None:
         "maximize",
         "minimize",
     ]
-    assert AFFINITY_FIRST_V1.objectives[0].expression.kind == (
-        "weighted_dominant_share"
-    )
-    assert AFFINITY_FIRST_V1.objectives[-1].expression.kind == (
-        "resource_fragmentation"
-    )
+    assert AFFINITY_FIRST.objectives[0].expression.kind == ("weighted_dominant_share")
+    assert AFFINITY_FIRST.objectives[-1].expression.kind == ("resource_fragmentation")
 
 
 def test_formal_placement_language_is_exported_at_package_root() -> None:
     assert fluxway.PlacementRecipe is PlacementRecipe
     assert fluxway.support is support
     assert fluxway.subseteq is subseteq
-    assert fluxway.AFFINITY_FIRST_V1 is AFFINITY_FIRST_V1
+    assert fluxway.AFFINITY_FIRST is AFFINITY_FIRST
 
 
 def test_recipe_preserves_expert_constraint_order() -> None:
@@ -156,8 +151,7 @@ def test_recipe_preserves_expert_constraint_order() -> None:
     second = disjoint(s0, s1)
     common = {
         "recipe_id": "canonical",
-        "version": "1.0.0",
-        "objective": AFFINITY_FIRST_V1,
+        "objective": AFFINITY_FIRST,
     }
     left = PlacementRecipe(**common, constraints=(first, second, first))
     assert left.constraints == (first, second, first)

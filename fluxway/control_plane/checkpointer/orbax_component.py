@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from etils import epath
-import msgpack
+
+from fluxway.common import msgpack_codec
 
 from fluxway.common.types.checkpoint import (
     CheckpointComponentPublication,
@@ -87,6 +88,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         *,
         finalize_state: Callable[[Any, SaveSession], Any] | None = None,
         retention_domain: str | None = None,
+        output_path: str | None = None,
     ) -> None:
         super().__init__(
             component_id,
@@ -95,6 +97,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
             finalize_state=finalize_state,
             restore_topology=RestoreTopologyMode.GLOBAL_RESHARD,
             retention_domain=retention_domain,
+            output_path=output_path,
         )
         self._restore_layout = _as_async(restore_layout, "restore_layout")
         self._handler = None
@@ -121,12 +124,57 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         import orbax.checkpoint as ocp
 
         state = await self._save_state(session.instance, session)
-        shared_staging = self._staging_root(session) / "shared"
-        completion_marker = shared_staging.parent / ".shared-save-complete"
-        shared_final = self._final_component_root(session) / "state" / "shared"
-        shared_staging.parent.mkdir(parents=True, exist_ok=True)
+        if self.descriptor.output_path is not None:
+            if not isinstance(state, Mapping) or set(state) != {
+                "step",
+                "model_state",
+                "optimizer_state",
+            }:
+                raise ValueError(
+                    "model output requires the canonical training checkpoint state"
+                )
+            model_staging = Path(session.staging_output_path or "")
+            if not model_staging.is_absolute():
+                raise RuntimeError("Fluxway did not bind model output staging path")
 
         collective = _require_collective_contract(session.source_topology.world_size)
+
+        if self.descriptor.output_path is not None:
+
+            def write_model() -> None:
+                model_staging.parent.mkdir(parents=True, exist_ok=True)
+                checkpointer = ocp.Checkpointer(
+                    self._get_handler(),
+                    multiprocessing_options=ocp.options.MultiprocessingOptions(
+                        **(
+                            {
+                                "barrier_sync_key_prefix": _barrier_sync_key(
+                                    session, "model-save"
+                                )
+                            }
+                            if collective
+                            else {}
+                        )
+                    ),
+                )
+                try:
+                    checkpointer.save(
+                        epath.Path(model_staging),
+                        force=False,
+                        args=ocp.args.StandardSave(state["model_state"]),
+                    )
+                finally:
+                    checkpointer.close()
+
+        shared_staging = self._staging_root(session.attempt_id) / "shared"
+        completion_marker = shared_staging.parent / ".shared-save-complete"
+        shared_final = (
+            self._final_component_root(session.attempt_id) / "state" / "shared"
+        )
+        shared_staging.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.descriptor.output_path is not None:
+            await asyncio.to_thread(write_model)
 
         def write_global() -> None:
             options = ocp.options.MultiprocessingOptions(
@@ -161,14 +209,13 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
             checkpoint_object_id="state",
             version_id=session.checkpoint_id,
             storage_locator=shared_final.as_uri().encode("utf-8"),
-            format_version=self.descriptor.format_version,
         )
         return WorkerSaveResult(
             record=CheckpointObjectRecord(
                 payload=b"",
                 checkpoint_objects=(checkpoint_object,),
             ),
-            commit_metadata=msgpack.packb(
+            commit_metadata=msgpack_codec.packb(
                 {"shared_staging_uri": shared_staging.as_uri()},
                 use_bin_type=True,
             ),
@@ -181,6 +228,11 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         self._require_worker(session)
         if not session.worker_results:
             raise ValueError("Orbax commit_save requires rank records")
+        expected_ranks = set(range(session.source_topology.world_size))
+        if set(session.worker_results) != expected_ranks:
+            raise ValueError(
+                "Orbax commit_save requires one record for every source rank"
+            )
         prepared_values = tuple(session.worker_results.values())
         records = [prepared.record for prepared in prepared_values]
         if any(record is None for record in records):
@@ -193,12 +245,27 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
                 "Orbax rank record must contain exactly one shared checkpoint_object"
             )
         shared_checkpoint_object = first_record.checkpoint_objects[0]
-        first_metadata = msgpack.unpackb(prepared_values[0].commit_metadata, raw=False)
-        if not isinstance(first_metadata, Mapping):
-            raise TypeError("Orbax rank record has no commit_save metadata")
-        shared_staging_value = first_metadata.get("shared_staging_uri")
-        if not isinstance(shared_staging_value, str):
-            raise TypeError("Orbax shared staging URI is missing")
+        shared_staging_value: str | None = None
+        for prepared, record in zip(prepared_values, typed_records, strict=True):
+            if len(record.checkpoint_objects) != 1:
+                raise ValueError(
+                    "Orbax every rank record must contain exactly one shared checkpoint_object"
+                )
+            if record.checkpoint_objects[0] != shared_checkpoint_object:
+                raise ValueError(
+                    "Orbax rank checkpoint_objects disagree on the shared object"
+                )
+            metadata = msgpack_codec.unpackb(prepared.commit_metadata, raw=False)
+            if not isinstance(metadata, Mapping):
+                raise TypeError("Orbax rank record has no commit_save metadata")
+            staging_value = metadata.get("shared_staging_uri")
+            if not isinstance(staging_value, str):
+                raise TypeError("Orbax shared staging URI is missing")
+            if shared_staging_value is None:
+                shared_staging_value = staging_value
+            elif staging_value != shared_staging_value:
+                raise ValueError("Orbax rank records disagree on shared staging URI")
+        assert shared_staging_value is not None
 
         shared_staging = self._file_path(shared_staging_value.encode("utf-8"))
         shared_final = self._file_path(shared_checkpoint_object.storage_locator)
@@ -220,7 +287,6 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         )
         return CheckpointComponentPublication(
             component_id=self.descriptor.component_id,
-            format_version=self.descriptor.format_version,
             shared_records=(shared_record,),
             partitions=(),
         )
@@ -242,13 +308,13 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         self._require_worker(session)
         if session.rank == 0:
             paths = [
-                self._staging_root(session) / "shared",
-                self._staging_root(session) / ".shared-save-complete",
-                self._final_component_root(session) / "state" / "shared",
+                self._staging_root(session.attempt_id) / "shared",
+                self._staging_root(session.attempt_id) / ".shared-save-complete",
+                self._final_component_root(session.attempt_id) / "state" / "shared",
             ]
             for path in paths:
                 try:
-                    await asyncio.to_thread(shutil.rmtree, path)
+                    await asyncio.to_thread(_remove_path, path)
                 except FileNotFoundError:
                     pass
 
@@ -278,6 +344,8 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
     ) -> Any:
         import orbax.checkpoint as ocp
 
+        collective = _require_collective_contract(context.restore_topology.world_size)
+
         if len(record.checkpoint_objects) != 1:
             raise ValueError("Orbax shared record must contain one checkpoint_object")
         checkpoint_path = epath.Path(
@@ -286,7 +354,11 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
 
         def read() -> Any:
             options = ocp.options.MultiprocessingOptions(
-                barrier_sync_key_prefix=_barrier_sync_key(context, "restore")
+                **(
+                    {"barrier_sync_key_prefix": _barrier_sync_key(context, "restore")}
+                    if collective
+                    else {}
+                )
             )
             checkpointer = ocp.Checkpointer(
                 self._get_handler(), multiprocessing_options=options
@@ -300,3 +372,10 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
                 checkpointer.close()
 
         return await asyncio.to_thread(read)
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()

@@ -13,6 +13,7 @@ from fluxway.common.types.checkpoint import (
     CommitSaveSession,
     RestoreSession,
     CheckpointCut,
+    CheckpointObjectRecord,
     TopologySnapshot,
 )
 from fluxway.control_plane.checkpointer.orbax_component import (
@@ -54,7 +55,7 @@ async def test_orbax_component_commits_and_restores_nested_pytree_state(tmp_path
             }
         }
 
-    topology = TopologySnapshot(1, (), (), "v1")
+    topology = TopologySnapshot(1, (), ())
     context = SaveSession(
         instance=None,
         attempt_id="tx",
@@ -157,7 +158,7 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
     async def layout(module, context):
         return {"weights": jax.ShapeDtypeStruct((8, 4), np.float32)}
 
-    topology = TopologySnapshot(2, ("data",), (2,), "v1")
+    topology = TopologySnapshot(2, ("data",), (2,))
     permit = CheckpointCommitPermit("attempt", 1, b"permit")
     contexts = tuple(
         SaveSession(
@@ -189,6 +190,24 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
     for rank, component in enumerate(components):
         await component.finish_save(contexts[rank])
     context = contexts[0]
+    with pytest.raises(ValueError, match="every rank record"):
+        await components[0].commit_save(
+            CommitSaveSession(
+                instance=context.instance,
+                attempt_id=context.attempt_id,
+                checkpoint_id=context.checkpoint_id,
+                commit_permit=context.commit_permit,
+                cut=context.cut,
+                spmd_id=context.spmd_id,
+                rank=context.rank,
+                source_topology=context.source_topology,
+                component_id=context.component_id,
+                worker_results={
+                    0: prepared[0],
+                    1: replace(prepared[1], record=CheckpointObjectRecord()),
+                },
+            )
+        )
     publication = await components[0].commit_save(
         CommitSaveSession(
             instance=context.instance,
@@ -215,8 +234,86 @@ async def test_orbax_global_state_uses_one_collective_shared_checkpoint_object(
         await component.close()
 
 
+@pytest.mark.asyncio
+async def test_orbax_model_output_contains_model_state_only(tmp_path, monkeypatch):
+    import orbax.checkpoint as ocp
+
+    saved: list[tuple[Path, object]] = []
+
+    class Handler:
+        def close(self):
+            return None
+
+    class Checkpointer:
+        def __init__(self, handler, multiprocessing_options):
+            self.handler = handler
+
+        def save(self, path, force, args):
+            destination = Path(str(path))
+            assert not destination.exists()
+            assert force is False
+            destination.mkdir(parents=True, exist_ok=False)
+            saved.append((destination, args))
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(ocp, "Checkpointer", Checkpointer)
+    monkeypatch.setattr(ocp.args, "StandardSave", lambda value: ("save", value))
+    monkeypatch.setattr(
+        OrbaxCheckpointComponent, "_get_handler", lambda self: Handler()
+    )
+
+    model_state = {"weights": [1, 2]}
+    optimizer_state = {"momentum": [3, 4]}
+
+    async def save(module, context):
+        return {
+            "step": 9,
+            "model_state": model_state,
+            "optimizer_state": optimizer_state,
+        }
+
+    async def restore(module, state, context):
+        return None
+
+    async def layout(module, context):
+        return {"model_state": model_state}
+
+    topology = TopologySnapshot(1, (), ())
+    session = SaveSession(
+        instance=None,
+        attempt_id="attempt",
+        checkpoint_id="snapshot",
+        commit_permit=CheckpointCommitPermit("attempt", 1, b"permit"),
+        cut=CheckpointCut.for_step("cut", 9),
+        spmd_id="train",
+        rank=0,
+        source_topology=topology,
+        component_id="model",
+        repository_root=str(tmp_path),
+        staging_output_path=str(tmp_path / "steps" / ".snapshot.attempt" / "model"),
+        published_output_path=str(tmp_path / "steps" / "9" / "model"),
+    )
+    component = OrbaxCheckpointComponent(
+        "model", save, restore, layout, output_path="model"
+    )
+    await component.open(
+        CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
+    )
+    await component.save(session)
+    assert len(saved) == 2
+    by_name = {path.name: args for path, args in saved}
+    assert by_name["model"] == ("save", model_state)
+    assert by_name["shared"] == (
+        "save",
+        {"step": 9, "model_state": model_state, "optimizer_state": optimizer_state},
+    )
+    await component.close()
+
+
 def test_orbax_barrier_identity_scopes_component_snapshot_and_operation():
-    topology = TopologySnapshot(2, ("data",), (2,), "v1")
+    topology = TopologySnapshot(2, ("data",), (2,))
     permit = CheckpointCommitPermit("attempt", 1, b"permit")
     context = SaveSession(
         instance=None,

@@ -20,7 +20,8 @@ producer unit；fragment 传输按源和目标分片的交集装配。完整 mic
 不是 ownership cursor。ACK 进入有界的 `SourceAcknowledgementRuntime` 队列，并在
 checkpoint drain 中 flush。队列容量允许时不必同步等待每个 ACK；grant cache miss
 仍需等待 acquire RPC。Worker source scope 在安装后接收连续不可变窗口。启动 API
-不提供 adapter 自动 discovery/refill，支持范围见[Source 协调](source_coordination_zh.md)。
+只启动来源生命周期；Controller 的事件驱动 `SourceProgressSupervisor` 负责 adapter
+扫描和窗口补充，adapter 本身不拥有补窗。支持范围见[Source 协调](source_coordination_zh.md)。
 
 Grant 的批量大小同时受到 source credit 窗口和 pipeline depth 限制。如果一个 Reader
 每隔 `L` 个逻辑 step 执行一次，覆盖 `C` 个连续逻辑 step 的 credit 窗口最多包含

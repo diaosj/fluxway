@@ -1,19 +1,23 @@
 # Checkpoints
 
 Source metadata uses canonical MessagePack through `fluxway.common.metadata`,
-including catalog cursor validation and component transaction digests. Planner
-checkpoint version 2 stores canonical requests, pending tails and encoded cursors;
-logical ledger version 3 stores immutable epoch digests and the committed cut.
+including opaque source cursor envelope validation and component transaction digests.
+Source components participate in the same transaction as model and operator state.
+The target source state is a consumption bookmark and cut-aligned logical progress;
+prefetched layouts are reconstructed. These component images have one current field
+set; they do not carry a Fluxway release
+version or a numeric migration layer.
+The global `CheckpointManifest` also has no schema version field. Its dataclass
+defines the accepted root fields; decoding rejects missing or extra fields.
 Physical Worker descriptors are transient. User-owned binary metadata
 survives component prepare/apply/restore without conversion to text.
 
-This encoding contract does not establish continuous source recovery. The planner
-accepts ordered immutable windows and excludes physical topology from checkpoints.
-Workers accept contiguous published source windows. Automatic adapter replenishment
-is not provided by the checkpoint API.
-See [source coordination](source_coordination.md) for current streaming and
-resharding limits. A serialized cursor alone does not prove that cursor advancement
-and work publication were committed at the same cut.
+This encoding contract does not by itself establish continuous source recovery. The
+planner accepts ordered immutable windows and excludes physical topology from
+checkpoints. Workers accept contiguous published source windows; event-driven window
+replenishment remains part of the source coordination contract. A serialized
+cursor alone does not prove that cursor advancement and work publication were committed
+at the same cut.
 
 A checkpoint is the complete, restorable state of one Fluxway execution at one
 progress cut. Its public identity is intentionally small:
@@ -33,6 +37,20 @@ references, and cleanup decisions. A component owns serialization, physical
 storage, restore mapping, and physical cleanup. This keeps Fluxway independent
 of filesystems, object stores, Lance, catalogs, and data formats.
 
+The checkpoint root directory is managed by `CheckpointDirectory` (`fluxway.control_plane.checkpointer.directory`).
+It can be pre-created externally or created automatically by Fluxway via `CheckpointDirectory.open()`.
+It must be a regular directory and cannot be a symlink. When Fluxway creates a new root directory, it writes the
+`CHECKPOINT_ROOT_MARKER` (`.fluxway-checkpoint-root`) ownership marker containing `fluxway-checkpoint-root\n`.
+Opening an existing unmarked directory does not add a marker or claim ownership. If an existing directory contains this
+marker, it must be a regular, non-symlink file with a valid format; any mismatch raises `CheckpointDirectoryOwnershipError`.
+Destructive cleanup via `CheckpointDirectory.clear()` strictly validates ownership before removing the
+directory to prevent accidental deletion of unmanaged paths.
+
+Manifest records, cleanup intents, transactions, and references are serialized to disk using compact binary MessagePack
+via `msgpack_codec` (`packb(..., use_bin_type=True)` and `unpackb(...)`) rather than uncompacted JSON, ensuring fast
+metadata reads and bounded coordinator storage overhead. Unknown marker contents and old manifest fields fail; opening a
+repository does not migrate its files.
+
 ## Saving and restoring
 
 Checkpoint publication is coordinated by one durable decision record named
@@ -48,18 +66,19 @@ stateDiagram-v2
     [*] --> STAGED
     STAGED --> COMMIT_DECIDED: durable decision written
     STAGED --> ABANDONED: pre-decision failure (permit revoked)
-    COMMIT_DECIDED --> COMMITTED: publish + apply complete
-    COMMIT_DECIDED --> ABANDONED: startup fencing after crash
+    COMMIT_DECIDED --> COMMITTED: publish + apply complete (or replayed on restart)
+    COMMIT_DECIDED --> ABANDONED: startup fencing without commit marker
     COMMITTED --> [*]
     ABANDONED --> [*]
 ```
 
-`COMMIT_DECIDED` records that physical checkpoint publication has started but
-has not completed. It is not a replayable commit promise: a process crash loses
-the in-memory component sessions and pending publication context. On startup
-Fluxway fences every `STAGED` and `COMMIT_DECIDED` record by moving it to
-`ABANDONED`; physical artifacts are left for GC. Only `COMMITTED` records enter
-`latest`, reference resolution, retention cleanup, and restore.
+`COMMIT_DECIDED` records that physical checkpoint publication has started.
+If a crash occurs before the global commit marker (`committed.<checkpoint_id>`) is written,
+startup fencing invokes `abort_save(permit)` on registered components and moves the record
+to `ABANDONED`; physical artifacts are left for GC. If the global commit marker has already been
+written, the checkpoint commit is logically decided and complete; startup fencing replays
+`acknowledge_save(permit)` with the persisted permit and advances the transaction to `COMMITTED`.
+Only `COMMITTED` records enter `latest`, reference resolution, retention cleanup, and restore.
 
 The checkpointer creates one monotonic deadline for each global snapshot and
 passes it to all participant invocations in parallel. A custom Controller implementation
@@ -78,11 +97,9 @@ state. Optimizer restore defaults to `True`; the explicit form is:
 from fluxway.integrations.sparse_embedding.checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
-    modulo_partition,
 )
 
 embedding_checkpoint = SparseEmbeddingCheckpointComponent(
-    modulo_partition,
     LocalLanceStorageFactory(),
     load_optimizer_state=True,
 ).registration()
@@ -108,6 +125,8 @@ flowchart LR
     D --> E[Publish worker artifacts]
     E --> F[Apply Controller tokens]
     F --> G[Write COMMITTED marker]
+    G --> H[Acknowledge component save]
+    H --> I[Complete transaction -> COMMITTED]
 ```
 
 Participant preparation performs all fallible validation. Apply is a validated
@@ -233,6 +252,8 @@ class MyComponent(
     async def commit_save(self, session) -> CheckpointComponentPublication: ...
     async def rollback_save(self, session): ...
     async def publish_save(self, session): ...
+    async def abort_save(self, permit): ...
+    async def acknowledge_save(self, permit): ...
     async def restore(self, session): ...
 ```
 
@@ -241,7 +262,13 @@ The six capability names map directly to the six SPI contracts:
 `OBJECT_LIFECYCLE` (holds and cleanup reservations), and `OBJECT_CLEANUP`
 (`cleanup`). `SAVE` is one atomic transaction contract; its phases are not
 independent capabilities. `commit_save` creates the component publication;
-`publish_save` is called only after the global manifest is durable and visible.
+`publish_save` runs on each worker after the commit decision and before the global
+committed marker. `rollback_save` also requires a live worker session. Control
+recovery calls `abort_save(permit)` before the marker, or
+`acknowledge_save(permit)` after it, with the original persisted permit. Both
+control phases must be idempotent and propagate failures so the transaction stays
+retryable. Built-in filesystem components group payloads by attempt ID so
+control cleanup can remove every rank without reconstructing a worker session.
 
 ### Worker Transaction: FINALIZING vs PREPARED
 
@@ -377,6 +404,12 @@ native `ocp.args.StandardSave(state)` and declares `GLOBAL_RESHARD`. Rank-privat
 input reader cursors, local RNG, or per-worker metrics) must be registered under
 `WorkerLocalCheckpointComponent` with `EXACT_TOPOLOGY`.
 
+For large-scale sparse tables in recommendation models, `SparseEmbeddingCheckpointComponent`
+(`fluxway.integrations.sparse_embedding`) provides native table persistence:
+- **Storage backends**: `LocalLanceStorage` (`LocalLanceStorageFactory`) for local disk or shared POSIX storage, and `GravitinoLanceStorage` (`GravitinoLanceStorageFactory`) for Apache Gravitino-managed lakehouse catalogs.
+- **Topology elasticity**: Declares `RestoreTopologyMode.LOGICAL_PARTITION_REMAP` and uses `LogicalPartitionBinding` to remap table shards when worker counts scale up or down.
+- **Compaction**: Fragments can be compacted off the training critical path using `compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)`.
+
 ## Component registration and cleanup
 
 A Fluxway-managed artifact with finite `CheckpointRetentionPolicy(retain_last=N)`
@@ -467,11 +500,11 @@ repository after cancellation.
 ## Topology
 
 The manifest records source topology. Restore receives both source and current
-topologies. A component explicitly chooses one topology mode:
+topologies. A component explicitly chooses one `RestoreTopologyMode`:
 
-- `EXACT_TOPOLOGY` for rank-local iterator or process state;
-- `LOGICAL_PARTITION_REMAP` for stable logical partitions;
-- `GLOBAL_RESHARD` for global arrays that the component can reshard.
+- `RestoreTopologyMode.EXACT_TOPOLOGY` (`"exact_topology"`): requires identical rank count and worker assignments, used for rank-local iterator or process state;
+- `RestoreTopologyMode.LOGICAL_PARTITION_REMAP` (`"logical_partition_remap"`): preserves canonical logical partition IDs and uses `LogicalPartitionBinding` to map them to the active physical workers (e.g. sparse embedding table partitions);
+- `RestoreTopologyMode.GLOBAL_RESHARD` (`"global_reshard"`): collective shared state (e.g. Orbax standard tensors) automatically resharded across the new mesh.
 
 Fluxway never guesses a partition function or silently copies rank-local state.
 The user-side adapter supplies any component-specific restore policy.
@@ -488,18 +521,26 @@ Physical segments carry independent interval leases. ACK confirms only the lease
 interval; candidate cut advances over consecutive fully acknowledged steps.
 Only the coordinated checkpoint transaction advances committed cut.
 
-Logical-ledger checkpoint version 3 saves committed cut and immutable epoch digests,
-excluding ranks, leases and ACK caches. Planner checkpoint version 2 saves canonical
-requests, logical batch cardinality, pending tail and cursor, excluding topology.
-Restore verifies fixed source revisions and the logical batch size before rebinding.
-New lease IDs fence delayed acknowledgements from the previous attempt.
+The restore contract saves the source-owned consumption bookmark, source
+binding and logical progress at the shared model cut. Restore validates the binding
+and logical batch size, then replans and prefetches using current window limits and
+reader topology. Window digests, pending prefetch buffers, leases and ACK caches are
+not durable source state. Stateful operators retain everything needed to reproduce
+their future output. New lease IDs fence delayed acknowledgements.
+
+The planner persists a consumption bookmark and the ledger persists logical progress
+at the shared cut. Old windows, leading watermarks, leases and prefetch buffers are
+recreated during restore. The source, model and optimizer components participate in the
+same checkpoint transaction; their individual state mappings remain component-owned.
 
 Driver activation checkpoint state is empty.
-Controller restores planner components, publishes rebound segments, then restores
-the committed logical cut. Workers read acquired assignment intervals.
+Controller restore installs source bookmarks and the shared logical cut
+before publishing newly planned segments. Workers read acquired assignment intervals.
 Restore uses fresh Workers: topology readiness precedes restore, and explicit
 execution activation follows it. Source layout installation and per-cut admission
 are separate authorizations. See [execution lifecycle](execution_lifecycle.md) for
-start, cancellation and continuation examples. Automatic adapter discovery/refill
-is outside the startup API. Each checkpoint component defines the topology changes
-it accepts; a source ledger proof alone cannot establish model convergence or
+start, cancellation and continuation examples. The startup API starts the source
+lifecycle; the controller's event-driven `SourceProgressSupervisor` performs adapter
+scans and window refill. Each checkpoint component defines the topology changes it
+accepts; a source ledger proof alone cannot establish model convergence or transport
+performance.

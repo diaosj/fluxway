@@ -9,7 +9,7 @@ from ray import cloudpickle
 from fluxway.common.mesh import DeviceMesh
 from fluxway.control_plane.scheduler import Scheduler
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     ClusterNode,
     ClusterSnapshot,
     PlacementPlanner,
@@ -64,14 +64,13 @@ def _compiled_affinity_graph():
     )
     recipe = PlacementRecipe(
         recipe_id="compiled-affinity",
-        version="1.0.0",
         constraints=(
             subseteq(
                 support(workers(AffineSPMD)),
                 support(workers(AcceleratorSPMD)),
             ),
         ),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (

@@ -13,6 +13,43 @@ from math import prod
 from typing import Any
 
 
+type RestoreOption = bytes
+type RestoreOptionsByComponent = Mapping[str, RestoreOption]
+type RestoreOptionsByRank = Mapping[int, RestoreOptionsByComponent]
+type RestoreOptions = Mapping[str, RestoreOptionsByRank]
+
+
+def validate_restore_options(
+    options: RestoreOptions | None,
+) -> None:
+    if options is None:
+        return
+    if not isinstance(options, Mapping):
+        raise TypeError("restore_options must be an SPMD mapping")
+    for spmd_id, rank_options in options.items():
+        if not isinstance(spmd_id, str) or not spmd_id:
+            raise TypeError("restore_options SPMD IDs must be non-empty strings")
+        if not isinstance(rank_options, Mapping):
+            raise TypeError(f"restore_options for {spmd_id!r} must be a rank mapping")
+        for rank, component_options in rank_options.items():
+            if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+                raise TypeError(
+                    "restore_options rank keys must be non-negative integers"
+                )
+            if not isinstance(component_options, Mapping):
+                raise TypeError(
+                    f"restore_options for {spmd_id!r} rank {rank} "
+                    "must be a component mapping"
+                )
+            for component_id, option in component_options.items():
+                if not isinstance(component_id, str) or not component_id:
+                    raise TypeError(
+                        "restore_options component IDs must be non-empty strings"
+                    )
+                if not isinstance(option, bytes) or not option:
+                    raise TypeError("restore_options values must be non-empty bytes")
+
+
 class CheckpointError(RuntimeError):
     pass
 
@@ -220,7 +257,6 @@ class TopologySnapshot:
     world_size: int
     mesh_axis_names: tuple[str, ...]
     mesh_axis_shapes: tuple[int, ...]
-    partition_scheme_version: str
 
     def __post_init__(self) -> None:
         if self.world_size <= 0:
@@ -233,8 +269,6 @@ class TopologySnapshot:
             raise ValueError("mesh axis shapes must be positive")
         if self.mesh_axis_shapes and prod(self.mesh_axis_shapes) != self.world_size:
             raise ValueError("mesh shape product must equal topology world_size")
-        if not self.partition_scheme_version:
-            raise ValueError("topology requires partition_scheme_version")
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,13 +299,14 @@ class CheckpointObjectKey:
 class CheckpointObjectRef:
     component_id: str
     checkpoint_object_id: str
-    version_id: str
+    version_id: str | bytes
     storage_locator: bytes
-    format_version: int
     partition_key: str | None = None
     cleanup_group: str | None = None
 
     def __post_init__(self) -> None:
+        if not isinstance(self.version_id, (str, bytes)):
+            raise TypeError("checkpoint_object version_id must be str or bytes")
         if (
             not self.component_id
             or not self.checkpoint_object_id
@@ -284,8 +319,6 @@ class CheckpointObjectRef:
             raise ValueError(
                 "checkpoint_object reference requires an opaque storage_locator"
             )
-        if self.format_version <= 0:
-            raise ValueError("checkpoint_object format_version must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,19 +360,29 @@ class CheckpointObjectSpec:
 @dataclass(frozen=True, slots=True)
 class CheckpointComponentSpec:
     component_id: str
-    format_version: int = 1
     retention_domain: str | None = None
     save: CheckpointSaveSpec | None = None
     restore: CheckpointRestoreSpec | None = None
     checkpoint_objects: tuple[CheckpointObjectSpec, ...] = ()
+    output_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.component_id:
             raise ValueError("checkpoint component requires component_id")
         if self.retention_domain is not None and not self.retention_domain:
             raise ValueError("retention_domain must be non-empty when provided")
-        if self.format_version <= 0:
-            raise ValueError("component format_version must be positive")
+        if self.output_path is not None:
+            if not isinstance(self.output_path, str):
+                raise TypeError("component output_path must be a string or None")
+            path = self.output_path.replace("\\", "/")
+            if (
+                not path
+                or path.startswith("/")
+                or any(part in {"", ".", ".."} for part in path.split("/"))
+            ):
+                raise ValueError(
+                    "component output_path must be a non-empty relative path"
+                )
         checkpoint_object_ids = [
             checkpoint_object.checkpoint_object_id
             for checkpoint_object in self.checkpoint_objects
@@ -373,7 +416,9 @@ class SaveSession:
     rank: int
     source_topology: TopologySnapshot
     component_id: str
-    format_version: int = 1
+    repository_root: str = ""
+    staging_output_path: str | None = None
+    published_output_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.attempt_id or not self.checkpoint_id:
@@ -384,8 +429,6 @@ class SaveSession:
             raise ValueError("save session requires SPMD and component IDs")
         if self.rank < 0 or self.rank >= self.source_topology.world_size:
             raise ValueError("save session rank is outside source topology")
-        if self.format_version <= 0:
-            raise ValueError("save session format_version must be positive")
 
     def checkpoint_object_key(
         self, checkpoint_object_id: str, partition_key: str | None = None
@@ -420,7 +463,6 @@ class SaveSession:
             checkpoint_object_id=checkpoint_object_id,
             version_id=version_id,
             storage_locator=storage_locator,
-            format_version=self.format_version,
             partition_key=partition_key,
             cleanup_group=cleanup_group,
         )
@@ -430,7 +472,6 @@ class SaveSession:
     ) -> CheckpointComponentPublication:
         return CheckpointComponentPublication(
             component_id=self.component_id,
-            format_version=self.format_version,
             shared_records=(CheckpointObjectRecord(checkpoint_objects=objects),),
         )
 
@@ -458,7 +499,7 @@ class RestoreSession:
     restore_topology: TopologySnapshot
     component_id: str
     component_checkpoint: CheckpointComponentPublication
-    format_version: int = 1
+    restore_options: RestoreOption | None = None
 
     def __post_init__(self) -> None:
         if not self.checkpoint_id or not self.spmd_id or not self.component_id:
@@ -467,6 +508,10 @@ class RestoreSession:
             )
         if self.rank < 0 or self.rank >= self.restore_topology.world_size:
             raise ValueError("restore session rank is outside restore topology")
+        if self.restore_options is not None and (
+            not isinstance(self.restore_options, bytes) or not self.restore_options
+        ):
+            raise TypeError("restore_options must be non-empty opaque bytes")
 
     @property
     def source_topology(self) -> TopologySnapshot:
@@ -535,15 +580,12 @@ class PartitionRecord:
 @dataclass(frozen=True, slots=True)
 class CheckpointComponentPublication:
     component_id: str
-    format_version: int
     shared_records: tuple[CheckpointObjectRecord, ...] = ()
     partitions: tuple[PartitionRecord, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.component_id:
             raise ValueError("component publication requires component_id")
-        if self.format_version <= 0:
-            raise ValueError("component publication format_version must be positive")
         keys = [partition.partition_key for partition in self.partitions]
         if len(keys) != len(set(keys)):
             raise ValueError("component publication partition keys must be unique")
@@ -559,7 +601,7 @@ class CheckpointComponentPublication:
             raise ValueError(
                 "checkpoint_object component does not match its publication"
             )
-        versions_by_checkpoint_object: dict[str, set[str]] = {}
+        versions_by_checkpoint_object: dict[str | bytes, set[str | bytes]] = {}
         for record in records:
             for checkpoint_object in record.checkpoint_objects:
                 versions_by_checkpoint_object.setdefault(
@@ -623,7 +665,6 @@ CheckpointReference = StepReference | NameReference | CheckpointIdReference
 
 @dataclass(frozen=True, slots=True)
 class CheckpointManifest:
-    schema_version: int
     checkpoint_id: str
     attempt_id: str
     coordinator_generation: int
@@ -634,8 +675,6 @@ class CheckpointManifest:
     spmds: Mapping[str, SpmdCheckpoint]
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
-            raise ValueError("only checkpoint manifest schema version 1 is supported")
         if not self.checkpoint_id:
             raise ValueError("checkpoint manifest requires checkpoint_id")
         if self.checkpoint_sequence < 0:
@@ -736,7 +775,7 @@ class CleanupReservationRequest:
     checkpoint_object_id: str
     ordered_candidates: tuple[CheckpointObjectRef, ...]
     required_count: int
-    protected_versions: frozenset[str] = frozenset()
+    protected_versions: frozenset[str | bytes] = frozenset()
 
     def __post_init__(self) -> None:
         if not self.checkpoint_object_id:
@@ -751,6 +790,11 @@ class CleanupReservation:
     checkpoint_object_id: str
     claimed: tuple[CheckpointObjectRef, ...]
     generation: int
+    owner_handle: bytes = b""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner_handle, bytes):
+            raise TypeError("cleanup reservation owner_handle must be bytes")
 
 
 @dataclass(frozen=True, slots=True)

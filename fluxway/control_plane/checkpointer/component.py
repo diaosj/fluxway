@@ -62,6 +62,16 @@ class CheckpointComponentSave(ABC):
     @abstractmethod
     async def publish_save(self, session: SaveSession) -> None: ...
 
+    @abstractmethod
+    async def abort_save(self, permit: CheckpointCommitPermit) -> None:
+        """Idempotently discard an incomplete attempt from the control runtime."""
+        ...
+
+    @abstractmethod
+    async def acknowledge_save(self, permit: CheckpointCommitPermit) -> None:
+        """Idempotently acknowledge a globally committed attempt on control."""
+        ...
+
 
 class CheckpointComponentRestore(ABC):
     @abstractmethod
@@ -208,6 +218,12 @@ class CheckpointComponentRegistry:
         if registration is None:
             raise KeyError(f"checkpoint component is not registered: {component_id!r}")
         return registration
+
+    def get(self, component_id: str) -> CheckpointComponentRegistration | None:
+        return self._by_id.get(component_id)
+
+    def __contains__(self, component_id: str) -> bool:
+        return component_id in self._by_id
 
     async def open_all(self, runtime: CheckpointRuntime) -> None:
         opened: list[CheckpointComponentLifecycle] = []

@@ -115,7 +115,13 @@ class _Controller:
     def abort_checkpoint_transaction(self, checkpoint_id, permit):
         return None
 
-    async def restore_snapshot(self, checkpoint_id, manifest, repository_dir):
+    async def restore_snapshot(
+        self,
+        checkpoint_id,
+        manifest,
+        repository_dir,
+        restore_options=None,
+    ):
         raise AssertionError("cleaned_up checkpoint reached the restore controller")
 
 
@@ -238,7 +244,7 @@ def _checkpoint_object_paths(manifest) -> tuple[Path, ...]:
 async def test_retain_last_automatically_cleanups_old_physical_checkpoint_object(
     tmp_path,
 ):
-    topology = TopologySnapshot(1, (), (), "v1")
+    topology = TopologySnapshot(1, (), ())
     owner = _Owner()
     controller = _Controller(owner, topology)
     control_component = _component()
@@ -279,7 +285,7 @@ async def test_retain_last_automatically_cleanups_old_physical_checkpoint_object
 async def test_artifact_retention_counts_versions_not_rank_objects(
     tmp_path,
 ):
-    topology = TopologySnapshot(2, ("data",), (2,), "v1")
+    topology = TopologySnapshot(2, ("data",), (2,))
     owners = (_Owner(), _Owner())
     controller = _MultiRankController(owners, topology)
     control_component = _component()
@@ -310,7 +316,7 @@ async def test_artifact_retention_counts_versions_not_rank_objects(
 async def test_multirank_reservation_write_failure_rolls_back_every_claim(
     tmp_path, monkeypatch
 ):
-    topology = TopologySnapshot(2, ("data",), (2,), "v1")
+    topology = TopologySnapshot(2, ("data",), (2,))
     owners = (_Owner(), _Owner())
     controller = _MultiRankController(owners, topology)
     control_component = _component()
@@ -360,7 +366,7 @@ async def test_multirank_reservation_write_failure_rolls_back_every_claim(
 
 @pytest.mark.asyncio
 async def test_failed_cleanup_is_automatically_repaired_before_next_save(tmp_path):
-    topology = TopologySnapshot(2, ("data",), (2,), "v1")
+    topology = TopologySnapshot(2, ("data",), (2,))
     owners = (_Owner(), _Owner())
     controller = _MultiRankController(owners, topology)
     control_component = _component()
@@ -399,7 +405,7 @@ async def test_failed_cleanup_is_automatically_repaired_before_next_save(tmp_pat
     next_owners = (*owners, _Owner())
     for owner in next_owners:
         owner.state = {"value": 3}
-    next_topology = TopologySnapshot(3, ("data",), (3,), "v1")
+    next_topology = TopologySnapshot(3, ("data",), (3,))
     next_controller = _MultiRankController(next_owners, next_topology)
     next_component = _component()
     next_checkpointer = await FluxwayCheckpointer.create(

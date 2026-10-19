@@ -847,6 +847,7 @@ def spmd(
     mesh_axis_shapes: tuple[int, ...] | None = None,
     checkpoint_components: tuple[Any, ...] = (),
     heartbeat_interval_s: float = 5.0,
+    execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
 ):
     """
@@ -975,6 +976,7 @@ def spmd(
                 driver_runtime_env=c._driver_runtime_env,
                 checkpoint_components=c._checkpoint_components,
                 heartbeat_interval_s=heartbeat_interval_s,
+                execution_progress_warning_s=execution_progress_warning_s,
                 heartbeat_timeout_s=heartbeat_timeout_s,
             )
 
@@ -996,6 +998,7 @@ def spmd_source(
     driver_runtime_env: dict[str, Any] | None = None,
     checkpoint_components: tuple[Any, ...] = (),
     heartbeat_interval_s: float = 5.0,
+    execution_progress_warning_s: float = 90.0,
     heartbeat_timeout_s: float = 90.0,
 ):
     """
@@ -1010,6 +1013,7 @@ def spmd_source(
         driver_runtime_env=driver_runtime_env,
         checkpoint_components=checkpoint_components,
         heartbeat_interval_s=heartbeat_interval_s,
+        execution_progress_warning_s=execution_progress_warning_s,
         heartbeat_timeout_s=heartbeat_timeout_s,
     )
 

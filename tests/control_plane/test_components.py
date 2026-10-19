@@ -52,6 +52,20 @@ def test_source_descriptor_is_operator_metadata_only():
         OperatorSpec(name="compute", source=descriptor)
 
 
+def test_controlled_source_descriptor_requires_all_scan_capabilities():
+    class Descriptor:
+        requires_source_control_runtime = True
+
+        def build_component(self, context):
+            return _Component()
+
+        def build_reader_topology(self, **kwargs):
+            return None
+
+    with pytest.raises(TypeError, match="bounded scan capabilities"):
+        OperatorSpec(name="read", is_source=True, source=Descriptor())
+
+
 def test_registry_forwards_lifecycle_and_round_trips_domain_state():
     component = _Component()
     registry = ControlPlaneComponentRegistry()

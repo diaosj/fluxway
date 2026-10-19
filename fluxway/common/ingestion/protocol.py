@@ -163,10 +163,8 @@ class WorkerLayoutDescriptor:
     layout_digest: str
     worker_id: str
     segments: tuple[CompiledSegment, ...]
-    PROTOCOL_VERSION: ClassVar[int] = 1
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
-            "protocol_version",
             "source_identity",
             "view_identity",
             "schema_digest",
@@ -218,7 +216,6 @@ class WorkerLayoutDescriptor:
     def encode(self) -> EncodedWorkerLayoutDescriptor:
         encoded = pack_metadata(
             {
-                "protocol_version": self.PROTOCOL_VERSION,
                 "source_identity": self.source_identity,
                 "view_identity": self.view_identity,
                 "schema_digest": self.schema_digest,
@@ -256,8 +253,6 @@ class WorkerLayoutDescriptor:
             ) from error
         if not isinstance(decoded, Mapping) or set(decoded) != cls.FIELDS:
             raise ValueError("worker layout descriptor fields do not match protocol")
-        if decoded["protocol_version"] != cls.PROTOCOL_VERSION:
-            raise ValueError("unsupported worker layout descriptor version")
         for name in (
             "source_identity",
             "view_identity",

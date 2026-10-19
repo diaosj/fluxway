@@ -70,6 +70,27 @@ Reader/Input placement 约束；下游节点间的亲和性（如 Input/Dense）
 `sort_indices=None` 表示不重排；真实 permutation 才执行 backend 原生 gather。
 不能因为某次动态路由恰好有序，就把全部动态路由声明为恒等排列。
 
+## 多维路由与动态分片
+
+针对跨多种并行维度（如数据并行 `dp`、完全分片数据并行 `fsdp`、张量并行 `tp`）的复杂计算拓扑：
+
+- **DeviceMesh 与 RoutingDomain**：
+  `DeviceMesh(axis_names=("dp", "fsdp"), device_shape=(2, 3))` 定义多维设备网格；
+  `RoutingDomain.from_layout(...)` 将张量分片规范投影到该网格上推导路由边界。
+- **规范索引表示**：
+  各维度切分采用规范化索引数据结构：
+  - `RangeIndices.contiguous(start, length)`：表示连续区间；
+  - `LiteralIndices(length, values)`：表示显式任意坐标选择；
+  - `IdentityIndices(length)`：表示全量不切分透传。
+- **动态函数分片与 ResourceRegistry**：
+  当路由关系依赖运行时动态计算（如动态稀疏路由、运行时 Rank Provider）时，
+  `FunctionPartition(target=...)` 既支持传入普通 Callable，也支持传入 `ResourceHandle(namespace=..., resource_id=...)`。
+  传输规划时通过当前上下文绑定的 `ResourceRegistry`（`bind_resource_registry`）解析资源句柄，
+  从而将图结构与底层物理 Actor 端点或内存地址彻底解耦。
+- **LogicalPartitionBinding**：
+  `LogicalPartitionBinding` 建立逻辑分片坐标到物理 Rank 的绑定映射，在集群扩缩容或拓扑重映射时
+  确保路由关系的一致性与可恢复性。
+
 
 ## 公共声明
 

@@ -33,7 +33,7 @@ from fluxway.transport.manifest import (  # type: ignore
     FRAME_SENDER_RANK,
     FRAME_SENDER_SPMD_CODE,
     FRAME_SENDER_WORLD_SIZE,
-    FRAME_VERSION,
+    FRAME_ABI_TAG_FIELD,
     FRAME_WIDTH,
     PAYLOAD_DTYPE,
     PAYLOAD_FLAGS,
@@ -44,7 +44,7 @@ from fluxway.transport.manifest import (  # type: ignore
     PAYLOAD_SHAPE_COUNT,
     PAYLOAD_VALID_COUNT,
     PAYLOAD_WIDTH,
-    PROTOCOL_VERSION,
+    TRANSPORT_ABI_TAG,
     TensorEntryKind,
     PayloadRole,
     TransportFrame,
@@ -133,7 +133,7 @@ def build_preallocated_frame(edge_count: int, rows: int, cols: int) -> Transport
     segment = np.zeros((rows, cols), dtype=np.float32)
     idx = np.arange(edge_count, dtype=np.int32)
     frame_i32 = np.empty(FRAME_WIDTH, dtype=np.int32)
-    frame_i32[FRAME_VERSION] = PROTOCOL_VERSION
+    frame_i32[FRAME_ABI_TAG_FIELD] = TRANSPORT_ABI_TAG
     frame_i32[1] = 7
     frame_i32[FRAME_SENDER_SPMD_CODE] = 3
     frame_i32[FRAME_SENDER_RANK] = 1

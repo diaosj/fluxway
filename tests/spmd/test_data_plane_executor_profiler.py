@@ -22,7 +22,7 @@ from fluxway.transport.manifest import (
     ENTRY_WIDTH,
     PAYLOAD_WIDTH,
     PayloadRole,
-    PROTOCOL_VERSION,
+    TRANSPORT_ABI_TAG,
     TensorEntryKind,
     TransportFrameBuilder,
     TransportFrameHeader,
@@ -44,7 +44,7 @@ class _Handler(DataPlaneCallable):
 def _empty_header(step: int = 0) -> TransportFrameHeader:
     return TransportFrameHeader(
         frame_i32=np.array(
-            [PROTOCOL_VERSION, step, 0, 0, 1, 0, 0, 0],
+            [TRANSPORT_ABI_TAG, step, 0, 0, 1, 0, 0, 0],
             dtype=np.int32,
         ),
         entry_i32=np.zeros((0, ENTRY_WIDTH), dtype=np.int32),
@@ -172,7 +172,7 @@ async def test_profiler_builds_frames_in_background_thread_and_records_split_spa
         build_threads.append(threading.get_ident())
         header = TransportFrameHeader(
             frame_i32=np.array(
-                [PROTOCOL_VERSION, kwargs["exec_step"], 0, 0, 1, 0, 0, 0],
+                [TRANSPORT_ABI_TAG, kwargs["exec_step"], 0, 0, 1, 0, 0, 0],
                 dtype=np.int32,
             ),
             entry_i32=np.zeros((0, ENTRY_WIDTH), dtype=np.int32),

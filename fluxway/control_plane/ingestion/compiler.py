@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -18,6 +18,8 @@ from fluxway.common.ingestion.segment import (
     CanonicalWorkInterval,
     CompiledSegment,
     LayoutUnitDescriptor,
+    SYNTHETIC_PAD_IDENTITY,
+    SourceWorkKind,
     SourceWorkAssignment,
     _count,
     _id,
@@ -249,7 +251,9 @@ class LayoutCompileRequest:
     topology: ReaderTopologyDescriptor
     tail_layout_mode: TailLayoutMode | str
     lineage_digest: str
-    assignment_policy: AssignmentPolicy = AssignmentPolicy.default()
+    assignment_policy: AssignmentPolicy = field(
+        default_factory=AssignmentPolicy.default
+    )
 
     def __post_init__(self) -> None:
         for value in (
@@ -272,7 +276,7 @@ class LayoutCompileRequest:
         policy = AssignmentPolicy.from_value(self.assignment_policy)
         object.__setattr__(self, "assignment_policy", policy)
         if mode is TailLayoutMode.DISCARD_REMAINDER and any(
-            unit.physical_identity == "__VIRTUAL_PAD__" for unit in units
+            unit.is_synthetic_padding for unit in units
         ):
             raise ValueError(
                 "layout cannot discard remainder when units contain virtual padding"
@@ -441,6 +445,7 @@ class CompiledIngestionLayout:
         return tuple(
             unit.canonical_work_interval(self.request.source_identity)
             for unit in self.request.units
+            if not unit.is_synthetic_padding
         )
 
     def encoded_worker_layouts(self) -> tuple[EncodedWorkerLayoutDescriptor, ...]:
@@ -530,16 +535,19 @@ class AlgebraicLayoutCompiler:
                     units[0].cardinality_metric,
                     "SplittableSpan",
                     "local",
-                    "__VIRTUAL_PAD__",
+                    SYNTHETIC_PAD_IDENTITY,
                     0,
                     "pad:virtual",
+                    work_kind=SourceWorkKind.SYNTHETIC_PADDING,
                 ),
             )
             steps += 1
             residual = 0
         validate_canonical_work_intervals(
             tuple(
-                unit.canonical_work_interval(request.source_identity) for unit in units
+                unit.canonical_work_interval(request.source_identity)
+                for unit in units
+                if not unit.is_synthetic_padding
             )
         )
         cursor = _UnitCursor(units)
@@ -559,16 +567,23 @@ class AlgebraicLayoutCompiler:
         for step in range(start_step, start_step + steps):
             step_assignments = []
             global_start = step * batch
-            for descriptor in cursor.take(batch):
+            step_descriptors = cursor.take(batch)
+            valid_cardinality = sum(
+                d.cardinality for d in step_descriptors if not d.is_synthetic_padding
+            )
+            for descriptor in step_descriptors:
                 step_assignments.append(
                     SourceWorkAssignment.create(
                         epoch=epoch,
                         step=step,
                         source_identity=request.source_identity,
+                        view_identity=request.view_identity,
                         schema_digest=request.schema_digest,
+                        lineage_digest=request.lineage_digest,
                         descriptor=descriptor,
                         global_start=global_start,
                         global_batch_size=batch,
+                        global_valid_count=valid_cardinality,
                     )
                 )
                 global_start += descriptor.cardinality
@@ -589,6 +604,7 @@ class AlgebraicLayoutCompiler:
                 )
                 for worker_id in remaining_by_worker
             }
+            strategy: _WorkerAllocationStrategy
             if policy.node_affinity_hint:
                 assert (
                     owner_nodes_by_physical is not None
@@ -831,17 +847,7 @@ class _UnitCursor:
                 raise ValueError("source demand exceeds canonical units")
             unit = self._units[self._index]
             amount = min(demand, unit.cardinality - self._offset)
-            if unit.split_policy == "AtomicItem" and (
-                self._offset != 0 or amount != unit.cardinality
-            ):
-                raise ValueError("AtomicItem cannot be split across layout segments")
-            slices.append(
-                replace(
-                    unit,
-                    logical_start=unit.logical_start + self._offset,
-                    cardinality=amount,
-                )
-            )
+            slices.append(unit.slice(self._offset, amount))
             demand -= amount
             self._offset += amount
             if self._offset == unit.cardinality:
@@ -861,7 +867,21 @@ def _request_from_dict(value: Any) -> LayoutCompileRequest:
         raise TypeError("layout planning request must be a mapping")
     request = dict(value)
     request["tail_layout_mode"] = TailLayoutMode.from_value(request["tail_layout_mode"])
-    request["units"] = tuple(LayoutUnitDescriptor(**item) for item in value["units"])
+    request["units"] = tuple(
+        LayoutUnitDescriptor(
+            unit_id=item["unit_id"],
+            revision_identity=item["revision_identity"],
+            cardinality=item["cardinality"],
+            cardinality_metric=item["cardinality_metric"],
+            split_policy=item["split_policy"],
+            locality_key=item["locality_key"],
+            physical_identity=item["physical_identity"],
+            logical_start=item["logical_start"],
+            opaque_token=item["opaque_token"],
+            work_kind=SourceWorkKind(item["work_kind"]),
+        )
+        for item in value["units"]
+    )
     execution_cycle = value["topology"]["execution_cycle"]
     request["topology"] = ReaderTopologyDescriptor(
         value["topology"]["global_cardinality"],

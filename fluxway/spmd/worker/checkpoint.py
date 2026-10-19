@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
+from pathlib import Path
 from typing import Any, TypeVar
 
 from fluxway.common.types.checkpoint import (
@@ -10,6 +11,7 @@ from fluxway.common.types.checkpoint import (
     CheckpointRuntime,
     CheckpointRuntimeRole,
     CheckpointBusyError,
+    RestoreOptionsByComponent,
     CheckpointCommitPermit,
     SaveSession,
     CommitSaveSession,
@@ -27,6 +29,12 @@ from fluxway.control_plane.checkpointer.component import (
 
 
 _PhaseResult = TypeVar("_PhaseResult")
+
+
+def _safe_path_segment(value: str, name: str) -> str:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"{name} must be a single safe path segment")
+    return value
 
 
 class WorkerCheckpointCoordinator:
@@ -79,6 +87,14 @@ class WorkerCheckpointCoordinator:
                 f"worker already owns checkpoint attempt {self.active_attempt_id!r}"
             )
         await self._ensure_open()
+        _safe_path_segment(checkpoint_id, "checkpoint_id")
+        _safe_path_segment(attempt_id, "attempt_id")
+        if cut.position is None and any(
+            component.descriptor.output_path is not None for component in self._registry
+        ):
+            raise ValueError(
+                "checkpoint component output requires a durable step position"
+            )
         self._checkpoint_id = checkpoint_id
         self._attempt_id = attempt_id
         self._permit = permit
@@ -177,6 +193,9 @@ class WorkerCheckpointCoordinator:
                         rank=save_session.rank,
                         source_topology=save_session.source_topology,
                         component_id=save_session.component_id,
+                        repository_root=save_session.repository_root,
+                        staging_output_path=save_session.staging_output_path,
+                        published_output_path=save_session.published_output_path,
                         worker_results=gathered,
                     )
                 )
@@ -185,14 +204,20 @@ class WorkerCheckpointCoordinator:
 
         return await self._run_phase(operation)
 
-    async def publish_save(self) -> None:
+    async def publish_save(self) -> bool:
         self._require_state(CheckpointSaveState.COMMITTED)
+        has_output = any(
+            component.save is not None and component.descriptor.output_path is not None
+            for component in self._registry
+        )
         for component in self._registry:
             save = component.save
-            if save is None:
-                continue
-            await save.publish_save(self._session(component.descriptor.component_id))
+            if save is not None:
+                await save.publish_save(
+                    self._session(component.descriptor.component_id)
+                )
         self._clear_transaction()
+        return has_output
 
     async def rollback_save(self) -> None:
         if self._state is None:
@@ -214,11 +239,35 @@ class WorkerCheckpointCoordinator:
         publications: Mapping[str, CheckpointComponentPublication],
         source_topology: TopologySnapshot,
         current_topology: TopologySnapshot,
+        restore_options_by_component: RestoreOptionsByComponent | None = None,
     ) -> None:
         self._require_available()
         if self._state is not None:
             raise CheckpointBusyError("cannot restore during an active checkpoint")
         await self._ensure_open()
+        if restore_options_by_component is not None and not isinstance(
+            restore_options_by_component, Mapping
+        ):
+            raise TypeError(
+                "restore_options_by_component must be a component-bytes mapping"
+            )
+        if restore_options_by_component is not None:
+            for component_id, option in restore_options_by_component.items():
+                if not isinstance(component_id, str) or not component_id:
+                    raise TypeError(
+                        "restore_options_by_component keys must be non-empty component IDs"
+                    )
+                if not isinstance(option, bytes) or not option:
+                    raise TypeError(
+                        "restore_options_by_component values must be non-empty bytes"
+                    )
+        component_options = restore_options_by_component or {}
+        unknown_components = set(component_options).difference(publications)
+        if unknown_components:
+            raise ValueError(
+                "restore options contain unknown components: "
+                f"{sorted(unknown_components)!r}"
+            )
         for component_id, publication in publications.items():
             component = self._registry.require(component_id)
             restore = component.restore
@@ -236,7 +285,7 @@ class WorkerCheckpointCoordinator:
                 restore_topology=current_topology,
                 component_id=component_id,
                 component_checkpoint=publication,
-                format_version=component.descriptor.format_version,
+                restore_options=component_options.get(component_id),
             )
             await restore.restore(session)
 
@@ -304,6 +353,20 @@ class WorkerCheckpointCoordinator:
             or self._cut is None
         ):
             raise RuntimeError("checkpoint transaction context is not initialized")
+        descriptor = self._registry.require(component_id).descriptor
+        staging_output_path = None
+        published_output_path = None
+        if descriptor.output_path is not None:
+            root = Path(self._repository_root)
+            staging_output_path = str(
+                root
+                / "steps"
+                / f".{self._checkpoint_id}.{self._attempt_id}"
+                / descriptor.output_path
+            )
+            published_output_path = str(
+                root / "steps" / str(self._cut.position) / descriptor.output_path
+            )
         return SaveSession(
             instance=self._owner,
             attempt_id=self._attempt_id,
@@ -314,9 +377,9 @@ class WorkerCheckpointCoordinator:
             rank=self._rank,
             source_topology=self._source_topology,
             component_id=component_id,
-            format_version=self._registry.require(
-                component_id
-            ).descriptor.format_version,
+            repository_root=self._repository_root,
+            staging_output_path=staging_output_path,
+            published_output_path=published_output_path,
         )
 
     def _require_state(self, state: CheckpointSaveState) -> None:

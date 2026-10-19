@@ -1,177 +1,142 @@
-# Source Coordination
+# Source coordination
 
-## Typed Layout Activation
+## Ownership
 
-Source-specific adapters implement `IngestionSourceAdapter.capture_view` and own
-immutable revision discovery, locators and cursor encoding. Custom structured
-metadata uses canonical MessagePack. Workers must read the captured revision and
-locator, never substitute the latest table state during replay.
+`SourceScanBinding` is the session owner for topology, tail policy, scan adapter, and the
+`initial_cursor_factory` resolver. The `IngestionSourceAdapter` only exposes
+`scan_next(cursor, budget)` and pure `advance_cursor(cursor, records)`; it does not resolve the
+session's initial position. The binding resolver may return `None` while an empty continuous
+source has no scan view, allowing the controller to retry the same binding later. Once a cursor
+is resolved, the planner owns that resolver for the session and never asks the adapter or a fresh
+latest snapshot for an initial position. Scans return an immutable
+`SourceScanResult` with ordered units and an `OpaqueSourceCursor`. The adapter owns
+source identity, revision selection, locators and cursor encoding. Fluxway does
+not interpret Iceberg snapshots or require producer-specific metadata.
+Producers and consumers operate independently. Fluxway does not require producer notifications,
+shared checkpoints, logs, or progress watermarks. Source progress is advanced by explicit scan
+and acknowledgement events owned by the controller; the source-progress supervisor does not
+poll on a timer.
 
-`IngestionLayoutPlanningComponent` owns ordered immutable compile windows.
-Descriptor plan construction and adapter capture use a dedicated `IOLane`, separate
-from heartbeat, payload transport and checkpoint storage. Pure layout compilation
-uses a persistent process executor with the `spawn` start method. Threads isolate
-blocking I/O; they do not provide parallel execution of Python CPU work under the
-GIL. Repeated publication must match the existing epoch; conflicting requests fail.
+Range reading and source scanning are separate capabilities. Reading specified rows
+from a format does not establish bounded scanning or resumable cursor support; the
+planning component requires the scan contract. Each adapter must implement and validate
+that contract independently; the generic interface does not imply support for every
+storage format.
 
-The component owns submitted operation tasks. Cancelling a caller stops its wait;
-it does not cancel an accepted observation or publication. `close()` rejects new
-submissions, joins accepted operations, joins the compiler processes on a separate
-lifecycle lane, and closes the adapter lane. Concurrent close callers await one
-shielded cleanup task. Failures abandoned by cancelled waiters are reported after
-resource cleanup. A blocking adapter must eventually return for shutdown to finish.
+`unit_cursors` gives the source-owned origin of every ordered unit. The adapter's
+pure `advance_cursor(cursor, records)` advances within a unit without I/O; the
+result's `cursor_at` selects the origin for a consumed prefix. These origins remain
+in the control plane and are not worker layout fields.
 
-`AlgebraicLayoutCompiler` first builds logical step assignments from the immutable
-units captured in the current observation, then lowers each step to the current
-reader quotas. A 1,000-row historical file followed by two
-10-row append files, with one 1,020-row logical batch and quotas 340/340/340, yields:
+`LayoutUnitDescriptor.slice` is the sole unit-slicing operation used by compilation,
+window planning and the in-memory adapter. It preserves physical coordinates and
+opaque metadata. `SourceScanStatus.from_scan` derives status from record count,
+visible-range exhaustion and the finite-source contract; adapters supply facts
+instead of implementing parallel status decisions.
 
-| Worker | Source Intervals | Rows |
-| --- | --- | --- |
-| 0 | historical `[0,340)` | 340 |
-| 1 | historical `[340,680)` | 340 |
-| 2 | historical `[680,1000)`, append1 `[0,10)`, append2 `[0,10)` | 340 |
+`IngestionLayoutPlanningComponent` owns scan-result assembly, pending tails, compilation
+and window publication. The compiler partitions logical steps before assigning
+physical reader quotas. Readers consume only assigned immutable intervals; they
+never replace a captured revision with the latest source state.
 
-This is interval planning, not whole-file assignment. The default lowering keeps
-each Reader on its current contiguous unit prefix and minimizes physical-unit
-transitions subject to exact quotas and canonical coverage. It does not require
-the adapter to know future files. Byte cardinality is also supported by the
-compiler; actual byte-range readability depends on the adapter.
+`LogicalWorkLedger` owns leases, acknowledgements and logical progress. A reader
+acknowledgement records production, not downstream consumption or durable model
+state. Global checkpoint publication is the only durable commit boundary.
 
-Adapters may observe a stream while a source is still being written. Each
-`capture_view` result is an immutable bounded observation, and its tuple order is
-the only ordering authority for that observation. Fluxway retains incomplete units
-as a pending tail; a nonterminal observation smaller than one global batch publishes
-no layout and does not advance the source cut. The next observation is stitched to
-that tail. Unseen future files are never inferred or reordered.
+The source ledger does not derive a common downstream-consumed prefix from the
+training graph and does not require a linear path after the source. Its candidate cut
+advances from contiguous source-work acknowledgements, and source acquisition is
+bounded by the source's own in-flight window. Fan-out, joins, and conditional edges
+remain owned by dependency flow control and whole-graph drain; they do not redefine
+source identity or manufacture a source bookmark.
 
-Controller publishes the canonical epoch and validates physical coverage.
-`IngestionLayoutActivationComponent` reuses DriverComponent worker control for
-concurrent delivery of encoded `WorkerLayoutDescriptor` values. Worker indexes
-the installed segments by active step and requests chunks bounded by operator
-pipeline depth. Each invocation receives only its step's interval work items.
+The existing credit topology covers remote dependencies but cannot replace source
+leases and candidate-cut tracking. Arrival-triggered local completion counts also
+cannot be written directly into a durable source position. Complex graphs still
+require whole-graph drain and a common checkpoint to prove recovery; the generic scan
+interface is not a recovery guarantee for arbitrary graphs.
 
-## Streaming Windows
+## Budgets and windows
 
-`plan_adapter_window` accepts empty nonterminal observations without publishing an
-epoch or advancing the cut. An incomplete batch is retained and combined with the
-next observation. Nonempty complete windows advance epoch and step boundaries;
-terminal empty windows seal the stream without manufacturing source records.
+`SourceControlConfig` rejects unknown fields and provides:
 
-Planner checkpoint includes immutable requests, pending tail and encoded cursor.
-Its restore requires the current reader topology and validates the unchanged
-logical batch cardinality and canonical epoch digests. Physical layout is rebuilt.
-This component API does not itself run a discovery polling loop or activate workers.
+| Field | Responsibility |
+| --- | --- |
+| `planning_window_steps` | Target complete logical steps per window |
+| `max_in_flight_steps` | Acquisition credit relative to the source candidate cut |
+| `max_planning_records` | Record budget |
+| `max_planning_units` | Unit budget |
+| `max_planning_descriptor_bytes` | Total encoded worker descriptor budget |
 
-## Ownership and ACKs
+These quantities are independent. Source adapters own native metadata read limits;
+Fluxway limits scan rows and units and measures actual compiled descriptor bytes. A full logical step must fit. Pending
+units retain source order across scan results and revisions; nonterminal tails are not
+padded or dropped. Finite termination applies the declared tail policy once.
 
-`LogicalWorkLedger` owns interval leases, ACK validation, observed candidate cut and
-committed cut. `SourceWorkKey` uses `(epoch, step, assignment_id)`. `receive(position)`
-and worker-local durable cursors are not ownership APIs.
+Acquisition is bounded by the active window end and
+`candidate_cut + max_in_flight_steps`. A worker that reaches the end of a published window
+waits on the next contiguous activation; it does not poll, retry, or fail with `KeyError`.
+Planning is triggered by explicit progress events and keeps a bounded lead derived from the
+existing planning and in-flight limits. Reaching a source window boundary never forces a model
+checkpoint. `READY`, `PROGRESS`, `IDLE` and `TERMINAL` describe source scan results, not
+checkpoint states. An empty scan result is not end-of-source.
 
-Physical segments of a shared assignment have distinct runtime lease IDs. Only
-complete interval coverage advances a step. Worker ACK batching is bounded by its
-configured pipeline capacity and participates in outbound checkpoint drain.
-`SourceWorkRuntime` caches Controller-issued grants and shares an owned fetch task
-within each chunk. Controller returns the nonempty complete-step prefix allowed
-by current credit; a future credit wait does not prevent consuming cached earlier
-steps. Cancelled callers leave fetch supervision with Worker background tasks.
-The cache grants no execution permission and allocates no independent ownership.
-A cache miss still waits for a Controller RPC. A full in-flight
-window waits for a committed checkpoint cut; checkpoint cadence must permit progress.
+## Publication and lifecycle
 
-After compilation, publication validates the planner window and ledger bindings
-before installing the window, tail, cursor, observation identity and ledger epoch
-in one Controller event-loop section without an `await`. Acquisition and ACK
-operations cannot interleave within that section. Ledger coverage validation,
-descriptor decoding and installation still perform work proportional to the window
-on the owner loop. `SourceControlConfig.max_planning_units` and
-`max_planning_descriptor_bytes` bound accepted Controller layout publications;
-these limits are acceptance checks, not a constant-time publication guarantee.
+Controller source-window progress is supervised by one `SourceProgressSupervisor` generation.
+The supervisor owns event wakeup, planning execution, failure observation and stop/join. Controller
+state transitions do not own a second polling task or timer, and checkpoint resume does not replay
+source startup. Window planning runs outside the Controller FSM lock; only a bounded wakeup and
+typed failure event cross the Controller boundary. A published activation wakes every worker
+admission waiter for its newly available steps.
 
-Driver activation checkpoints are empty; physical layouts are transient. Controller restore rebuilds canonical
-plans with the current reader topology, publishes the rebound segments, then
-restores the logical ledger's committed cut. Driver activation redistributes
-the resulting descriptors to fresh workers.
+Capture and blocking metadata work use the existing adapter I/O lane. Compilation
+uses the existing process executor. Accepted operations remain owned by the
+component when a caller cancels its wait; close rejects new work, joins accepted
+operations and releases executors. Failures remain observable.
 
-Restore requires fresh Worker actors before source activation. An already-used
-Worker rejects restore before changing its scheduler watermark. Normal save/resume
-retains the same source scope and its valid future grants.
+Publication validates bounds and interval coverage before installing the window,
+cursor, pending tail and ledger epoch. Activation delivers compiled worker layout
+descriptors without creating a second planning identity. Physical binding and
+placement are transient and do not change logical batch contents.
 
-## Fault Tolerance and Elasticity Guarantees
+A window is a prefetch boundary, never a discard boundary. Units retained by the planner but not
+yet consumed remain in its canonical pending state and are carried into the next contiguous
+activation with the same source work identity. A terminal activation publishes the end position;
+requests beyond that position return typed `SOURCE_EXHAUSTED`, which drives normal whole-graph
+drain and checkpoint cut handling.
 
-The system architecture provides the following core guarantees:
+The planning API does not by itself prove an application has a complete event-driven
+refill and shutdown loop. In particular, bounded scanning of results containing no
+new records must be validated with the source adapter and controller lifecycle.
 
-- **Comprehensive Boundary Handling**: Natively supports empty observations, seamless tail stitching across revisions, and graceful termination of terminal windows.
-- **Protocol Robustness**: Guarantees deterministic behavior for out-of-order ACKs, lease fencing to prevent re-entrancy, and precise state restoration of the Canonical Planner.
-- **Dynamic Concurrency Scaling**: Supports arbitrary scaling out or scaling in of Readers during Checkpoint restore (e.g., safely scaling from 6 concurrent readers down to 3, or 3 down to 2). As long as the logical batch cardinality remains unchanged, the system redistributes physical intervals without data loss or duplicate delivery.
-- **Exact-Once Provenance**: During Controller restore, the protocol strictly follows a "restore Canonical Plan first, then restore Committed Ledger" sequence, ensuring that the data lineage (Provenance) derived from Work Items remains absolutely stable.
+## Checkpoint and recovery
 
-Controller startup activates one layout. Worker source scopes accept contiguous
-immutable windows per operator; BaseReader provides installation without duplicating
-activation identity. Custom adapters can express idle observations, pending tails and
-immutable revisions. Automatic discovery and replenishment of unbounded sources are
-not part of the public startup API. External publisher integrations require their own
-validation against the adapter contract.
+Use the existing Controller, Driver and Worker component registries. The planner
+owns cut-aligned source state; source-control owns logical progress; model and
+optimizer state are saved by Worker components. Driver components save only their
+owned state. The current ingestion activation component has an empty checkpoint
+image and rebuilds physical delivery after restore.
 
-Admission delivery uses the existing boundary revision and validates completion
-participant membership. Driver RPC and source ACK coverage waits occur outside the
-Controller reducer lock. Restore retains the Worker gate at committed cut; resume
-does not clear it. Source ownership and payload routing are separate: the latter
-uses [compiled transfer relations](transfer_planning.md).
+Recovery saves a source-owned consumption bookmark and replans and prefetches with
+current window limits and reader topology. Logical batch
+cardinality and ordered records must be preserved. Pure prefetch buffers, pending
+tails and old plan digests are not durable source state; stateful operators still
+save state that determines their future output. Physical actors, leases and iterators
+are recreated. Required source history must remain available; missing history fails.
 
-Acquisition and ACK queues are bounded. Committed planning windows and physical
-binding history are retained for canonical reconstruction; retention grows with the
-number of installed windows. Account for this metadata when sizing a workload.
+The planner saves the consumption bookmark and source constraints aligned with the
+coordinated checkpoint; the source ledger saves logical work progress. Recovery replans
+windows from the committed bookmark and rebuilds leases and assignments for the active
+reader topology. Windows, tails, leases and prefetch caches are runtime state rather
+than durable source checkpoint state. Model, optimizer and other state that affects
+future results must participate in the same checkpoint.
 
-`PlacementPolicy` is the solver input value object. It expresses generic layout invariants and locality preferences; it is not a Parquet-specific file-owner API. The default policy preserves unit order, contiguous prefixes, splittable-unit support, and minimum physical transitions. Callers may pass a validated policy when compiling a placement plan, while the physical cost model remains an internal compiler detail. Source adapters provide stable unit identity, split capability, locality metadata, and cursor fences. Affinity and zero-copy must still be checked separately through actual placement and transport. No 256-Input/768-Source throughput or multi-node zero-copy result follows from compiler or ledger tests. See [formal protocol](source_spmd_formal_protocol.md).
+Scan observations are reclaimed at durable cuts. Per-scan and per-window limits do
+not bound the accumulated observations between checkpoints; long-running retention
+and process memory still require validation.
 
-## PlacementPolicy and Physical Worker Allocation (Owner-Affinity)
-
-`PlacementPolicy` acts as the immutable input configuration for the Ingestion Solver, controlling physical worker assignment and affinity:
-- `require_sequential_order`
-- `affinity_contiguous_chunks`
-- `affinity_same_file`
-- `allow_unit_splitting`
-
-> [!NOTE]
-> This policy no longer supports string aliases like "ordered_prefix". It is strictly a strongly typed Value Object composed of configuration flags. The Canonical Interval of a `SourceWorkKey` from the same source is immune to Transient Bindings (ephemeral physical assignments) caused by topological or resource variations.
-
-### Allocation Lexicographic Scoring Function
-
-Given a physical segment $P_i$, the allocation key for a candidate Worker $w$ is formally projected as:
-
-$$ Key(w, P_i) = \left( \mathbb{I}_{w.\text{prev} \neq P_i},\; \mathbb{I}_{w \notin \text{owners}(P_i)},\; \text{rank}(w, P_i),\; \text{cycle\_order}(w) \right) $$
-
-The scheduler optimizes the assignment by selecting the Worker with the lexicographically smallest key:
-1. **$k_1 \in \{0, 1\}$ (Contiguous Prefix):** Prioritizes the Reader that is currently continuously reading the same physical identity.
-2. **$k_2 \in \{0, 1\} \times \mathbb{N}$ (Owner Set Reunion):** Next, reuses Readers that have already read this physical identity within the current window.
-3. **$k_3 \in \mathbb{N}$ (Cycle Order):** Finally, selects according to the deterministic order within the active-cycle.
-4. It splits to more Readers only when the quota is exhausted. If `allow_unit_splitting=False`, splitting triggers a direct exception.
-
-### Streaming Source Contract Execution Flow
-
-```mermaid
-sequenceDiagram
-    participant Catalog
-    participant Compiler
-    participant Topology
-    participant Worker
-    
-    Catalog->>Compiler: Capture Immutable Observation
-    Note over Compiler: Ignore unobserved future files<br/>(Do not participate in sorting)
-    Compiler->>Topology: Compute Quota and Canonical Coverage
-    Topology-->>Compiler: Return Active-Cycle
-    Compiler->>Compiler: Determine lexicographic assignment based on Owner-Affinity
-    
-    alt Normal Assignment
-        Compiler->>Worker: Dispatch Transient Binding
-    else Quota Insufficient & allow_unit_splitting=False
-        Compiler->>Compiler: Trigger Runtime Exception Directly
-    end
-    
-    Note over Compiler: Nonterminal Incomplete Observation<br/>Does not advance Cut, only retains Pending Tail
-```
-
-> [!TIP]
-> The complex logical requirements above (including Quota, Canonical Coverage, Active-cycle, and Owner-affinity) are unified and implemented within the same Lowering solver to avoid scattered hardcoding. Moreover, because it is a Transient Binding, the system can cleanly reconstruct the assignment upon Restore without violating the Canonical Source contract.
+See [formal work protocol](source_spmd_formal_protocol.md),
+[reader API](base_reader.md), and [checkpoint lifecycle](checkpoint.md).
+Scenario-specific integration configuration belongs to the downstream application repository;
+this document defines only the generic Fluxway contract.

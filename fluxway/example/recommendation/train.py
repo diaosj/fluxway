@@ -17,7 +17,7 @@ from fluxway.control_plane.checkpointer.directory import CheckpointDirectory
 from fluxway.common.types import CheckpointConfig, SourceControlConfig
 from fluxway.profiler import ProfilerDiagnostic
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     PlacementRecipe,
     ResourceProfile,
     equal,
@@ -35,10 +35,7 @@ async def _print_resource_allocation_summary(execution):
         print("[Fluxway] Controller resource summary is empty.")
         return
 
-    print(
-        "[Fluxway] Controller resource summary: "
-        f"recipe={summary['recipe_id']}@{summary['recipe_version']}"
-    )
+    print(f"[Fluxway] Controller resource summary: recipe={summary['recipe_id']}")
     counts = {}
     for assignment in summary["assignments"]:
         key = (assignment["spmd_id"], assignment["node_id"])
@@ -162,6 +159,7 @@ async def run_training(args):
             await compact_sparse_checkpoints(
                 repository_root=args.checkpoint_dir,
                 spmd_id=spmd_id,
+                lineage_name="embedding",
             )
         print("[Fluxway] Sparse checkpoint compaction completed.")
         return
@@ -318,7 +316,6 @@ async def run_training(args):
                         )
         placement_recipe = PlacementRecipe(
             recipe_id="recommendation-training",
-            version="2.0.0",
             constraints=(
                 *(
                     equal(
@@ -329,7 +326,7 @@ async def run_training(args):
                 ),
                 *input_dense_constraints,
             ),
-            objective=AFFINITY_FIRST_V1,
+            objective=AFFINITY_FIRST,
         )
 
     _apply_data_plane_config(task_graph, args)
@@ -390,6 +387,7 @@ async def run_training(args):
             await compact_sparse_checkpoints(
                 repository_root=args.checkpoint_dir,
                 spmd_id=spmd_id,
+                lineage_name="embedding",
             )
         print("[Fluxway] Manual sparse checkpoint compaction completed.")
 

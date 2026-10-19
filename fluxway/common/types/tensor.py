@@ -51,6 +51,12 @@ class _ConsumerLeaseOwner(Protocol):
     ) -> Any: ...
 
 
+class _ConsumerLeaseReservationRef(Protocol):
+    def claim(self) -> Any: ...
+
+    def release_for_cleanup(self) -> None: ...
+
+
 class TensorConsumerLease:
     __slots__ = ("_lease", "_tensor", "_released")
 
@@ -299,7 +305,7 @@ class TransportTensor:
         self._runtime_access_intent = TensorAccessIntent.WRITABLE
         self._runtime_state = TensorRuntimeState.VALID
         self._consumer_lease_owner: _ConsumerLeaseOwner | None = None
-        self._consumer_lease_reservation: Any | None = None
+        self._consumer_lease_reservation_ref: _ConsumerLeaseReservationRef | None = None
         self._active_consumer_leases = 0
         self._release_requested = False
         self._coherence_instances: tuple[CoherenceInstance, ...] = ()
@@ -604,10 +610,10 @@ class TransportTensor:
             raise CoherenceStateTransitionError(
                 "coherence-bound tensor has no consumer lease owner."
             )
-        reservation = self._consumer_lease_reservation
-        if reservation is not None:
-            lease = reservation.claim()
-            self._consumer_lease_reservation = None
+        reservation_ref = self._consumer_lease_reservation_ref
+        if reservation_ref is not None:
+            lease = reservation_ref.claim()
+            self._consumer_lease_reservation_ref = None
         else:
             lease = (
                 owner.acquire_consumer_lease(self._coherence_instances)
@@ -627,20 +633,20 @@ class TransportTensor:
             raise CoherenceStateTransitionError(
                 "coherence-bound tensor has no consumer lease owner."
             )
-        if self._consumer_lease_reservation is not None:
+        if self._consumer_lease_reservation_ref is not None:
             raise CoherenceStateTransitionError(
                 "tensor already has a consumer lease reservation."
             )
-        self._consumer_lease_reservation = owner.reserve_consumer_lease(
+        self._consumer_lease_reservation_ref = owner.reserve_consumer_lease(
             self._coherence_instances
         )
 
-    def _cancel_consumer_lease_reservation(self) -> None:
-        reservation = self._consumer_lease_reservation
-        if reservation is None:
+    def _cleanup_consumer_lease_reservation_ref(self) -> None:
+        reservation_ref = self._consumer_lease_reservation_ref
+        if reservation_ref is None:
             return
-        self._consumer_lease_reservation = None
-        reservation.cancel()
+        self._consumer_lease_reservation_ref = None
+        reservation_ref.release_for_cleanup()
 
     def _release_consumer_lease(self) -> None:
         if self._active_consumer_leases <= 0:
@@ -674,7 +680,7 @@ class TransportTensor:
         if self._runtime_state is TensorRuntimeState.RELEASED:
             raise CoherenceStateTransitionError("tensor payload was already released.")
         self._runtime_state = TensorRuntimeState.INVALIDATED
-        self._cancel_consumer_lease_reservation()
+        self._cleanup_consumer_lease_reservation_ref()
         if self._active_consumer_leases:
             self._release_requested = True
 
@@ -698,7 +704,7 @@ class TransportTensor:
         self._origin_indices = None
         self._receipt = None
         self._coherence_instances = ()
-        self._consumer_lease_reservation = None
+        self._consumer_lease_reservation_ref = None
         self._routing_indices_materialize_cache = None
         self._origin_indices_materialize_cache = None
         self._allocation_descriptor = None

@@ -18,8 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
-# pyrefly: ignore [missing-import]
-import msgpack
+from fluxway.common import msgpack_codec
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
@@ -94,10 +93,10 @@ class FilesystemCheckpointComponent(
         finalize_state: Callable[[Any, SaveSession], Any] | None = None,
         retention_domain: str | None = None,
         restore_topology: RestoreTopologyMode,
+        output_path: str | None = None,
     ) -> None:
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
-            format_version=1,
             retention_domain=retention_domain,
             checkpoint_objects=(CheckpointObjectSpec("state"),),
             save=CheckpointSaveSpec(
@@ -105,6 +104,7 @@ class FilesystemCheckpointComponent(
                 commit_scope=CheckpointSaveScope.LEADER,
             ),
             restore=CheckpointRestoreSpec(topology=restore_topology),
+            output_path=output_path,
         )
         self._save_state = _as_async(save_state, "save_state")
         self._restore_state = _as_async(restore_state, "restore_state")
@@ -151,7 +151,7 @@ class FilesystemCheckpointComponent(
     async def prepare_save(self, session: SaveSession) -> None:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
-        staging = self._staging_root(session)
+        staging = self._staging_root(session.attempt_id)
         if staging.exists():
             raise FileExistsError(
                 f"checkpoint staging directory already exists: {staging}"
@@ -177,15 +177,14 @@ class FilesystemCheckpointComponent(
             checkpoint_object_id="state",
             version_id=session.checkpoint_id,
             storage_locator=final.as_uri().encode("utf-8"),
-            format_version=self.descriptor.format_version,
             partition_key=partition_key,
         )
         return WorkerSaveResult(
             record=CheckpointObjectRecord(
-                payload=msgpack.packb(metadata, use_bin_type=True),
+                payload=msgpack_codec.packb(metadata, use_bin_type=True),
                 checkpoint_objects=(checkpoint_object,),
             ),
-            commit_metadata=msgpack.packb(
+            commit_metadata=msgpack_codec.packb(
                 {"staging_uri": staging.as_uri()}, use_bin_type=True
             ),
         )
@@ -209,7 +208,7 @@ class FilesystemCheckpointComponent(
                     or len(prepared.record.checkpoint_objects) != 1
                 ):
                     raise ValueError(f"checkpoint rank {rank} has an invalid record")
-                metadata = msgpack.unpackb(
+                metadata = msgpack_codec.unpackb(
                     prepared.commit_metadata, raw=False, strict_map_key=False
                 )
                 if not isinstance(metadata, Mapping):
@@ -243,7 +242,6 @@ class FilesystemCheckpointComponent(
             raise
         return CheckpointComponentPublication(
             component_id=self.descriptor.component_id,
-            format_version=self.descriptor.format_version,
             partitions=tuple(partitions),
         )
 
@@ -263,6 +261,21 @@ class FilesystemCheckpointComponent(
     async def publish_save(self, session: SaveSession) -> None:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
+
+    async def abort_save(self, permit: CheckpointCommitPermit) -> None:
+        self._require_control()
+        for path in (
+            self._staging_root(permit.attempt_id),
+            self._final_component_root(permit.attempt_id),
+        ):
+            try:
+                await asyncio.to_thread(shutil.rmtree, path)
+            except FileNotFoundError:
+                pass
+
+    async def acknowledge_save(self, permit: CheckpointCommitPermit) -> None:
+        # Filesystem payloads have no owner intent beyond the global manifest.
+        self._require_control()
 
     async def restore(self, session: RestoreSession) -> None:
         self._require_worker(session)
@@ -615,38 +628,34 @@ class FilesystemCheckpointComponent(
             )
         return self._runtime
 
-    def _staging_root(self, context: SaveSession) -> Path:
+    def _staging_root(self, attempt_id: str) -> Path:
+        runtime = self._require_runtime()
         root = self._require_root()
         return (
             root
             / ".checkpoint-transactions"
-            / quote(context.attempt_id, safe="")
-            / quote(context.spmd_id, safe="")
+            / quote(attempt_id, safe="")
+            / quote(runtime.spmd_id, safe="")
             / quote(self.descriptor.component_id, safe="")
         )
 
     def _staging_path(self, context: SaveSession, partition_key: str) -> Path:
-        return self._staging_root(context) / quote(partition_key, safe="")
+        return self._staging_root(context.attempt_id) / quote(partition_key, safe="")
 
-    def _final_component_root(self, context: SaveSession) -> Path:
+    def _final_component_root(self, attempt_id: str) -> Path:
+        runtime = self._require_runtime()
         root = self._require_root()
-        progress = (
-            Path("steps") / str(context.cut.position)
-            if context.cut.position is not None
-            else Path("cuts") / quote(context.cut.cut_id, safe="")
-        )
         return (
             root
             / "checkpoint_objects"
-            / progress
-            / quote(context.checkpoint_id, safe="")
-            / quote(context.spmd_id, safe="")
+            / quote(attempt_id, safe="")
+            / quote(runtime.spmd_id, safe="")
             / quote(self.descriptor.component_id, safe="")
         )
 
     def _final_path(self, context: SaveSession, partition_key: str) -> Path:
         return (
-            self._final_component_root(context)
+            self._final_component_root(context.attempt_id)
             / "state"
             / quote(partition_key, safe="")
         )
@@ -683,7 +692,11 @@ class FilesystemCheckpointComponent(
     def _lifecycle_path(self, checkpoint_object: CheckpointObjectRef) -> Path:
         identity = b"\x00".join(
             (
-                checkpoint_object.version_id.encode("utf-8"),
+                (
+                    checkpoint_object.version_id
+                    if isinstance(checkpoint_object.version_id, bytes)
+                    else checkpoint_object.version_id.encode("utf-8")
+                ),
                 (checkpoint_object.partition_key or "").encode("utf-8"),
                 checkpoint_object.storage_locator,
             )
@@ -705,7 +718,9 @@ class FilesystemCheckpointComponent(
                 "claim": None,
                 "completed_claim": None,
             }
-        payload = msgpack.unpackb(path.read_bytes(), raw=False, strict_map_key=False)
+        payload = msgpack_codec.unpackb(
+            path.read_bytes(), raw=False, strict_map_key=False
+        )
         if not isinstance(payload, dict):
             raise TypeError(f"checkpoint_object lifecycle state is corrupt: {path}")
         expected = {"status", "leases", "released", "claim", "completed_claim"}
@@ -723,7 +738,7 @@ class FilesystemCheckpointComponent(
         temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
         try:
             with temporary.open("xb") as stream:
-                stream.write(msgpack.packb(state, use_bin_type=True))
+                stream.write(msgpack_codec.packb(state, use_bin_type=True))
                 stream.flush()
                 os.fsync(stream.fileno())
             temporary.replace(path)

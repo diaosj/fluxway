@@ -7,7 +7,7 @@ from ortools.sat.python import cp_model
 
 from fluxway.common.types import Graph
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     ClusterNode,
     ClusterSnapshot,
     affinity_constraints,
@@ -164,7 +164,6 @@ def test_constraint_algebra_matches_exhaustive_assignment_oracle() -> None:
         for left_node, right_node in product(range(2), repeat=2):
             recipe = PlacementRecipe(
                 recipe_id=(f"constraint-oracle-{case_index}-{left_node}-{right_node}"),
-                version="1.0.0",
                 constraints=(
                     equal(left_nodes, anchor_nodes[left_node]),
                     equal(right_nodes, anchor_nodes[right_node]),
@@ -224,7 +223,6 @@ def test_affinity_objectives_include_positive_equal_relations() -> None:
     for left_node, right_node in product(range(2), repeat=2):
         recipe = PlacementRecipe(
             recipe_id=f"affinity-oracle-{left_node}-{right_node}",
-            version="1.0.0",
             constraints=(
                 equal(left_nodes, anchors[left_node]),
                 equal(right_nodes, anchors[right_node]),
@@ -266,7 +264,6 @@ def test_fragmentation_matches_finite_multidimensional_packing_oracle(
     )
     recipe = PlacementRecipe(
         recipe_id=f"fragmentation-oracle-{capacity['CPU']}-{capacity['GPU']}",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -300,7 +297,6 @@ def test_assignment_is_total_and_preserves_resources(
     )
     recipe = PlacementRecipe(
         recipe_id=f"resource-property-{worker_count}-{node_count}",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -349,9 +345,8 @@ def test_solver_call_count_does_not_scale_with_homogeneous_workers(
     )
     recipe = PlacementRecipe(
         recipe_id="solver-call-bound",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="node", resources={"CPU": worker_count}),)
@@ -380,7 +375,6 @@ def test_lexicographic_program_uses_one_decreasing_solve_budget(
     graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
     recipe = PlacementRecipe(
         recipe_id="single-deadline",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -416,7 +410,6 @@ def test_lexicographic_program_stops_when_shared_deadline_expires(
     graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
     recipe = PlacementRecipe(
         recipe_id="expired-deadline",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(
             minimize(cardinality(support(all_workers()))),
@@ -454,7 +447,6 @@ def test_feasible_incumbent_without_optimality_is_a_timeout(monkeypatch) -> None
     graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 1)})
     recipe = PlacementRecipe(
         recipe_id="feasible-incumbent",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -489,7 +481,6 @@ def _majorization_complexity_case() -> tuple[Graph, PlacementRecipe, ClusterSnap
     relation = subseteq(support(workers(LeftSPMD)), support(workers(RightSPMD)))
     recipe = PlacementRecipe(
         recipe_id="complexity-admission",
-        version="1.0.0",
         constraints=(relation,),
         objective=lexicographic(
             maximize_majorization(target_occupancy(affinity_constraints()))
@@ -557,7 +548,6 @@ def test_model_size_is_rejected_before_assignment_matrix_construction(
     )
     recipe = PlacementRecipe(
         recipe_id="model-variable-admission",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -591,7 +581,6 @@ def test_fractional_resource_scalar_uses_physical_quantity() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="fractional-resource-scalar",
-        version="1.0.0",
         constraints=(equal(resource_usage(all_workers(), "CPU"), 1),),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -618,7 +607,6 @@ def test_scalar_comparison_rejects_incompatible_resource_dimensions() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="incompatible-resource-dimensions",
-        version="1.0.0",
         constraints=(
             equal(
                 resource_usage(all_workers(), "CPU"),
@@ -641,7 +629,6 @@ def test_max_min_accepts_occupancy_vector() -> None:
     graph = placement_graph(nodes={"property": graph_node("property", PropertySPMD, 2)})
     recipe = PlacementRecipe(
         recipe_id="max-min-occupancy",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(max_min(occupancy(all_workers()))),
     )
@@ -675,7 +662,6 @@ def test_majorization_accepts_weighted_dominant_share_vector() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="majorize-weighted-share",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(
             maximize_majorization(weighted_dominant_share(all_workers()))
@@ -707,7 +693,6 @@ def test_resource_integerization_supports_pib_scale_memory() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="pib-memory",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(cardinality(support(all_workers())))),
     )
@@ -743,7 +728,6 @@ def test_drf_coefficients_reject_int64_overflow() -> None:
     selected = workers(PropertySPMD)
     recipe = PlacementRecipe(
         recipe_id="drf-overflow",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(max_min(weighted_dominant_share(selected))),
     )

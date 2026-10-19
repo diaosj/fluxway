@@ -46,6 +46,41 @@ or advances a directory epoch. `ENTRY_AUX` is only the wire projection of that i
 epoch. `FRAME_STEP` remains scheduler/delivery metadata. No mutable second epoch counter,
 global directory, sibling holder list or cross-level broadcast exists.
 
+### Consumer lease reservation ownership
+
+`ConsumerLeaseReservationRef` is a non-owning tensor reference to a reservation owned by the
+sequencer. The sequencer keeps the only mutable state and active-count binding. Its lifecycle
+has one owner at each stage:
+
+```mermaid
+stateDiagram-v2
+    [*] --> RESERVED
+    RESERVED --> CLAIMED: claim()
+    RESERVED --> RELEASED: cancel()
+    RESERVED --> RELEASED: release_for_cleanup()
+    CLAIMED --> RELEASED: ConsumerLease.release()
+    CLAIMED --> RELEASED: release_for_cleanup()
+    RELEASED --> [*]
+```
+
+| State | Owner | Legal operation | Result |
+|---|---|---|---|
+| `RESERVED` | Sequencer reservation state | `claim()`, `cancel()`, cleanup | Claim transfers the only lease owner; cancel/cleanup releases the reserved counts. |
+| `CLAIMED` | The saved `ConsumerLease` | lease `release()`, cleanup before tensor handoff | The saved lease releases the active counts exactly once. `cancel()` raises. |
+| `RELEASED` | None | Normal lease release is invalid; repeated shutdown cleanup is complete | A repeated explicit `ConsumerLease.release()` raises; repeated shutdown cleanup is idempotent. |
+
+`claim()` changes the sequencer-owned state and creates the saved lease. `TransportTensor` only
+keeps a `ConsumerLeaseReservationRef`; after `acquire_consumer_lease()` it clears that reference
+and the `ConsumerLease` owns normal release. If shutdown races with claim, both paths address the
+same sequencer state machine; one transition releases the active counts and the other observes
+completion. Worker shutdown never turns a claimed reservation into a successful `cancel()`.
+
+The sequencer reservation index is protected separately from each reservation state. The sequencer
+fence takes a snapshot under that boundary and cleans each snapshot entry through
+`release_for_cleanup()`, so a claim racing with fence cannot leave an active count behind.
+`ConsumerLease.release()` may be called from a worker thread; it schedules count mutation on the
+sequencer owner loop and rejects a second release.
+
 For each logical tensor, child slots are assigned by sorting its finite set of
 `(target_spmd_id, target_rank)` endpoints. The mapping is bijective and projections never
 renumber an existing slot.

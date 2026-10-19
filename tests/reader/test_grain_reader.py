@@ -228,7 +228,7 @@ class TestGrainReaderSharding:
             TopologySnapshot,
         )
 
-        topology = TopologySnapshot(2, ("data",), (2,), "v1")
+        topology = TopologySnapshot(2, ("data",), (2,))
         save_session = SaveSession(
             instance=reader,
             attempt_id="tx",

@@ -10,10 +10,15 @@ from fluxway.common.types import (
     DrainEventKind,
     DrainPhase,
     ExecutionFailure,
+    RestoreOptions,
     SaveCheckpointRequest,
 )
 from fluxway.common.types.drain import DrainAdmission
 from fluxway.common.utils.logging import get_logger
+from fluxway.common.effect_scheduler import (
+    BoundedLifecycleEffectScheduler,
+    LifecycleEffectSubmission,
+)
 from fluxway.control_plane.errors import ExecutionFailedError
 
 logger = get_logger(__name__)
@@ -29,6 +34,7 @@ class ExecutionLifecycle:
         self._operations: set[asyncio.Task[None]] = set()
         self._terminal_cleanup: asyncio.Task[None] | None = None
         self._startup: asyncio.Task[int | None] | None = None
+        self._effects = BoundedLifecycleEffectScheduler(queue_size=64, worker_count=4)
 
     async def transition(self, event: ControllerEvent) -> None:
         if not await self._controller.state_machine.trigger_event(event):
@@ -41,24 +47,39 @@ class ExecutionLifecycle:
             ControllerState.CANCELLED,
         ):
             return
-        if state in (
-            ControllerState.COMPLETING,
-            ControllerState.FAILING,
-            ControllerState.CANCELLING,
-        ):
-            self.begin_terminal_cleanup(state)
-            return
         controller = self._controller
         try:
+            await self._effects.start()
             if controller._profiler_runtime.enabled:
-                async with (
-                    controller._profiler_runtime.recorder.controller_fsm_entry_callback(
+
+                async def operation() -> None:
+                    async with controller._profiler_runtime.recorder.controller_fsm_entry_callback(
                         state=state.name
-                    )
-                ):
-                    await self._enter_state(state)
+                    ):
+                        await self._enter_state(state)
             else:
-                await self._enter_state(state)
+
+                async def operation() -> None:
+                    await self._enter_state(state)
+
+            result = await self._effects.submit(
+                LifecycleEffectSubmission(
+                    operation=operation,
+                    ordering_key=f"controller-state:{state.name}",
+                    state_revision=controller.state_machine.state_revision,
+                )
+            )
+            current_revision = controller.state_machine.state_revision
+            if result.state_revision != current_revision:
+                logger.debug(
+                    "Discarding stale lifecycle effect state_revision=%s current=%s state=%s",
+                    result.state_revision,
+                    current_revision,
+                    state.name,
+                )
+                return
+            if result.error is not None:
+                raise result.error
         except Exception as error:
             if state not in (ControllerState.COMPLETED, ControllerState.FAILED):
                 await self.fail(error, state.name)
@@ -80,7 +101,12 @@ class ExecutionLifecycle:
             ):
                 await self.transition(ControllerEvent.ALL_DRIVERS_COMPLETED)
 
-    async def start(self, resume: str | int | None) -> int | None:
+    async def start(
+        self,
+        resume: str | int | None,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
         if (
             self._terminal_cleanup is not None
             or self._controller.state_machine.is_completed()
@@ -88,7 +114,10 @@ class ExecutionLifecycle:
             raise RuntimeError("execution startup requires a live execution")
         if self._startup is not None:
             raise RuntimeError("execution startup is already registered")
-        self._startup = asyncio.create_task(self._run_startup(resume))
+        await self._effects.start()
+        self._startup = asyncio.create_task(
+            self._run_startup(resume, restore_options=restore_options)
+        )
         self._startup.add_done_callback(self._startup_finished)
         try:
             return await asyncio.shield(self._startup)
@@ -102,23 +131,39 @@ class ExecutionLifecycle:
         if not startup.cancelled():
             startup.exception()
 
-    async def _run_startup(self, resume: str | int | None) -> int | None:
+    async def _run_startup(
+        self,
+        resume: str | int | None,
+        *,
+        restore_options: RestoreOptions | None,
+    ) -> int | None:
         try:
-            return await self._start(resume)
+            return await self._start(resume, restore_options=restore_options)
         except Exception as error:
             await self.fail(error, "STARTUP")
             raise
 
-    async def _start(self, resume: str | int | None) -> int | None:
+    async def _start(
+        self,
+        resume: str | int | None,
+        *,
+        restore_options: RestoreOptions | None,
+    ) -> int | None:
         controller = self._controller
         await controller.initialize()
         await controller._ready_event.wait()
         if controller.state_machine.state is not ControllerState.READY:
             raise RuntimeError("execution did not reach READY")
+        controller._execution_generation = (
+            getattr(controller, "_execution_generation", 0) + 1
+        )
         await self.transition(ControllerEvent.START)
         restored_step = None
         if resume is not None:
-            restored_step = await self.restore(resume)
+            restored_step = await self.restore(
+                resume,
+                restore_options=restore_options,
+            )
         if controller._graph.requires_source_control_runtime:
             await controller.activate_source_layout_from_descriptor()
         self.require_state(ControllerState.ACTIVATING)
@@ -130,7 +175,12 @@ class ExecutionLifecycle:
         await self.admit(initial=True)
         return restored_step
 
-    async def restore(self, reference: object) -> int | None:
+    async def restore(
+        self,
+        reference: object,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
         controller = self._controller
         if controller.state_machine.state not in (
             ControllerState.READY,
@@ -139,13 +189,20 @@ class ExecutionLifecycle:
             raise RuntimeError("checkpoint restore requires pre-execution readiness")
         if controller._checkpointer is None:
             raise ValueError("Cannot restore without a checkpoint_config")
-        return await controller._checkpointer.restore(reference)
+        return await controller._checkpointer.restore(
+            reference,
+            restore_options=restore_options,
+        )
 
     async def resume(self) -> None:
         try:
             if self.completion_reached():
                 await self.transition(ControllerEvent.ALL_DRIVERS_COMPLETED)
                 return
+            controller = self._controller
+            controller._execution_generation = (
+                getattr(controller, "_execution_generation", 0) + 1
+            )
             await self.transition(ControllerEvent.RESUME)
             await self.fanout("resume")
             await self.transition(ControllerEvent.ACTIVATION_COMPLETE)
@@ -215,7 +272,7 @@ class ExecutionLifecycle:
         if actual is not expected:
             raise RuntimeError(f"execution requires {expected}, got {actual}")
 
-    async def fail(self, error: Exception, phase: str) -> None:
+    async def fail(self, error: BaseException, phase: str) -> None:
         machine = self._controller.state_machine
         if machine.state is not ControllerState.FAILED:
             await machine.trigger_event(
@@ -349,8 +406,10 @@ class ExecutionLifecycle:
                     exception=error,
                 ),
             )
+            await self._effects.close()
             return
         await controller.state_machine.trigger_event(ControllerEvent.CLEANUP_FINISHED)
+        await self._effects.close()
 
     def _terminal_cleanup_finished(self, cleanup: asyncio.Task[None]) -> None:
         if not cleanup.cancelled():

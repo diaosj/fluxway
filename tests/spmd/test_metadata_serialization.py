@@ -40,6 +40,7 @@ from fluxway.common.decorators import (
     spmd,
 )
 from fluxway.common.operator_instances import OperatorInstanceContainer
+from fluxway.common.logical_partition_binding import LogicalPartitionBinding
 from fluxway.spmd.worker.worker import SPMDWorker
 from tests.compiled_graph_fixtures import compiled_spmd_spec
 
@@ -173,6 +174,16 @@ class _ResolvableModel:
 
 @spmd(mesh_axis_names=("dp",), mesh_axis_shapes=(1,))
 class _InstantiableModel:
+    @operator(name="run", static_argument=["x"])
+    def run(self, x):
+        return x
+
+
+@spmd(mesh_axis_names=("dp", "replica"), mesh_axis_shapes=(2, 2))
+class _BindingModel:
+    def __init__(self, payload):
+        self.payload = payload
+
     @operator(name="run", static_argument=["x"])
     def run(self, x):
         return x
@@ -313,6 +324,27 @@ class TestOwnerClassTransport:
         assert complete_records
         assert all(record.levelname == "DEBUG" for record in begin_records)
         assert all(record.levelname == "DEBUG" for record in complete_records)
+
+    @pytest.mark.parametrize(
+        ("rank", "expected"),
+        [(0, b"dp-0"), (1, b"dp-0"), (2, b"dp-1"), (3, b"dp-1")],
+    )
+    def test_pre_instantiate_resolves_logical_partition_binding(self, rank, expected):
+        config = _compiled_class_config(_BindingModel, "binding")
+        container = OperatorInstanceContainer()
+        SPMDWorker._pre_instantiate_operators(  # type: ignore
+            config,
+            rank=rank,
+            static_args={
+                "payload": LogicalPartitionBinding(
+                    {0: b"dp-0", 1: b"dp-1"}, axes=("dp",)
+                )
+            },
+            instance_container=container,
+        )
+        instance = container.get(config.operator_specs["run"].owner)
+        assert instance is not None
+        assert instance.payload == expected
 
 
 if __name__ == "__main__":

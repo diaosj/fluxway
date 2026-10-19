@@ -1,77 +1,78 @@
-# Source SPMD 正式协议
+# 来源任务协议
 
-## Canonical Ownership
+## 任务身份与区间
 
-`LayoutUnitDescriptor` 固定 revision、物理 locator、cardinality metric、区间及
-source 自有 metadata。compiler 先将有序数据流划分为 logical step，再分配物理 Worker 配额。
+`LayoutUnitDescriptor` 描述固定的数据修订、物理位置、记录计量方式、区间及来源
+自身的编码。编译器先把有序数据划成逻辑训练步，再分配给当前读取进程。
 
-`SourceWorkAssignment` 描述某个 logical step 内的 descriptor 区间。
-`SourceWorkKey(epoch, step, assignment_id)` 是 canonical identity；MessagePack
-摘要仅由 assignment 模型计算。对同一逻辑计划更换 Worker 数量不会改变 assignment 或 key。
+同一物理文件的区间坐标保持不变。窗口切分只改变任务边界，不改写来源编码；
+读取器相对编码中的原始区间定位任务。重新扫描或划分窗口不能重新编号文件行号。
+编译器与窗口规划共用 `LayoutUnitDescriptor.slice`，连续切分等价于直接切分到
+同一区间，最终坐标和切分身份不依赖切分路径。
 
-重绑定必须保持 logical batch cardinality。改变物理 Worker 数量不意味着可以改变
-每个 logical step 的数据集合；planner restore 会拒绝 logical batch cardinality 变化。
+`SourceWorkAssignment` 描述一个训练步内的读取区间，
+`SourceWorkKey(epoch, step, assignment_id)` 标识该任务，摘要由任务模型统一计算。
+将同一计划重新分配给不同数量的进程不会改变任务身份。
 
-## 物理区间 Lease
+重新规划可以生成不同任务，但每个训练步中的有序记录必须相同。全局批次大小
+保持不变；恢复拒绝批次大小变化，不能用改变进程数量作为改变训练输入的理由。
 
-`CompiledSegment` 将 assignment 的一部分绑定到 Worker，包含 `step` 和
-`assignment_id`。`WorkerLayoutDescriptor` 第 1 版通过 canonical MessagePack
-传输 segment，不再增加另一套 assignment binding 协议。
+## 物理区间租约
 
-一个 assignment 可以跨多个 Worker。Ledger 在发布时验证全部 segment 对每个
-assignment 的覆盖完整、无重叠。批量 acquire 必须精确匹配已发布的 segment；
-重复 acquire 已租用 segment 直接失败，不会替换原 lease。
+`CompiledSegment` 将任务的一部分分配给读取进程，包含训练步和任务标识。
+`WorkerLayoutDescriptor` 使用当前统一的 MessagePack 编码传输这些区间。
 
-`SourceWorkItem` 包含 assignment 和本次读取的精确区间；`SourceWorkLease` 增加
-运行时 `lease_id`。`SourceWorkAcknowledgement(key, lease_id)` 只确认该 lease
-对应的区间，不能代替其他 Worker 确认整个 parent descriptor。
+一个任务可以分给多个进程。账本在发布时验证各区间完整覆盖任务且没有重叠，
+批量申请必须精确匹配已发布区间；重复申请已租用区间直接失败。
 
-ACK 整批验证后再更新状态。在 lease 保留期间，完全相同的重复 ACK 幂等；提交后释放
-已完成的 lease/ACK 记录，已释放 lease 的 ACK 按过期拒绝。未知或过期 lease、冲突 key
-直接失败。Restore 后生成新的 lease ID，旧 attempt 延迟到达的 ACK 无法确认新读取。
+`SourceWorkItem` 包含任务及本次读取的区间，`SourceWorkLease` 增加运行时租约
+标识。`SourceWorkAcknowledgement` 只确认对应租约的区间，不能代替其他进程
+确认整个原始任务。
 
-## Frontier 与 Checkpoint
+确认请求整批验证后再更新状态。租约保留期间，完全相同的重复确认不重复推进；
+提交后释放已完成的租约和确认记录，迟到确认按过期拒绝。未知租约、过期租约和
+冲突任务标识直接失败。恢复生成新租约，旧任务的迟到确认不能确认恢复后的读取。
 
-每个 step 维护剩余 segment 数量，ACK 只更新涉及的 segment，不扫描整个计划。
-`candidate_cut` 只越过连续完整确认的 step。ACK 表示 source 生产完成，不代表模型已消费。
+## 进度与共同检查点
 
-`committed_cut` 通过已有的协调 checkpoint 事务推进。Source、模型和 optimizer 必须
-对齐同一个边界；source ACK 不构成另一套持久提交点。
+每个训练步维护尚未确认的区间数。收到确认只更新涉及的区间，不扫描整个计划。
+`candidate_cut` 只越过连续完成读取的训练步；读取完成不代表模型已经消费。
 
-Logical ledger checkpoint 第 3 版保存 committed cut 和 immutable epoch digest，
-不保存 lease、ACK cache 或物理 owner。Planner checkpoint 第 2 版保存 canonical
-request、固定 logical batch cardinality、待拼接尾部及 cursor，不保存物理 topology。
+`committed_cut` 由既有共同检查点事务推进。来源、模型和优化器必须对齐该点，
+读取确认不构成独立的持久化提交。
 
-`max_in_flight_steps` 按 committed cut 限制 acquire。窗口耗尽时异步等待，取消不会
-持有 ledger 锁。Checkpoint 周期必须允许窗口推进，否则 acquire 会持续受到背压。
+来源保存消费书签和共同切点的逻辑进度。恢复重新规划、分配和预取，旧租约、
+确认缓存、预取计划及尾部重新生成；影响未来结果的算子状态仍须保存。来源组件
+不携带自有发布版本号，具体保存接口见[检查点](checkpoint_zh.md)。
+
+`max_in_flight_steps` 相对来源候选切点限制预取，并受当前窗口末尾约束。
+额度耗尽时异步等待，取消不持有账本锁。规划窗口不强制模型保存。
 
 ## 执行边界
 
-Worker 按 operator pipeline depth 批量申请活跃 step。Controller 可以返回信用窗口
-内非空、完整的 step 前缀。Worker 验证 epoch、lease ID 唯一性、精确区间覆盖和
-前缀完整性后才写入瞬态缓存；同一批次共享 fetch，调用者取消不终止其监管。
-ACK 使用有界本地队列，后台批量发送，错误传播到 Worker，并纳入 checkpoint drain。
-缓存未命中仍有 acquire RPC 延迟，批量化本身不能证明 Controller 不会成为吞吐瓶颈。
+工作进程按算子流水线深度批量申请训练步。控制器可以在可预取范围内返回一段
+非空、完整且连续的训练步。工作进程验证任务代次、租约唯一性、区间覆盖及前缀
+完整性后写入临时缓存。同一批请求共享获取任务，调用者取消不放弃对任务的监管。
 
-Compiled execution layout 定义物理成员与组内逻辑 rank，Dispatcher 与 send-plan
-lowering 读取同一不可变绑定，不负责 revision discovery、lease 或 checkpoint cut。
-同机零拷贝依赖 placement 和 transport 条件，与 checkpoint 正确性独立。
+确认请求使用有界本地队列，后台批量发送；失败传播到工作进程，并纳入保存前的
+在途任务收尾。缓存未命中仍需要远程申请，批量化本身不证明控制器没有吞吐瓶颈。
 
-任意用户代码的外部副作用不能默认安全重试。恢复应以协调 checkpoint 为准；外部效果
-需要用户事务或能够处理物理区间边界变化的幂等设计。
+执行布局定义物理成员和组内编号，任务分发与发送计划读取同一份不可变布局。
+它们不负责发现来源修订、管理租约或推进保存点。同机零拷贝取决于实际放置和
+传输条件，与检查点正确性分别验证。
 
-## 协议一致性保障 (Protocol Consistency Guarantees)
+任意业务代码的外部写入不能默认安全重试。恢复依据共同检查点；外部副作用需要
+相应事务或能够处理物理区间变化的幂等设计。
 
-该协议提供了以下严格的一致性与弹性保证：
-- 分片 Assignment、乱序 ACK、批量原子性、过期 ACK 隔离、安全的取消等待以及 Revision 冲突的处理。
-- **拓扑变更弹性**：在更换拓扑并进行 Ledger Restore 后，系统能够保证从精确的 Committed Cut 继续无缝读取（例如从三个 Reader 安全缩减为两个 Reader）。
-- **稳定的数据血缘**：Worker 按 Canonical Assignment 区间进行读取，任何重绑定（Rebinding）操作都严格保持原有的 Logical Batch 大小与数据出处（Provenance）。
+## 一致性要求
 
-**架构流转**：
-Driver Activation 时 Checkpoint 状态保持为空。Controller 在 Restore 时，总是首先根据当前的 Reader Topology 重建 Canonical Plan，随后再恢复 Logical Committed Cut。
+物理拓扑变化时，实现必须保持逻辑批次大小和区间完整覆盖。规划器在共同检查点
+切点保存来源消费书签；恢复时按该书签重新建立物理任务和租约，读取器不拥有
+独立的持久游标，也不恢复旧窗口。
 
-Controller 启动发布一个 layout。Worker source scope 在 Reader 安装成功后接受连续
-不可变窗口。公开启动 API 不提供无界 adapter 的自动 discovery/refill。外部存储集成、
-训练收敛和零拷贝性能需要面向具体工作负载验证。
+来源接入必须在全局模型检查点下保持显式扫描/补充窗口、历史保留和重放语义。
+source-window 进度由事件驱动，Fluxway supervisor 不额外定时轮询。外部副作用需要独立
+事务，或需要能够适应物理区间变化的幂等契约。
 
-参见 [source coordination](source_coordination_zh.md) 与 [checkpoint](checkpoint_zh.md)。
+接口见[来源协调](source_coordination_zh.md)；下游集成仓负责场景配置和验收，本文只定义
+通用来源任务协议。

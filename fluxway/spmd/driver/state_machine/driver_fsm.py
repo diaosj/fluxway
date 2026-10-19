@@ -13,10 +13,13 @@ State transitions:
 
 import logging
 import threading
-from collections.abc import Callable
 from typing import Any
 
 from fluxway.common.types import DriverEvent, DriverState, ExecutionFailure
+from fluxway.spmd.driver.state_machine.driver_transitions import (
+    DriverEffect,
+    plan_driver_transition,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,59 +28,8 @@ class DriverStateMachine:
     """
     State machine for SPMD Driver lifecycle management.
 
-    Handles state transitions based on events from workers and controller.
+    Applies pure lifecycle transitions and executes their local effects.
     """
-
-    # State transition table: (current_state, event) -> next_state
-    _TRANSITIONS = {
-        (DriverState.INITIALIZING, DriverEvent.INIT_COMPLETE): DriverState.READY,
-        (DriverState.INITIALIZING, DriverEvent.INIT_FAILED): DriverState.ERROR,
-        (DriverState.INITIALIZING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.INITIALIZING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.READY, DriverEvent.START): DriverState.ACTIVATING,
-        (DriverState.ACTIVATING, DriverEvent.ACTIVATION_COMPLETE): DriverState.RUNNING,
-        (DriverState.ACTIVATING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.ACTIVATING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.READY, DriverEvent.RESTORE_REQUESTED): DriverState.RESTORING,
-        (DriverState.RESTORING, DriverEvent.RESTORE_COMPLETE): DriverState.READY,
-        (DriverState.RESTORING, DriverEvent.RESTORE_FAILED): DriverState.ERROR,
-        (DriverState.RESTORING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.RESTORING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.READY, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.READY, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.RUNNING, DriverEvent.BLOCK_REQUESTED): DriverState.BLOCKED,
-        (DriverState.RUNNING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.RUNNING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.BLOCKED, DriverEvent.UNBLOCK_REQUESTED): DriverState.RUNNING,
-        (DriverState.BLOCKED, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.BLOCKED, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.RUNNING, DriverEvent.ALL_WORKERS_COMPLETED): DriverState.COMPLETED,
-        (DriverState.RUNNING, DriverEvent.COMPLETE): DriverState.COMPLETED,
-        # Drain → Drained → Snapshot → Running
-        (DriverState.RUNNING, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
-        (DriverState.DRAINING, DriverEvent.DRAIN_COMPLETE): DriverState.DRAINED,
-        (DriverState.DRAINING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.DRAINING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        (DriverState.DRAINED, DriverEvent.SNAPSHOT_REQUESTED): DriverState.SNAPSHOTTING,
-        (DriverState.SNAPSHOTTING, DriverEvent.DRAIN_REQUESTED): DriverState.DRAINING,
-        (DriverState.DRAINED, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.DRAINED, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-        # Allow resuming even if we didn't snapshot
-        (DriverState.DRAINED, DriverEvent.RESUME): DriverState.RUNNING,
-        (DriverState.SNAPSHOTTING, DriverEvent.RESUME): DriverState.RUNNING,
-        (DriverState.SNAPSHOTTING, DriverEvent.SNAPSHOT_FAILED): DriverState.ERROR,
-        (DriverState.SNAPSHOTTING, DriverEvent.WORKER_ERROR): DriverState.ERROR,
-        (DriverState.SNAPSHOTTING, DriverEvent.COMPONENT_ERROR): DriverState.ERROR,
-    }
-
-    _TRANSITIONS.update(
-        {
-            (state, DriverEvent.STOP): DriverState.STOPPING
-            for state in DriverState
-            if state not in (DriverState.STOPPING, DriverState.STOPPED)
-        }
-    )
-    _TRANSITIONS[DriverState.STOPPING, DriverEvent.STOPPED] = DriverState.STOPPED
 
     def __init__(self, driver: "Any"):
         """
@@ -88,22 +40,11 @@ class DriverStateMachine:
         """
         self._driver = driver
         self._state = DriverState.INITIALIZING
+        self._state_revision = 0
         self._lock = threading.Lock()
 
         self._worker_failures: dict[int, ExecutionFailure] = {}
         self._failure: ExecutionFailure | None = None
-
-        # Callbacks for state entry
-        self._entry_callbacks: dict[DriverState, Callable[[], None]] = {
-            DriverState.READY: self._on_enter_ready,
-            DriverState.RUNNING: self._on_enter_running,
-            DriverState.BLOCKED: self._on_enter_blocked,
-            DriverState.DRAINING: self._on_enter_draining,
-            DriverState.DRAINED: self._on_enter_drained,
-            DriverState.SNAPSHOTTING: self._on_enter_snapshotting,
-            DriverState.COMPLETED: self._on_enter_completed,
-            DriverState.ERROR: self._on_enter_error,
-        }
 
     @property
     def state(self) -> DriverState:
@@ -111,9 +52,14 @@ class DriverStateMachine:
         with self._lock:
             return self._state
 
+    @property
+    def state_revision(self) -> int:
+        with self._lock:
+            return self._state_revision
+
     @classmethod
     def can_transition(cls, state: DriverState, event: DriverEvent) -> bool:
-        return (state, event) in cls._TRANSITIONS
+        return plan_driver_transition(state, event) is not None
 
     def trigger(self, event: DriverEvent, **kwargs) -> bool:
         """
@@ -127,11 +73,10 @@ class DriverStateMachine:
         Returns:
             True if transition occurred, False otherwise
         """
+        invalid_reason: str | None = None
+        failure_to_report: ExecutionFailure | None = None
         with self._lock:
             current = self._state
-            key = (current, event)
-
-            # Guard: BLOCK/UNBLOCK must not interrupt drain or snapshot
             if event in (
                 DriverEvent.BLOCK_REQUESTED,
                 DriverEvent.UNBLOCK_REQUESTED,
@@ -140,47 +85,58 @@ class DriverStateMachine:
                 DriverState.DRAINED,
                 DriverState.SNAPSHOTTING,
             ):
-                logger.warning(
-                    f"Ignoring {event} in {current} state spmd_id={self._driver.spmd_id}"
+                invalid_reason = (
+                    f"Ignoring {event} in {current} state "
+                    f"spmd_id={self._driver.spmd_id}"
                 )
-                return False
+                transition = None
+            else:
+                transition = plan_driver_transition(current, event)
+                if transition is None:
+                    invalid_reason = f"No transition for: {current} + {event}"
 
-            if not self.can_transition(current, event):
-                logger.debug(f"No transition for: {current} + {event}. Ignoring event.")
-                return False
+            if invalid_reason is not None:
+                pass
+            else:
+                next_state = transition.target_state
+                if next_state is DriverState.ERROR:
+                    failure = self._failure_for_event(event, kwargs)
+                    if event is DriverEvent.WORKER_ERROR:
+                        worker_rank = failure.rank
+                        if worker_rank is None:
+                            raise ValueError(
+                                "WORKER_ERROR failure requires a worker rank."
+                            )
+                    else:
+                        worker_rank = None
+                    if self._failure is None:
+                        self._failure = failure
+                    if worker_rank is not None:
+                        self._worker_failures[worker_rank] = failure
+                    failure_to_report = failure
+                old_state = self._state
+                self._state = next_state
+                self._state_revision += 1
+                state_revision = self._state_revision
 
-            next_state = self._TRANSITIONS[key]
-
-            if next_state is DriverState.ERROR:
-                failure = self._failure_for_event(event, kwargs)
-                if event is DriverEvent.WORKER_ERROR:
-                    worker_rank = failure.rank
-                    if worker_rank is None:
-                        raise ValueError("WORKER_ERROR failure requires a worker rank.")
-                else:
-                    worker_rank = None
-                if self._failure is None:
-                    self._failure = failure
-                if worker_rank is not None:
-                    self._worker_failures[worker_rank] = failure
-                logger.error(
-                    "Driver failure in SPMD %s: %s",
-                    self._driver.spmd_id,
-                    failure,
-                )
-
-            # Perform state transition
-            old_state = self._state
-            self._state = next_state
-            logger.debug(
-                f"SPMD {self._driver.spmd_id} state transition: "
-                f"{old_state} -> {next_state} (event: {event})"
+        if invalid_reason is not None:
+            logger.debug("%s", invalid_reason)
+            return False
+        logger.debug(
+            "SPMD %s state transition: %s -> %s (event: %s)",
+            self._driver.spmd_id,
+            old_state,
+            next_state,
+            event,
+        )
+        if failure_to_report is not None:
+            logger.error(
+                "Driver failure in SPMD %s: %s",
+                self._driver.spmd_id,
+                failure_to_report,
             )
 
-        # Execute entry callback (outside lock to prevent deadlock)
-        entry_callback = self._entry_callbacks.get(next_state)
-        if entry_callback:
-            entry_callback()
+        self._apply_effect(transition.effect, state_revision=state_revision)
 
         return True
 
@@ -296,59 +252,51 @@ class DriverStateMachine:
         with self._lock:
             return dict(self._worker_failures)
 
-    # =========================================================================
-    # State entry callbacks
-    # =========================================================================
-
-    def _on_enter_ready(self) -> None:
-        """Called when entering READY state.
-
-        Note: Heartbeat is already started in initialize() (before READY),
-        so we do NOT call _start_heartbeat() here.
-        """
-        logger.debug(f"SPMD {self._driver.spmd_id} is ready")
-
-    def _on_enter_running(self) -> None:
-        """Called when entering RUNNING state."""
-        logger.debug(f"SPMD {self._driver.spmd_id} is running")
-
-    def _on_enter_blocked(self) -> None:
-        """Called when entering BLOCKED state."""
-        logger.warning(f"SPMD {self._driver.spmd_id} is blocked")
-        # Block all workers
-        self._driver._block_all_workers()
-
-    def _on_enter_draining(self) -> None:
-        """Called when entering DRAINING state."""
-        logger.debug(f"SPMD {self._driver.spmd_id} is draining to target step")
-
-    def _on_enter_drained(self) -> None:
-        """Called when entering DRAINED state."""
-        logger.debug(f"SPMD {self._driver.spmd_id} has reached its drain target")
-
-    def _on_enter_snapshotting(self) -> None:
-        """Called when entering SNAPSHOTTING state."""
-        logger.debug(f"SPMD {self._driver.spmd_id} is snapshotting operator states")
-
-    def _on_enter_completed(self) -> None:
-        """Called when entering COMPLETED state."""
-        logger.debug(f"SPMD {self._driver.spmd_id} completed")
-        # Report completion to controller
-        self._driver._report_completion()
-
-    def _on_enter_error(self) -> None:
-        """Called when entering ERROR state."""
-        logger.error(f"SPMD {self._driver.spmd_id} entered ERROR state")
-        self._driver._schedule_driver_component_state(DriverState.ERROR)
-        failure = self.failure
-        if failure is None:
-            raise RuntimeError("ERROR state requires an ExecutionFailure.")
-        self._driver._report_error(failure)
+    def _apply_effect(self, effect: DriverEffect, *, state_revision: int) -> None:
+        if effect is DriverEffect.NONE:
+            return
+        if effect is DriverEffect.BLOCK_WORKERS:
+            submit = getattr(self._driver, "_submit_driver_effect", None)
+            if not callable(submit):
+                raise RuntimeError("Driver effect sink is not configured")
+            submit(
+                self._driver._block_all_workers,
+                effect_name=effect.value,
+                state_revision=state_revision,
+            )
+            return
+        if effect is DriverEffect.REPORT_COMPLETION:
+            submit = getattr(self._driver, "_submit_driver_effect", None)
+            if not callable(submit):
+                raise RuntimeError("Driver effect sink is not configured")
+            submit(
+                self._driver._report_completion,
+                effect_name=effect.value,
+                state_revision=state_revision,
+            )
+            return
+        if effect is DriverEffect.REPORT_ERROR:
+            failure = self.failure
+            if failure is None:
+                raise RuntimeError("ERROR state requires an ExecutionFailure.")
+            self._driver._schedule_driver_component_state(DriverState.ERROR)
+            submit = getattr(self._driver, "_submit_driver_effect", None)
+            if not callable(submit):
+                raise RuntimeError("Driver effect sink is not configured")
+            submit(
+                self._driver._report_error,
+                args=(failure,),
+                effect_name=effect.value,
+                state_revision=state_revision,
+            )
+            return
+        raise RuntimeError(f"unsupported Driver effect: {effect}")
 
     def reset(self) -> None:
         """Reset state machine to initial state."""
         with self._lock:
             self._state = DriverState.INITIALIZING
+            self._state_revision = 0
             self._worker_failures.clear()
             self._failure = None
         logger.debug(f"SPMD {self._driver.spmd_id} state machine reset")

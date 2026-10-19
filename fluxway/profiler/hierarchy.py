@@ -10,9 +10,8 @@ TRACE_ROOT_TRACK_NAME = "Fluxway MPMD"
 
 
 _ROLE_ORDER = {
-    "Control Plane": 0,
+    "Controller": 0,
     "SPMDs": 10,
-    "controller": 0,
     "driver": 0,
 }
 
@@ -72,10 +71,10 @@ class TraceTrackHierarchy:
     def _from_controller(
         cls, parts: tuple[str, ...], track_name: str
     ) -> TraceTrackHierarchy:
-        if len(parts) < 3 or parts[1] != "controller":
+        if len(parts) < 3:
             raise ValueError(f"invalid controller profiler track: {track_name!r}")
         return cls(
-            groups=("Control Plane", "controller"),
+            groups=("Controller", parts[1]),
             leaf_name="/".join(parts[2:]),
         )
 

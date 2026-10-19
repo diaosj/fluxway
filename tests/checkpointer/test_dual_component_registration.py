@@ -59,7 +59,7 @@ async def test_worker_checkpoint_coordinator_round_trips_both_components(
         lambda value, session: value.local,
         lambda value, state, session: value.restored.__setitem__("local", state),
     )
-    topology = TopologySnapshot(1, (), (), "v1")
+    topology = TopologySnapshot(1, (), ())
     coordinator = WorkerCheckpointCoordinator(
         (orbax.registration(), local.registration()),
         owner,

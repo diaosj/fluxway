@@ -8,9 +8,9 @@ from fluxway.transport.manifest import (
     ENTRY_STATE_FLAGS,
     ENTRY_WIDTH,
     FRAME_FLAGS,
-    FRAME_VERSION,
+    FRAME_ABI_TAG_FIELD,
     PAYLOAD_DTYPE,
-    PROTOCOL_VERSION,
+    TRANSPORT_ABI_TAG,
     CoherenceAction,
     FrameFlag,
     PayloadRole,
@@ -22,8 +22,8 @@ from fluxway.transport.manifest import (
 from fluxway.transport.coherence import entry_tensor_kind, pack_entry_state_flags
 
 
-def test_transport_route_protocol_version_matches_runtime_manifest_abi():
-    assert PROTOCOL_VERSION == 1
+def test_transport_route_abi_tag_matches_runtime_manifest_abi():
+    assert TRANSPORT_ABI_TAG == 1
     assert ENTRY_WIDTH == 9
     assert hasattr(TransportFrameBuilder, "add_tensor_transfer_entry")
 
@@ -222,13 +222,13 @@ def test_manifest_validate_rejects_negative_metadata():
         entry_index, PayloadRole.VALUES, np.arange(1, dtype=np.int32), 1
     )
     frame = builder.build()
-    frame.frame_i32[FRAME_VERSION] = -1
+    frame.frame_i32[FRAME_ABI_TAG_FIELD] = -1
 
     with pytest.raises(ValueError, match="negative int32 metadata"):
         frame.validate()
 
 
-def test_manifest_rejects_previous_protocol_version_without_fallback():
+def test_manifest_rejects_unknown_abi_tag_without_fallback():
     builder = TransportFrameBuilder(
         step=1,
         sender_spmd_code=0,
@@ -241,9 +241,9 @@ def test_manifest_rejects_previous_protocol_version_without_fallback():
         expected_count=1,
     )
     frame = builder.build()
-    frame.frame_i32[FRAME_VERSION] = 3
+    frame.frame_i32[FRAME_ABI_TAG_FIELD] = 3
 
-    with pytest.raises(ValueError, match="Unsupported transport frame version 3"):
+    with pytest.raises(ValueError, match="Unsupported transport frame ABI tag 3"):
         frame.validate()
 
 

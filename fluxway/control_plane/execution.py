@@ -7,6 +7,8 @@ from fluxway.common.types import (
     AsyncStepConfig,
     SourceControlConfig,
     CheckpointConfig,
+    RestoreOptions,
+    validate_restore_options,
 )
 from fluxway.placement import (
     PlacementRecipe,
@@ -105,6 +107,7 @@ async def start(
     source_control: SourceControlConfig | None = None,
     checkpoint_config: CheckpointConfig | None = None,
     resume: Literal["latest"] | int | None = None,
+    restore_options: RestoreOptions | None = None,
     runtime_env: dict[str, Any] | None = None,
     transport_config: dict[str, str] | None = None,
     profiler_config: "ProfilerConfig | None" = None,
@@ -114,6 +117,9 @@ async def start(
     """
     if resume is not None and checkpoint_config is None:
         raise ValueError("Cannot specify resume without a checkpoint_config")
+    if restore_options is not None and resume is None:
+        raise ValueError("Cannot specify restore_options without resume")
+    validate_restore_options(restore_options)
 
     if placement_runtime is None:
         placement_runtime = PlacementRuntimeConfig()
@@ -130,7 +136,10 @@ async def start(
         placement_runtime=placement_runtime,
     )
 
-    restored_step = await controller.start.remote(resume)
+    restored_step = await controller.start.remote(
+        resume,
+        restore_options=restore_options,
+    )
 
     # Get allocation synchronously after initialization is done
     allocation = await controller.get_resource_allocation_summary.remote()

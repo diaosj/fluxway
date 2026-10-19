@@ -12,6 +12,8 @@ from fluxway.common.types.checkpoint import (
     CommitSaveSession,
     RestoreSession,
     CheckpointCut,
+    CheckpointObjectRecord,
+    CheckpointObjectRef,
     TopologyMismatchError,
     TopologySnapshot,
 )
@@ -30,8 +32,8 @@ async def test_worker_local_records_require_exact_topology(tmp_path):
     async def restore(module, state, context):
         return None
 
-    source = TopologySnapshot(1, (), (), "v1")
-    changed = TopologySnapshot(2, ("data",), (2,), "v1")
+    source = TopologySnapshot(1, (), ())
+    changed = TopologySnapshot(2, ("data",), (2,))
     save_session = SaveSession(
         instance=None,
         attempt_id="tx",
@@ -92,7 +94,7 @@ async def test_orbax_rollback_is_safe_when_cleanup_races(tmp_path, monkeypatch):
     async def layout(module, context):
         return {"weights": np.array([1.0])}
 
-    topology = TopologySnapshot(1, (), (), "v1")
+    topology = TopologySnapshot(1, (), ())
     session = SaveSession(
         instance=None,
         attempt_id="tx",
@@ -108,7 +110,7 @@ async def test_orbax_rollback_is_safe_when_cleanup_races(tmp_path, monkeypatch):
     await component.open(
         CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
     )
-    staging = component._staging_root(session) / "shared"
+    staging = component._staging_root(session.attempt_id) / "shared"
     staging.mkdir(parents=True)
     cleanup_started = asyncio.Event()
     release_cleanup = asyncio.Event()
@@ -129,3 +131,77 @@ async def test_orbax_rollback_is_safe_when_cleanup_races(tmp_path, monkeypatch):
     release_cleanup.set()
     await asyncio.gather(first, second)
     await component.close()
+
+
+@pytest.mark.asyncio
+async def test_orbax_rollback_removes_regular_completion_marker(tmp_path):
+    async def save(module, context):
+        return {"weights": np.array([1.0])}
+
+    async def restore(module, state, context):
+        return None
+
+    async def layout(module, context):
+        return {"weights": np.array([1.0])}
+
+    session = SaveSession(
+        instance=None,
+        attempt_id="tx",
+        checkpoint_id="snapshot",
+        commit_permit=CheckpointCommitPermit("tx", 1, b"permit"),
+        cut=CheckpointCut.for_step("cut", 1),
+        spmd_id="train",
+        rank=0,
+        source_topology=TopologySnapshot(1, (), ()),
+        component_id="orbax",
+    )
+    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    await component.open(
+        CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
+    )
+    marker = component._staging_root(session.attempt_id) / ".shared-save-complete"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("snapshot", encoding="utf-8")
+
+    await component.rollback_save(session)
+
+    assert not marker.exists()
+    await component.close()
+
+
+@pytest.mark.asyncio
+async def test_orbax_restore_rejects_noncollective_topology(tmp_path, monkeypatch):
+    async def save(module, context):
+        return {"weights": np.array([1.0])}
+
+    async def restore(module, state, context):
+        return None
+
+    async def layout(module, context):
+        return {"weights": np.array([1.0])}
+
+    monkeypatch.setattr(orbax_module, "_jax_process_count", lambda: 1)
+    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    context = RestoreSession(
+        instance=None,
+        checkpoint_id="snapshot",
+        cut=CheckpointCut.for_step("cut", 1),
+        spmd_id="train",
+        rank=0,
+        saved_topology=TopologySnapshot(2, ("data",), (2,)),
+        restore_topology=TopologySnapshot(2, ("data",), (2,)),
+        component_id="orbax",
+        component_checkpoint=None,
+    )
+    record = CheckpointObjectRecord(
+        checkpoint_objects=(
+            CheckpointObjectRef(
+                component_id="orbax",
+                checkpoint_object_id="state",
+                version_id="snapshot",
+                storage_locator=b"file:///tmp/missing",
+            ),
+        )
+    )
+    with pytest.raises(RuntimeError, match="one initialized JAX process"):
+        await component._read_global(record, {}, context)

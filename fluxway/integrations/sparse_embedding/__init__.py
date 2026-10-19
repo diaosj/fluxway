@@ -5,7 +5,6 @@ from .checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
     compact_sparse_checkpoints,
-    modulo_partition,
 )
 
 __all__ = [
@@ -13,5 +12,4 @@ __all__ = [
     "LocalLanceStorageFactory",
     "SparseEmbeddingCheckpointComponent",
     "compact_sparse_checkpoints",
-    "modulo_partition",
 ]

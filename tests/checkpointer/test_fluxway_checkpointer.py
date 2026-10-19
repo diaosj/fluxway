@@ -13,7 +13,6 @@ from fluxway.control_plane.checkpointer.checkpoint import FluxwayCheckpointer
 from fluxway.control_plane.checkpointer.repository import CheckpointRepository
 from fluxway.control_plane.checkpointer.directory import (
     CHECKPOINT_ROOT_MARKER,
-    CheckpointDirectoryOwnershipError,
 )
 
 
@@ -27,11 +26,17 @@ async def test_checkpointer_claims_a_new_repository_directory(
 
 
 @pytest.mark.asyncio
-async def test_checkpointer_rejects_an_unowned_directory(tmp_path):
+async def test_checkpointer_opens_an_existing_unmarked_directory(tmp_path):
     root = tmp_path / "repository"
     root.mkdir()
-    with pytest.raises(CheckpointDirectoryOwnershipError):
-        await FluxwayCheckpointer.create(object(), str(root), interval_steps=1)
+    business_file = root / "business-repair"
+    business_file.write_text("repaired", encoding="utf-8")
+    session_checkpointer = await FluxwayCheckpointer.create(
+        object(), str(root), interval_steps=1
+    )
+    await session_checkpointer.close()
+    assert business_file.read_text(encoding="utf-8") == "repaired"
+    assert not (root / CHECKPOINT_ROOT_MARKER).exists()
 
 
 @pytest.mark.asyncio

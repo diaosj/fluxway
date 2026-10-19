@@ -51,7 +51,8 @@ def fresh_worker():
 
 
 @pytest.mark.parametrize("order", ["counts-first", "handlers-first", "isolated"])
-def test_topology_prepares_restore_without_authorizing_execution(order):
+@pytest.mark.asyncio
+async def test_topology_prepares_restore_without_authorizing_execution(order):
     worker = fresh_worker()
     if order == "counts-first":
         worker.set_expected_topology(1, 1)
@@ -73,7 +74,7 @@ def test_topology_prepares_restore_without_authorizing_execution(order):
     assert worker._scheduled_step_count == {"process": 17}
     with pytest.raises(RuntimeError, match="fresh Worker"):
         worker._restore_checkpoint_runtime_state({})
-    worker._execution_lifecycle.begin_close()
+    await worker._execution_lifecycle.close(lambda: asyncio.sleep(0))
     with pytest.raises(RuntimeError, match="activation requires READY"):
         worker.activate_execution()
 

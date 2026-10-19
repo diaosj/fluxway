@@ -64,13 +64,17 @@ def _validated_source_work_items(
     assignment = items[0].assignment
     signature = (
         assignment.source_identity,
+        assignment.view_identity,
         assignment.schema_digest,
+        assignment.lineage_digest,
         assignment.global_batch_size,
     )
     if any(
         (
             item.assignment.source_identity,
+            item.assignment.view_identity,
             item.assignment.schema_digest,
+            item.assignment.lineage_digest,
             item.assignment.global_batch_size,
         )
         != signature

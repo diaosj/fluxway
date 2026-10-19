@@ -41,7 +41,6 @@ INTERNED_PAYLOAD_FIELDS = frozenset(
         "graph_id",
         "method_id",
         "op_id",
-        "snapshot_id",
         "spmd_id",
         "state_id",
         "static_names_id",
@@ -55,6 +54,8 @@ INTERNED_PAYLOAD_FIELDS = frozenset(
 )
 
 type GraphAnnotations = tuple[tuple[str, str], ...]
+
+_OPTIONAL_OPERATOR_ID_EVENTS = frozenset({"execution.phase"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,7 +450,11 @@ class _GraphAnnotationResolver:
             annotations.append(
                 ("graph_generation", str(self._graph_symbols.generation))
             )
-        if op_ident is not None:
+        if op_ident is not None and not self._allows_unresolved_operator_identity(
+            name_id=name_id,
+            op_ident=op_ident,
+            plan=plan,
+        ):
             annotations.extend(
                 self._resolve_operator_annotations(
                     plan=plan,
@@ -477,6 +482,20 @@ class _GraphAnnotationResolver:
         resolved = tuple(annotations)
         self._event_annotations[event_key] = resolved
         return resolved
+
+    def _allows_unresolved_operator_identity(
+        self,
+        *,
+        name_id: int,
+        op_ident: int,
+        plan: _GraphAnnotationPlan,
+    ) -> bool:
+        event_name = self._metadata.name_for(name_id)
+        if event_name not in _OPTIONAL_OPERATOR_ID_EVENTS:
+            return False
+        if self._name(op_ident) == "":
+            return True
+        return plan.track_spmd_id is None and plan.spmd_index is None
 
     def _plan(self, *, track_uuid: int, name_id: int) -> _GraphAnnotationPlan:
         key = (track_uuid, name_id)

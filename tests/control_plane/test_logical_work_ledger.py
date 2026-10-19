@@ -3,10 +3,10 @@ from dataclasses import replace
 
 import pytest
 
-from fluxway.common.ingestion import WorkerLayoutDescriptor
+from fluxway.common.ingestion import SourceWorkAcknowledgement, WorkerLayoutDescriptor
 from fluxway.common.metadata import metadata_digest
 from fluxway.common.types import CheckpointCommitPermit, CheckpointCut
-from fluxway.common.ingestion import SourceWorkAcknowledgement
+from fluxway.control_plane.ingestion.compiler import AlgebraicLayoutCompiler
 from fluxway.control_plane.logical_work_ledger import LogicalWorkLedger
 
 
@@ -95,6 +95,19 @@ async def test_publication_rejects_incomplete_and_overlapping_bindings(source_la
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["view_identity", "lineage_digest"])
+async def test_publication_rejects_incomplete_source_identity(
+    source_layout, field: str
+):
+    compiled = source_layout()
+    ledger = LogicalWorkLedger(max_in_flight_steps=2)
+    bound = list(bindings(compiled))
+    bound[0] = replace(bound[0], **{field: f"changed-{field}"})
+    with pytest.raises(ValueError, match="source, view, schema, or lineage"):
+        await ledger.publish(compiled.work_epoch, tuple(bound))
+
+
+@pytest.mark.asyncio
 async def test_cancelled_window_wait_does_not_block_ack_or_checkpoint(source_layout):
     compiled = source_layout()
     ledger = LogicalWorkLedger(max_in_flight_steps=1)
@@ -109,13 +122,12 @@ async def test_cancelled_window_wait_does_not_block_ack_or_checkpoint(source_lay
     await ledger.acknowledge(tuple(map(ack, leases)))
     waiting = asyncio.create_task(ledger.acquire(0, segments(compiled, 1)))
     await asyncio.sleep(0)
-    assert not waiting.done()
-    await ledger.commit_cut(1)
     assert len(await asyncio.wait_for(waiting, 1)) == 2
+    await ledger.commit_cut(1)
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_restore_fences_attempt_and_keeps_canonical_plan(
+async def test_checkpoint_restore_fences_attempt_and_accepts_new_plan(
     source_layout,
 ):
     original = source_layout()
@@ -144,11 +156,15 @@ async def test_checkpoint_restore_fences_attempt_and_keeps_canonical_plan(
     assert ledger.committed_cut == 1
     assert all(lease.item.key.step >= 1 for lease in ledger._leases.values())
     assert not ledger._acknowledged
-    rebound = source_layout(demands=(1, 1, 2))
-    assert rebound.work_epoch == original.work_epoch
+    seed = source_layout(demands=(1, 1, 2), cardinality=8)
+    rebound = AlgebraicLayoutCompiler().compile(
+        replace(seed.request, units=(replace(seed.request.units[0], logical_start=4),)),
+        epoch=0,
+        start_step=1,
+    )
     restored = LogicalWorkLedger(max_in_flight_steps=3)
-    await restored.publish(rebound.work_epoch, bindings(rebound))
     restored.restore_state(image)
+    await restored.publish(rebound.work_epoch, bindings(rebound))
     replay = await restored.acquire(0, segments(rebound, 1))
     assert sorted(
         row
@@ -157,13 +173,10 @@ async def test_checkpoint_restore_fences_attempt_and_keeps_canonical_plan(
     ) == [4, 5, 6, 7]
     with pytest.raises(RuntimeError, match="stale"):
         await restored.acknowledge((ack(old[0]),))
-    with pytest.raises(RuntimeError, match="committed cut"):
-        await restored.acquire(0, segments(rebound, 0))
-    changed = source_layout(revision="different")
     another = LogicalWorkLedger(max_in_flight_steps=3)
-    await another.publish(changed.work_epoch, bindings(changed))
-    with pytest.raises(ValueError, match="immutable plans"):
-        another.restore_state(image)
+    another.restore_state(image)
+    with pytest.raises(ValueError, match="contiguous"):
+        await another.publish(original.work_epoch, bindings(original))
 
 
 @pytest.mark.asyncio
@@ -179,3 +192,56 @@ async def test_contiguous_revision_windows_advance_incrementally(source_layout):
         )
         await ledger.acknowledge(tuple(map(ack, leases)))
     assert await ledger.candidate_cut() == 2
+
+
+@pytest.mark.asyncio
+async def test_durable_cut_reclaims_old_epochs_and_keeps_one_anchor(
+    source_layout,
+) -> None:
+    layouts = tuple(
+        source_layout(cardinality=4, epoch=epoch, start_step=epoch, terminal=False)
+        for epoch in range(3)
+    )
+    ledger = LogicalWorkLedger(max_in_flight_steps=4)
+    for layout in layouts:
+        await ledger.publish(layout.work_epoch, bindings(layout))
+        leases = await ledger.acquire(
+            layout.work_epoch.epoch, segments(layout, layout.work_epoch.start_step)
+        )
+        await ledger.acknowledge(tuple(map(ack, leases)))
+    await ledger.commit_cut(2)
+    assert tuple(ledger._epochs) == (2,)
+    assert all(key[0] == 2 for key in ledger._bindings)
+    with pytest.raises(RuntimeError, match="reclaimed"):
+        await ledger.acquire(0, segments(layouts[0], 0))
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_restarts_epoch_number_at_durable_cut(source_layout) -> None:
+    ledger = LogicalWorkLedger(max_in_flight_steps=4)
+    compiled = []
+    for epoch in range(3):
+        value = source_layout(
+            demands=(1,),
+            cardinality=1,
+            epoch=epoch,
+            start_step=epoch,
+            terminal=False,
+        )
+        compiled.append(value)
+        await ledger.publish(value.work_epoch, bindings(value))
+        leases = await ledger.acquire(epoch, segments(value, epoch))
+        await ledger.acknowledge(tuple(map(ack, leases)))
+    await ledger.commit_cut(2)
+    image = ledger.checkpoint_state(committed_cut=2)
+    assert image == {"committed_cut": 2}
+
+    restored = LogicalWorkLedger(max_in_flight_steps=4)
+    restored.restore_state(image)
+    rebuilt = source_layout(
+        demands=(1,), cardinality=1, epoch=0, start_step=2, terminal=False
+    )
+    await restored.publish(rebuilt.work_epoch, bindings(rebuilt))
+    assert restored.committed_cut == 2
+    with pytest.raises(RuntimeError, match="reclaimed"):
+        await restored.acquire(1, segments(compiled[1], 1))

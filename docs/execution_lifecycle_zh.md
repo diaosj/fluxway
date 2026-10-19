@@ -17,6 +17,67 @@ Controller RPC 方法校验请求并调用该编排器；数值边界仍由 `Dra
 | LogicalWorkLedger | canonical assignment、lease、ACK coverage | tensor 路由 |
 | CompiledSendPlan 与 DataPlane | payload 路由和交付 | 启动、发现或 checkpoint 决策 |
 
+## 存活、进度与执行诊断
+
+`heartbeat_timeout_s` 只定义存活边界。只要 worker 或 driver 继续发布心跳，
+即使已提交的执行进度暂时没有变化，也仍然视为存活。`execution_progress_warning_s`
+只控制诊断告警，不会停止执行；检查点不活跃仍由 checkpoint watchdog 负责。
+
+Worker 会在 heartbeat 和 profiler record 中携带执行元数据：执行 generation、
+SPMD/rank、operator、step、epoch、sequence、当前 phase、phase age、执行活动 age、
+已提交进度 age 以及 typed wait classification。classification 会区分 active
+operator invocation（其中可能包含首次 JAX/XLA 编译）、source admission、operator
+admission、传输、输入准备、队列等待和空的 completion/driver wait。这些状态只用于
+诊断，不触发取消。heartbeat 不能证明 XLA 编译器本身健康；active operator phase
+只能证明 Worker 尚未提交 completion，仍需后端编译回调或后续 completion/failure
+事件才能结束这个不确定性。
+
+共享事件链覆盖 activation 发布与分发、安装、source-scope 等待/获取、admission、
+本地计划与 operator invocation、传输/屏障活动以及 completion report。
+`execution_progress_warning_s` 会同时报告 committed progress age、activity age 和
+wait state；它不会停止、重试或回退执行。
+
+## Effect 调度与 Python 执行边界
+
+Controller 和 Driver reducer 的同步热路径只做输入校验、O(1) 纯转移、提交状态以及向
+有界队列执行一次 `put_nowait`。reducer 锁不等待 RPC、checkpoint 存储、组件代码、Worker
+fan-out 或 source 规划。每个已接受的提交都携带 `ordering_key` 和已提交的
+`state_revision`：
+
+```mermaid
+sequenceDiagram
+    participant E as 事件调用方
+    participant F as FSM owner
+    participant Q as 有界 effect 队列
+    participant L as async/thread/process lane
+    participant F2 as fact 事件
+    E->>F: event
+    F->>F: 纯计划 + 提交 state_revision
+    F->>Q: put_nowait(submission)
+    Q->>L: 有界 worker
+    L-->>F: outcome(state_revision, value/error)
+    F->>F: 丢弃过期结果或发出 typed fact
+    F-->>F2: 后续 event
+```
+
+`BoundedLifecycleEffectScheduler` 使用固定 worker 数和固定队列容量。同一
+`ordering_key` 严格串行，不同 key 只在 worker 上限内并发。队列满立即抛出
+`LifecycleEffectQueueFullError`，由 owner 执行 admission/backpressure 策略。关闭时先拒绝
+新提交，再等待已接受工作，最后关闭 executor；调用方取消等待不会取消已经接受的 effect。
+
+```mermaid
+flowchart LR
+    Q[有界队列] --> A[ASYNC lane\n真正的 awaitable I/O]
+    Q --> T[THREAD lane\n短阻塞或释放 GIL 的调用]
+    Q --> P[PROCESS lane\n可 pickle 的纯 Python CPU]
+    Q -. 满 .-> B[明确的背压异常]
+```
+
+CPython 的 `asyncio` 事件循环是单线程协作式调度器。`async def` 不会自动把同步 I/O 或
+Python CPU 循环移出 actor 线程；这类操作必须明确选择 thread 或 process lane。process
+lane 使用 spawn 上下文，并在线程中异步初始化进程池，避免在事件循环调用栈中启动进程。
+该架构规定调度和顺序；吞吐与尾延迟仍须针对实际 workload 测量。
+
 Worker heartbeat 区分 INITIALIZING、READY、RESTORING、RUNNING、BLOCKED、STOPPED 和
 ERROR。Driver heartbeat 分别聚合 `workers_ready`（初始化）与 `topology_ready`
 （通信拓扑注册完成），两者均不触发 Driver START。
@@ -64,9 +125,19 @@ INITIALIZING 转换为 READY，不打开事件。恢复执行 READY → RESTORIN
 只有显式激活执行 READY → ACTIVE。本地调度读取 ACTIVE，无需逐 step 请求 Controller。
 关闭和失败阶段拒绝迟到激活。算子背压、checkpoint activity、source lease 和 cut
 admission 保持各自独立的状态所有权。
+Tensor consumer reservation 保持独立的 `RESERVED → CLAIMED → RELEASED` 生命周期；
+Sequencer 唯一拥有状态，Tensor 只保存非拥有的 reservation 引用。Worker shutdown 向同一
+状态机提交 cleanup；cleanup 可重复观察完成，但显式重复 `ConsumerLease.release()` 仍抛错。
+shutdown 不得对 claimed reservation 调用 `cancel()`。详见[连贯性协议](coherence_protocol_zh.md#consumer-lease-reservation-所有权)。
 Driver 使用原 FSM 的 STOPPING → STOPPED 完成关闭，迟到的激活确认不能令已关闭的
 Driver 重新进入 RUNNING。Driver 与 Worker 各自持有本地资源释放任务，重复 stop
 等待同一个操作并观察其异常。
+
+Driver 转移由唯一的纯关系计算，返回 next state 和局部 effect
+（`BLOCK_WORKERS`、`REPORT_COMPLETION` 或 `REPORT_ERROR`）。Driver 锁只提交状态与失败
+记录；阻塞 Worker、向 Controller 报告和组件通知均在锁外执行。Worker phase 由单一
+lifecycle owner 维护，`close()` 只创建一个 release future；重复 close 只加入同一个
+future，不重复写 phase 或释放资源。
 
 `SourceExecutionScope` 是 Worker 的子资源，不另设执行状态机。它持有已安装窗口、
 活跃 step 索引、授权缓存、安装操作和执行中的 lease。相同 activation 共享一个
@@ -79,6 +150,19 @@ cardinality 构建新图，并向同一 checkpoint repository 调用
 不能对已经使用过的 Worker 直接调用 restore 来回退本地队列或模型状态。
 
 ## Drain、checkpoint 与继续执行
+
+### Source progress supervisor
+
+`SourceProgressSupervisor` 是 source window 进度 task 的唯一 owner，独立维护
+`generation` 以及 `STOPPED`、`STARTING`、`RUNNING`、`STOPPING`、`FAILED` 状态。Controller
+进入 `RUNNING` 时启动当前 generation；进入 `RESUMING` 不会创建第二个 task。重复启动会
+加入当前 generation，失败 generation 在当前执行中不可重启。进度报告只负责唤醒 supervisor，
+不会在 Controller FSM 锁内执行规划。规划在 supervisor task 中异步执行，失败沿用 Controller
+的统一失败路径。
+
+不变量是 `live_source_progress_tasks(generation) <= 1`。终止清理停止并观察同一个
+supervisor 的结果后，才发布 Controller 终态。这是运行时所有权规则，不改变训练或 source
+数据协议。
 
 ```mermaid
 flowchart TD
@@ -179,12 +263,9 @@ logical batch，并满足各 checkpoint component 的拓扑契约。`wait(timeou
 公开启动入口接收编译图。无 source 图使用相同授权顺序，省略 source layout 准备。
 框架不提供独立的动态 eager 图提交 API；算子内部的 eager 计算使用同一执行授权契约。
 
-## 验证边界
+## 一致性边界
 
-`tests/control_plane/test_execution_lifecycle.py` 使用真实 Controller/Driver 状态机
-和 admission 接收方法，通过异步屏障控制交错，覆盖启动各阶段、Driver 乱序激活、
-零/非零 terminal cut、restore 顺序、并发 revision、重复应用、save/resume 失败及
-checkpoint 后继续执行。Ray 图测试另外验证 actor transport。
-
-公开启动 API 不提供无界 source adapter 的自动 discovery/refill。
-摄取能力范围见 [Source 协调协议](source_coordination_zh.md)。
+生命周期契约覆盖启动、Driver 乱序激活、终止切点、恢复顺序、并发准入版本、重复应用、
+保存与继续执行的失败传播，以及检查点后的继续执行。来源窗口进度和补充由来源协调契约
+负责，其中 Controller 的事件驱动 `SourceProgressSupervisor` 执行扫描和补窗，公开启动
+API 只启动生命周期。摄取语义见[来源协调](source_coordination_zh.md)。

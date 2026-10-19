@@ -18,6 +18,77 @@ this coordinator. Numerical boundary reduction remains in `DrainBoundary`.
 | LogicalWorkLedger | Canonical source assignments, leases and ACK coverage | Tensor routing |
 | CompiledSendPlan and DataPlane | Payload routing and delivery | Startup, discovery or checkpoint decisions |
 
+## Liveness, progress and execution diagnostics
+
+`heartbeat_timeout_s` is a liveness boundary only. A worker or driver that
+continues to publish heartbeats remains alive even when committed execution
+progress is quiet. `execution_progress_warning_s` controls a diagnostic warning
+and never stops execution; checkpoint inactivity remains owned by the checkpoint
+watchdog.
+
+Workers attach execution metadata to heartbeats and profiler records: execution
+generation, SPMD/rank, operator, step, epoch, sequence, current phase, phase age,
+execution-activity age, committed-progress age, and a typed wait classification.
+The classification distinguishes an active operator invocation (which may include
+first-use JAX/XLA compilation), source admission, operator admission, transport,
+input preparation, queued work, and an empty completion/driver wait. These are
+diagnostic states, not cancellation decisions. A heartbeat cannot prove that an
+XLA compiler is healthy; an active operator phase only proves that the worker has
+not reached a committed completion yet. Backend-specific compile callbacks or a
+later completion/failure event are required to close that uncertainty.
+
+The shared event chain covers activation publication and dispatch, installation,
+source-scope wait/take, admission, local-plan and operator invocation,
+transport/barrier activity, and completion reporting. `execution_progress_warning_s`
+reports committed-progress age together with the activity and wait state; it never
+stops, retries, or rewinds execution.
+
+## Effect scheduling and Python execution boundaries
+
+The Controller and Driver reducers perform only validation, an O(1) pure transition,
+state commit, and a bounded `put_nowait` into the lifecycle effect scheduler. The
+reducer lock never waits for RPC, checkpoint storage, component code, worker fan-out,
+or source planning. Every accepted submission carries an `ordering_key` and the
+committed `state_revision`:
+
+```mermaid
+sequenceDiagram
+    participant E as event caller
+    participant F as FSM owner
+    participant Q as bounded effect queue
+    participant L as async/thread/process lane
+    participant F2 as fact event
+    E->>F: event
+    F->>F: pure plan + state_revision commit
+    F->>Q: put_nowait(submission)
+    Q->>L: bounded worker
+    L-->>F: outcome(state_revision, value/error)
+    F->>F: discard stale outcome or emit typed fact
+    F-->>F2: next event
+```
+
+`BoundedLifecycleEffectScheduler` uses fixed worker and queue limits. Effects with the
+same `ordering_key` are serialized; different keys run concurrently up to the worker
+limit. A full queue raises `LifecycleEffectQueueFullError` immediately so the owning
+state machine can apply its admission policy. Closing rejects new submissions, joins
+accepted work, and then closes the executors. Cancelling a caller's wait does not cancel
+an accepted effect.
+
+```mermaid
+flowchart LR
+    Q[bounded queue] --> A[ASYNC lane\nawaitable I/O]
+    Q --> T[THREAD lane\nshort blocking or GIL-releasing call]
+    Q --> P[PROCESS lane\npickleable pure-Python CPU]
+    Q -. full .-> B[explicit backpressure error]
+```
+
+CPython's `asyncio` loop is single-threaded and cooperative. `async def` does not move
+synchronous I/O or a Python CPU loop away from the actor thread; those operations must
+use the explicitly selected thread or process lane. The process lane uses a spawn
+context and initializes its pool outside the event-loop call stack. This architecture
+defines scheduling and ordering; throughput and tail latency still require workload-
+specific measurement.
+
 Worker heartbeat distinguishes INITIALIZING, READY, RESTORING, RUNNING, BLOCKED,
 STOPPED and ERROR. Driver heartbeat aggregates `workers_ready` (initialization)
 and `topology_ready` (registered communication topology). Neither authorizes START.
@@ -74,10 +145,22 @@ READY → RESTORING → READY; failure retires execution into FAILED. Activation
 moves READY → ACTIVE. Local scheduling reads ACTIVE without a Controller RPC.
 Closing and failure reject activation, including delayed commands. Operator blocking,
 checkpoint activity, source leases and cut admission retain their separate owners.
+Tensor consumer reservations retain their own `RESERVED → CLAIMED → RELEASED` lifecycle;
+the sequencer owns the state and Tensor keeps only a non-owning reservation reference. Worker
+shutdown submits cleanup to that state machine; cleanup is idempotent, while an explicit repeated
+`ConsumerLease.release()` remains an error. Shutdown must not call `cancel()` on a claimed
+reservation. See [coherence protocol](coherence_protocol.md#consumer-lease-reservation-ownership).
 Driver shutdown moves through STOPPING → STOPPED in its existing FSM. A delayed
 activation acknowledgement cannot transition a stopped Driver to RUNNING. Driver
 and Worker each retain their local resource-release task; repeated stop calls join
 the same operation and observe its errors.
+
+Driver transitions are reduced by one pure relation that returns the next state and a local
+effect (`BLOCK_WORKERS`, `REPORT_COMPLETION`, or `REPORT_ERROR`). The Driver lock only commits
+state and failure records; worker blocking, Controller reporting and component notification run
+after the lock. Worker phase changes use one lifecycle owner, and `close()` creates one release
+future; repeated close calls join that future instead of repeating phase writes or resource
+release.
 
 `SourceExecutionScope` is a child resource of Worker, not another execution state
 machine. It owns installed source windows, their active-step index, grant caches,
@@ -93,6 +176,20 @@ Stop the previous execution before admitting the replacement. Do not invoke Work
 restore on an already-used actor to rewind its local queues or model state.
 
 ## Drain, checkpoint and continuation
+
+### Source progress supervisor
+
+`SourceProgressSupervisor` is the sole owner of the source-window progress task. It has an
+independent `generation` and state (`STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `FAILED`).
+Entering Controller `RUNNING` starts the current generation; entering `RESUMING` does not
+create another task. A repeated start joins the live generation, and a failed generation is
+terminal until the execution itself is replaced. Progress reports wake the supervisor without
+running planning work in the Controller FSM lock. Planner work runs in the supervisor task and
+its failure enters the normal Controller failure path.
+
+The invariant is `live_source_progress_tasks(generation) <= 1`. Terminal cleanup stops the same
+supervisor and observes its failure before publishing the terminal Controller state. This is a
+runtime ownership rule, not a training or source-data protocol.
 
 ```mermaid
 flowchart TD
@@ -208,13 +305,11 @@ authorization sequence and omit source layout preparation. A standalone dynamic
 eager graph submission API is not provided.
 Eager numerical computation inside an operator uses the same execution authorization.
 
-## Verification scope
+## Conformance boundaries
 
-`tests/control_plane/test_execution_lifecycle.py` exercises actual Controller and
-Driver state machines and admission receiver methods with controlled async barriers.
-It covers startup stages, out-of-order Driver activation, zero/nonzero terminal cuts,
-restore order, concurrent revisions, duplicate application, save/resume failures and
-checkpoint continuation. Ray graph tests separately exercise actor transport.
-
-Automatic discovery/refill for unbounded source adapters is outside the supported
-startup API. See [source coordination](source_coordination.md) for ingestion scope.
+The lifecycle contract covers startup, out-of-order Driver activation, terminal cuts,
+restore ordering, concurrent admission revisions, duplicate application, save/resume
+failure propagation and checkpoint continuation. Source-window progress and refill are
+owned by the source coordination contract: the controller's event-driven
+`SourceProgressSupervisor` performs them, while the public startup API only starts the
+lifecycle. See [source coordination](source_coordination.md) for ingestion semantics.

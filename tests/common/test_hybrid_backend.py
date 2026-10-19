@@ -152,6 +152,26 @@ class TestCPUNumbaJIT:
         assert isinstance(result, np.ndarray)
         np.testing.assert_array_equal(result, [2, 2, 1, 1])
 
+    def test_mod_jit_matches_numpy_for_all_sparse_integer_encodings(self, cpu_backend):
+        """Modulo keeps NumPy semantics, including high-bit uint64 values."""
+        size = 1 << 17  # Crosses the measured Numba parallelization threshold.
+        cases = {
+            np.dtype(np.int32): np.array(
+                [-(2**31), -3, -1, 0, 1, 2**31 - 1], dtype=np.int32
+            ),
+            np.dtype(np.uint32): np.array([0, 1, 3, 2**32 - 1], dtype=np.uint32),
+            np.dtype(np.int64): np.array(
+                [-(2**63), -3, -1, 0, 1, 2**63 - 1], dtype=np.int64
+            ),
+            np.dtype(np.uint64): np.array([0, 1, 3, 2**63, 2**64 - 1], dtype=np.uint64),
+        }
+        for dtype, edge_values in cases.items():
+            values = np.resize(edge_values, size).astype(dtype, copy=False)
+            result = cpu_backend.mod(values, 1009)
+            expected = np.mod(values, 1009)
+            np.testing.assert_array_equal(result, expected)
+            assert result.dtype == values.dtype
+
     def test_cumsum_jit_1d_path(self, cpu_backend):
         """Verify 1D cumsum uses Numba JIT path."""
         assert cpu_backend._use_jit is True

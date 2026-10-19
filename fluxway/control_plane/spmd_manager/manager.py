@@ -281,40 +281,6 @@ class SPMDManager:  # pyright: ignore[reportRedeclaration]
         """Get all registered SPMD IDs."""
         return list(self._spmd_handles.keys())
 
-    async def restore_spmd(
-        self,
-        spmd_id: str,
-        config: SPMDConfig,
-        worker_group: SPMDWorkerGroup,
-        checkpoint_id: str | None = None,
-    ) -> SPMDHandle:
-        """
-        Restore an SPMD from checkpoint.
-
-        Args:
-            spmd_id: ID of SPMD to restore
-            config: SPMD configuration
-            placement_group: Placement group for resources
-            worker_bundle_indices: Worker bundle indices
-            checkpoint_id: Checkpoint to restore from
-            node_type: Type of node (SPMD or READER)
-            reader_config: Reader configuration (for READER nodes)
-
-        Returns:
-            Handle to restored SPMD
-
-        TODO: Implement checkpoint loading
-        """
-        logger.warning(
-            f"restore_spmd called for {spmd_id} - checkpoint not implemented"
-        )
-        return await self.start_spmd(
-            spmd_id=spmd_id,
-            config=config,
-            worker_group=worker_group,
-            checkpoint_id=checkpoint_id,
-        )
-
     def establish_topology(self, topology: dict[str, list[str]]) -> None:
         """
         Establish SPMD topology connections.

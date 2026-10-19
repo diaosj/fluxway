@@ -1,7 +1,7 @@
 # Fluxway 架构
 
 本文档是 [ARCHITECTURE.md](ARCHITECTURE.md) 的中文对应版本。
-这两个文件描述了相同的当前实现与协议边界。
+这两个文件描述了相同的稳定实现与协议边界。
 
 ## 运行时所有权 (Runtime ownership)
 
@@ -11,6 +11,19 @@ Controller（控制器）拥有图生命周期、placement、driver、心跳、�
 
 `ExecutionLifecycle` 集中管理启动、恢复、drain/checkpoint 后的继续执行、准入交付以及故障排序。Driver 心跳仅报告就绪状态。
 有关状态流和所有权表，请参阅 [分布式执行生命周期](execution_lifecycle_zh.md)。
+
+Controller 和 Driver 状态机使用纯转移关系。转移只提交状态和失败记录，effect 在释放
+锁后由唯一 lifecycle owner 执行。Source progress 只有一个带 generation 的 supervisor，
+terminal cleanup 只有一个共享 future，Worker close 只有一个 release future。Ray、
+checkpoint、transport 和资源释放工作不会进入状态 reducer 的临界区，因此不会制造重复
+task 或占用 Controller 状态锁。
+
+生命周期 effect 统一由 `BoundedLifecycleEffectScheduler` 执行，使用有界队列和固定 worker
+明确限制容量。`ASYNC` 只用于真正的 awaitable I/O；短阻塞或释放 GIL 的调用使用固定
+thread lane，可 pickle 的纯 Python CPU 工作使用 spawn 进程 lane。同一 key 严格有序，不同
+key 在固定上限内并发，队列满立即抛出背压异常。结果携带 `state_revision`，owner 在发出
+fact event 前丢弃过期结果。CPython 事件循环仍是单线程协作式调度，因此仅把函数声明为
+`async def` 不能证明它不会阻塞。
 
 ## 连贯性与数据面 (Coherence and data plane)
 
@@ -46,21 +59,28 @@ flowchart LR
     D --> A
 ```
 
-`COMMIT_DECIDED` 记录物理发布已经启动。由于崩溃会丢失组件会话和待发布的上下文，因此启动时会将 `STAGED` 和 `COMMIT_DECIDED` 记录统一隔离（fences）为 `ABANDONED`。只有 `COMMITTED` 的清单（manifests）才是可恢复和可见的。
+`COMMIT_DECIDED` 记录物理发布已经启动。若崩溃发生在全局 commit marker 写入之前，启动时 fencing 将调用 `abort_save(permit)` 并将记录转为 `ABANDONED`；若 commit marker 已持久化成功，启动时 fencing 将回放组件的 `acknowledge_save(permit)` 并推进事务至 `COMMITTED`。只有 `COMMITTED` 的清单（manifests）才是可恢复和可见的。Manifest 清单、事务和清理意图统一使用 MessagePack（`msgpack_codec`）二进制格式持久化，而非未紧凑的 JSON，保障低延迟元数据交互与紧凑存储。
 
 ## 放置与执行 (Placement and execution)
 
 Placement 声明来自于编译后的 SPMD 声明和 `ResourceProfile`。`PlacementRecipe` 表达约束和字典序（lexicographic）目标，而不重复声明资源所有权。每个解出的 NodeID 映射到共享异构 placement group 中的一个复合 bundle。Ray 的 `ray.io/node-id` bundle 标签选择器在 `STRICT_SPREAD` 下固定确切的身份；IP 资源标记不是节点身份。CPU、GPU 和自定义加速器资源保留规划器（planner）选择的数量。Worker 验证其实际的 NodeID 是否符合规划。多机执行要求兼容的节点环境，启用恢复时需要共享的检查点存储库。
 
+运行期绑定的动态资源（如动态路由表、设备网格实例或运行时 Rank Provider）由 `ResourceRegistry`（`fluxway.common.resource_registry`）统一管理，通过 `ResourceHandle(namespace, resource_id)` 引用，并在 `bind_resource_registry` 激活的上下文中动态解析。`LogicalPartitionBinding` 建立逻辑分片坐标到物理 Rank 的映射，使 Placement 和路由解耦于底层物理 Worker 编号重排。
+
 Worker 的准入拥有者（admission owner）包含闸门（gating）和挂起状态的提升（pending-state promotion）。`SourcePipelineMaintenance.request()` 合并填充 Worker 源 step 队列的请求；`fill()` 在将工作入队之前检查运行状态、pipeline 深度、drain 边界和总 step 目标。这种队列维护不会发现数据源修订版本或发布新的摄取窗口。执行通道（execution lane）消耗其拥有的队列项，评估准入，分发计划，并完成 `task_done()`。
 
 ## 摄取布局与数据源协调 (Ingestion layout and source coordination)
 
-`IngestionSourceAdapter` 在有界的 `CatalogViewObservation` 窗口中捕获不可变的修订元数据。编译器首先创建规范分配（由 `SourceWorkKey(epoch, step, assignment_id)` 标识），然后将它们绑定到瞬态 `WorkerLayoutDescriptor` 值中当前的读取器配额。`LogicalWorkLedger` 独自拥有租约（leases）、ACK 边界（frontiers）和已提交的分界线（committed cuts）。Driver 激活 checkpoint 状态为空。恢复（Restore）在应用逻辑上已提交的分界线之前重建计划和绑定。
+`IngestionSourceAdapter` 为有界扫描请求返回不可变的 `SourceScanResult`。Controller 的
+`SourceProgressSupervisor` 拥有事件驱动的扫描和 activation 发布。编译器首先创建规范分配
+（由 `SourceWorkKey(epoch, step, assignment_id)` 标识），然后将它们绑定到瞬态
+`WorkerLayoutDescriptor` 值中当前的读取器配额。`LogicalWorkLedger` 独自拥有租约（leases）、
+ACK 边界（frontiers）和已提交的分界线（committed cuts）。Driver 激活 checkpoint 状态为空。
+恢复（Restore）在应用逻辑上已提交的分界线之前重建计划和绑定。
 
-`IngestionLayoutPlanningComponent` 拥有专用 `IOLane` 上的描述符构造和适配器捕获的所有权，并在持久的生成（spawn）进程池上进行纯编译。已接受的操作在其调用者取消后仍然存活。关闭（Close）操作拒绝新工作，合并（join）已接受的操作，并在单独的生命周期通道上合并编译器，最后关闭适配器通道。Planner 和 ledger 的发布是在所有者循环的一个区段内安装的，没有挂起；验证和安装成本仍然随窗口大小而增长。I/O 线程隔离了阻塞调用，但不解除 Python CPU 工作的 GIL 限制。
+`IngestionLayoutPlanningComponent` 拥有专用 `IOLane` 上的描述符构造和适配器扫描的所有权，并在持久的生成（spawn）进程池上进行纯编译。已接受的操作在其调用者取消后仍然存活。关闭（Close）操作拒绝新工作，合并（join）已接受的操作，并在单独的生命周期通道上合并编译器，最后关闭适配器通道。Planner 和 ledger 的发布是在所有者循环的一个区段内安装的，没有挂起；验证和安装成本仍然随窗口大小而增长。I/O 线程隔离了阻塞调用，但不解除 Python CPU 工作的 GIL 限制。
 
-`SourceExecutionScope` 拥有 Worker 窗口的安装、活跃 step 索引和瞬态授权（transient grants）的所有权。获取（Acquisition）批量处理活跃 step 直至算子 pipeline 深度；权限返回当前信用允许的完整 step 前缀。常规的 checkpoint 继续执行（continuation）保留了该 scope。恢复（Restore）在 source 激活之前使用全新的 actor。ACK 提交使用有界的异步队列；满容量会施加反压。Controller 启动时会激活一个布局。Planner 组件支持空闲观察和挂起的尾部，但启动 API 不运行自动适配器发现或补充。已提交的 planning 窗口和物理绑定仍被保留，因此元数据随着安装的窗口数量而增长。
+`SourceExecutionScope` 拥有 Worker 窗口的安装、活跃 step 索引和瞬态授权（transient grants）的所有权。获取（Acquisition）批量处理活跃 step 直至算子 pipeline 深度；权限返回当前信用允许的完整 step 前缀。常规的 checkpoint 继续执行（continuation）保留了该 scope。恢复（Restore）在 source 激活之前使用全新的 actor。ACK 提交使用有界的异步队列；满容量会施加反压。Controller 启动时会激活一个布局并启动来源进度生命周期；`SourceProgressSupervisor` 负责事件驱动的适配器扫描和补充，适配器本身不拥有补窗。已提交的 planning 窗口和物理绑定仍被保留，因此元数据随着安装的窗口数量而增长。
 支持的协议详见 [数据源协调](source_coordination_zh.md) 和 [形式化协议](source_spmd_formal_protocol_zh.md)。
 
 ## 进程诊断与信号捕获 (Process diagnostics and signal capture)

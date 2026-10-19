@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import enum
+import functools
+import operator
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, SupportsIndex
 from collections.abc import Callable, Mapping
 from pydantic import (
     ConfigDict,
@@ -25,6 +27,10 @@ from fluxway.common.index_descriptor import (
 )
 from fluxway.common.schema import FluxwayBaseSchema
 from fluxway.common.frozen_mapping import FrozenMap
+from fluxway.common.resource_registry import (
+    ResourceHandle,
+    get_active_resource_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -426,10 +432,9 @@ class IndexedModuloPartition(_IndexValuePartition):
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
-
+        worker_count = _require_positive_worker_count(num_workers)
         values = _dynamic_routing_values(indices, index_desc, backend)
-
-        return backend.mod(values, num_workers)
+        return backend.mod(values, worker_count)
 
 
 class GreedyPartition(PartitionStrategy):
@@ -461,62 +466,128 @@ class GreedyPartition(PartitionStrategy):
         return backend.tensor(assigned, dtype=backend.int32())
 
 
+def _validate_routing_arguments(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("routing arguments must be a mapping")
+    reserved = {"partition_count", "domain_size"}.intersection(value)
+    if reserved:
+        raise ValueError(f"routing arguments use reserved names: {sorted(reserved)}")
+    for name, argument in value.items():
+        if not isinstance(name, str) or not name:
+            raise TypeError("routing argument names must be non-empty strings")
+        try:
+            hash(argument)
+        except TypeError as error:
+            raise TypeError(f"routing argument {name!r} must be hashable") from error
+    return FrozenMap(value)
+
+
 class FunctionPartition(_IndexValuePartition):
     type: Literal["function"] = "function"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
-    target: Callable[..., Any]
-    arguments: Mapping[str, Any] = Field(default_factory=dict)
+    target: Callable[..., Any] | ResourceHandle
+    arguments: Mapping[str, Any] = Field(default_factory=lambda: FrozenMap({}))
 
     @field_validator("target", mode="before")
     @classmethod
-    def validate_target(cls, value: Any) -> Callable[..., Any]:
-        if not callable(value):
-            raise TypeError("function partition target must be callable")
-        return value
+    def validate_target(cls, value: Any) -> Callable[..., Any] | ResourceHandle:
+        if isinstance(value, ResourceHandle):
+            return value
+        if (
+            isinstance(value, Mapping)
+            and "namespace" in value
+            and "resource_id" in value
+        ):
+            return ResourceHandle.model_validate(value)
+        if callable(value):
+            return value
+        raise TypeError(
+            f"function partition target must be callable or ResourceHandle, got {type(value).__name__}"
+        )
 
     @field_validator("arguments")
     @classmethod
     def validate_arguments(cls, value: Any) -> Mapping[str, Any]:
-        if not isinstance(value, Mapping):
-            raise TypeError("routing arguments must be a mapping")
-        reserved = {"partition_count", "domain_size"}.intersection(value)
-        if reserved:
-            raise ValueError(
-                f"routing arguments use reserved names: {sorted(reserved)}"
-            )
-        for name, argument in value.items():
-            if not isinstance(name, str) or not name:
-                raise TypeError("routing argument names must be non-empty strings")
-            try:
-                hash(argument)
-            except TypeError as error:
-                raise TypeError(
-                    f"routing argument {name!r} must be hashable"
-                ) from error
-        return FrozenMap(value)
+        return _validate_routing_arguments(value)
 
     def validate_contract(self) -> None:
-        try:
-            inspect.signature(self.target).bind(
-                object(),
-                partition_count=1,
-                domain_size=1,
-                **self.arguments,
-            )
-        except (TypeError, ValueError) as error:
-            raise TypeError(
-                "function partition target does not satisfy the routing contract"
-            ) from error
+        if isinstance(self.target, ResourceHandle):
+            return
+        if callable(self.target):
+            _resolve_and_validate_callable(self.target, self.arguments)
+            return
+        raise TypeError(
+            f"unsupported target type for contract validation: {type(self.target).__name__}"
+        )
+
+    def resolve_callable(self) -> Callable[..., Any]:
+        registry = (
+            get_active_resource_registry()
+            if isinstance(self.target, ResourceHandle)
+            else None
+        )
+        return _resolve_and_validate_callable(self.target, self.arguments, registry)
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
         values = _dynamic_routing_values(indices, index_desc, backend)
-        return self.target(
+        callable_target = self.resolve_callable()
+        result = callable_target(
             values,
             partition_count=num_workers,
             domain_size=dim_size,
             **self.arguments,
         )
+        return backend.asarray(result, copy=False, device=backend.default_device)
+
+
+@functools.cache
+def _resolve_and_validate_callable(
+    target: Callable[..., Any] | ResourceHandle,
+    arguments: Mapping[str, Any],
+    registry: Any = None,
+) -> Callable[..., Any]:
+    if callable(target):
+        provider = target
+    elif isinstance(target, ResourceHandle):
+        if registry is None:
+            raise RuntimeError(
+                "No active ResourceRegistry bound to resolve ResourceHandle"
+            )
+        provider = registry.resolve(target.namespace, target.resource_id)
+        if not callable(provider):
+            raise TypeError(
+                f"resolved resource {target.resource_id!r} in namespace "
+                f"{target.namespace!r} is not callable"
+            )
+    else:
+        raise TypeError(f"unsupported target type: {type(target).__name__}")
+
+    try:
+        inspect.signature(provider).bind(
+            object(),
+            partition_count=1,
+            domain_size=1,
+            **arguments,
+        )
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "function partition target does not satisfy the routing contract"
+        ) from error
+
+    return provider
+
+
+def _require_positive_worker_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
+        raise TypeError("partition worker count must be an integer")
+    try:
+        worker_count = operator.index(value)
+    except TypeError as error:
+        raise TypeError("partition worker count must be an integer") from error
+    if worker_count <= 0:
+        raise ValueError(f"partition worker count must be positive; got {worker_count}")
+    return worker_count
 
 
 def _dynamic_routing_values(indices: Any, index_desc: Any, backend: Any) -> Any:

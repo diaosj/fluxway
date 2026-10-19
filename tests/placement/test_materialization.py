@@ -3,7 +3,7 @@ from decimal import Decimal
 import pytest
 
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     ClusterNode,
     ClusterSnapshot,
     PlacementGroupTimeoutError,
@@ -91,9 +91,8 @@ def test_heterogeneous_nodes_preserve_resources_and_identity(monkeypatch):
     )
     recipe = PlacementRecipe(
         recipe_id="heterogeneous",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     plan = PlacementPlanner(solve_timeout_s=10).resolve(
         placement_inventory(graph), recipe, snapshot
@@ -244,9 +243,8 @@ def test_pg_manager_preserves_multiple_accelerator_resources(monkeypatch) -> Non
     )
     recipe = PlacementRecipe(
         recipe_id="multi-accelerator",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (
@@ -326,9 +324,8 @@ def test_driver_resources_are_reserved_in_the_rank_zero_bundle(monkeypatch) -> N
     )
     recipe = PlacementRecipe(
         recipe_id="driver-resources",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (

@@ -47,6 +47,13 @@ Worker 的持续时间切片使用以下 Perfetto 层次结构：
 
 ```text
 SPMDs/<spmd_id>/rank:<rank>/<subsystem>/<leaf>/lane:<lane>
+
+Controller 生命周期事件使用同级根分支：
+
+Controller/<subsystem>/<leaf>
+
+`Controller` 和 `SPMDs` 是两个顶层执行 owner。Controller 记录使用独立的控制面
+recorder 入口，但复用相同的定宽 recorder 和导出管线。
 ```
 
 展开 rank 可以检查其 compute、transport、mailbox 和 scheduler 子系统。leaf 标识被记录的行为。`lane:<lane>` 区分同一个 leaf 上重叠的切片，因此 Perfetto 会保留每个切片的原始持续时间。Lane 分配是确定性的，并使用 leaf 最大并发度所需的最小 lane 数；它不会为每个 step 创建一条 track。
@@ -85,7 +92,7 @@ Payload 字段与外围的调用关联：
 
 一个生产者输出可能提供给多个目标端口。这些事件共享一个 `logical_tuuid`，但具有不同的 `transfer_code` 值，因此每个目标端口都会独立显示，而不是被单一的张量名映射覆盖。
 
-记录器热路径继续只存储固定宽度的整数记录。图名称不会复制到每个事件中，算子运行时也不会发生图查找。冻结的 profiler 符号投影在 trace 导出期间从当前的 `CompiledGraph` 构建一次。缺失的算子、传输或逻辑张量身份会引发 `MissingGraphTraceSymbol`；Fluxway 不会生成不完整的名称作为回退。
+记录器热路径继续只存储固定宽度的整数记录。图名称不会复制到每个事件中，算子运行时也不会发生图查找。冻结的 profiler 符号投影在 trace 导出期间从当前的 `CompiledGraph` 构建一次。显式携带算子、传输或逻辑张量身份的事件必须解析该身份；身份缺失时引发 `MissingGraphTraceSymbol`。生命周期元数据例如 `execution.phase` 可以有意携带空 operator id；这类记录按非算子元数据注解，不进入 compiled-operator 索引。Fluxway 不会生成不完整的名称作为回退。
 
 ## 规则
 

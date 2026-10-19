@@ -1,9 +1,8 @@
 # BaseReader 与数据源读取 API
 
-`BaseReader` 将 source record 转换为携带坐标的 `TransportTensor`。受控 source
-必须读取 `self.ctx.source_work_items` 中的精确区间。Planner 拥有 immutable revision
-和 canonical batch，`LogicalWorkLedger` 拥有 lease 与进度；Dispatcher 只选择
-活跃 Worker 并路由数据。
+`BaseReader` 将来源记录转换为携带坐标的 `TransportTensor`。受控来源必须读取
+`self.ctx.source_work_items` 中的精确区间。规划组件负责有序来源区间和训练批次，
+`LogicalWorkLedger` 负责租约与进度；分发器只选择活跃工作进程并路由数据。
 
 每次受控 source 调用前，OperatorManager 校验非空的 `SourceWorkItem` tuple：
 所有条目必须属于当前执行 step，source、schema 和 global batch size 必须一致，
@@ -41,23 +40,20 @@ checkpoint replay 或跨拓扑 ownership。
 
 ## 自定义 Source
 
-实现 `IngestionSourceAdapter.capture_view`、`encode_cursor` 与 `decode_cursor`
-进行 immutable metadata discovery。Source 自有 metadata 和二进制 cursor 使用共享
-MessagePack codec。`IngestionReadSession.read` 可以为 `read_ingestion_layout`
-提供同步区间 chunk；`IngestionLayoutSession` 在线程中迭代并校验实际读取 cardinality。
+实现 `IngestionSourceAdapter.scan_next(cursor, budget)`，返回有界来源扫描结果和不透明
+位置。位置内部由来源编码，Fluxway 不解析。`IngestionReadSession.read` 提供精确
+区间的数据，`IngestionLayoutSession` 在线程中迭代并检查实际读取数量。
 
-有限受控 source 示例见
-[RecommendationReader](../fluxway/example/recommendation/reader.py) 及其
-[source descriptor](../fluxway/example/recommendation/source_adapter.py)。
-Descriptor 提供 `build_reader_topology`、`build_ingestion_plan` 和已有 Driver
-activation component。受控 source 恢复必须先重建 canonical plan，再恢复 logical cut；
-物理 Reader cursor 不能成为第二个 ownership 权威。
+示例见[读取进程](../fluxway/example/recommendation/reader.py)和
+ [来源描述](../fluxway/example/recommendation/source_adapter.py)。当前描述提供一个
+ `build_source_scan_binding` 和 `build_component`；binding 统一拥有读取拓扑、扫描适配器、
+ 尾部策略和初始不透明位置。控制器在来源会话内只创建并缓存这一个 binding。
+物理读取位置不能成为独立的
+全局检查点。
 
-## 当前流式边界
+## 流式与恢复边界
 
-Planner component 接受空的非终止 observation，不创建空 epoch；不完整 batch 可以跨
-revision 拼接，checkpoint 保存 pending tail 和 cursor。系统原生支持在改变 Reader 配额的弹性缩放场景下，依然能够对固定 Revision 进行强一致性读取。
-
-Controller 启动激活一个 layout；公开启动 API 不提供 adapter 自动 discovery/refill。Worker 接受连续的
-不可变窗口并持有安装身份；BaseReader 提供安装 hook。仅实现 adapter 尚不能让训练图自动进行
-无界流式读取。支持范围见 [Source 协调协议](source_coordination_zh.md)。
+来源扫描结果和尾部由控制面规划。实现读取接口本身不能单独证明事件驱动的补充窗口和全局恢复可用。
+规划组件可以为窗口内部的模型保存点计算消费书签，恢复从书签重新规划。
+读取进程不另存独立位置，也不恢复旧窗口。持续推进以及模型、优化器和来源的共同
+故障恢复必须遵循[来源协调](source_coordination_zh.md)中的检查点契约。

@@ -67,7 +67,7 @@ class AbstractWorkerExecutor:
     async def checkpoint_rollback_save(self) -> None:
         raise NotImplementedError
 
-    async def checkpoint_publish_save(self) -> None:
+    async def checkpoint_publish_save(self) -> bool:
         raise NotImplementedError
 
     async def checkpoint_restore(self, *args, **kwargs) -> None:

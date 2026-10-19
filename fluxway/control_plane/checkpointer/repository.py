@@ -10,12 +10,11 @@ import secrets
 import uuid
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
-import msgpack
-
+from fluxway.common import msgpack_codec
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
     CheckpointComponentPublication,
@@ -116,7 +115,6 @@ def _encode_topology(topology: TopologySnapshot) -> dict[str, Any]:
         "world_size": topology.world_size,
         "mesh_axis_names": list(topology.mesh_axis_names),
         "mesh_axis_shapes": list(topology.mesh_axis_shapes),
-        "partition_scheme_version": topology.partition_scheme_version,
     }
 
 
@@ -125,7 +123,6 @@ def _decode_topology(payload: Mapping[str, Any]) -> TopologySnapshot:
         world_size=payload["world_size"],
         mesh_axis_names=tuple(payload["mesh_axis_names"]),
         mesh_axis_shapes=tuple(payload["mesh_axis_shapes"]),
-        partition_scheme_version=payload["partition_scheme_version"],
     )
 
 
@@ -135,7 +132,6 @@ def _encode_checkpoint_object(checkpoint_object: CheckpointObjectRef) -> dict[st
         "checkpoint_object_id": checkpoint_object.checkpoint_object_id,
         "version_id": checkpoint_object.version_id,
         "storage_locator": checkpoint_object.storage_locator,
-        "format_version": checkpoint_object.format_version,
         "partition_key": checkpoint_object.partition_key,
         "cleanup_group": checkpoint_object.cleanup_group,
     }
@@ -147,7 +143,6 @@ def _decode_checkpoint_object(payload: Mapping[str, Any]) -> CheckpointObjectRef
         checkpoint_object_id=payload["checkpoint_object_id"],
         version_id=payload["version_id"],
         storage_locator=payload["storage_locator"],
-        format_version=payload["format_version"],
         partition_key=payload.get("partition_key"),
         cleanup_group=payload.get("cleanup_group"),
     )
@@ -169,6 +164,7 @@ def _encode_cleanup_intent(intent: CheckpointCleanupIntent) -> dict[str, Any]:
                         for checkpoint_object in binding.reservation.claimed
                     ],
                     "generation": binding.reservation.generation,
+                    "owner_handle": binding.reservation.owner_handle,
                 },
             }
             for binding in intent.reservations
@@ -202,6 +198,7 @@ def _decode_cleanup_intent(payload: Any) -> CheckpointCleanupIntent:
                         for checkpoint_object in reservation["claimed"]
                     ),
                     generation=reservation["generation"],
+                    owner_handle=reservation["owner_handle"],
                 ),
             )
         )
@@ -236,7 +233,6 @@ def _decode_record(payload: Mapping[str, Any]) -> CheckpointObjectRecord:
 def _encode_publication(publication: CheckpointComponentPublication) -> dict[str, Any]:
     return {
         "component_id": publication.component_id,
-        "format_version": publication.format_version,
         "shared_records": [
             _encode_record(record) for record in publication.shared_records
         ],
@@ -254,7 +250,6 @@ def _encode_publication(publication: CheckpointComponentPublication) -> dict[str
 def _decode_publication(payload: Mapping[str, Any]) -> CheckpointComponentPublication:
     return CheckpointComponentPublication(
         component_id=payload["component_id"],
-        format_version=payload["format_version"],
         shared_records=tuple(
             _decode_record(record) for record in payload["shared_records"]
         ),
@@ -313,7 +308,6 @@ def manifest_to_payload(manifest: CheckpointManifest) -> dict[str, Any]:
             f"manifest.spmds.{spmd_id}.driver_components",
         )
     return {
-        "schema_version": manifest.schema_version,
         "checkpoint_id": manifest.checkpoint_id,
         "attempt_id": manifest.attempt_id,
         "coordinator_generation": manifest.coordinator_generation,
@@ -347,8 +341,8 @@ def manifest_to_payload(manifest: CheckpointManifest) -> dict[str, Any]:
 def manifest_from_payload(payload: Any) -> CheckpointManifest:
     if not isinstance(payload, Mapping):
         raise TypeError("checkpoint manifest root must be a mapping")
-    if payload.get("schema_version") != 1:
-        raise ValueError("only checkpoint manifest schema version 1 is supported")
+    if payload.keys() != {field.name for field in fields(CheckpointManifest)}:
+        raise ValueError("checkpoint manifest fields do not match")
     raw_cut = payload["cut"]
     if not isinstance(raw_cut, Mapping):
         raise TypeError("checkpoint manifest cut must be a mapping")
@@ -381,7 +375,6 @@ def manifest_from_payload(payload: Any) -> CheckpointManifest:
             driver_components=snapshot["driver_components"],
         )
     return CheckpointManifest(
-        schema_version=payload["schema_version"],
         checkpoint_id=payload["checkpoint_id"],
         attempt_id=payload["attempt_id"],
         coordinator_generation=payload["coordinator_generation"],
@@ -488,7 +481,7 @@ class CheckpointRepository:
                 ):
                     raise PermissionError("cleanup intent does not match commit permit")
         payload = manifest_to_payload(manifest)
-        encoded = cast(bytes, msgpack.packb(payload, use_bin_type=True))
+        encoded = msgpack_codec.packb(payload, use_bin_type=True)
         manifest_dir = self._manifests / manifest.checkpoint_id
         final_path = manifest_dir / "manifest.msgpack"
         with self._locked():
@@ -514,11 +507,8 @@ class CheckpointRepository:
                 for intent, path in zip(cleanup_intents, intent_paths, strict=True):
                     self._atomic_write(
                         path,
-                        cast(
-                            bytes,
-                            msgpack.packb(
-                                _encode_cleanup_intent(intent), use_bin_type=True
-                            ),
+                        msgpack_codec.packb(
+                            _encode_cleanup_intent(intent), use_bin_type=True
                         ),
                     )
                     written_intents.append(path)
@@ -541,8 +531,8 @@ class CheckpointRepository:
             actual = hashlib.sha256(encoded).hexdigest()
         else:
             payload = manifest_to_payload(manifest)
-            encoded = msgpack.packb(payload, use_bin_type=True)
-            actual = hashlib.sha256(cast(bytes, encoded)).hexdigest()
+            encoded = msgpack_codec.packb(payload, use_bin_type=True)
+            actual = hashlib.sha256(encoded).hexdigest()
         if manifest.checkpoint_id != checkpoint_id:
             raise ValueError("staged manifest does not match repository payload")
         if (
@@ -597,6 +587,10 @@ class CheckpointRepository:
                     f"invalid checkpoint transaction transition {current.status} -> "
                     f"{CheckpointTransactionState.ABANDONED}"
                 )
+            if self.is_committed(checkpoint_id):
+                raise RuntimeError(
+                    f"cannot abandon globally committed checkpoint transaction: {checkpoint_id}"
+                )
             manifest_dir = self._manifests / checkpoint_id
             if manifest_dir.exists():
                 for child in manifest_dir.iterdir():
@@ -649,7 +643,9 @@ class CheckpointRepository:
         path = self._manifests / checkpoint_id / "manifest.msgpack"
         if not path.is_file():
             raise FileNotFoundError(f"checkpoint manifest not found: {path}")
-        payload = msgpack.unpackb(path.read_bytes(), raw=False, strict_map_key=False)
+        payload = msgpack_codec.unpackb(
+            path.read_bytes(), raw=False, strict_map_key=False
+        )
         return manifest_from_payload(payload)
 
     def mark_committed(
@@ -664,7 +660,7 @@ class CheckpointRepository:
                 )
             encoded_manifest = manifest_path.read_bytes()
             manifest = manifest_from_payload(
-                msgpack.unpackb(
+                msgpack_codec.unpackb(
                     encoded_manifest,
                     raw=False,
                     strict_map_key=False,
@@ -684,10 +680,10 @@ class CheckpointRepository:
                 "coordinator_generation": permit.coordinator_generation,
                 "token_digest": hashlib.sha256(permit.token).hexdigest(),
             }
-            encoded_marker = msgpack.packb(marker, use_bin_type=True)
+            encoded_marker = msgpack_codec.packb(marker, use_bin_type=True)
             if not isinstance(encoded_marker, bytes):
                 raise TypeError(
-                    f"expected bytes from msgpack.packb, got {type(encoded_marker)}"
+                    f"expected bytes from msgpack_codec.packb, got {type(encoded_marker)}"
                 )
             if marker_path.exists():
                 if marker_path.read_bytes() != encoded_marker:
@@ -724,9 +720,9 @@ class CheckpointRepository:
             raise ValueError("checkpoint committed marker has no manifest")
         encoded_manifest = manifest_path.read_bytes()
         manifest = manifest_from_payload(
-            msgpack.unpackb(encoded_manifest, raw=False, strict_map_key=False)
+            msgpack_codec.unpackb(encoded_manifest, raw=False, strict_map_key=False)
         )
-        marker = msgpack.unpackb(
+        marker = msgpack_codec.unpackb(
             marker_path.read_bytes(), raw=False, strict_map_key=False
         )
         if (
@@ -800,11 +796,11 @@ class CheckpointRepository:
             "checkpoint_object_id": checkpoint_object.checkpoint_object_id,
             "version_id": checkpoint_object.version_id,
         }
-        encoded = msgpack.packb(payload, use_bin_type=True)
+        encoded = msgpack_codec.packb(payload, use_bin_type=True)
         path = self._cleaned_up_path(spmd_id, checkpoint_object)
         with self._locked():
             if path.exists():
-                existing = msgpack.unpackb(
+                existing = msgpack_codec.unpackb(
                     path.read_bytes(), raw=False, strict_map_key=False
                 )
                 if existing != payload:
@@ -812,7 +808,7 @@ class CheckpointRepository:
                         f"cleaned_up checkpoint_object index conflicts with {path}"
                     )
                 return
-            self._atomic_write(path, cast(bytes, encoded))
+            self._atomic_write(path, encoded)
 
     def is_checkpoint_object_cleaned_up(
         self, spmd_id: str, checkpoint_object: CheckpointObjectRef
@@ -822,7 +818,9 @@ class CheckpointRepository:
         path = self._cleaned_up_path(spmd_id, checkpoint_object)
         if not path.exists():
             return False
-        payload = msgpack.unpackb(path.read_bytes(), raw=False, strict_map_key=False)
+        payload = msgpack_codec.unpackb(
+            path.read_bytes(), raw=False, strict_map_key=False
+        )
         expected = {
             "spmd_id": spmd_id,
             "component_id": checkpoint_object.component_id,
@@ -880,7 +878,7 @@ class CheckpointRepository:
         for path in self._cleanup_intents.iterdir():
             if not path.is_file() or path.suffix != ".msgpack":
                 continue
-            payload = msgpack.unpackb(
+            payload = msgpack_codec.unpackb(
                 path.read_bytes(), raw=False, strict_map_key=False
             )
             item = _decode_cleanup_intent(payload)
@@ -901,7 +899,7 @@ class CheckpointRepository:
             if not path.is_file():
                 return
             encoded = path.read_bytes()
-            payload = msgpack.unpackb(encoded, raw=False, strict_map_key=False)
+            payload = msgpack_codec.unpackb(encoded, raw=False, strict_map_key=False)
             if _decode_cleanup_intent(payload) != intent:
                 raise ValueError(f"cleanup intent index conflicts with {path}")
             path.unlink()
@@ -933,7 +931,7 @@ class CheckpointRepository:
                 if not manifest_path.is_file() or not marker_path.is_file():
                     continue
                 manifest = manifest_from_payload(
-                    msgpack.unpackb(
+                    msgpack_codec.unpackb(
                         manifest_path.read_bytes(),
                         raw=False,
                         strict_map_key=False,
@@ -1016,12 +1014,17 @@ class CheckpointRepository:
     def _cleaned_up_path(
         self, spmd_id: str, checkpoint_object: CheckpointObjectRef
     ) -> Path:
+        version_id = (
+            checkpoint_object.version_id
+            if isinstance(checkpoint_object.version_id, str)
+            else checkpoint_object.version_id.hex()
+        )
         identity = "\x00".join(
             (
                 spmd_id,
                 checkpoint_object.component_id,
                 checkpoint_object.checkpoint_object_id,
-                checkpoint_object.version_id,
+                version_id,
             )
         )
         digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
@@ -1055,7 +1058,7 @@ class CheckpointRepository:
         for path in self._cleanup_intents.iterdir():
             if not path.is_file() or path.suffix != ".msgpack":
                 continue
-            payload = msgpack.unpackb(
+            payload = msgpack_codec.unpackb(
                 path.read_bytes(), raw=False, strict_map_key=False
             )
             intent = _decode_cleanup_intent(payload)
@@ -1070,7 +1073,7 @@ class CheckpointRepository:
         for path in self._cleanup_intents.iterdir():
             if not path.is_file() or path.suffix != ".msgpack":
                 continue
-            payload = msgpack.unpackb(
+            payload = msgpack_codec.unpackb(
                 path.read_bytes(), raw=False, strict_map_key=False
             )
             intent = _decode_cleanup_intent(payload)
@@ -1083,24 +1086,23 @@ class CheckpointRepository:
 
     @staticmethod
     def _encode_transaction(record: CheckpointTransactionRecord) -> bytes:
-        return cast(
-            bytes,
-            msgpack.packb(
-                {
-                    "checkpoint_id": record.checkpoint_id,
-                    "manifest_digest": record.manifest_digest,
-                    "attempt_id": record.permit.attempt_id,
-                    "coordinator_generation": record.permit.coordinator_generation,
-                    "token": record.permit.token,
-                    "status": record.status.value,
-                },
-                use_bin_type=True,
-            ),
+        return msgpack_codec.packb(
+            {
+                "checkpoint_id": record.checkpoint_id,
+                "manifest_digest": record.manifest_digest,
+                "attempt_id": record.permit.attempt_id,
+                "coordinator_generation": record.permit.coordinator_generation,
+                "token": record.permit.token,
+                "status": record.status.value,
+            },
+            use_bin_type=True,
         )
 
     @staticmethod
     def _read_transaction_unlocked(path: Path) -> CheckpointTransactionRecord:
-        payload = msgpack.unpackb(path.read_bytes(), raw=False, strict_map_key=False)
+        payload = msgpack_codec.unpackb(
+            path.read_bytes(), raw=False, strict_map_key=False
+        )
         if not isinstance(payload, Mapping) or set(payload) != {
             "checkpoint_id",
             "manifest_digest",
@@ -1177,7 +1179,7 @@ class CheckpointRepository:
     def _read_permit_state_unlocked(self) -> dict[str, Any]:
         if not self._permit_path.exists():
             return {"coordinator_generation": 0, "active_permits": {}}
-        payload = msgpack.unpackb(
+        payload = msgpack_codec.unpackb(
             self._permit_path.read_bytes(), raw=False, strict_map_key=False
         )
         if (
@@ -1199,7 +1201,7 @@ class CheckpointRepository:
     ) -> dict[str, CheckpointParticipantLease]:
         if not self._participant_lease_path.exists():
             return {}
-        payload = msgpack.unpackb(
+        payload = msgpack_codec.unpackb(
             self._participant_lease_path.read_bytes(),
             raw=False,
             strict_map_key=False,
@@ -1251,7 +1253,7 @@ class CheckpointRepository:
         }
         self._atomic_write(
             self._participant_lease_path,
-            cast(bytes, msgpack.packb(payload, use_bin_type=True)),
+            msgpack_codec.packb(payload, use_bin_type=True),
         )
 
     def _require_commit_permit_unlocked(
@@ -1289,7 +1291,7 @@ class CheckpointRepository:
             marker_path = self._commit_marker_path(directory.name)
             if not marker_path.is_file() or not self.is_committed(directory.name):
                 continue
-            marker = msgpack.unpackb(
+            marker = msgpack_codec.unpackb(
                 marker_path.read_bytes(), raw=False, strict_map_key=False
             )
             if (
@@ -1303,7 +1305,7 @@ class CheckpointRepository:
     def _write_permit_state_unlocked(self, payload: Mapping[str, Any]) -> None:
         self._atomic_write(
             self._permit_path,
-            cast(bytes, msgpack.packb(dict(payload), use_bin_type=True)),
+            msgpack_codec.packb(dict(payload), use_bin_type=True),
         )
 
     @staticmethod

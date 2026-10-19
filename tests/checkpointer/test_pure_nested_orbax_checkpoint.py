@@ -55,7 +55,7 @@ async def test_pure_nested_orbax_checkpoint_end_to_end(tmp_path):
     runtime = CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
     await component.open(runtime)
 
-    topology = TopologySnapshot(1, (), (), "v1")
+    topology = TopologySnapshot(1, (), ())
     permit = CheckpointCommitPermit("tx_attempt", 1, b"permit")
     save_session = SaveSession(
         instance=None,

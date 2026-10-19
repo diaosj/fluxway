@@ -1,7 +1,7 @@
 from decimal import Decimal
 
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     ClusterNode,
     ClusterSnapshot,
     PlacementPlanner,
@@ -26,7 +26,6 @@ def test_ray_component_limits_are_accounted_but_excluded_from_actor_bundles() ->
     graph = placement_graph({"metrics": graph_node("metrics", SPMD0, 1, profile)})
     recipe = PlacementRecipe(
         recipe_id="ray-component-limits",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(maximize(allocated_quanta(workers(SPMD0)))),
     )
@@ -66,9 +65,8 @@ def test_ray_component_limits_is_per_worker_and_immutable() -> None:
     graph = placement_graph({"metrics": graph_node("metrics", SPMD0, 2, profile)})
     recipe = PlacementRecipe(
         recipe_id="ray-component-limits-workers",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="cpu", resources={"CPU": 3}),)

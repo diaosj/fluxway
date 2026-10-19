@@ -13,7 +13,7 @@ import pytest
 
 import fluxway
 from fluxway.control_plane.graph.functional import FunctionalGraph
-from fluxway.placement import AFFINITY_FIRST_V1, PlacementRecipe, ResourceProfile
+from fluxway.placement import AFFINITY_FIRST, PlacementRecipe, ResourceProfile
 
 # Import helper nodes from the separate module so Ray can deserialize them.
 from tests.reader.helper_nodes import MockDataSource, SimpleProcessor, TypedGrainReader
@@ -58,9 +58,8 @@ async def test_reader_processor_data_flows():
     """Both Reader and Processor must make progress within the timeout."""
     recipe = PlacementRecipe(
         recipe_id="reader-e2e",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     graph = _build_graph().build("ReaderE2E")
     reader_id = next(n for n in graph.nodes if "Reader" in n)

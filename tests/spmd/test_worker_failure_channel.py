@@ -1,7 +1,7 @@
 import asyncio
 from types import SimpleNamespace
 import types
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -10,6 +10,7 @@ from fluxway.spmd.worker.worker import SPMDWorker, _EXECUTION_STOP_ITEM
 from fluxway.spmd.worker.admission import StepAdmissionState
 from fluxway.spmd.worker.checkpoint_activity import CheckpointActivity
 from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle
+from fluxway.spmd.worker.source_scope import SourceExecutionScope
 
 
 class LifecycleWorkerStub(SimpleNamespace):
@@ -49,6 +50,12 @@ def _worker():
         _heartbeat_task=None,
         _checkpoint_activity=CheckpointActivity(),
         _op_runnable={"op": asyncio.Event()},
+        _source_scope=SourceExecutionScope(
+            acquire=AsyncMock(),
+            spawn=asyncio.create_task,
+            completed=lambda _operator: 0,
+            depth=lambda _operator: 1,
+        ),
     )
     worker._op_runnable["op"].set()
     worker._execution_lifecycle.topology_ready()

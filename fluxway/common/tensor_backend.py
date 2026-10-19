@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from functools import wraps
 from math import prod
+import operator
 from typing import Any
 import contextlib
 import threading
@@ -1664,6 +1665,9 @@ except ImportError:
 
 # --- Numba JIT helpers (CPU acceleration) ---
 _NUMBA_AVAILABLE = False
+# Keep parallel-launch overhead out of small routing batches.  This is an
+# execution threshold only; modulo semantics remain owned by TensorBackend.
+_NUMBA_MODULO_MIN_SIZE = 1 << 17
 
 try:
     import numba as _numba
@@ -1712,6 +1716,20 @@ try:
         """1-D gather: out[i] = data[indices[i]]."""
         for i in range(indices.shape[0]):
             out[i] = data[indices[i]]
+
+    @_cached_numba_kernel(nopython=True, parallel=True, nogil=True, cache=True)
+    def _numba_modulo_loop(values, partition_count, out):
+        """Compute integer modulo into *out* with a dtype-matched divisor.
+
+        The caller must pass ``partition_count`` as a NumPy scalar matching
+        ``values.dtype``.  In particular, passing a Python ``int`` for a
+        ``uint64`` array makes Numba lower the divisor as signed and produces
+        incorrect results for keys above ``2**63 - 1``.
+        """
+        values_flat = values.reshape(-1)
+        out_flat = out.reshape(-1)
+        for index in _numba.prange(values_flat.size):
+            out_flat[index] = values_flat[index] % partition_count
 
 except ImportError:
     pass
@@ -2150,7 +2168,33 @@ class HybridBackend(TensorBackend):
         return self._lib_for(x).floor_divide(x, y)
 
     def mod(self, x: Any, y: Any) -> Any:
-        return self._lib_for(x).mod(x, y)
+        lib = self._lib_for(x)
+        if (
+            lib is np
+            and self._use_jit
+            and isinstance(x, np.ndarray)
+            and x.flags.c_contiguous
+            and x.size >= _NUMBA_MODULO_MIN_SIZE
+            and x.dtype
+            in {
+                np.dtype(np.int32),
+                np.dtype(np.uint32),
+                np.dtype(np.int64),
+                np.dtype(np.uint64),
+            }
+        ):
+            try:
+                partition_count = operator.index(y)
+            except TypeError:
+                partition_count = None
+            if partition_count is not None and partition_count > 0:
+                dtype_limits = np.iinfo(x.dtype)
+                if partition_count <= int(dtype_limits.max):
+                    divisor = np.asarray(partition_count, dtype=x.dtype)[()]
+                    out = np.empty_like(x)
+                    _numba_modulo_loop(x, divisor, out)
+                    return out
+        return lib.mod(x, y)
 
     def where(self, condition: Any, x: Any, y: Any) -> Any:
         if self._cp is not None and (

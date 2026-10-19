@@ -465,9 +465,8 @@ class PlacementPlanner:
     ) -> ResolvedPlacementPlan:
         deadline = time.monotonic() + self._solve_timeout_s
         logger.info(
-            "placement.recipe.selected recipe_id=%s version=%s",
+            "placement.recipe.selected recipe_id=%s",
             recipe.recipe_id,
-            recipe.version,
         )
         logger.info(
             "placement.capacity.snapshot nodes=%s available=%s",
@@ -492,7 +491,7 @@ class PlacementPlanner:
                 index,
                 constraint.kind,
             )
-        self._require_feasible(compiled, recipe, deadline)
+        self._require_feasible(compiled, recipe, snapshot, deadline)
         solver, objective_results = self._solve_objectives(
             compiled, resolver, recipe, snapshot, deadline
         )
@@ -516,7 +515,6 @@ class PlacementPlanner:
         fragmentation = self._fragmentation_report(compiled, solver, snapshot)
         plan = ResolvedPlacementPlan(
             recipe_id=recipe.recipe_id,
-            recipe_version=recipe.version,
             recipe=recipe,
             assignments=assignments,
             allocated_quanta=allocated_quanta,
@@ -674,6 +672,7 @@ class PlacementPlanner:
         self,
         compiled: _CompiledModel,
         recipe: PlacementRecipe,
+        snapshot: ClusterSnapshot,
         deadline: float,
     ) -> None:
         solver = self._solver()
@@ -683,7 +682,7 @@ class PlacementPlanner:
             return
         if status == cp_model.INFEASIBLE:
             raise PlacementInfeasibleError(
-                f"placement base resources are infeasible for recipe {recipe.recipe_id}"
+                self._feasibility_error_message(compiled, recipe, snapshot)
             )
         if status == cp_model.UNKNOWN:
             raise PlacementSolveTimeoutError(
@@ -691,6 +690,114 @@ class PlacementPlanner:
             )
         raise PlacementError(
             f"placement feasibility solver returned {solver.status_name(status)}"
+        )
+
+    def _feasibility_error_message(
+        self,
+        compiled: _CompiledModel,
+        recipe: PlacementRecipe,
+        snapshot: ClusterSnapshot,
+    ) -> str:
+        resource_names = tuple(
+            sorted(
+                {
+                    resource
+                    for worker in compiled.workers
+                    for resource in (
+                        set(worker.profile.placement_base)
+                        | set(worker.driver_resources)
+                    )
+                }
+            )
+        )
+        demand_by_spmd: dict[str, dict[str, Decimal]] = {}
+        worker_counts: defaultdict[str, int] = defaultdict(int)
+        worker_maxima: dict[str, Decimal] = defaultdict(Decimal)
+        for worker in compiled.workers:
+            worker_counts[worker.spmd_id] += 1
+            demand = demand_by_spmd.setdefault(worker.spmd_id, {})
+            for resource in resource_names:
+                quantity = worker.profile.placement_base.get(
+                    resource, Decimal(0)
+                ) + worker.driver_resources.get(resource, Decimal(0))
+                demand[resource] = demand.get(resource, Decimal(0)) + quantity
+                worker_maxima[resource] = max(worker_maxima[resource], quantity)
+
+        minimum_demand = {
+            resource: sum(
+                demand.get(resource, Decimal(0)) for demand in demand_by_spmd.values()
+            )
+            for resource in resource_names
+        }
+        capacity = {
+            resource: snapshot.available.get(resource, Decimal(0))
+            for resource in resource_names
+        }
+        deficits = {
+            resource: required - capacity.get(resource, Decimal(0))
+            for resource, required in minimum_demand.items()
+            if required > capacity.get(resource, Decimal(0))
+        }
+        largest_node = {
+            resource: max(
+                (node.resources.get(resource, Decimal(0)) for node in snapshot.nodes),
+                default=Decimal(0),
+            )
+            for resource in resource_names
+        }
+        single_worker_limits = {
+            resource: {
+                "worker": worker_maxima[resource],
+                "node": largest_node[resource],
+            }
+            for resource in resource_names
+            if worker_maxima[resource] > largest_node[resource]
+        }
+        worker_summary = ";".join(
+            f"{spmd_id}[count={worker_counts[spmd_id]},resources={{{','.join(f'{resource}={demand.get(resource, Decimal(0))}' for resource in resource_names if demand.get(resource, Decimal(0)) > 0)}}}]"
+            for spmd_id, demand in sorted(demand_by_spmd.items())
+        )
+        demand_summary = (
+            ",".join(
+                f"{resource}={minimum_demand[resource]}" for resource in resource_names
+            )
+            or "none"
+        )
+        capacity_summary = (
+            ",".join(f"{resource}={capacity[resource]}" for resource in resource_names)
+            or "none"
+        )
+        deficit_summary = (
+            ",".join(
+                f"{resource}={amount}" for resource, amount in sorted(deficits.items())
+            )
+            or "none"
+        )
+        limit_summary = (
+            ",".join(
+                f"{resource}(worker={values['worker']},node={values['node']})"
+                for resource, values in sorted(single_worker_limits.items())
+            )
+            or "none"
+        )
+        if deficits:
+            cause = "minimum resource capacity deficit"
+            hint = (
+                "increase cluster resources or reduce worker counts/resource "
+                "profiles (reader, input, compute, table, or metrics)"
+            )
+        else:
+            cause = "hard placement constraint or scaled-resource infeasibility"
+            hint = (
+                "review affinity/disjoint/equality constraints, worker counts, "
+                "and scalable resource limits"
+            )
+        return (
+            f"placement base resources are infeasible for recipe {recipe.recipe_id!r}; "
+            f"cause={cause}; workers={worker_summary}; "
+            f"minimum_demand={demand_summary}; capacity={capacity_summary}; "
+            f"deficits={deficit_summary}; single_worker_limits={limit_summary}; "
+            f"constraints={len(recipe.constraints)}; hint={hint}"
         )
 
     def _placement_units(

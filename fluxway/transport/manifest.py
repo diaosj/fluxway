@@ -24,7 +24,7 @@ INT32_MAX = np.iinfo(np.int32).max
 INT64_MAX = np.iinfo(np.int64).max
 INT32_NBYTES = np.dtype(np.int32).itemsize
 INT64_NBYTES = np.dtype(np.int64).itemsize
-PROTOCOL_VERSION = 1
+TRANSPORT_ABI_TAG = 1
 
 
 class TensorEntryKind(IntEnum):
@@ -77,7 +77,7 @@ class FrameFlag(IntEnum):
     COHERENCE = 3
 
 
-FRAME_VERSION = 0
+FRAME_ABI_TAG_FIELD = 0
 FRAME_STEP = 1
 FRAME_SENDER_SPMD_CODE = 2
 FRAME_SENDER_RANK = 3
@@ -321,10 +321,10 @@ class TransportFrameHeader:
                 "Invalid sender rank domain: "
                 f"rank={sender_rank} world_size={sender_world_size}."
             )
-        if int(self.frame_i32[FRAME_VERSION]) != PROTOCOL_VERSION:
+        if int(self.frame_i32[FRAME_ABI_TAG_FIELD]) != TRANSPORT_ABI_TAG:
             raise ValueError(
-                f"Unsupported transport frame version {int(self.frame_i32[FRAME_VERSION])}; "
-                f"expected {PROTOCOL_VERSION}."
+                f"Unsupported transport frame ABI tag {int(self.frame_i32[FRAME_ABI_TAG_FIELD])}; "
+                f"expected {TRANSPORT_ABI_TAG}."
             )
         frame_flag_value = int(self.frame_i32[FRAME_FLAGS])
         _validate_enum(FrameFlag, frame_flag_value, "frame flags")
@@ -1016,7 +1016,7 @@ class TransportFrameBuilder:
         payload_count = _as_i32(self._payload_count, "payload_count")
         frame_i32 = np.array(
             [
-                PROTOCOL_VERSION,
+                TRANSPORT_ABI_TAG,
                 self._step,
                 self._sender_spmd_code,
                 self._sender_rank,

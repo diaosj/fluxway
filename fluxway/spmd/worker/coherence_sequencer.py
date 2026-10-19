@@ -8,6 +8,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from dataclasses import dataclass, field
 import logging
 from enum import StrEnum
+import threading
 from typing import Any, TypeVar
 
 from fluxway.common.coherence import CoherenceStateTransitionError, CoherenceInstance
@@ -60,59 +61,90 @@ class _TicketState(StrEnum):
 
 
 class ConsumerLease:
-    __slots__ = ("_bindings", "_released", "_sequencer")
+    __slots__ = (
+        "_bindings",
+        "_lock",
+        "_released",
+        "_reservation_id",
+        "_sequencer",
+    )
 
     def __init__(
         self,
         sequencer: CoherenceSequencer[Any],
         bindings: tuple[tuple[_Ticket[Any], _Intent], ...],
+        reservation_id: int | None = None,
     ) -> None:
         self._sequencer = sequencer
         self._bindings = bindings
+        self._lock = threading.Lock()
         self._released = False
+        self._reservation_id = reservation_id
+
+    def _release(self, *, strict: bool) -> None:
+        with self._lock:
+            if self._released:
+                if strict:
+                    raise CoherenceStateTransitionError(
+                        "coherence consumer lease was already released."
+                    )
+                return
+            self._released = True
+        self._sequencer._release_consumer_lease(
+            self._bindings,
+            reservation_id=self._reservation_id,
+        )
 
     def release(self) -> None:
-        if self._released:
-            raise CoherenceStateTransitionError(
-                "coherence consumer lease was already released."
-            )
-        self._released = True
-        self._sequencer._release_consumer_lease(self._bindings)
+        self._release(strict=True)
+
+    def release_for_cleanup(self) -> None:
+        self._release(strict=False)
 
     def cancel(self) -> None:
         self.release()
 
 
-class ConsumerLeaseReservation:
-    __slots__ = ("_bindings", "_claimed", "_sequencer")
+class _ReservationPhase(StrEnum):
+    RESERVED = "reserved"
+    CLAIMED = "claimed"
+    RELEASED = "released"
+
+
+class _ConsumerLeaseReservationRecord:
+    __slots__ = ("bindings", "claimed_lease", "lock", "state")
 
     def __init__(
         self,
-        sequencer: CoherenceSequencer[Any],
         bindings: tuple[tuple[_Ticket[Any], _Intent], ...],
     ) -> None:
+        self.bindings = bindings
+        self.claimed_lease: ConsumerLease | None = None
+        self.lock = threading.Lock()
+        self.state = _ReservationPhase.RESERVED
+
+
+class ConsumerLeaseReservationRef:
+    """Non-owning tensor reference to one sequencer-owned reservation."""
+
+    __slots__ = ("_sequencer", "_reservation_id")
+
+    def __init__(self, sequencer: CoherenceSequencer[Any], reservation_id: int) -> None:
         self._sequencer = sequencer
-        self._bindings = bindings
-        self._claimed = False
-        sequencer._consumer_lease_reservations.add(self)
+        self._reservation_id = reservation_id
 
     def claim(self) -> ConsumerLease:
-        if self._claimed:
-            raise CoherenceStateTransitionError(
-                "coherence consumer lease reservation was already claimed."
-            )
-        self._claimed = True
-        self._sequencer._consumer_lease_reservations.discard(self)
-        return ConsumerLease(self._sequencer, self._bindings)
+        return self._sequencer._claim_consumer_lease_reservation(self._reservation_id)
+
+    @property
+    def claimed(self) -> bool:
+        return self._sequencer._consumer_lease_reservation_claimed(self._reservation_id)
+
+    def release_for_cleanup(self) -> None:
+        self._sequencer._cleanup_consumer_lease_reservation(self._reservation_id)
 
     def cancel(self) -> None:
-        if self._claimed:
-            raise CoherenceStateTransitionError(
-                "cannot cancel a claimed coherence consumer lease reservation."
-            )
-        self._claimed = True
-        self._sequencer._consumer_lease_reservations.discard(self)
-        self._sequencer._release_consumer_lease(self._bindings)
+        self._sequencer._cancel_consumer_lease_reservation(self._reservation_id)
 
 
 @dataclass(slots=True)
@@ -193,9 +225,43 @@ class CoherenceSequencer[PayloadT]:
         self._tickets: dict[int, _Ticket[Any]] = {}
         self._drain_handle: asyncio.Handle | None = None
         self._retire_tasks: dict[int, asyncio.Task[None]] = {}
-        self._consumer_lease_reservations: set[ConsumerLeaseReservation] = set()
+        self._consumer_lease_reservations: dict[
+            int, _ConsumerLeaseReservationRecord
+        ] = {}
+        self._consumer_lease_reservations_lock = threading.Lock()
+        self._next_consumer_lease_reservation_id = 1
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._fenced_error: BaseException | None = None
+
+    def _register_consumer_lease_reservation(
+        self, control: _ConsumerLeaseReservationRecord
+    ) -> int:
+        with self._consumer_lease_reservations_lock:
+            reservation_id = self._next_consumer_lease_reservation_id
+            self._next_consumer_lease_reservation_id += 1
+            self._consumer_lease_reservations[reservation_id] = control
+            return reservation_id
+
+    def _find_consumer_lease_reservation(
+        self, reservation_id: int
+    ) -> _ConsumerLeaseReservationRecord:
+        with self._consumer_lease_reservations_lock:
+            try:
+                return self._consumer_lease_reservations[reservation_id]
+            except KeyError as exc:
+                raise CoherenceStateTransitionError(
+                    "coherence consumer lease reservation was already released."
+                ) from exc
+
+    def _retire_consumer_lease_reservation(self, reservation_id: int) -> None:
+        with self._consumer_lease_reservations_lock:
+            self._consumer_lease_reservations.pop(reservation_id, None)
+
+    def _take_consumer_lease_reservations(
+        self,
+    ) -> tuple[tuple[int, _ConsumerLeaseReservationRecord], ...]:
+        with self._consumer_lease_reservations_lock:
+            return tuple(self._consumer_lease_reservations.items())
 
     def issue_intent(self, instance: CoherenceInstance) -> None:
         self._ensure_open()
@@ -252,7 +318,7 @@ class CoherenceSequencer[PayloadT]:
 
     def reserve_consumer_lease(
         self, instances: Iterable[CoherenceInstance]
-    ) -> ConsumerLeaseReservation:
+    ) -> ConsumerLeaseReservationRef:
         self._ensure_open()
         self._capture_owner_loop()
         ordered = tuple(dict.fromkeys(instances))
@@ -285,10 +351,70 @@ class CoherenceSequencer[PayloadT]:
         for ticket, _intent in bindings:
             ticket.active_consumer_leases += 1
             _intent.active_consumer_leases += 1
-        return ConsumerLeaseReservation(self, tuple(bindings))
+        control = _ConsumerLeaseReservationRecord(tuple(bindings))
+        reservation_id = self._register_consumer_lease_reservation(control)
+        return ConsumerLeaseReservationRef(self, reservation_id)
+
+    def _claim_consumer_lease_reservation(self, reservation_id: int) -> ConsumerLease:
+        control = self._find_consumer_lease_reservation(reservation_id)
+        with control.lock:
+            if control.state is _ReservationPhase.CLAIMED:
+                raise CoherenceStateTransitionError(
+                    "coherence consumer lease reservation was already claimed."
+                )
+            if control.state is _ReservationPhase.RELEASED:
+                raise CoherenceStateTransitionError(
+                    "coherence consumer lease reservation was already released."
+                )
+            lease = ConsumerLease(self, control.bindings, reservation_id=reservation_id)
+            control.state = _ReservationPhase.CLAIMED
+            control.claimed_lease = lease
+            return lease
+
+    def _consumer_lease_reservation_claimed(self, reservation_id: int) -> bool:
+        try:
+            control = self._find_consumer_lease_reservation(reservation_id)
+        except CoherenceStateTransitionError:
+            return False
+        with control.lock:
+            return control.state is _ReservationPhase.CLAIMED
+
+    def _cancel_consumer_lease_reservation(self, reservation_id: int) -> None:
+        control = self._find_consumer_lease_reservation(reservation_id)
+        with control.lock:
+            if control.state is _ReservationPhase.CLAIMED:
+                raise CoherenceStateTransitionError(
+                    "cannot cancel a claimed coherence consumer lease reservation."
+                )
+            if control.state is _ReservationPhase.RELEASED:
+                raise CoherenceStateTransitionError(
+                    "cannot cancel a released coherence consumer lease reservation."
+                )
+            control.state = _ReservationPhase.RELEASED
+            bindings = control.bindings
+        self._release_consumer_lease(bindings, reservation_id=reservation_id)
+
+    def _cleanup_consumer_lease_reservation(self, reservation_id: int) -> None:
+        try:
+            control = self._find_consumer_lease_reservation(reservation_id)
+        except CoherenceStateTransitionError:
+            return
+        with control.lock:
+            if control.state is _ReservationPhase.RELEASED:
+                return
+            control.state = _ReservationPhase.RELEASED
+            lease = control.claimed_lease
+            bindings = control.bindings
+        if lease is None:
+            self._release_consumer_lease(bindings, reservation_id=reservation_id)
+        else:
+            lease.release_for_cleanup()
 
     def _release_consumer_lease(
-        self, bindings: tuple[tuple[_Ticket[Any], _Intent], ...]
+        self,
+        bindings: tuple[tuple[_Ticket[Any], _Intent], ...],
+        *,
+        reservation_id: int | None = None,
     ) -> None:
         owner_loop = self._owner_loop
         if owner_loop is None:
@@ -303,12 +429,15 @@ class CoherenceSequencer[PayloadT]:
             owner_loop.call_soon_threadsafe(
                 self._release_consumer_lease_on_owner_loop,
                 bindings,
+                reservation_id,
             )
             return
-        self._release_consumer_lease_on_owner_loop(bindings)
+        self._release_consumer_lease_on_owner_loop(bindings, reservation_id)
 
     def _release_consumer_lease_on_owner_loop(
-        self, bindings: tuple[tuple[_Ticket[Any], _Intent], ...]
+        self,
+        bindings: tuple[tuple[_Ticket[Any], _Intent], ...],
+        reservation_id: int | None = None,
     ) -> None:
         for ticket, _intent in bindings:
             if ticket.active_consumer_leases <= 0:
@@ -318,6 +447,8 @@ class CoherenceSequencer[PayloadT]:
         for ticket, intent in bindings:
             ticket.active_consumer_leases -= 1
             intent.active_consumer_leases -= 1
+        if reservation_id is not None:
+            self._retire_consumer_lease_reservation(reservation_id)
         self._schedule_drain()
 
     def _capture_owner_loop(self) -> None:
@@ -508,8 +639,8 @@ class CoherenceSequencer[PayloadT]:
     def fence(self, error: BaseException | None = None) -> None:
         if self._fenced_error is not None:
             return
-        for reservation in tuple(self._consumer_lease_reservations):
-            reservation.cancel()
+        for reservation_id, _control in self._take_consumer_lease_reservations():
+            self._cleanup_consumer_lease_reservation(reservation_id)
         self._fenced_error = error or RuntimeError("coherence sequencer fenced")
         if self._drain_handle is not None:
             self._drain_handle.cancel()

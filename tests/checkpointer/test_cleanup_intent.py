@@ -76,6 +76,7 @@ def test_cleanup_intent_completion_is_idempotent_after_crash_repair(tmp_path):
                             "checkpoint_object_id": binding.reservation.checkpoint_object_id,
                             "claimed": [],
                             "generation": binding.reservation.generation,
+                            "owner_handle": binding.reservation.owner_handle,
                         },
                     }
                     for binding in current.reservations

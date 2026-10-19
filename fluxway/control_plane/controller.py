@@ -56,9 +56,9 @@ from fluxway.common.types import (
     DrainEventKind,
     DrainPhase,
     reduce_drain_boundary,
+    RestoreOptions,
 )
 from fluxway.common.utils import ensure_logging_configured
-from fluxway.common.metadata import metadata_digest
 from fluxway.common.utils.logging import get_logger
 from fluxway.control_plane.monitor import Monitor
 from fluxway.control_plane.scheduler import Scheduler, build_topology
@@ -75,10 +75,11 @@ from fluxway.control_plane.components import (
     driver_component_id,
 )
 from fluxway.control_plane.ingestion import (
-    IngestionCatalogCheckpointComponent,
     IngestionLayoutPlanningComponent,
-    IngestionPlacementContext,
     LayoutCompileRequest,
+    ReaderTopologyDescriptor,
+    SourceScanBinding,
+    TailLayoutMode,
 )
 from fluxway.control_plane.checkpointer.repository import validate_checkpoint_value
 from fluxway.control_plane.errors import ExecutionFailedError
@@ -90,6 +91,7 @@ from fluxway.common.types import (
     SourceControlConfig,
 )
 from fluxway.control_plane.source_control import SourceControlRuntime
+from fluxway.control_plane.source_progress import SourceProgressSupervisor
 from fluxway.common.types.drain import (
     DrainAdmission,
     DrainStrategy,
@@ -108,7 +110,54 @@ from fluxway.placement import (
 logger = get_logger(__name__)
 
 
+async def _publish_checkpoint_output_step(
+    repository_root: str, checkpoint_id: str, attempt_id: str, position: int
+) -> None:
+    staging_step = Path(repository_root) / "steps" / f".{checkpoint_id}.{attempt_id}"
+    published_step = Path(repository_root) / "steps" / str(position)
+    if published_step.exists() or published_step.is_symlink():
+        raise FileExistsError(
+            f"checkpoint output step already exists: {published_step}"
+        )
+    if not staging_step.is_dir():
+        raise FileNotFoundError(
+            f"checkpoint output staging root is missing: {staging_step}"
+        )
+    await asyncio.to_thread(published_step.parent.mkdir, parents=True, exist_ok=True)
+    await asyncio.to_thread(os.replace, staging_step, published_step)
+
+
 _F = TypeVar("_F", bound=Callable[..., Any])
+
+
+async def _ensure_source_scan_binding(
+    owner: Any,
+    *,
+    node_id: str,
+    operator_name: str,
+    config: Any,
+) -> SourceScanBinding:
+    source = config.operator_specs[operator_name].source
+    if source is None:
+        raise ValueError("source scan binding requires a source descriptor")
+    async with owner._source_scan_binding_lock:
+        binding = owner._source_scan_binding
+        if binding is None:
+            build_binding = getattr(source, "build_source_scan_binding", None)
+            if not callable(build_binding):
+                raise TypeError("source descriptor must provide source scan binding")
+            binding = await asyncio.to_thread(
+                build_binding,
+                spmd_id=node_id,
+                operator_name=operator_name,
+                config=config,
+            )
+            if not isinstance(binding, SourceScanBinding):
+                raise TypeError("source descriptor must return SourceScanBinding")
+            owner._source_scan_binding = binding
+        elif not isinstance(binding, SourceScanBinding):
+            raise TypeError("controller source scan binding has invalid type")
+        return binding
 
 
 def require_manager(manager_attr: str) -> Callable[[_F], _F]:
@@ -298,6 +347,7 @@ class ControllerActor:
             profiler_config,
             process_name="controller",
         )
+        self._execution_sequence = 0
         self._heartbeat_observer = self._profiler_runtime.heartbeat_observer()
 
         self._monitor = Monitor()
@@ -317,6 +367,7 @@ class ControllerActor:
         )
         # checkpoint_id → {expected, received, metadata, event}
         self._pending_snapshots: dict[str, Any] = {}
+        self._snapshot_publication_context: dict[str, tuple[str, str, int]] = {}
         if (
             checkpoint_config is not None
             and self._graph.requires_source_control_runtime
@@ -348,6 +399,7 @@ class ControllerActor:
             if resolved_source_control is None
             else SourceControlRuntime(resolved_source_control)
         )
+        self._control_plane_components = ControlPlaneComponentRegistry()
         self._drain_strategy: DrainStrategy | None = (
             GraphModeDrainStrategy(checkpoint_config.interval_steps)
             if checkpoint_config is not None
@@ -357,19 +409,35 @@ class ControllerActor:
                 else None
             )
         )
-        self._control_plane_components = ControlPlaneComponentRegistry()
         self._initialized = False
         self._ingestion_planner: IngestionLayoutPlanningComponent | None = None
         if self._graph.requires_source_control_runtime:
             self.install_ingestion_layout_planning_component(
                 IngestionLayoutPlanningComponent("ingestion-planning")
             )
+            if self._source_control is None:
+                raise RuntimeError(
+                    "source-control graph requires a SourceControlRuntime"
+                )
+            self.control_plane_components.register(self._source_control)
 
         self._checkpoint_task: asyncio.Task | None = None
         self._drain_boundary = DrainBoundary()
         self._drain_boundary_lock = asyncio.Lock()
+        self._source_window_activation_lock = asyncio.Lock()
+        self._source_scan_binding_lock = asyncio.Lock()
+        self._source_scan_binding: SourceScanBinding | None = None
+        self._execution_generation = 0
         self._admission: DrainAdmission | None = None
         self._execution_lifecycle = ExecutionLifecycle(self)
+        self._source_progress_supervisor = (
+            None
+            if self._source_control is None
+            else SourceProgressSupervisor(
+                self._maybe_activate_next_source_window,
+                on_failure=self._on_source_progress_failure,
+            )
+        )
 
         # Track source nodes (entry points)
         self._source_nodes = (
@@ -557,11 +625,19 @@ class ControllerActor:
             if span is not None:
                 await span.__aexit__(None, None, None)
 
-    async def start(self, resume: str | int | None = None) -> int | None:
+    async def start(
+        self,
+        resume: str | int | None = None,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
         if self._initialized:
             raise RuntimeError("Controller is already initialized or started")
 
-        return await self._execution_lifecycle.start(resume)
+        return await self._execution_lifecycle.start(
+            resume,
+            restore_options=restore_options,
+        )
 
     # =====================================================================
     # Properties (as methods for Ray Actor)
@@ -631,6 +707,26 @@ class ControllerActor:
         """Route one typed worker notice to the sole owning Controller component."""
         return await self.control_plane_components.dispatch_unaddressed_request(request)
 
+    def _record_execution_phase(
+        self,
+        phase: str,
+        *,
+        op_name: str | None,
+        step: int | None,
+        epoch: int,
+    ) -> None:
+        if not self._profiler_runtime.enabled:
+            return
+        self._execution_sequence += 1
+        self._profiler_runtime.recorder.controller_execution_phase(
+            phase=phase,
+            op_name=op_name,
+            step=step,
+            epoch=epoch,
+            sequence=self._execution_sequence,
+            execution_generation=getattr(self, "_execution_generation", 0),
+        )
+
     async def activate_ingestion_layout(
         self,
         spmd_id: str,
@@ -653,13 +749,82 @@ class ControllerActor:
             epoch=epoch,
             start_position=start_position,
             max_units=self._require_source_control().planning_limits[0],
+            max_records=self._require_source_control().planning_records,
+            max_steps=self._require_source_control().planning_window_steps,
             max_descriptor_bytes=self._require_source_control().planning_limits[1],
         )
+        record_execution_phase = getattr(self, "_record_execution_phase", None)
+        if record_execution_phase is not None:
+            record_execution_phase(
+                "activation.publish",
+                op_name=operator_name,
+                step=activation.epoch.start_position,
+                epoch=activation.epoch.epoch,
+            )
         await self.dispatch_driver_component(
             spmd_id,
             driver_component_id(spmd_id, operator_name),
             activation,
         )
+
+    async def activate_source_scan_layout_from_descriptor(self) -> None:
+        async with self._source_window_activation_lock:
+            node_id, operator_name, config = self._source_layout_target()
+            planner = self._require_ingestion_planner()
+            binding = await _ensure_source_scan_binding(
+                self,
+                node_id=node_id,
+                operator_name=operator_name,
+                config=config,
+            )
+            planner.bind_source_identity(binding.identity)
+            adapter = binding.adapter
+            topology = binding.topology
+            cursor = planner.resume_cursor
+            tail_layout_mode = binding.tail_layout_mode
+            assignment_policy = binding.assignment_policy
+            if not isinstance(topology, ReaderTopologyDescriptor):
+                raise TypeError(
+                    "source descriptor must return ReaderTopologyDescriptor"
+                )
+            if not isinstance(tail_layout_mode, TailLayoutMode):
+                raise TypeError("source descriptor must return TailLayoutMode")
+            planner.bind_source_scan(
+                adapter,
+                initial_cursor_factory=binding.initial_cursor_factory,
+                budget=self._require_source_control().scan_budget,
+                tail_layout_mode=tail_layout_mode,
+                assignment_policy=assignment_policy,
+            )
+            activation = await planner.plan_source_scan(
+                adapter,
+                binding.initial_cursor_factory,
+                self._require_source_control().work_ledger,
+                cursor,
+                budget=self._require_source_control().scan_budget,
+                topology=topology,
+                tail_layout_mode=tail_layout_mode,
+                assignment_policy=assignment_policy,
+                epoch=0,
+                start_position=planner.resume_step,
+                max_steps=self._require_source_control().planning_window_steps,
+                max_descriptor_bytes=self._require_source_control().planning_limits[1],
+            )
+            if activation is None:
+                return
+            record_execution_phase = getattr(self, "_record_execution_phase", None)
+            if record_execution_phase is not None:
+                record_execution_phase(
+                    "activation.publish",
+                    op_name=operator_name,
+                    step=activation.epoch.start_position,
+                    epoch=activation.epoch.epoch,
+                )
+            await self.dispatch_driver_component(
+                node_id,
+                driver_component_id(node_id, operator_name),
+                activation,
+            )
 
     # =====================================================================
     # Heartbeat Interface (called by drivers)
@@ -705,6 +870,10 @@ class ControllerActor:
             spmd_id, op_name, completed_count
         )
         await self._apply_flow_control_windows(windows)
+        supervisor = self._source_progress_supervisor
+        if supervisor is not None:
+            supervisor.wake()
+        await self._raise_source_progress_failure()
         if (
             self._drain_strategy is None
             and self.async_step_manager.is_all_completed()
@@ -713,6 +882,67 @@ class ControllerActor:
             await self.state_machine.trigger_event(
                 ControllerEvent.ALL_DRIVERS_COMPLETED
             )
+
+    async def _maybe_activate_next_source_window(self) -> None:
+        if self._ingestion_planner is None or self._source_control is None:
+            return
+        node_id, operator_name, _ = self._source_layout_target()
+        progress = self.async_step_manager.get_spmd_steps(node_id)
+        if progress is None:
+            return
+        completed_count = progress.completed_step_count.get(operator_name, 0)
+        planner = self._ingestion_planner
+        if not planner.windows:
+            await self.activate_source_scan_layout_from_descriptor()
+            return
+        latest = planner.windows[-1]
+        lead = self._source_control.window_lead_steps
+        if latest.work_epoch.terminal or completed_count < max(
+            latest.work_epoch.start_step,
+            latest.work_epoch.end_step - lead,
+        ):
+            return
+        async with self._source_window_activation_lock:
+            if planner.windows[-1].work_epoch.terminal:
+                return
+            latest = planner.windows[-1].work_epoch
+            if latest.terminal or completed_count < max(
+                latest.start_step,
+                latest.end_step - self._source_control.window_lead_steps,
+            ):
+                return
+            activation = await planner.plan_next_window(
+                self._source_control.work_ledger,
+                max_units=self._source_control.planning_limits[0],
+                max_records=self._source_control.planning_records,
+                max_steps=self._source_control.planning_window_steps,
+                max_descriptor_bytes=self._source_control.planning_limits[1],
+            )
+            if activation is None:
+                return
+            record_execution_phase = getattr(self, "_record_execution_phase", None)
+            if record_execution_phase is not None:
+                record_execution_phase(
+                    "activation.publish",
+                    op_name=operator_name,
+                    step=activation.epoch.start_position,
+                    epoch=activation.epoch.epoch,
+                )
+            await self.dispatch_driver_component(
+                node_id,
+                driver_component_id(node_id, operator_name),
+                activation,
+            )
+
+    async def _on_source_progress_failure(self, error: BaseException) -> None:
+        logger.error("source progress supervisor failed", exc_info=error)
+        if self.state_machine.is_running():
+            await self._execution_lifecycle.fail(error, "SOURCE_PROGRESS")
+
+    async def _raise_source_progress_failure(self) -> None:
+        supervisor = self._source_progress_supervisor
+        if supervisor is not None:
+            await supervisor.raise_if_failed()
 
     async def report_boundary_event(
         self, spmd_id: str, op_name: str, event: DrainEvent
@@ -760,6 +990,10 @@ class ControllerActor:
         self, acknowledgements: list[SourceWorkAcknowledgement]
     ) -> None:
         await self._require_source_control().acknowledge_work(acknowledgements)
+        supervisor = self._source_progress_supervisor
+        if supervisor is not None:
+            supervisor.wake()
+        await self._raise_source_progress_failure()
 
     async def candidate_source_work_cut(self) -> int:
         return await self._require_source_control().candidate_work_cut()
@@ -812,7 +1046,19 @@ class ControllerActor:
         return self._graph.source_control_spmd_ids
 
     async def _notify_control_plane_components(self, state: ControllerState) -> None:
-        await self.control_plane_components.notify_state(state)
+        supervisor = self._source_progress_supervisor
+        operations = [self.control_plane_components.notify_state(state)]
+        if state is ControllerState.RUNNING:
+            if supervisor is not None:
+                operations.append(supervisor.start())
+        elif state in (
+            ControllerState.COMPLETING,
+            ControllerState.FAILING,
+            ControllerState.CANCELLING,
+        ):
+            if supervisor is not None:
+                operations.append(supervisor.stop())
+        await asyncio.gather(*operations)
 
     def install_ingestion_layout_planning_component(
         self, component: IngestionLayoutPlanningComponent
@@ -834,24 +1080,6 @@ class ControllerActor:
             raise RuntimeError("source control requires an ingestion planner")
         return self._ingestion_planner
 
-    def install_ingestion_catalog_checkpoint_component(
-        self, component: IngestionCatalogCheckpointComponent
-    ) -> None:
-        if not isinstance(component, IngestionCatalogCheckpointComponent):
-            raise TypeError(
-                "Controller requires an IngestionCatalogCheckpointComponent"
-            )
-        if self._initialized:
-            raise RuntimeError(
-                "catalog checkpoint component must be installed before "
-                "Controller initialization"
-            )
-        if self.control_plane_components.components_implementing(
-            "stage", "prepare_checkpoint", "apply_prepared"
-        ):
-            raise RuntimeError("Controller already has a catalog checkpoint component")
-        self.control_plane_components.register(component)
-
     def _source_layout_target(self):
         targets = []
         for node_id, node in self._graph.nodes.items():
@@ -869,28 +1097,10 @@ class ControllerActor:
         return targets[0]
 
     async def activate_source_layout_from_descriptor(self) -> None:
-        node_id, operator_name, config = self._source_layout_target()
+        node_id, operator_name, _ = self._source_layout_target()
         planner = self._require_ingestion_planner()
         if not planner.windows:
-
-            def resolve_reader_node_ids() -> tuple[str, ...]:
-                allocation = self.scheduler.allocation_report
-                if allocation is None or node_id not in allocation.attested_node_ids:
-                    raise PlacementContractError(
-                        "node affinity hint requires attested reader node identities"
-                    )
-                return tuple(allocation.attested_node_ids[node_id])
-
-            request = await planner.build_ingestion_plan(
-                config.operator_specs[operator_name].source,
-                spmd_id=node_id,
-                operator_name=operator_name,
-                config=config,
-                placement_context=IngestionPlacementContext(resolve_reader_node_ids),
-            )
-            await self.activate_ingestion_layout(
-                node_id, operator_name, request, epoch=0, start_position=0
-            )
+            await self.activate_source_scan_layout_from_descriptor()
             return
         for compiled in planner.windows:
             epoch = compiled.work_epoch
@@ -951,12 +1161,6 @@ class ControllerActor:
             "components": self.control_plane_components.checkpoint_state(cut),
             "drain_boundary": snapshot_boundary.to_dict(),
         }
-        if self._source_control is not None:
-            state["logical_work_ledger"] = (
-                self._source_control.logical_work_checkpoint_state(
-                    committed_cut=cut.position
-                )
-            )
         validate_checkpoint_value(state)
         return state
 
@@ -971,8 +1175,6 @@ class ControllerActor:
         if not isinstance(state, dict):
             raise TypeError("checkpoint control state must be a dictionary")
         expected_fields = {"components", "drain_boundary"}
-        if self._source_control is not None:
-            expected_fields.add("logical_work_ledger")
         if set(state) != expected_fields:
             raise ValueError(
                 "checkpoint control state fields do not match protocol: "
@@ -981,15 +1183,18 @@ class ControllerActor:
         if self._source_control is not None:
             node_id, operator_name, config = self._source_layout_target()
             planner = self._require_ingestion_planner()
-            source = config.operator_specs[operator_name].source
-            assert source is not None
-            topology = await asyncio.to_thread(
-                source.build_reader_topology,
-                spmd_id=node_id,
+            binding = await _ensure_source_scan_binding(
+                self,
+                node_id=node_id,
                 operator_name=operator_name,
                 config=config,
             )
-            planner.set_reader_topology(topology)
+            planner.bind_source_identity(binding.identity)
+            if not isinstance(binding.topology, ReaderTopologyDescriptor):
+                raise TypeError(
+                    "source descriptor must return ReaderTopologyDescriptor"
+                )
+            planner.set_reader_topology(binding.topology)
         restored_boundary = DrainBoundary.from_mapping(state["drain_boundary"])
         if restored_boundary.committed_cut is None:
             raise ValueError(
@@ -1002,19 +1207,6 @@ class ControllerActor:
         if not isinstance(components, Mapping):
             raise ValueError("checkpoint control state is missing components")
         self.control_plane_components.restore_state(components, cut)
-        if self._source_control is not None:
-            self._source_control = SourceControlRuntime(self._source_control.config)
-            for compiled in self._require_ingestion_planner().windows:
-                await self._source_control.publish_work_epoch(
-                    compiled.work_epoch,
-                    tuple(
-                        WorkerLayoutDescriptor.decode(value)
-                        for value in compiled.encoded_worker_layouts()
-                    ),
-                )
-            self._source_control.restore_logical_work_state(
-                state["logical_work_ledger"]
-            )
 
     def prepare_checkpoint_transaction(
         self,
@@ -1026,34 +1218,13 @@ class ControllerActor:
         components = control_state.get("components")
         if not isinstance(components, Mapping):
             raise ValueError("checkpoint control state is missing components")
-        ledger_state = control_state.get("logical_work_ledger")
-        ledger_prepared = None
-        if self._source_control is not None:
-            if not isinstance(ledger_state, Mapping):
-                raise ValueError(
-                    "checkpoint control state is missing logical_work_ledger state"
-                )
-            ledger_digest = metadata_digest(ledger_state)
-            ledger_prepared = self._source_control.prepare_checkpoint(
-                checkpoint_id, permit, cut, ledger_digest, ledger_state
-            )
-        elif ledger_state is not None:
-            raise ValueError(
-                "checkpoint control state contains unexpected logical_work_ledger"
-            )
         try:
-            prepared: dict[str, Any] = {
+            return {
                 "components": self.control_plane_components.prepare_checkpoint_transaction(
                     checkpoint_id, permit, cut, components
                 )
             }
-            if self._source_control is not None:
-                assert ledger_prepared is not None
-                prepared["logical_work_ledger"] = ledger_prepared
-            return prepared
         except BaseException:
-            if self._source_control is not None:
-                self._source_control.abort_prepared(checkpoint_id, permit)
             self.control_plane_components.abort_checkpoint_transaction(
                 checkpoint_id, permit
             )
@@ -1069,15 +1240,6 @@ class ControllerActor:
     ) -> None:
         if cut.position is None:
             raise ValueError("checkpoint transaction requires a positioned cut")
-        ledger_state = control_state.get("logical_work_ledger")
-        if self._source_control is not None and not isinstance(ledger_state, Mapping):
-            raise ValueError(
-                "checkpoint control state is missing logical_work_ledger state"
-            )
-        if self._source_control is None and ledger_state is not None:
-            raise ValueError(
-                "checkpoint control state contains unexpected logical_work_ledger"
-            )
         components = control_state.get("components")
         if not isinstance(components, Mapping):
             raise ValueError("checkpoint control state is missing components")
@@ -1085,13 +1247,11 @@ class ControllerActor:
             checkpoint_id, permit, cut, components, prepared_state
         )
         if self._source_control is not None:
-            self._source_control.apply_prepared(prepared_state["logical_work_ledger"])
+            self._require_ingestion_planner().reclaim_before(cut.position)
 
     def abort_checkpoint_transaction(
         self, checkpoint_id: str, permit: CheckpointCommitPermit
     ) -> None:
-        if self._source_control is not None:
-            self._source_control.abort_prepared(checkpoint_id, permit)
         self.control_plane_components.abort_checkpoint_transaction(
             checkpoint_id, permit
         )
@@ -1112,9 +1272,22 @@ class ControllerActor:
                 )
             tasks.append(driver.publish_snapshot.remote(checkpoint_id, permit))
         if deadline is not None:
-            await deadline.run_phase(asyncio.gather(*tasks))
+            results = await deadline.run_phase(asyncio.gather(*tasks))
         else:
-            await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks)
+        context = self._snapshot_publication_context.get(checkpoint_id)
+        if not any(result is True for result in results):
+            self._snapshot_publication_context.pop(checkpoint_id, None)
+            return
+        if context is None:
+            raise RuntimeError(
+                f"checkpoint output publication context is missing for {checkpoint_id!r}"
+            )
+        repository_root, attempt_id, position = context
+        await _publish_checkpoint_output_step(
+            repository_root, checkpoint_id, attempt_id, position
+        )
+        self._snapshot_publication_context.pop(checkpoint_id, None)
 
     @require_spmd_manager
     async def rollback_snapshot(
@@ -1383,6 +1556,12 @@ class ControllerActor:
                 not isinstance(snapshot, SpmdCheckpoint) for snapshot in spmds.values()
             ):
                 raise TypeError("Driver component capture must return SpmdCheckpoint")
+            if resolved_cut.position is not None:
+                self._snapshot_publication_context[checkpoint_id] = (
+                    repository_root,
+                    attempt_id,
+                    resolved_cut.position,
+                )
             return CheckpointAssembly(
                 cut=resolved_cut,
                 framework_state=self.checkpoint_state(
@@ -1495,20 +1674,24 @@ class ControllerActor:
         checkpoint_id: str,
         manifest: CheckpointManifest,
         repository_root: str,
+        restore_options: RestoreOptions | None = None,
     ) -> None:
-        """
-        Restore a published schema-v2 manifest through each SPMD backend.
-        """
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.controller_restore(
                 checkpoint_id=checkpoint_id,
             ):
                 await self._restore_snapshot_unprofiled(
-                    checkpoint_id, manifest, repository_root
+                    checkpoint_id,
+                    manifest,
+                    repository_root,
+                    restore_options,
                 )
             return
         await self._restore_snapshot_unprofiled(
-            checkpoint_id, manifest, repository_root
+            checkpoint_id,
+            manifest,
+            repository_root,
+            restore_options,
         )
 
     async def _restore_snapshot_unprofiled(
@@ -1516,6 +1699,7 @@ class ControllerActor:
         checkpoint_id: str,
         manifest: CheckpointManifest,
         repository_root: str,
+        restore_options: RestoreOptions | None = None,
     ) -> None:
         if self.state_machine.state not in (
             ControllerState.READY,
@@ -1529,6 +1713,12 @@ class ControllerActor:
         )
         if manifest.checkpoint_id != checkpoint_id:
             raise ValueError("manifest checkpoint ID does not match restore request")
+        if restore_options is not None:
+            unknown_spmds = set(restore_options).difference(manifest.spmds)
+            if unknown_spmds:
+                raise ValueError(
+                    f"restore_options contain unknown SPMDs: {sorted(unknown_spmds)!r}"
+                )
         await self.restore_checkpoint_state(
             dict(manifest.framework_state), manifest.cut
         )
@@ -1578,7 +1768,11 @@ class ControllerActor:
                 )
             tasks.append(
                 driver.restore_from_manifest.remote(
-                    checkpoint_id, manifest.cut, snapshot, repository_root
+                    checkpoint_id,
+                    manifest.cut,
+                    snapshot,
+                    repository_root,
+                    None if restore_options is None else restore_options.get(spmd_id),
                 )
             )
         if tasks:
@@ -1586,7 +1780,12 @@ class ControllerActor:
 
         logger.info("Snapshot restored successfully")
 
-    async def restore_checkpoint(self, step: int | None = None) -> int | None:
+    async def restore_checkpoint(
+        self,
+        step: int | None = None,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
         """
         User-facing API to trigger checkpoint restoration.
         """
@@ -1596,7 +1795,10 @@ class ControllerActor:
             )
 
         reference = "latest" if step is None else StepReference(step)
-        return await self._execution_lifecycle.restore(reference)
+        return await self._execution_lifecycle.restore(
+            reference,
+            restore_options=restore_options,
+        )
 
     async def acquire_checkpoint_lease(
         self,

@@ -42,3 +42,12 @@ node and shared checkpoint storage for recoverable multi-node jobs.
 
 See [placement_mathematics.md](placement_mathematics.md) for solver semantics
 and the Chinese companion for the complete parallel explanation.
+
+## Dynamic resources and ResourceRegistry
+
+While static hardware quotas (e.g., CPU, GPU, accelerators, memory) are declared in each SPMD's
+`ResourceProfile`, runtime-bound resources (such as dynamic routing tables, device meshes, or rank
+providers) are managed via `ResourceRegistry` (`fluxway.common.resource_registry`).
+Operators and partition strategies reference these resources using `ResourceHandle(namespace=..., resource_id=...)`,
+which the runtime resolves dynamically within the active registry context established by `bind_resource_registry`
+or `set_active_resource_registry`, keeping placement recipes completely decoupled from physical runtime instances.

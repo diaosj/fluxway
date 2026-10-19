@@ -58,6 +58,7 @@ def harness(count=2):
         sync = SPMDSynchronizer(name, 1)
         sync.register_expected_ops(("read",))
         local = SimpleNamespace(spmd_id=name)
+        local._submit_driver_effect = lambda operation, args=(), **_: operation(*args)
         fsm = DriverStateMachine(local)
         fsm.require_transition(DriverEvent.INIT_COMPLETE)
         local.state_machine = fsm
@@ -492,8 +493,9 @@ async def test_failed_save_is_visible_and_never_resumes():
 async def test_restore_precedes_layout_and_admits_from_committed_cut():
     controller, _, _, calls = harness(1)
 
-    async def restore(reference):
+    async def restore(reference, *, restore_options=None):
         assert reference == "latest"
+        assert restore_options is None
         assert controller.state_machine.state is ControllerState.ACTIVATING
         assert not calls
         calls.append(("restore",))

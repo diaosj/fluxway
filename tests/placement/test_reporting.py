@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     ClusterNode,
     ClusterSnapshot,
     PlacementContractError,
@@ -169,9 +169,8 @@ def test_invalid_rank_is_not_logged_as_validated(caplog) -> None:
     worker = workers(SPMD0)
     recipe = PlacementRecipe(
         recipe_id="invalid-rank",
-        version="1.0.0",
         constraints=(subseteq(support(rank(worker, 1)), support(worker)),),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="cpu", resources={"CPU": 1}),)
@@ -200,9 +199,8 @@ def test_infeasible_scheduler_run_records_one_failed_summary(
     )
     recipe = PlacementRecipe(
         recipe_id="infeasible-report",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="cpu", resources={"CPU": 1}),)

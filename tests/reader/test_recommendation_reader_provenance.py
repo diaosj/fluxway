@@ -4,12 +4,13 @@ import pytest
 
 from fluxway.common.decorators import _inject_context_properties, operator_context
 from fluxway.common.ingestion import (
-    LayoutUnitDescriptor,
+    SourceScanBudget,
     SourceWorkAssignment,
     SourceWorkItem,
 )
 from fluxway.common.types.configs import OperatorContext
 from fluxway.example.recommendation.reader import RecommendationReader
+from fluxway.example.recommendation.source_adapter import RecommendationSourceAdapter
 
 
 def _static_args() -> dict[str, int]:
@@ -25,25 +26,22 @@ def _static_args() -> dict[str, int]:
 def _work(
     *, step: int, global_start: int, global_batch_size: int
 ) -> tuple[SourceWorkItem, ...]:
-    descriptor = LayoutUnitDescriptor(
-        unit_id=f"unit-{step}-{global_start}",
-        revision_identity="recommendation:test",
-        cardinality=4,
-        cardinality_metric="samples",
-        split_policy="SplittableSpan",
-        locality_key="recommendation",
-        physical_identity="recommendation:test",
-        logical_start=global_start,
-        opaque_token=b"test",
+    adapter = RecommendationSourceAdapter(revision_id=7)
+    scan_result = adapter.scan_next(
+        adapter.cursor(start=global_start, end=global_start + 4, finite=True),
+        SourceScanBudget(4, 1),
     )
     assignment = SourceWorkAssignment.create(
         epoch=0,
         step=step,
-        source_identity="recommendation",
-        schema_digest="recommendation-schema-v1",
-        descriptor=descriptor,
+        source_identity=scan_result.source_identity,
+        view_identity=scan_result.view_identity,
+        schema_digest=scan_result.schema_digest,
+        lineage_digest=scan_result.lineage_digest,
+        descriptor=scan_result.units[0],
         global_start=global_start,
         global_batch_size=global_batch_size,
+        global_valid_count=global_batch_size,
     )
     return (SourceWorkItem(assignment, global_start, global_start + 4),)
 

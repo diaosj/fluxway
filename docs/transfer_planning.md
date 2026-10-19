@@ -85,6 +85,27 @@ For fragment routing, `sort_indices=None` means no reorder; an actual permutatio
 uses backend-native gather. Dynamic routing cannot be declared identity merely
 because one observed batch happened to be ordered.
 
+## Multi-axis routing and dynamic partitioning
+
+For complex topologies spanning multiple parallelism dimensions (e.g., Data Parallelism `dp`, Fully Sharded Data Parallelism `fsdp`, Tensor Parallelism `tp`):
+
+- **DeviceMesh and RoutingDomain**:
+  `DeviceMesh(axis_names=("dp", "fsdp"), device_shape=(2, 3))` defines the multidimensional layout.
+  `RoutingDomain.from_layout(...)` projects a sharding specification across the mesh.
+- **Index representations**:
+  Axes are partitioned using canonical index structures:
+  - `RangeIndices.contiguous(start, length)`: contiguous intervals;
+  - `LiteralIndices(length, values)`: explicit arbitrary coordinate selections;
+  - `IdentityIndices(length)`: full unpartitioned pass-through.
+- **Dynamic function partitions and ResourceRegistry**:
+  When routing depends on dynamic runtime inputs (e.g., dynamic sparse router or runtime rank provider),
+  `FunctionPartition(target=...)` accepts either a callable or a `ResourceHandle(namespace=..., resource_id=...)`.
+  During transport planning, handles are resolved through the active `ResourceRegistry` (`bind_resource_registry`),
+  keeping graph definitions decoupled from runtime memory addresses or actor instances.
+- **LogicalPartitionBinding**:
+  `LogicalPartitionBinding` maps logical coordinate partitions to physical ranks, ensuring consistent routing
+  even after cluster rescaling or topology remapping.
+
 
 ## Public declaration
 

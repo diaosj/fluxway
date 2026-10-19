@@ -4,9 +4,27 @@ Device Mesh Abstraction.
 
 from __future__ import annotations
 
-import numpy as np
 from types import MappingProxyType
 from typing import Any
+
+import numpy as np
+
+_INT32_MAX = int(np.iinfo(np.int32).max)
+
+
+def _coerce_device_ids(device_ids: Any) -> np.ndarray:
+    """Validate topology IDs before converting them to Fluxway's int32 ABI."""
+
+    raw = np.asarray(device_ids)
+    for value in raw.reshape(-1).tolist():
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)
+        ):
+            raise TypeError("device_ids must contain integer ranks")
+        rank = int(value)
+        if rank < 0 or rank > _INT32_MAX:
+            raise ValueError("device_ids must contain non-negative int32 ranks")
+    return np.asarray(raw, dtype=np.int32)
 
 
 class DeviceMesh:
@@ -18,7 +36,7 @@ class DeviceMesh:
     Attributes:
         shape (Tuple[int, ...]): The shape of the mesh (number of devices per axis).
         axis_names (Tuple[str, ...]): Names for each axis of the mesh.
-        device_ids (np.ndarray): Array of physical device IDs (ranks) with shape `shape`.
+        device_ids (np.ndarray): Physical device IDs (ranks), shaped like ``shape``.
     """
 
     _frozen: bool
@@ -39,15 +57,15 @@ class DeviceMesh:
             axis_names: Tuple of names for each axis.
             device_shape: Optional tuple defining the dimensions of the mesh.
             device_ids: Optional physical device IDs.
-                        If provided as a multi-dimensional array, device_shape will be inferred.
-                        If provided as a 1D array and device_shape is given, it will be reshaped.
+                        A multi-dimensional array infers ``device_shape``.
+                        A 1D array uses the supplied shape for reshaping.
         """
         self._frozen = False
         self._axis_names = tuple(axis_names)
 
         # Determine device_ids and shape
         if device_ids is not None:
-            self.device_ids = np.array(device_ids, dtype=np.int32)
+            self.device_ids = _coerce_device_ids(device_ids)
             if device_shape is None:
                 # Infer shape from device_ids
                 if self.device_ids.ndim == 1:
@@ -56,7 +74,8 @@ class DeviceMesh:
                         self._shape = self.device_ids.shape
                     else:
                         raise ValueError(
-                            f"Cannot infer multi-dimensional shape from 1D device_ids without device_shape. axis_names: {self._axis_names}"
+                            "Cannot infer multi-dimensional shape from 1D device_ids "
+                            f"without device_shape. axis_names: {self._axis_names}"
                         )
                 else:
                     self._shape = tuple(int(s) for s in self.device_ids.shape)
@@ -68,7 +87,8 @@ class DeviceMesh:
                     expected_size *= s
                 if self.device_ids.size != expected_size:
                     raise ValueError(
-                        f"device_ids size {self.device_ids.size} does not match device_shape {self._shape}"
+                        f"device_ids size {self.device_ids.size} does not match "
+                        f"device_shape {self._shape}"
                     )
                 self.device_ids = self.device_ids.reshape(self._shape)
         elif device_shape is not None:
@@ -173,7 +193,7 @@ class DeviceMesh:
         return self.size_map[axis_name]
 
     def get_coordinate(self, rank_id: int) -> tuple[int, ...]:
-        """Get the multi-dimensional logical coordinates of a physical rank in the mesh."""
+        """Get logical coordinates for a physical rank in the mesh."""
         if rank_id not in self._inverse_map:
             raise ValueError(f"Rank {rank_id} not found in mesh")
         return self._inverse_map[rank_id]
@@ -231,7 +251,7 @@ class DeviceMesh:
         )
 
     def to_backend_mesh(self, backend_engine: Any = None):
-        """Convert to the mesh representation of the corresponding backend framework (e.g. JAX Mesh or PyTorch DeviceMesh)."""
+        """Convert to a corresponding backend mesh representation."""
         raise NotImplementedError("Backend conversion not implemented yet.")
 
 
@@ -270,9 +290,8 @@ try:
         # _inverse_map relies on iterating device_ids.
         # If device_ids is a Tracer, we CANNOT iterate it.
         # So _inverse_map will be empty or invalid inside JIT.
-        # BUT _inverse_map is only used by `get_coordinate` (scalar) and `get_rank` (via logic).
-        # Vectorized methods (unravel_index, coordinate_to_device) use tensor ops (backend)
-        # and do NOT use _inverse_map.
+        # _inverse_map is only used by scalar coordinate/rank methods.
+        # Vectorized methods use backend tensor operations instead.
         # So it is safe to skip _inverse_map construction inside JIT.
         obj._inverse_map = {}
 

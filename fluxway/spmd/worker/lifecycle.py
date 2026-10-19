@@ -74,17 +74,10 @@ class WorkerExecutionLifecycle:
     def fail(self) -> None:
         self._phase = WorkerPhase.FAILED
 
-    def begin_close(self) -> None:
-        if self._phase not in (WorkerPhase.FAILED, WorkerPhase.CLOSED):
-            self._phase = WorkerPhase.CLOSING
-
-    def finish_close(self) -> None:
-        if self._phase is WorkerPhase.CLOSING:
-            self._phase = WorkerPhase.CLOSED
-
     async def close(self, release: Callable[[], Awaitable[None]]) -> None:
         if self._close_task is None:
-            self.begin_close()
+            if self._phase not in (WorkerPhase.FAILED, WorkerPhase.CLOSED):
+                self._phase = WorkerPhase.CLOSING
             self._close_task = asyncio.create_task(self._close(release))
             self._close_task.add_done_callback(self._close_finished)
         await asyncio.shield(self._close_task)
@@ -95,7 +88,7 @@ class WorkerExecutionLifecycle:
         except BaseException:
             self.fail()
             raise
-        self.finish_close()
+        self._phase = WorkerPhase.CLOSED
 
     def _close_finished(self, task: asyncio.Task[None]) -> None:
         if not task.cancelled():

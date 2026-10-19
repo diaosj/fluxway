@@ -2,8 +2,9 @@
 Unit tests for DeviceMesh.
 """
 
-import pytest
 import numpy as np
+import pytest
+
 from fluxway.common.mesh import DeviceMesh
 
 
@@ -84,6 +85,13 @@ def test_invalid_initialization():
     with pytest.raises(ValueError, match="does not match device_shape"):
         DeviceMesh(("x", "y"), (2, 2), device_ids=[0, 1, 2])
 
+    with pytest.raises(ValueError, match="non-negative int32"):
+        DeviceMesh(("x",), device_ids=[2**31])
+    with pytest.raises(ValueError, match="non-negative int32"):
+        DeviceMesh(("x",), device_ids=[-1])
+    with pytest.raises(TypeError, match="integer ranks"):
+        DeviceMesh(("x",), device_ids=[1.0])
+
 
 def test_invalid_access():
     """Test error handling for invalid access."""
@@ -96,11 +104,11 @@ def test_invalid_access():
         mesh.get_coordinate(100)
 
     # Rank 0 exists, but coordinate dim mismatch
-    # Python generic IndexError or custom? Implementation might raise IndexError or strict check
+    # Python generic IndexError or custom? The implementation is strict.
     # Let's check implementation behavior for dimensionality
-    # If we pass (0,0,0) to 2D mesh, numpy indexing might fail or succeed depending on structure
+    # Passing three coordinates to a 2D mesh must fail.
     # The implementation as written accesses self.device_ids[coord]
-    # For robust code, we should probably check lengths in get_rank too, but current test is good check.
+    # The explicit dimensionality check covers this contract.
     # We added explicit check in implementation: "Coordinate {coord} dim does not match"
 
     with pytest.raises(ValueError, match="dim does not match"):

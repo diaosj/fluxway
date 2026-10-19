@@ -2,27 +2,24 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Any, cast, Protocol
+from typing import Protocol
 
-import msgpack  # type: ignore[import-untyped]
-import numpy as np
-import sparse_embedding as se  # type: ignore
+
 from sparse_embedding.checkpoint import (  # type: ignore
-    ElasticRestore,
+    CheckpointSaveMode,
     GravitinoLanceStorage,
     LocalLanceStorage,
-    SparseCheckpointLocator,
+    PartitionSpec,
+    RestorePlan,
+    resolve_effective_save_mode,
 )
 from sparse_embedding.checkpoint.gravitino_lance import SdkConfig  # type: ignore
-from sparse_embedding.checkpoint.spi import (  # type: ignore
+from sparse_embedding.checkpoint.base import (  # type: ignore
     CheckpointCommitAuthority,
-    CheckpointFragment,
     CheckpointParticipant,
     CheckpointSaveIdentity,
     CheckpointConflictError,
@@ -31,6 +28,8 @@ from sparse_embedding.checkpoint.spi import (  # type: ignore
     CheckpointLease as SparseCheckpointLease,
     SparseCheckpointStorage,
 )
+
+from fluxway.common.io_lane import IOLane
 
 from fluxway.common.types.checkpoint import (
     CheckpointObjectRef,
@@ -64,17 +63,6 @@ from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRestore,
     CheckpointComponentSave,
 )
-
-
-_WIRE_VERSION = 1
-PartitionFn = Callable[[Any, int], Any]
-
-
-def modulo_partition(keys: object, partition_count: int) -> np.ndarray:
-    key_array = np.asarray(keys)
-    if not key_array.flags.c_contiguous or not key_array.flags.writeable:
-        key_array = np.array(key_array, copy=True, order="C")
-    return np.from_dlpack(se.ModuloPartitioner(partition_count).partition(key_array))
 
 
 class SparseCheckpointStorageFactory(Protocol):
@@ -143,22 +131,51 @@ class SparseEmbeddingCheckpointComponent(
 ):
     def __init__(
         self,
-        partition_fn: PartitionFn,
         storage_factory: SparseCheckpointStorageFactory,
         *,
         component_id: str = "embedding",
+        weight_group: str | None = None,
         load_optimizer_state: bool = True,
         retention_domain: str | None = None,
+        mode: CheckpointSaveMode = CheckpointSaveMode.INCREMENTAL,
+        initial_mode: CheckpointSaveMode = CheckpointSaveMode.FULL,
+        include_page_images: bool = False,
+        lineage_name: str | None = None,
+        partition_spec: PartitionSpec | None = None,
     ) -> None:
-        if not callable(partition_fn):
-            raise TypeError("partition_fn must be callable")
         if not callable(storage_factory):
             raise TypeError("storage_factory must be callable")
         if not isinstance(load_optimizer_state, bool):
             raise TypeError("load_optimizer_state must be bool")
+        if not isinstance(mode, CheckpointSaveMode):
+            raise TypeError("mode must be a CheckpointSaveMode")
+        if initial_mode is not CheckpointSaveMode.FULL:
+            raise ValueError("initial_mode must be CheckpointSaveMode.FULL")
+        if not isinstance(include_page_images, bool):
+            raise TypeError("include_page_images must be bool")
+        if lineage_name is None:
+            lineage_name = component_id
+        if not isinstance(lineage_name, str) or not lineage_name.strip():
+            raise ValueError("lineage_name cannot be empty")
+        if partition_spec is None:
+            partition_spec = PartitionSpec.modulo()
+        if not isinstance(partition_spec, PartitionSpec):
+            raise TypeError("partition_spec must be a PartitionSpec")
+        if weight_group is None:
+            weight_group = (
+                component_id.removesuffix("_embedding")
+                if component_id.endswith("_embedding")
+                else component_id
+            )
+        if (
+            not weight_group
+            or "/" in weight_group
+            or "\\" in weight_group
+            or weight_group in {".", ".."}
+        ):
+            raise ValueError("weight_group must be a single safe path segment")
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
-            format_version=_WIRE_VERSION,
             retention_domain=retention_domain,
             checkpoint_objects=(CheckpointObjectSpec(component_id),),
             save=CheckpointSaveSpec(
@@ -168,12 +185,19 @@ class SparseEmbeddingCheckpointComponent(
             restore=CheckpointRestoreSpec(
                 topology=RestoreTopologyMode.LOGICAL_PARTITION_REMAP
             ),
+            output_path=f"sparse/{weight_group}",
         )
-        self._partition_fn = partition_fn
         self._storage_factory = storage_factory
         self._load_optimizer_state = load_optimizer_state
+        self._mode = mode
+        self._initial_mode = initial_mode
+        self._include_page_images = include_page_images
+        self._lineage_name = lineage_name
+        self._partition_spec = partition_spec
+        self._active_parent_handle: bytes | None = None
         self._runtime: CheckpointRuntime | None = None
         self._storage: SparseCheckpointStorage | None = None
+        self._io_lane = IOLane("sparse-checkpoint", capacity=1)
 
     @property
     def descriptor(self) -> CheckpointComponentSpec:
@@ -194,36 +218,78 @@ class SparseEmbeddingCheckpointComponent(
             raise RuntimeError(
                 f"sparse checkpoint component {self.descriptor.component_id!r} is open"
             )
-        self._storage = await asyncio.to_thread(
-            self._storage_factory,
-            runtime,
-            self.descriptor.component_id,
-        )
+        try:
+            storage = await self._io(
+                self._storage_factory,
+                runtime,
+                self.descriptor.component_id,
+            )
+        except BaseException as primary:
+            try:
+                await self._io_lane.close()
+            except BaseException as cleanup:
+                primary.add_note(
+                    f"sparse checkpoint lane cleanup failed: {type(cleanup).__name__}: {cleanup}"
+                )
+            else:
+                self._io_lane = IOLane("sparse-checkpoint", capacity=1)
+            raise
+        self._storage = storage
         self._runtime = runtime
 
     async def prepare_save(self, session: SaveSession) -> None:
         self._require_worker(session)
-        identity = self._identity(session, session.commit_permit)
-        await asyncio.to_thread(self._require_storage().prepare_checkpoint, identity)
+        identity = self._identity(session.commit_permit)
+        await self._io(self._require_storage().prepare_checkpoint, identity)
 
     async def save(self, session: SaveSession) -> WorkerSaveResult:
         self._require_worker(session)
-        identity = self._identity(session, session.commit_permit)
+        identity = self._identity(session.commit_permit)
         participant = CheckpointParticipant(
             session.rank, session.source_topology.world_size
         )
-        fragment = await asyncio.to_thread(
-            self._require_storage().write_checkpoint_fragment,
-            session.instance.store,
+        store = session.instance.store
+        parent_handle = (
+            self._active_parent_handle
+            if self._active_parent_handle is not None
+            else await self._io(
+                self._require_storage().resolve_lineage_head_handle,
+                self._lineage_name,
+            )
+        )
+        requires_full = await self._io(
+            self._require_storage().requires_full_checkpoint,
+            store,
+        )
+        configured_mode = self._initial_mode if parent_handle is None else self._mode
+        save_mode, effective_parent_handle = resolve_effective_save_mode(
+            configured_mode,
+            requires_full,
+            parent_handle,
+        )
+
+        if save_mode is CheckpointSaveMode.INCREMENTAL:
+            baseline = await self._io(store.checkpoint_baseline)
+            if not isinstance(baseline, str) or not baseline:
+                raise RuntimeError(
+                    "incremental checkpoint requires a non-empty store baseline"
+                )
+
+        fragment = await self._io(
+            self._require_storage().write_checkpoint_fragment_bytes,
+            store,
             identity,
             participant,
+            include_page_images=self._include_page_images,
+            mode=save_mode,
+            parent_handle=effective_parent_handle,
         )
-        return WorkerSaveResult(commit_metadata=self._encode_fragment(fragment))
+        return WorkerSaveResult(commit_metadata=fragment)
 
     async def finish_save(self, session: SaveSession) -> None:
         self._require_worker(session)
-        identity = self._identity(session, session.commit_permit)
-        await asyncio.to_thread(
+        identity = self._identity(session.commit_permit)
+        await self._io(
             self._require_storage().finalize_checkpoint,
             identity,
         )
@@ -232,36 +298,38 @@ class SparseEmbeddingCheckpointComponent(
         self, session: CommitSaveSession
     ) -> CheckpointComponentPublication:
         self._require_worker(session)
-        identity = self._identity(session, session.commit_permit)
+        identity = self._identity(session.commit_permit)
         fragments = tuple(
-            self._decode_fragment(record.commit_metadata)
+            record.commit_metadata
             for _, record in sorted(session.worker_results.items())
         )
-        reference_id = self._reference_id(
-            self.descriptor.component_id,
-            session.checkpoint_id,
-        )
-        storage_locator = await asyncio.to_thread(
-            self._require_storage().commit_checkpoint,
+        committed = await self._io(
+            self._require_storage().commit_checkpoint_bytes,
             identity,
             fragments,
-            None,
-            reference_id,
         )
-        storage_locator_payload = self._encode_storage_locator(storage_locator)
-        version_id = (
-            f"{storage_locator.checkpoint_name}:{storage_locator.checkpoint_version}"
+        storage_locator = committed.handle
+        # Publish the owner-private inference reference before the control-plane
+        # acknowledgement.  The inference reader only receives this path and
+        # never interprets the checkpoint locator above.
+        if session.staging_output_path is None:
+            raise RuntimeError("Fluxway did not bind sparse component output path")
+        weight_root = Path(session.staging_output_path)
+        await self._io(weight_root.mkdir, parents=True, exist_ok=True)
+        await self._io(
+            self._require_storage().publish_weight_handle,
+            str(weight_root),
+            storage_locator,
         )
+        version_id = committed.version_id
         checkpoint_object = CheckpointObjectRef(
             component_id=self.descriptor.component_id,
             checkpoint_object_id=self.descriptor.component_id,
             version_id=version_id,
-            storage_locator=storage_locator_payload,
-            format_version=self.descriptor.format_version,
+            storage_locator=storage_locator,
         )
         return CheckpointComponentPublication(
             component_id=self.descriptor.component_id,
-            format_version=self.descriptor.format_version,
             shared_records=(
                 CheckpointObjectRecord(checkpoint_objects=(checkpoint_object,)),
             ),
@@ -269,26 +337,48 @@ class SparseEmbeddingCheckpointComponent(
 
     async def rollback_save(self, session: SaveSession) -> None:
         self._require_worker(session)
-        identity = self._identity(session, session.commit_permit)
+        identity = self._identity(session.commit_permit)
         if session.rank == 0:
-            await asyncio.to_thread(self._require_storage().abort_checkpoint, identity)
+            await self._io(self._require_storage().abort_checkpoint, identity)
+
+    async def abort_save(self, permit: CheckpointCommitPermit) -> None:
+        self._require_control()
+        await self._io(self._require_storage().abort_checkpoint, self._identity(permit))
 
     async def publish_save(self, session: SaveSession) -> None:
         self._require_worker(session)
-        identity = self._identity(session, session.commit_permit)
-        if session.rank == 0:
-            await asyncio.to_thread(
-                self._require_storage().acknowledge_checkpoint,
-                identity,
+        if session.staging_output_path is None:
+            raise RuntimeError("Fluxway did not bind sparse component output path")
+        staging = Path(session.staging_output_path)
+        if not await self._io(staging.is_dir):
+            raise FileNotFoundError(
+                f"sparse weight staging directory is missing: {staging}"
             )
+        handle = await self._io(
+            self._require_storage().read_published_weight_handle,
+            staging,
+        )
+        await self._io(
+            self._require_storage().acknowledge_store_mutations,
+            session.instance.store,
+            handle,
+            session.rank,
+        )
+        self._active_parent_handle = handle
+
+    async def acknowledge_save(self, permit: CheckpointCommitPermit) -> None:
+        self._require_control()
+        identity = self._identity(permit)
+        await self._io(
+            self._require_storage().acknowledge_checkpoint,
+            identity,
+        )
 
     async def restore(self, session: RestoreSession) -> None:
         self._require_worker(session)
         publication = session.component_checkpoint
         if publication.component_id != self.descriptor.component_id:
             raise ValueError("sparse publication belongs to another component")
-        if publication.format_version != self.descriptor.format_version:
-            raise ValueError("sparse publication format version is unsupported")
         if len(publication.shared_records) != 1:
             raise ValueError("sparse publication requires one shared record")
         record = publication.shared_records[0]
@@ -301,24 +391,32 @@ class SparseEmbeddingCheckpointComponent(
             raise ValueError(
                 "sparse checkpoint_object belongs to another checkpoint_object"
             )
-        if checkpoint_object.format_version != self.descriptor.format_version:
-            raise ValueError("sparse checkpoint_object format version is unsupported")
-        storage_locator = self._decode_storage_locator(
-            checkpoint_object.storage_locator
-        )
-        topology = session.current_topology or session.source_topology
-        mode = ElasticRestore(
-            partition_fn=self._partition_fn,
-            partition_count=topology.world_size,
-            target_partition_id=session.rank,
-        )
-        await asyncio.to_thread(
-            self._require_storage().restore_checkpoint,
+        self._validate_checkpoint_object(checkpoint_object)
+        restore_options = session.restore_options
+        if restore_options is None:
+            plan = RestorePlan.from_partition(
+                self._partition_spec,
+                session.restore_topology.world_size,
+                session.rank,
+                key_dtype=session.instance.store.key_dtype(),
+            )
+            restore_payload = plan.encode()
+        elif isinstance(restore_options, bytes):
+            restore_payload = restore_options
+        elif isinstance(restore_options, RestorePlan):
+            restore_payload = restore_options.encode()
+        else:
+            raise TypeError(
+                f"restore_options must be bytes, RestorePlan, or None; got {type(restore_options).__name__}"
+            )
+        await self._io(
+            self._require_storage().load_component_checkpoint,
             session.instance.store,
-            storage_locator,
-            mode,
-            self._load_optimizer_state,
+            checkpoint_object.storage_locator,
+            restore_payload,
+            load_optimizer_state=self._load_optimizer_state,
         )
+        self._active_parent_handle = checkpoint_object.storage_locator
 
     async def hold_checkpoint_object(
         self,
@@ -328,13 +426,11 @@ class SparseEmbeddingCheckpointComponent(
         request_id: str,
     ) -> CheckpointHold:
         self._require_control()
-        storage_locator = self._storage_locator_from_checkpoint_object(
-            checkpoint_object
-        )
+        self._validate_checkpoint_object(checkpoint_object)
         try:
-            lease = await asyncio.to_thread(
+            lease = await self._io(
                 self._require_storage().acquire_checkpoint_lease,
-                storage_locator,
+                checkpoint_object.storage_locator,
                 SparseLeaseRequest(lease_holder_id, ttl_seconds, request_id),
             )
         except CheckpointConflictError as error:
@@ -346,7 +442,7 @@ class SparseEmbeddingCheckpointComponent(
     ) -> CheckpointHold:
         self._require_control()
         try:
-            renewed = await asyncio.to_thread(
+            renewed = await self._io(
                 self._require_storage().renew_checkpoint_lease,
                 self._to_sparse_lease(lease),
                 ttl_seconds,
@@ -358,7 +454,7 @@ class SparseEmbeddingCheckpointComponent(
     async def release_checkpoint_hold(self, lease: CheckpointHold) -> None:
         self._require_control()
         try:
-            await asyncio.to_thread(
+            await self._io(
                 self._require_storage().release_checkpoint_lease,
                 self._to_sparse_lease(lease),
             )
@@ -374,16 +470,16 @@ class SparseEmbeddingCheckpointComponent(
             for checkpoint_object in request.ordered_candidates
             if checkpoint_object.version_id not in request.protected_versions
         )
-        storage_locators = tuple(
-            self._storage_locator_from_checkpoint_object(item) for item in candidates
-        )
+        for checkpoint_object in candidates:
+            self._validate_checkpoint_object(checkpoint_object)
+        storage_locators = tuple(item.storage_locator for item in candidates)
         reservation_id = self._reservation_id(
             request.permit.attempt_id,
             request.permit.coordinator_generation,
             request.checkpoint_object_id,
         )
         try:
-            sparse_reservation = await asyncio.to_thread(
+            sparse_reservation = await self._io(
                 self._require_storage().reserve_cleanup,
                 reservation_id,
                 storage_locators,
@@ -396,9 +492,10 @@ class SparseEmbeddingCheckpointComponent(
             attempt_id=request.permit.attempt_id,
             checkpoint_object_id=request.checkpoint_object_id,
             claimed=tuple(
-                by_storage_locator[item] for item in sparse_reservation.locators
+                by_storage_locator[item] for item in sparse_reservation.handles
             ),
             generation=request.permit.coordinator_generation,
+            owner_handle=sparse_reservation.owner_handle,
         )
 
     async def commit_cleanup(
@@ -408,7 +505,7 @@ class SparseEmbeddingCheckpointComponent(
     ) -> None:
         self._require_control()
         sparse = self._sparse_reservation(reservation, permit)
-        await asyncio.to_thread(self._require_storage().commit_cleanup, sparse)
+        await self._io(self._require_storage().commit_cleanup, sparse)
 
     async def rollback_cleanup(
         self,
@@ -417,7 +514,7 @@ class SparseEmbeddingCheckpointComponent(
     ) -> None:
         self._require_control()
         sparse = self._sparse_reservation(reservation, permit)
-        await asyncio.to_thread(self._require_storage().rollback_cleanup, sparse)
+        await self._io(self._require_storage().rollback_cleanup, sparse)
 
     async def cleanup(
         self,
@@ -425,37 +522,33 @@ class SparseEmbeddingCheckpointComponent(
     ) -> None:
         self._require_control()
         sparse = self._sparse_reservation_from_reservation(reservation)
-        for checkpoint_object, storage_locator in zip(
-            reservation.claimed, sparse.locators, strict=True
-        ):
-            await asyncio.to_thread(
+        for _, storage_locator in zip(reservation.claimed, sparse.handles, strict=True):
+            await self._io(
                 self._require_storage().cleanup_checkpoint,
                 sparse,
                 storage_locator,
-                self._reference_id(
-                    checkpoint_object.component_id, storage_locator.checkpoint_name
-                ),
             )
 
     async def compact_checkpoints(self) -> None:
         self._require_control()
-        await self._require_storage().compact_checkpoints_async()
+        handle = await self._io(
+            self._require_storage().resolve_lineage_head_handle,
+            self._lineage_name,
+        )
+        if handle is None:
+            return
+        await self._io(self._require_storage().compact_checkpoint, handle)
 
     async def compact_checkpoint(
         self,
-        locator: SparseCheckpointLocator | CheckpointObjectRef,
+        checkpoint_object: CheckpointObjectRef,
     ) -> None:
         self._require_control()
-        storage_locator = (
-            self._storage_locator_from_checkpoint_object(locator)
-            if isinstance(locator, CheckpointObjectRef)
-            else locator
+        self._validate_checkpoint_object(checkpoint_object)
+        await self._io(
+            self._require_storage().compact_checkpoint,
+            checkpoint_object.storage_locator,
         )
-        if not isinstance(storage_locator, SparseCheckpointLocator):
-            raise TypeError(
-                "locator must be SparseCheckpointLocator or CheckpointObjectRef"
-            )
-        await self._require_storage().compact_checkpoint_async(storage_locator)
 
     async def close(self) -> None:
         if self._runtime is None or self._storage is None:
@@ -463,24 +556,48 @@ class SparseEmbeddingCheckpointComponent(
                 f"sparse checkpoint component {self.descriptor.component_id!r} is not open"
             )
         storage = self._storage
+        primary: BaseException | None = None
         try:
-            await asyncio.to_thread(storage.close)
-        finally:
-            self._storage = None
-            self._runtime = None
+            await self._io(storage.close)
+        except BaseException as error:
+            primary = error
+        self._storage = None
+        self._runtime = None
+        try:
+            await self._io_lane.close()
+        except BaseException as error:
+            if primary is None:
+                primary = error
+            else:
+                primary.add_note(
+                    f"sparse checkpoint lane close failed: {type(error).__name__}: {error}"
+                )
+        else:
+            self._io_lane = IOLane("sparse-checkpoint", capacity=1)
+        if primary is not None:
+            raise primary
 
-    def _require_worker(self, context: SaveSession | RestoreSession) -> None:
+    async def _io(self, operation, /, *args, **kwargs):
+        return await self._io_lane.call(operation, *args, **kwargs)
+
+    def _require_open(
+        self, context: SaveSession | RestoreSession | None = None
+    ) -> None:
         runtime = self._runtime
         if runtime is None or self._storage is None:
             raise RuntimeError(
                 f"sparse checkpoint component {self.descriptor.component_id!r} is not open"
             )
-        if runtime.role is not CheckpointRuntimeRole.WORKER:
+        if context is not None and context.component_id != self.descriptor.component_id:
+            raise ValueError("checkpoint context belongs to another component")
+
+    def _require_worker(self, context: SaveSession | RestoreSession) -> None:
+        self._require_open(context)
+        assert self._runtime is not None
+        if self._runtime.role is not CheckpointRuntimeRole.WORKER:
             raise RuntimeError(
                 "sparse checkpoint save and restore require a worker runtime"
             )
-        if context.component_id != self.descriptor.component_id:
-            raise ValueError("checkpoint context belongs to another component")
 
     def _require_control(self) -> None:
         runtime = self._runtime
@@ -498,18 +615,17 @@ class SparseEmbeddingCheckpointComponent(
             )
         return self._storage
 
-    def _storage_locator_from_checkpoint_object(
+    def _validate_checkpoint_object(
         self, checkpoint_object: CheckpointObjectRef
-    ) -> SparseCheckpointLocator:
+    ) -> None:
         if checkpoint_object.component_id != self.descriptor.component_id:
             raise ValueError("sparse checkpoint_object belongs to another component")
         if checkpoint_object.checkpoint_object_id != self.descriptor.component_id:
             raise ValueError(
                 "sparse checkpoint_object belongs to another checkpoint_object"
             )
-        if checkpoint_object.format_version != self.descriptor.format_version:
-            raise ValueError("sparse checkpoint_object format version is unsupported")
-        return self._decode_storage_locator(checkpoint_object.storage_locator)
+        if not checkpoint_object.storage_locator:
+            raise ValueError("sparse checkpoint_object requires an owner handle")
 
     @staticmethod
     def _from_sparse_lease(
@@ -527,9 +643,6 @@ class SparseEmbeddingCheckpointComponent(
     def _to_sparse_lease(self, lease: CheckpointHold) -> SparseCheckpointLease:
         return SparseCheckpointLease(
             lease_id=lease.lease_id,
-            locator=self._storage_locator_from_checkpoint_object(
-                lease.checkpoint_object
-            ),
             lease_holder_id=lease.lease_holder_id,
             expires_at=datetime.fromtimestamp(lease.expires_at, UTC),
             generation=lease.generation,
@@ -560,8 +673,9 @@ class SparseEmbeddingCheckpointComponent(
                 reservation.generation,
                 reservation.checkpoint_object_id,
             ),
+            reservation.owner_handle,
             tuple(
-                self._storage_locator_from_checkpoint_object(checkpoint_object)
+                checkpoint_object.storage_locator
                 for checkpoint_object in reservation.claimed
             ),
         )
@@ -579,94 +693,17 @@ class SparseEmbeddingCheckpointComponent(
             )
         )
 
-    @staticmethod
-    def _reference_id(component_id: str, checkpoint_name: str) -> str:
-        return f"fluxway:{component_id}:{checkpoint_name}"
-
-    @staticmethod
-    def _identity(
-        context: SaveSession, permit: CheckpointCommitPermit
-    ) -> CheckpointSaveIdentity:
-        if context.commit_permit != permit:
-            raise PermissionError(
-                "checkpoint commit_save permit does not match context"
-            )
+    def _identity(self, permit: CheckpointCommitPermit) -> CheckpointSaveIdentity:
+        self._require_open()
+        assert self._runtime is not None
         return CheckpointSaveIdentity(
-            checkpoint_name=context.checkpoint_id,
-            save_attempt=context.attempt_id,
+            checkpoint_name=self._lineage_name,
+            save_attempt=permit.attempt_id,
             commit_authority=CheckpointCommitAuthority(
-                scope=f"fluxway:{context.spmd_id}:{context.component_id}",
+                scope=f"fluxway:{self._runtime.spmd_id}:{self.descriptor.component_id}",
                 generation=permit.coordinator_generation,
                 authority_id=hashlib.sha256(permit.token).hexdigest(),
             ),
-        )
-
-    @staticmethod
-    def _encode_fragment(fragment: CheckpointFragment) -> bytes:
-        return cast(
-            bytes,
-            msgpack.packb(
-                {
-                    "wire_version": _WIRE_VERSION,
-                    "fragment_id": fragment.fragment_id,
-                    "checkpoint_name": fragment.checkpoint_name,
-                    "save_attempt": fragment.save_attempt,
-                    "participant_index": fragment.participant.participant_index,
-                    "participant_count": fragment.participant.participant_count,
-                    "entry_count": fragment.entry_count,
-                    "page_count": fragment.page_count,
-                    "schema_digest": fragment.schema_digest,
-                    "content_digest": fragment.content_digest,
-                },
-                use_bin_type=True,
-            ),
-        )
-
-    @staticmethod
-    def _decode_fragment(payload: bytes) -> CheckpointFragment:
-        decoded = msgpack.unpackb(payload, raw=False, strict_map_key=False)
-        if (
-            not isinstance(decoded, dict)
-            or decoded.get("wire_version") != _WIRE_VERSION
-        ):
-            raise ValueError("sparse fragment wire payload is invalid")
-        return CheckpointFragment(
-            fragment_id=decoded["fragment_id"],
-            checkpoint_name=decoded["checkpoint_name"],
-            save_attempt=decoded["save_attempt"],
-            participant=CheckpointParticipant(
-                decoded["participant_index"], decoded["participant_count"]
-            ),
-            entry_count=decoded["entry_count"],
-            page_count=decoded["page_count"],
-            schema_digest=decoded["schema_digest"],
-            content_digest=decoded["content_digest"],
-        )
-
-    @staticmethod
-    def _encode_storage_locator(storage_locator: SparseCheckpointLocator) -> bytes:
-        return cast(
-            bytes,
-            msgpack.packb(
-                {
-                    "wire_version": _WIRE_VERSION,
-                    "checkpoint_name": storage_locator.checkpoint_name,
-                    "checkpoint_version": storage_locator.checkpoint_version,
-                },
-                use_bin_type=True,
-            ),
-        )
-
-    @staticmethod
-    def _decode_storage_locator(payload: bytes) -> SparseCheckpointLocator:
-        decoded = msgpack.unpackb(payload, raw=False, strict_map_key=False)
-        if (
-            not isinstance(decoded, dict)
-            or decoded.get("wire_version") != _WIRE_VERSION
-        ):
-            raise ValueError("sparse storage_locator wire payload is invalid")
-        return SparseCheckpointLocator(
-            decoded["checkpoint_name"], decoded["checkpoint_version"]
         )
 
 
@@ -674,9 +711,9 @@ async def compact_sparse_checkpoints(
     repository_root: str | Path,
     spmd_id: str,
     *,
+    lineage_name: str,
     component_id: str = "embedding",
     storage_factory: SparseCheckpointStorageFactory | None = None,
-    partition_fn: PartitionFn | None = None,
 ) -> None:
     runtime = CheckpointRuntime(
         role=CheckpointRuntimeRole.CONTROL,
@@ -684,11 +721,12 @@ async def compact_sparse_checkpoints(
         spmd_id=spmd_id,
     )
     actual_factory = storage_factory or LocalLanceStorageFactory()
-    actual_partition_fn = partition_fn or modulo_partition
     component = SparseEmbeddingCheckpointComponent(
-        actual_partition_fn,
         actual_factory,
         component_id=component_id,
+        mode=CheckpointSaveMode.INCREMENTAL,
+        initial_mode=CheckpointSaveMode.FULL,
+        lineage_name=lineage_name,
     )
     await component.open(runtime)
     try:
@@ -703,5 +741,4 @@ __all__ = [
     "SparseCheckpointStorageFactory",
     "SparseEmbeddingCheckpointComponent",
     "compact_sparse_checkpoints",
-    "modulo_partition",
 ]

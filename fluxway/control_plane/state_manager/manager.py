@@ -16,7 +16,7 @@ class StateManager:
     """
     Global State Manager.
 
-    Stores snapshots keyed by snapshot_id.  The snapshot payload is a nested dict:
+    Stores snapshots keyed by checkpoint_id.  The snapshot payload is a nested dict:
         {spmd_id: {rank: worker_state_dict}}
 
     Persistence (writing to disk, GCS, etc.) is the caller's responsibility;
@@ -33,22 +33,22 @@ class StateManager:
     # =========================================================================
 
     def save_snapshot(
-        self, snapshot_id: str, spmd_states: dict[str, dict[int, dict[str, Any]]]
+        self, checkpoint_id: str, spmd_states: dict[str, dict[int, dict[str, Any]]]
     ) -> None:
-        self._snapshot_store[snapshot_id] = spmd_states
+        self._snapshot_store[checkpoint_id] = spmd_states
 
-    def load_snapshot(self, snapshot_id: str) -> dict[str, dict[int, dict[str, Any]]]:
-        if snapshot_id not in self._snapshot_store:
-            raise KeyError(f"Snapshot {snapshot_id!r} not found")
-        return self._snapshot_store[snapshot_id]
+    def load_snapshot(self, checkpoint_id: str) -> dict[str, dict[int, dict[str, Any]]]:
+        if checkpoint_id not in self._snapshot_store:
+            raise KeyError(f"Snapshot {checkpoint_id!r} not found")
+        return self._snapshot_store[checkpoint_id]
 
     def list_snapshots(self) -> list[str]:
         return list(self._snapshot_store.keys())
 
-    def delete_snapshot(self, snapshot_id: str) -> None:
-        if snapshot_id not in self._snapshot_store:
-            raise KeyError(f"Snapshot {snapshot_id!r} not found")
-        del self._snapshot_store[snapshot_id]
+    def delete_snapshot(self, checkpoint_id: str) -> None:
+        if checkpoint_id not in self._snapshot_store:
+            raise KeyError(f"Snapshot {checkpoint_id!r} not found")
+        del self._snapshot_store[checkpoint_id]
 
     # =========================================================================
     # SPMD Runtime State

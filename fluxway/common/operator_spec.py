@@ -211,13 +211,19 @@ class OperatorSpec(BaseModel):
                 "operator source descriptor must declare boolean "
                 "requires_source_control_runtime"
             )
-        if capability and not callable(
-            getattr(self.source, "build_reader_topology", None)
-        ):
-            raise TypeError(
-                "operator source descriptor with requires_source_control_runtime=True "
-                "must implement build_reader_topology(...)"
+        if capability:
+            required_scan_result_capabilities = ("build_source_scan_binding",)
+            missing = tuple(
+                name
+                for name in required_scan_result_capabilities
+                if not callable(getattr(self.source, name, None))
             )
+            if missing:
+                raise TypeError(
+                    "operator source descriptor with "
+                    "requires_source_control_runtime=True must implement bounded "
+                    f"scan capabilities: {missing!r}"
+                )
         return self
 
     @property

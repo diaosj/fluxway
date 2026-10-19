@@ -6,6 +6,13 @@
 interval and source-owned metadata. The compiler partitions the ordered stream
 into logical steps before assigning physical worker quotas.
 
+Interval coordinates are stable within their physical identity. Splitting a unit
+changes its interval without rewriting the opaque source metadata; a source reader
+resolves the assigned interval relative to the original encoded range. A new scan
+or window must not renumber an existing physical interval. Compilation and window
+planning both use `LayoutUnitDescriptor.slice`; slice composition preserves final
+interval coordinates and identity independently of the slicing path.
+
 `SourceWorkAssignment` describes one descriptor interval within a logical step.
 `SourceWorkKey(epoch, step, assignment_id)` is its canonical identity. The
 MessagePack digest is computed once by the assignment model. Rebinding the same
@@ -18,8 +25,8 @@ step. The planner restore rejects a changed logical batch cardinality.
 ## Physical Leases
 
 `CompiledSegment` binds part of an assignment to a worker and includes `step` and
-`assignment_id`. `WorkerLayoutDescriptor` version 1 encodes these segments using
-canonical MessagePack. No additional assignment binding protocol is used.
+`assignment_id`. `WorkerLayoutDescriptor` encodes these segments using the current
+canonical MessagePack field set. No additional assignment binding protocol is used.
 
 One assignment can span multiple workers. The ledger validates that published
 segments cover each assignment exactly once, without gaps or overlaps. Batch
@@ -48,14 +55,17 @@ model and optimizer must agree on that boundary. The existing checkpoint decisio
 and participant commit protocol remains the authority; source ACK is not a second
 durable commit point.
 
-Logical ledger checkpoint version 3 contains the committed cut and immutable epoch
-digests. Leases, ACK caches and physical owners are rebuilt. Planner checkpoint
-version 2 stores canonical requests, fixed logical batch cardinality, pending tail
-units and cursor state, excluding physical topology.
+The source recovery contract is a consumption bookmark and logical progress
+at the shared cut. Replanning may change window boundaries and assignment keys while
+preserving the ordered records in every logical batch. Leases, ACK caches, prefetched
+layouts and tails are recreated; stateful operators retain required logical state.
+Neither source component image carries a numeric protocol version. Source identity and
+cursor compatibility are defined by [source coordination](source_coordination.md).
 
-`max_in_flight_steps` bounds acquisition relative to the committed cut. Exhaustion
-waits asynchronously; cancellation does not retain a ledger lock. Checkpoint
-cadence must allow that window to advance, or acquisition will remain backpressured.
+`max_in_flight_steps` bounds acquisition relative to the source candidate cut,
+also capped by the active window end. Exhaustion waits asynchronously; a source
+window does not force a model checkpoint. See [source coordination](source_coordination.md)
+for configuration and checkpoint semantics.
 
 ## Execution Boundaries
 
@@ -77,19 +87,18 @@ Automatic retry of arbitrary user side effects is not guaranteed safe. Recovery
 must use the coordinated checkpoint; external effects require a user transaction
 or an idempotency scheme that accounts for changing physical interval boundaries.
 
-## Protocol Consistency Guarantees
+## Conformance requirements
 
-The protocol provides the following strict consistency and elasticity guarantees:
-- Handles split assignments, out-of-order ACKs, batch atomicity, isolation of stale ACKs, safe cancellation of waits, and revision conflicts.
-- **Topology Elasticity**: After replacing the topology and restoring the ledger, the system guarantees seamless continued reading from the precise committed cut (e.g., safely scaling from three Readers down to two).
-- **Stable Provenance**: Workers read along Canonical Assignment intervals. Any rebinding operations strictly preserve the original logical batch cardinality and data provenance.
+A valid implementation preserves logical batch cardinality and exact interval coverage
+when the physical topology changes. The planner stores the source consumption bookmark
+at the coordinated checkpoint cut. Restore rebuilds physical assignments and leases
+from that bookmark; the reader does not own an independent durable cursor or restore
+an old window.
 
-**Architectural Flow**:
-The Driver activation checkpoint state is empty. Upon restoration, the Controller always first rebuilds the canonical plan using the current reader topology before restoring the logical committed cut.
-
-Controller startup publishes one layout. Worker source scopes accept contiguous
-immutable windows after Reader installation. Automatic unbounded adapter discovery
-and replenishment are outside the startup API. External storage integrations,
-training convergence and zero-copy performance need workload-specific validation.
+Source integrations must preserve explicit scan/refill, history retention and replay semantics
+under the global model checkpoint. Source-window progress is event-driven; an adapter may use its
+own storage protocol internally, but the Fluxway supervisor does not add timer polling. External
+side effects require their own transaction
+or an idempotency contract that remains valid when physical interval boundaries change.
 
 See [source coordination](source_coordination.md) and [checkpoint](checkpoint.md).

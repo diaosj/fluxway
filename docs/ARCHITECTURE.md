@@ -1,7 +1,7 @@
 # Fluxway Architecture
 
 This document is the English companion to [ARCHITECTURE_zh.md](ARCHITECTURE_zh.md).
-Both files describe the same current implementation and protocol boundaries.
+Both files describe the same stable implementation and protocol boundaries.
 
 ## Runtime ownership
 
@@ -19,6 +19,20 @@ step lifecycle, transport delivery, and local plan execution.
 admission delivery and failure ordering. Driver heartbeats report readiness only.
 See [distributed execution lifecycle](execution_lifecycle.md) for the state flow
 and ownership table.
+
+Controller and Driver state machines use pure transition relations. A transition commits only
+state and failure records; its effect is executed after the lock by the owning lifecycle object.
+Source progress has one generation-aware supervisor, and terminal cleanup has one shared future.
+Worker close has one release future. These boundaries prevent duplicate tasks and keep Ray,
+checkpoint, transport and resource-release work off state-reducer critical sections.
+
+Lifecycle effects use `BoundedLifecycleEffectScheduler`, whose bounded queue and fixed workers
+provide explicit capacity. `ASYNC` is reserved for genuinely awaitable I/O; short blocking or
+GIL-releasing calls use the fixed thread lane, and pickleable pure-Python CPU work uses the spawn-
+based process lane. Same-key effects are ordered, different keys are bounded-concurrent, and a
+full queue raises a backpressure error. Outcomes carry `state_revision`; an owner discards stale
+outcomes before producing a fact event. CPython's event loop remains single-threaded and
+cooperative, so an `async def` declaration alone is not a non-blocking guarantee.
 
 ## Coherence and data plane
 
@@ -86,10 +100,13 @@ flowchart LR
     D --> A
 ```
 
-`COMMIT_DECIDED` records that physical publication has started. Because a crash
-loses component sessions and pending publication context, startup fences both
-`STAGED` and `COMMIT_DECIDED` records to `ABANDONED`. Only `COMMITTED` manifests
-are restorable and visible.
+`COMMIT_DECIDED` records that physical publication has started. If a crash occurs
+before the global commit marker is written, startup fences the transaction via `abort_save(permit)`
+to `ABANDONED`. If the commit marker was already written, startup fencing replays component
+`acknowledge_save(permit)` and advances the transaction to `COMMITTED`. Only `COMMITTED` manifests
+are restorable and visible. Manifests, transactions, and cleanup intents are persisted
+using compact binary MessagePack via `msgpack_codec` rather than uncompacted JSON,
+ensuring low coordinator latency and bounded storage size.
 
 ## Placement and execution
 
@@ -103,6 +120,12 @@ the quantities selected by the planner. Workers attest their actual NodeID again
 the plan. Multi-node execution requires compatible node environments and a shared
 checkpoint repository when recovery is enabled.
 
+Runtime-bound dynamic resources (such as dynamic routing tables, device meshes, or rank
+providers) are managed through `ResourceRegistry` (`fluxway.common.resource_registry`)
+and referenced via `ResourceHandle(namespace, resource_id)`. The active registry context is established
+by `bind_resource_registry`. `LogicalPartitionBinding` associates logical coordinate
+partitions with physical ranks, decoupling placement and routing from physical worker renumbering.
+
 The worker admission owner contains gating and pending-state promotion.
 `SourcePipelineMaintenance.request()` coalesces requests to fill the Worker source
 step queue; `fill()` checks running state, pipeline depth, drain boundaries and
@@ -113,15 +136,16 @@ consumes owned queue items, evaluates admission, dispatches plans, and completes
 
 ## Ingestion layout and source coordination
 
-`IngestionSourceAdapter` captures immutable revision metadata in bounded
-`CatalogViewObservation` windows. The compiler first creates canonical assignments,
+`IngestionSourceAdapter` returns immutable `SourceScanResult` values for bounded
+scan requests. The controller's `SourceProgressSupervisor` owns event-driven
+scan and activation publication. The compiler first creates canonical assignments,
 identified by `SourceWorkKey(epoch, step, assignment_id)`, then binds them to current
 reader quotas in transient `WorkerLayoutDescriptor` values. `LogicalWorkLedger`
 alone owns leases, ACK frontiers and committed cuts. Driver activation checkpoint
 state is empty. Restore reconstructs plans
 and bindings before applying the logical committed cut.
 
-`IngestionLayoutPlanningComponent` owns descriptor construction and adapter capture
+`IngestionLayoutPlanningComponent` owns descriptor construction and adapter scans
 on a dedicated `IOLane`, and pure compilation on a persistent spawn process pool.
 Accepted operations survive cancellation of their callers. Close rejects new work,
 joins accepted operations, and joins the compiler on a separate lifecycle lane
@@ -136,8 +160,9 @@ the authority returns the complete-step prefix permitted by current credit.
 Normal checkpoint continuation retains the scope. Restore uses fresh actors before
 source activation. ACK submission uses a bounded asynchronous queue; full capacity
 applies backpressure. Controller startup activates one layout. The planner component
-supports idle observations and pending tails, but the startup API does not run
-automatic adapter discovery or replenishment. Committed planning windows and
+supports idle observations and pending tails. The startup API starts this lifecycle;
+the controller supervisor performs event-driven adapter scans and replenishment,
+while the adapter itself does not own refill. Committed planning windows and
 physical bindings remain retained, so metadata grows with installed window count.
 See [source coordination](source_coordination.md) and
 [formal protocol](source_spmd_formal_protocol.md) for the supported contracts.

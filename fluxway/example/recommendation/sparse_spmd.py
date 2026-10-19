@@ -3,6 +3,7 @@ import os
 
 import numpy as np
 import sparse_embedding as se  # type: ignore
+from sparse_embedding.checkpoint import CheckpointSaveMode
 
 from fluxway.common.tensor_backend import get_backend, prepare_dlpack_input
 from fluxway.common.decorators import spmd, operator, requires_worker_process
@@ -14,7 +15,6 @@ from fluxway.example.recommendation.data_types import LookupOutput
 from fluxway.integrations.sparse_embedding.checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
-    modulo_partition,
 )
 
 logger = get_logger(__name__)
@@ -34,8 +34,10 @@ def _balanced_counts(total: int, shard_count: int) -> list[int]:
     mesh_axis_names=("shard",),
     checkpoint_components=(
         SparseEmbeddingCheckpointComponent(
-            modulo_partition,
             LocalLanceStorageFactory(),
+            lineage_name="embedding",
+            mode=CheckpointSaveMode.INCREMENTAL,
+            initial_mode=CheckpointSaveMode.FULL,
         ).registration(),
     ),
 )

@@ -10,6 +10,7 @@ from dataclasses import replace
 from typing import Any
 
 from fluxway.common.types.checkpoint import (
+    CheckpointCommitPermit,
     CheckpointDeadline,
     CheckpointObjectRef,
     CheckpointObjectCleanedUpError,
@@ -25,6 +26,8 @@ from fluxway.common.types.checkpoint import (
     CheckpointHold,
     CheckpointTransactionState,
     CheckpointRetentionPolicy,
+    RestoreOptions,
+    validate_restore_options,
 )
 from fluxway.common.types.configs import (
     DEFAULT_SNAPSHOT_TIMEOUT_SECS,
@@ -33,6 +36,9 @@ from fluxway.common.types.configs import (
 from fluxway.control_plane.checkpointer.component import (
     CheckpointComponentRegistration,
     CheckpointComponentRegistry,
+)
+from fluxway.control_plane.checkpointer.repository import (
+    CheckpointTransactionRecord,
 )
 from fluxway.control_plane.checkpointer.repository_session import (
     CheckpointRepositorySession,
@@ -213,7 +219,6 @@ class FluxwayCheckpointer:
                 self._repository_lane.call(self._repository.next_checkpoint_sequence),
             )
             manifest = CheckpointManifest(
-                schema_version=1,
                 checkpoint_id=str(checkpoint_id),
                 attempt_id=request.attempt_id,
                 coordinator_generation=permit.coordinator_generation,
@@ -307,6 +312,10 @@ class FluxwayCheckpointer:
                     str(checkpoint_id),
                     permit,
                 ),
+            )
+            await deadline.run_phase(
+                "acknowledge_transaction",
+                self._acknowledge_committed_transaction(manifest, permit),
             )
             await deadline.run_phase(
                 "complete_transaction",
@@ -411,9 +420,12 @@ class FluxwayCheckpointer:
         | NameReference
         | CheckpointIdReference
         | str = "latest",
+        *,
+        restore_options: RestoreOptions | None = None,
     ) -> int | None:
         if self._closed:
             raise RuntimeError("FluxwayCheckpointer is closed")
+        validate_restore_options(restore_options)
         await self._fence_incomplete_transactions()
         await self._ensure_control_components()
         if reference == "latest":
@@ -435,20 +447,49 @@ class FluxwayCheckpointer:
             manifest.checkpoint_id,
             manifest,
             self._repository_dir,
+            restore_options,
         )
         return manifest.cut.position
 
-    async def restore_latest(self) -> int | None:
-        return await self.restore()
+    async def restore_latest(
+        self,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
+        return await self.restore(restore_options=restore_options)
 
-    async def restore_step(self, step: int) -> int | None:
-        return await self.restore(StepReference(step))
+    async def restore_step(
+        self,
+        step: int,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
+        return await self.restore(
+            StepReference(step),
+            restore_options=restore_options,
+        )
 
-    async def restore_named(self, name: str) -> int | None:
-        return await self.restore(NameReference(name))
+    async def restore_named(
+        self,
+        name: str,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
+        return await self.restore(
+            NameReference(name),
+            restore_options=restore_options,
+        )
 
-    async def restore_checkpoint(self, checkpoint_id: str) -> int | None:
-        return await self.restore(CheckpointIdReference(checkpoint_id))
+    async def restore_checkpoint(
+        self,
+        checkpoint_id: str,
+        *,
+        restore_options: RestoreOptions | None = None,
+    ) -> int | None:
+        return await self.restore(
+            CheckpointIdReference(checkpoint_id),
+            restore_options=restore_options,
+        )
 
     async def list_steps(self) -> tuple[int, ...]:
         return await self._repository_lane.call(self._repository.list_steps)
@@ -586,27 +627,70 @@ class FluxwayCheckpointer:
             raise
         self._control_open = True
 
-    async def _fence_incomplete_transactions(self) -> None:
-        """Abandon all STAGED and COMMIT_DECIDED transactions on startup.
+    async def _acknowledge_committed_transaction(
+        self, manifest: CheckpointManifest, permit: CheckpointCommitPermit
+    ) -> None:
+        await self._ensure_control_components()
+        for spmd_id, spmd in manifest.spmds.items():
+            for component_id in spmd.components:
+                registration = self._require_component(spmd_id, component_id)
+                if registration.save is None:
+                    raise RuntimeError(
+                        "committed checkpoint component has no save capability: "
+                        f"spmd={spmd_id!r} component={component_id!r}"
+                    )
+                await registration.save.acknowledge_save(permit)
 
-        Physical artifacts from incomplete attempts remain on storage and are
-        cleaned up by GC; they are never visible to restore because only
-        COMMITTED manifests enter latest() and reference resolution.
+    async def _abort_incomplete_transaction(
+        self, record: CheckpointTransactionRecord
+    ) -> None:
+        await self._ensure_control_components()
+        for registry in self._registries.values():
+            for registration in registry:
+                if registration.save is not None:
+                    await registration.save.abort_save(record.permit)
+
+    async def _fence_incomplete_transactions(self) -> None:
+        """Reconcile all incomplete transactions on startup.
+
+        Transactions that have already been marked committed with a durable global
+        marker must replay owner acknowledgement using their persisted permit and
+        advance to COMMITTED. Pre-marker incomplete transactions are rolled back across
+        components and marked ABANDONED.
         """
         incomplete = await self._repository_lane.call(
             self._repository.incomplete_transactions
         )
         for record in incomplete:
-            await self._repository_lane.call(
-                self._repository.abandon_transaction,
-                record.checkpoint_id,
-                record.permit,
+            is_committed = await self._repository_lane.call(
+                self._repository.is_committed, record.checkpoint_id
             )
-            logger.warning(
-                "fenced incomplete checkpoint attempt checkpoint=%s status=%s",
-                record.checkpoint_id,
-                record.status,
-            )
+            if is_committed:
+                manifest = await self._repository_lane.call(
+                    self._repository.read, record.checkpoint_id
+                )
+                await self._acknowledge_committed_transaction(manifest, record.permit)
+                await self._repository_lane.call(
+                    self._repository.complete_transaction,
+                    record.checkpoint_id,
+                    record.permit,
+                )
+                logger.info(
+                    "replayed committed checkpoint acknowledgement checkpoint=%s",
+                    record.checkpoint_id,
+                )
+            else:
+                await self._abort_incomplete_transaction(record)
+                await self._repository_lane.call(
+                    self._repository.abandon_transaction,
+                    record.checkpoint_id,
+                    record.permit,
+                )
+                logger.warning(
+                    "fenced incomplete checkpoint attempt checkpoint=%s status=%s",
+                    record.checkpoint_id,
+                    record.status,
+                )
 
     async def _repair_cleanup_intents(self) -> int:
         intents = await self._repository_lane.call(
@@ -813,17 +897,8 @@ class FluxwayCheckpointer:
 
     @staticmethod
     def _validate_manifest_progress(manifest: CheckpointManifest) -> None:
-        ledger = manifest.framework_state.get("logical_work_ledger")
-        if ledger is None:
-            return
-        if not isinstance(ledger, Mapping):
-            raise TypeError("manifest logical work state must be a mapping")
-        if set(ledger) != {"version", "committed_cut", "epochs"}:
-            raise ValueError("manifest logical work state fields do not match")
-        durable_cut = ledger["committed_cut"]
-        if not isinstance(durable_cut, int) or isinstance(durable_cut, bool):
-            raise TypeError("manifest logical committed cut must be an integer")
-        if manifest.cut.position is not None and durable_cut != manifest.cut.position:
-            raise ValueError(
-                "CheckpointCut position disagrees with logical committed cut"
-            )
+        if not isinstance(manifest.framework_state, Mapping):
+            raise TypeError("manifest framework state must be a mapping")
+        # Source progress validation belongs to the registered Controller
+        # components.  The generic checkpointer only validates the global cut
+        # envelope and must not parse a source-specific state projection.

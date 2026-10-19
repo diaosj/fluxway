@@ -30,68 +30,86 @@ Usage:
             return process(data)
 """
 
-__version__ = "0.1.0"
-
 # Force logging to be visible across driver + Ray worker processes.
 # Users of this repo want INFO logs by default.
 from fluxway.common.utils.logging import ensure_logging_configured
 
-# Import decorators for top-level access
-from fluxway.common.decorators import data_type, operator, requires_worker_process
-from fluxway.common.bind import bind_spmd
-
-# Import common types
+# SPMD & Common Types (imported first to initialize type definitions and prevent circular imports)
 from fluxway.common.types import (
-    SPMDConfig,
+    ExecutionFailure,
     Graph,
     Node,
-    # Sharding types
-    ShardingSpec,
-    PhysicalLayout,
-    PartitionSpec,
+    SPMDConfig,
+    # Sharding & Layout Primitives
     ChunkPartition,
     CyclicPartition,
     FunctionPartition,
     GreedyPartition,
-    ExecutionFailure,
+    PartitionSpec,
+    PhysicalLayout,
+    ShardingSpec,
 )
 
-# Import control plane components
-from fluxway.control_plane import Builder, ExecutionFailedError, start, GraphExecution
+# Decorators & Operator Declarations
+from fluxway.common.decorators import (
+    data_type,
+    operator,
+    requires_worker_process,
+)
+from fluxway.common.bind import bind_spmd
 
-# Import runner
+# Resource Registry & Execution Binding
+from fluxway.common.resource_registry import (
+    ResourceHandle,
+    ResourceRegistry,
+    bind_resource_registry,
+    get_active_resource_registry,
+    reset_active_resource_registry,
+    set_active_resource_registry,
+)
+from fluxway.common.logical_partition_binding import LogicalPartitionBinding
+
+# Control Plane, Graph & Orchestration
+from fluxway.control_plane import (
+    Builder,
+    ExecutionFailedError,
+    GraphExecution,
+    start,
+)
 from fluxway.runner import run_in_sandbox
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.coherence import TensorAccessIntent
 from fluxway import profiler
 from fluxway.visualization import view_graph, visualize_graph
+
+# Placement & Scheduling Engine
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
-    PlacementRecipe,
+    AFFINITY_FIRST,
     PlacementAttestationError,
     PlacementContractError,
     PlacementError,
     PlacementGroupTimeoutError,
     PlacementInfeasibleError,
     PlacementMaterializationError,
+    PlacementRecipe,
     PlacementRuntimeConfig,
     PlacementSolveTimeoutError,
     ResourceProfile,
     ResourceScale,
     SPMDRef,
-    allocated_quanta,
     affinity_constraints,
     affinity_coverage,
     all_of,
     all_workers,
+    allocated_quanta,
     any_of,
     cardinality,
     co_location_mass,
     difference,
     disjoint,
     equal,
-    instance,
     incident_spmds,
+    instance,
     intersection,
     isolated_spmds,
     less_equal,
@@ -116,65 +134,73 @@ from fluxway.placement import (
 )
 
 __all__ = [
-    # Version
-    "__version__",
-    # Runner
-    "run_in_sandbox",
-    # Decorators
+    # Decorators & Operator Declarations
     "data_type",
     "operator",
-    "profiler",
     "requires_worker_process",
     "bind_spmd",
     "OperatorSpec",
     "TensorAccessIntent",
-    # Types
-    "PartitionSpec",
-    "SPMDConfig",
+    # Graph & Orchestration
+    "Builder",
+    "GraphExecution",
+    "start",
+    "run_in_sandbox",
+    "view_graph",
+    "visualize_graph",
+    # SPMD & Common Types
     "Graph",
     "Node",
+    "SPMDConfig",
     "ExecutionFailure",
     "ExecutionFailedError",
-    # Sharding
-    "ShardingSpec",
-    "PhysicalLayout",
-    "PartitionSpec",
+    # Sharding & Layout Primitives
     "ChunkPartition",
     "CyclicPartition",
     "FunctionPartition",
     "GreedyPartition",
-    # Control Plane
-    "Builder",
-    "start",
-    "GraphExecution",
-    "visualize_graph",
-    "view_graph",
-    "AFFINITY_FIRST_V1",
+    "PartitionSpec",
+    "PhysicalLayout",
+    "ShardingSpec",
+    # Resource Registry & Execution Binding
+    "ResourceHandle",
+    "ResourceRegistry",
+    "LogicalPartitionBinding",
+    "bind_resource_registry",
+    "get_active_resource_registry",
+    "reset_active_resource_registry",
+    "set_active_resource_registry",
+    # Profiler
+    "profiler",
+    # Placement & Scheduling Engine
+    "AFFINITY_FIRST",
     "PlacementRecipe",
+    "PlacementRuntimeConfig",
+    "ResourceProfile",
+    "ResourceScale",
+    "SPMDRef",
+    # Placement Exceptions
     "PlacementAttestationError",
     "PlacementContractError",
     "PlacementError",
     "PlacementGroupTimeoutError",
     "PlacementInfeasibleError",
     "PlacementMaterializationError",
-    "PlacementRuntimeConfig",
     "PlacementSolveTimeoutError",
-    "ResourceProfile",
-    "ResourceScale",
-    "SPMDRef",
-    "allocated_quanta",
+    # Placement Constraint & Objective DSL
     "affinity_constraints",
     "affinity_coverage",
     "all_of",
     "all_workers",
+    "allocated_quanta",
     "any_of",
     "cardinality",
     "co_location_mass",
     "difference",
     "disjoint",
     "equal",
-    "instance",
     "incident_spmds",
+    "instance",
     "intersection",
     "isolated_spmds",
     "less_equal",

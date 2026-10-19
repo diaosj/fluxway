@@ -18,7 +18,11 @@ from fluxway.common.types.checkpoint import (
     CheckpointTransactionState,
 )
 from fluxway.common.types import DrainBoundary
-from fluxway.control_plane.checkpointer.repository import CheckpointRepository
+from fluxway.control_plane.checkpointer.repository import (
+    CheckpointRepository,
+    manifest_from_payload,
+    manifest_to_payload,
+)
 
 
 def _manifest(sequence: int) -> CheckpointManifest:
@@ -27,10 +31,8 @@ def _manifest(sequence: int) -> CheckpointManifest:
         checkpoint_object_id="state",
         version_id=f"version-{sequence}",
         storage_locator=f"gravitino://catalog/version-{sequence}".encode(),
-        format_version=1,
     )
     return CheckpointManifest(
-        schema_version=1,
         checkpoint_id=f"snapshot-{sequence}",
         attempt_id=f"attempt-{sequence}",
         coordinator_generation=1,
@@ -40,14 +42,13 @@ def _manifest(sequence: int) -> CheckpointManifest:
         framework_state={},
         spmds={
             "train": SpmdCheckpoint(
-                source_topology=TopologySnapshot(1, (), (), "v1"),
+                source_topology=TopologySnapshot(1, (), ()),
                 runtime_state={
                     "drain_boundary": DrainBoundary(committed_cut=sequence).to_dict()
                 },
                 components={
                     "state": CheckpointComponentPublication(
                         component_id="state",
-                        format_version=1,
                         shared_records=(
                             CheckpointObjectRecord(
                                 checkpoint_objects=(checkpoint_object,)
@@ -58,6 +59,23 @@ def _manifest(sequence: int) -> CheckpointManifest:
             )
         },
     )
+
+
+@pytest.mark.parametrize("field", ["schema_version", "unknown_field"])
+def test_manifest_rejects_extra_root_fields(field):
+    payload = manifest_to_payload(_manifest(1))
+    payload[field] = 1
+
+    with pytest.raises(ValueError, match="manifest fields do not match"):
+        manifest_from_payload(payload)
+
+
+def test_manifest_rejects_a_missing_root_field():
+    payload = manifest_to_payload(_manifest(1))
+    del payload["framework_state"]
+
+    with pytest.raises(ValueError, match="manifest fields do not match"):
+        manifest_from_payload(payload)
 
 
 def test_repository_round_trips_opaque_checkpoint_objects_and_references(tmp_path):
@@ -205,12 +223,11 @@ def test_coordinator_takeover_revokes_unpublished_commit_permit(tmp_path):
 def test_spmd_snapshot_rejects_component_identity_aliases():
     with pytest.raises(ValueError, match="mapping key"):
         SpmdCheckpoint(
-            source_topology=TopologySnapshot(1, (), (), "v1"),
+            source_topology=TopologySnapshot(1, (), ()),
             runtime_state={"drain_boundary": DrainBoundary(committed_cut=1).to_dict()},
             components={
                 "declared": CheckpointComponentPublication(
                     component_id="actual",
-                    format_version=1,
                 )
             },
         )
@@ -223,7 +240,6 @@ def test_checkpoint_object_publication_requires_one_logical_version():
             checkpoint_object_id="state",
             version_id=version_id,
             storage_locator=f"opaque:{version_id}".encode(),
-            format_version=1,
         )
         for version_id in ("version-1", "version-2")
     )
@@ -231,7 +247,6 @@ def test_checkpoint_object_publication_requires_one_logical_version():
     with pytest.raises(ValueError, match="one logical checkpoint_object version"):
         CheckpointComponentPublication(
             component_id="state",
-            format_version=1,
             shared_records=(
                 CheckpointObjectRecord(checkpoint_objects=checkpoint_objects),
             ),

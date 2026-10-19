@@ -5,7 +5,7 @@ from collections.abc import Mapping
 from enum import Enum
 from typing import Any
 
-import msgpack
+from fluxway.common import msgpack_codec
 
 
 def _canonical_metadata(value: Any) -> Any:
@@ -21,7 +21,7 @@ def _canonical_metadata(value: Any) -> Any:
 
 
 def pack_metadata(value: Any) -> bytes:
-    return msgpack.packb(
+    return msgpack_codec.packb(
         _canonical_metadata(value), use_bin_type=True, strict_types=True
     )
 
@@ -30,7 +30,7 @@ def unpack_metadata(payload: bytes) -> Any:
     if not isinstance(payload, bytes):
         raise TypeError("metadata payload must be bytes")
     try:
-        value = msgpack.unpackb(payload, raw=False)
+        value = msgpack_codec.unpackb(payload, raw=False)
         if pack_metadata(value) != payload:
             raise ValueError("noncanonical encoding")
     except (TypeError, ValueError) as error:

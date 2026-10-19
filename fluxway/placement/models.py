@@ -141,7 +141,6 @@ class ConstraintResult(PlacementModel):
 
 class ResolvedPlacementPlan(PlacementModel):
     recipe_id: str
-    recipe_version: str
     recipe: PlacementRecipe
     assignments: tuple[WorkerAssignment, ...]
     allocated_quanta: dict[str, int]
@@ -235,7 +234,6 @@ class AllocationReport(ResolvedPlacementPlan):
     ) -> AllocationReport:
         return cls(
             recipe_id=recipe.recipe_id,
-            recipe_version=recipe.version,
             recipe=recipe,
             assignments=(),
             allocated_quanta={},

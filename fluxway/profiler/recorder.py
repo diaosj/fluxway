@@ -336,6 +336,18 @@ LOCAL_STEP_COMMIT = TraceEventSpec(
     ("op_id", "step"),
     "step",
 )
+EXECUTION_PHASE = TraceEventSpec(
+    "execution.phase",
+    "compute/lifecycle",
+    ("phase_id", "op_id", "step", "epoch", "sequence", "execution_generation"),
+    "step",
+)
+CONTROLLER_EXECUTION_PHASE = TraceEventSpec(
+    "execution.phase",
+    "lifecycle/execution_phase",
+    ("phase_id", "op_id", "step", "epoch", "sequence", "execution_generation"),
+    "step",
+)
 USER_CALLABLE_EXECUTE = TraceEventSpec(
     "user_callable.execute",
     "compute/user_callable",
@@ -408,94 +420,94 @@ TRANSPORT_RECEIVER_WAIT = TraceEventSpec(
 )
 CONTROLLER_INITIALIZE = TraceEventSpec(
     "controller.initialize",
-    "controller/lifecycle",
+    "lifecycle/initialize",
     ("spmd_count",),
 )
 CONTROLLER_TOPOLOGY_REGISTRATION = TraceEventSpec(
     "controller.topology_registration",
-    "controller/topology",
+    "topology/registration",
     ("spmd_count", "edge_count"),
 )
 CONTROLLER_DRAIN = TraceEventSpec(
     "controller.drain",
-    "controller/drain",
+    "drain/admission",
     ("target_step", "spmd_count"),
     "target_step",
 )
 CONTROLLER_CHECKPOINT = TraceEventSpec(
     "controller.checkpoint",
-    "controller/checkpoint",
+    "checkpoint/save",
     ("target_step",),
     "target_step",
 )
 CONTROLLER_RESTORE = TraceEventSpec(
     "controller.restore",
-    "controller/checkpoint",
+    "checkpoint/restore",
     ("checkpoint_id",),
 )
 CONTROLLER_BACKPRESSURE = TraceEventSpec(
     "controller.backpressure",
-    "controller/backpressure",
+    "backpressure/flow",
     ("busy_spmd_count", "paused_reader_count"),
 )
 CONTROLLER_COMPLETION = TraceEventSpec(
     "controller.completion",
-    "controller/lifecycle",
+    "lifecycle/completion",
     ("spmd_count",),
 )
 CONTROLLER_CLEANUP = TraceEventSpec(
     "controller.reclaim",
-    "controller/lifecycle",
+    "lifecycle/reclaim",
     ("spmd_count",),
 )
 CONTROLLER_PROFILER_EXPORT = TraceEventSpec(
     "controller.profiler_export",
-    "controller/profiler",
+    "profiler/export",
     ("spmd_count", "record_count"),
 )
 CONTROLLER_FSM_TRANSITION = TraceEventSpec(
     "controller_fsm.transition",
-    "controller/fsm",
+    "fsm/transition",
     ("from_state_id", "event_id", "to_state_id"),
 )
 CONTROLLER_FSM_ENTRY_CALLBACK = TraceEventSpec(
     "controller_fsm.entry_callback",
-    "controller/fsm",
+    "fsm/entry_callback",
     ("state_id",),
 )
 HEARTBEAT_RECEIVE = TraceEventSpec(
     "heartbeat.receive",
-    "controller/heartbeat",
+    "heartbeat/receive",
     ("spmd_id", "state_id", "healthy_workers", "num_workers"),
 )
 HEARTBEAT_MONITOR_LOOP = TraceEventSpec(
     "heartbeat.monitor_loop",
-    "controller/heartbeat",
+    "heartbeat/monitor_loop",
     ("spmd_count",),
 )
 HEARTBEAT_TIMEOUT_CHECK = TraceEventSpec(
     "heartbeat.timeout_check",
-    "controller/heartbeat",
+    "heartbeat/timeout_check",
     ("spmd_id", "elapsed_ms"),
 )
 HEARTBEAT_BLOCKED_WATCHDOG = TraceEventSpec(
     "heartbeat.blocked_watchdog",
-    "controller/heartbeat",
+    "heartbeat/blocked_watchdog",
     ("timeout_ms",),
 )
 SPMD_MANAGER_PLACEMENT_GROUP_CREATE = TraceEventSpec(
     "spmd_manager.placement_group_create",
-    "controller/spmd_manager",
+    "spmd_manager/placement_group_create",
     ("spmd_id", "worker_count"),
 )
 SPMD_MANAGER_DRIVER_START = TraceEventSpec(
     "spmd_manager.driver_start",
-    "controller/spmd_manager",
+    "spmd_manager/driver_start",
     ("spmd_id", "worker_count"),
 )
 SPMD_MANAGER_DRIVER_STOP = TraceEventSpec(
     "spmd_manager.driver_stop",
-    "controller/spmd_manager",
+    "spmd_manager/driver_stop",
     ("spmd_id",),
 )
 DRIVER_INITIALIZE = TraceEventSpec(
@@ -522,13 +534,13 @@ DRIVER_DRAIN = TraceEventSpec(
 DRIVER_SNAPSHOT = TraceEventSpec(
     "driver.snapshot",
     "driver/checkpoint",
-    ("snapshot_id", "target_step", "worker_count"),
+    ("checkpoint_id", "target_step", "worker_count"),
     "target_step",
 )
 DRIVER_RESTORE = TraceEventSpec(
     "driver.restore",
     "driver/checkpoint",
-    ("snapshot_id", "worker_count"),
+    ("checkpoint_id", "worker_count"),
 )
 DRIVER_HEARTBEAT_THREAD_JOIN = TraceEventSpec(
     "driver.heartbeat_thread_join",
@@ -1137,6 +1149,70 @@ class TraceRecorder:
             payload=(self.intern(op_name), step, node_count),
         )
 
+    def execution_phase(
+        self,
+        *,
+        phase: str,
+        op_name: str | None,
+        step: int | None,
+        epoch: int,
+        sequence: int,
+        execution_generation: int,
+    ) -> None:
+        """Record opaque lifecycle metadata shared by all execution backends."""
+        self._record_execution_phase(
+            EXECUTION_PHASE,
+            phase=phase,
+            op_name=op_name,
+            step=step,
+            epoch=epoch,
+            sequence=sequence,
+            execution_generation=execution_generation,
+        )
+
+    def controller_execution_phase(
+        self,
+        *,
+        phase: str,
+        op_name: str | None,
+        step: int | None,
+        epoch: int,
+        sequence: int,
+        execution_generation: int,
+    ) -> None:
+        self._record_execution_phase(
+            CONTROLLER_EXECUTION_PHASE,
+            phase=phase,
+            op_name=op_name,
+            step=step,
+            epoch=epoch,
+            sequence=sequence,
+            execution_generation=execution_generation,
+        )
+
+    def _record_execution_phase(
+        self,
+        spec: TraceEventSpec,
+        *,
+        phase: str,
+        op_name: str | None,
+        step: int | None,
+        epoch: int,
+        sequence: int,
+        execution_generation: int,
+    ) -> None:
+        self._instant(
+            spec,
+            payload=(
+                self.intern(phase),
+                self.intern(op_name or ""),
+                -1 if step is None else step,
+                epoch,
+                sequence,
+                execution_generation,
+            ),
+        )
+
     def local_step_node(
         self,
         *,
@@ -1517,19 +1593,19 @@ class TraceRecorder:
         return self._async_span(DRIVER_DRAIN, payload=(target_step, worker_count))
 
     def driver_snapshot(
-        self, *, snapshot_id: str, target_step: int, worker_count: int
+        self, *, checkpoint_id: str, target_step: int, worker_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             DRIVER_SNAPSHOT,
-            payload=(self.intern(snapshot_id), target_step, worker_count),
+            payload=(self.intern(checkpoint_id), target_step, worker_count),
         )
 
     def driver_restore(
-        self, *, snapshot_id: str, worker_count: int
+        self, *, checkpoint_id: str, worker_count: int
     ) -> AbstractAsyncContextManager[None]:
         return self._async_span(
             DRIVER_RESTORE,
-            payload=(self.intern(snapshot_id), worker_count),
+            payload=(self.intern(checkpoint_id), worker_count),
         )
 
     def driver_heartbeat_thread_join(

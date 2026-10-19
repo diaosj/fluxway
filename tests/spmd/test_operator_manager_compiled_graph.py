@@ -63,6 +63,19 @@ class _ControlledSourceDescriptor:
         del context
         raise AssertionError("context-only test must not construct source components")
 
+    def _build_reader_topology(self, *, spmd_id, operator_name, config):
+        del spmd_id, operator_name, config
+        raise AssertionError("context-only test must not build reader topology")
+
+    def _build_source_scan_adapter(self, **kwargs):
+        raise AssertionError("context-only test must not build scan result adapter")
+
+    def _build_source_scan_tail_layout(self, **kwargs):
+        raise AssertionError("context-only test must not build tail policy")
+
+    def build_source_scan_binding(self, **kwargs):
+        raise AssertionError("context-only test must not build source binding")
+
 
 _SOURCE_OPERATORS = {
     "before": OperatorSpec(name="before", owner=_Source),
@@ -420,10 +433,13 @@ def _source_work(*, step: int, global_start: int, schema: str = "schema"):
         epoch=0,
         step=step,
         source_identity="source",
+        view_identity="view",
         schema_digest=schema,
+        lineage_digest="lineage",
         descriptor=descriptor,
         global_start=global_start,
         global_batch_size=4,
+        global_valid_count=4,
     )
     return SourceWorkItem(assignment, global_start, global_start + 1)
 

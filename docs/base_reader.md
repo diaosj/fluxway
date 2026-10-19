@@ -2,7 +2,7 @@
 
 `BaseReader` converts source records into coordinate-aware `TransportTensor`
 values. A controlled source reads the exact intervals in `self.ctx.source_work_items`.
-The planner owns immutable revisions and canonical batches; `LogicalWorkLedger`
+The planner owns ordered source intervals and canonical batches; `LogicalWorkLedger`
 owns leases and progress. Dispatcher only selects active workers and routes data.
 
 Before a controlled source call, OperatorManager validates a nonempty tuple of
@@ -44,29 +44,24 @@ alone does not establish checkpoint replay or topology-independent ownership.
 
 ## Custom Sources
 
-Implement `IngestionSourceAdapter.capture_view`, `encode_cursor` and `decode_cursor`
-for immutable metadata discovery. Source-specific metadata and binary cursors use
-the shared MessagePack codec. `IngestionReadSession.read` can provide synchronous
-interval chunks to `read_ingestion_layout`; `IngestionLayoutSession` offloads
-iteration to a thread and validates consumed cardinality.
+Implement `IngestionSourceAdapter.scan_next(cursor, budget)` to return bounded
+`SourceScanResult` values with opaque cursors. Cursor payloads are source-owned; Fluxway
+must not decode source-specific fields. `IngestionReadSession.read` supplies exact
+interval chunks, and `IngestionLayoutSession` offloads iteration and validates
+consumed cardinality.
 
-For a finite controlled-source example, see
-[RecommendationReader](../fluxway/example/recommendation/reader.py) and its
-[source descriptor](../fluxway/example/recommendation/source_adapter.py).
-Its source descriptor supplies `build_reader_topology`, `build_ingestion_plan`
-and the existing Driver activation component. Restoring a controlled source must
-reconstruct canonical plans before restoring the logical cut; a physical reader
-cursor must not become a second ownership authority.
+See [RecommendationReader](../fluxway/example/recommendation/reader.py) and its
+[source descriptor](../fluxway/example/recommendation/source_adapter.py). The
+current descriptor provides one `build_source_scan_binding` method and `build_component`;
+the binding owns the reader topology, scan adapter, tail policy, and initial opaque cursor.
+The controller creates and caches this binding once for the source session.
+A physical reader cursor is not an independent checkpoint authority.
 
-## Streaming support
+## Streaming and recovery limits
 
-The planner component accepts empty nonterminal observations without creating an
-epoch, carries incomplete batches across revisions, and checkpoints pending tails
-and cursors. The runtime inherently supports strongly-consistent reading of pinned revisions even across Reader quota scaling events.
-
-Controller startup activates one layout; automatic adapter discovery/refill is not
-part of the startup API. Worker accepts contiguous immutable windows and owns their
-installation identity; BaseReader supplies the installation hook. Implementing
-the adapter alone does not enable automatic
-unbounded streaming through a training graph. See
-[source coordination](source_coordination.md) for the supported ingestion scope.
+Scan results and pending tails are planned by the control plane. A reader implementation
+alone does not establish event-driven window refill, bounded progress or global training recovery.
+The planner can derive a consumption bookmark at a checkpoint cut inside a window.
+Restore replans from that bookmark; the reader does not save an independent cursor
+or restore an old window. See [source coordination](source_coordination.md) for
+the event-driven source-window progress and joint model/optimizer/source checkpoint contract.

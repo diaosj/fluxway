@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import itertools
-from dataclasses import asdict, dataclass
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, replace
+from enum import StrEnum
 from typing import Any, Literal
 
 from fluxway.common.metadata import metadata_digest
 
 
 SplitPolicy = Literal["AtomicItem", "SplittableSpan"]
+
+SYNTHETIC_PAD_IDENTITY: str = "__VIRTUAL_PAD__"
+
+
+class SourceWorkKind(StrEnum):
+    PHYSICAL = "physical"
+    SYNTHETIC_PADDING = "synthetic_padding"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +32,7 @@ class LayoutUnitDescriptor:
     physical_identity: str
     logical_start: int
     opaque_token: str | bytes
+    work_kind: SourceWorkKind = SourceWorkKind.PHYSICAL
 
     def __post_init__(self) -> None:
         _id(self.unit_id, "layout unit id")
@@ -37,6 +47,35 @@ class LayoutUnitDescriptor:
         _id(self.physical_identity, "layout unit physical identity")
         _count(self.logical_start, "layout unit logical start")
         _opaque_token(self.opaque_token)
+        if not isinstance(self.work_kind, SourceWorkKind):
+            raise TypeError("layout unit work kind must be SourceWorkKind")
+
+    def slice(self, offset: int, count: int) -> LayoutUnitDescriptor:
+        _count(offset, "layout slice offset")
+        _count(count, "layout slice count", positive=True)
+        if offset + count > self.cardinality:
+            raise ValueError("layout slice exceeds its source interval")
+        if offset == 0 and count == self.cardinality:
+            return self
+        start = self.logical_start + offset
+        return replace(
+            self,
+            unit_id=metadata_digest(
+                (
+                    self.revision_identity,
+                    self.physical_identity,
+                    self.cardinality_metric,
+                    start,
+                    start + count,
+                )
+            ),
+            logical_start=start,
+            cardinality=count,
+        )
+
+    @property
+    def is_synthetic_padding(self) -> bool:
+        return self.work_kind is SourceWorkKind.SYNTHETIC_PADDING
 
     def canonical_work_interval(self, source_identity: str) -> CanonicalWorkInterval:
         return CanonicalWorkInterval(
@@ -118,20 +157,26 @@ class SourceWorkKey:
         epoch: int,
         step: int,
         source_identity: str,
+        view_identity: str,
         schema_digest: str,
+        lineage_digest: str,
         descriptor: LayoutUnitDescriptor,
         global_start: int,
         global_batch_size: int,
+        global_valid_count: int,
     ) -> SourceWorkKey:
         identity = metadata_digest(
             {
                 "epoch": epoch,
                 "step": step,
                 "source_identity": source_identity,
+                "view_identity": view_identity,
                 "schema_digest": schema_digest,
+                "lineage_digest": lineage_digest,
                 "descriptor": asdict(descriptor),
                 "global_start": global_start,
                 "global_batch_size": global_batch_size,
+                "global_valid_count": global_valid_count,
             }
         )
         return cls(epoch=epoch, step=step, assignment_id=identity)
@@ -142,23 +187,33 @@ class SourceWorkAssignment:
     epoch: int
     step: int
     source_identity: str
+    view_identity: str
     schema_digest: str
+    lineage_digest: str
     descriptor: LayoutUnitDescriptor
     global_start: int
     global_batch_size: int
     key: SourceWorkKey
+    global_valid_count: int
 
     def __post_init__(self) -> None:
         _count(self.epoch, "source assignment epoch")
         _count(self.step, "source assignment step")
         _id(self.source_identity, "source assignment source")
+        _id(self.view_identity, "source assignment view")
         _id(self.schema_digest, "source assignment schema")
+        _id(self.lineage_digest, "source assignment lineage")
         if not isinstance(self.descriptor, LayoutUnitDescriptor):
             raise TypeError("source assignment requires LayoutUnitDescriptor")
         _count(self.global_start, "source assignment global start")
         _count(
             self.global_batch_size, "source assignment global batch size", positive=True
         )
+        _count(self.global_valid_count, "source assignment global valid count")
+        if self.global_valid_count > self.global_batch_size:
+            raise ValueError(
+                "source assignment global valid count exceeds global batch size"
+            )
         if (
             not self.step * self.global_batch_size
             <= self.global_start
@@ -167,6 +222,14 @@ class SourceWorkAssignment:
         ):
             raise ValueError(
                 "source assignment provenance is outside its logical batch"
+            )
+        start = self.batch_relative_global_start
+        end = start + self.descriptor.cardinality
+        if (self.is_synthetic_padding and start < self.global_valid_count) or (
+            not self.is_synthetic_padding and end > self.global_valid_count
+        ):
+            raise ValueError(
+                "source assignment conflicts with global valid count prefix"
             )
         if not isinstance(self.key, SourceWorkKey):
             raise TypeError("source assignment key must be SourceWorkKey")
@@ -182,45 +245,50 @@ class SourceWorkAssignment:
         epoch: int,
         step: int,
         source_identity: str,
+        view_identity: str,
         schema_digest: str,
+        lineage_digest: str,
         descriptor: LayoutUnitDescriptor,
         global_start: int,
         global_batch_size: int,
+        global_valid_count: int,
         key: SourceWorkKey | None = None,
     ) -> SourceWorkAssignment:
-        if key is not None:
-            expected_key = SourceWorkKey.for_provenance(
-                epoch=epoch,
-                step=step,
-                source_identity=source_identity,
-                schema_digest=schema_digest,
-                descriptor=descriptor,
-                global_start=global_start,
-                global_batch_size=global_batch_size,
-            )
-            if key != expected_key:
-                raise ValueError("source assignment key does not match provenance")
-            resolved_key = key
-        else:
-            resolved_key = SourceWorkKey.for_provenance(
-                epoch=epoch,
-                step=step,
-                source_identity=source_identity,
-                schema_digest=schema_digest,
-                descriptor=descriptor,
-                global_start=global_start,
-                global_batch_size=global_batch_size,
-            )
+        resolved_key = SourceWorkKey.for_provenance(
+            epoch=epoch,
+            step=step,
+            source_identity=source_identity,
+            view_identity=view_identity,
+            schema_digest=schema_digest,
+            lineage_digest=lineage_digest,
+            descriptor=descriptor,
+            global_start=global_start,
+            global_batch_size=global_batch_size,
+            global_valid_count=global_valid_count,
+        )
+        if key is not None and key != resolved_key:
+            raise ValueError("source assignment key does not match provenance")
         return cls(
             epoch=epoch,
             step=step,
             source_identity=source_identity,
+            view_identity=view_identity,
             schema_digest=schema_digest,
+            lineage_digest=lineage_digest,
             descriptor=descriptor,
             global_start=global_start,
             global_batch_size=global_batch_size,
             key=resolved_key,
+            global_valid_count=global_valid_count,
         )
+
+    @property
+    def is_synthetic_padding(self) -> bool:
+        return self.descriptor.is_synthetic_padding
+
+    @property
+    def batch_relative_global_start(self) -> int:
+        return self.global_start - self.step * self.global_batch_size
 
     @property
     def interval(self) -> CanonicalWorkInterval:
@@ -248,6 +316,20 @@ class SourceWorkItem:
             raise ValueError("source work interval is outside its assignment")
 
     @property
+    def is_synthetic_padding(self) -> bool:
+        return self.assignment.is_synthetic_padding
+
+    @property
+    def global_valid_count(self) -> int:
+        return self.assignment.global_valid_count
+
+    @property
+    def batch_relative_global_start(self) -> int:
+        return (
+            self.global_start - self.assignment.step * self.assignment.global_batch_size
+        )
+
+    @property
     def key(self) -> SourceWorkKey:
         return self.assignment.key
 
@@ -262,6 +344,44 @@ class SourceWorkItem:
     @property
     def cardinality(self) -> int:
         return self.logical_end - self.logical_start
+
+
+@dataclass(frozen=True, slots=True)
+class _BatchProvenance:
+    epoch: int
+    step: int
+    source_identity: str
+    view_identity: str
+    schema_digest: str
+    lineage_digest: str
+    global_batch_size: int
+    global_valid_count: int
+
+
+def source_work_global_valid_count(work_items: Sequence[SourceWorkItem]) -> int:
+    if not work_items:
+        raise ValueError("global valid count requires source work items")
+    if any(not isinstance(item, SourceWorkItem) for item in work_items):
+        raise TypeError("global valid count requires SourceWorkItem values")
+    provenances = {
+        _BatchProvenance(
+            epoch=item.assignment.epoch,
+            step=item.assignment.step,
+            source_identity=item.assignment.source_identity,
+            view_identity=item.assignment.view_identity,
+            schema_digest=item.assignment.schema_digest,
+            lineage_digest=item.assignment.lineage_digest,
+            global_batch_size=item.assignment.global_batch_size,
+            global_valid_count=item.global_valid_count,
+        )
+        for item in work_items
+    }
+    if len(provenances) != 1:
+        raise ValueError(
+            "source work items have conflicting batch provenance or global valid count"
+        )
+    (single_provenance,) = provenances
+    return single_provenance.global_valid_count
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,5 +486,7 @@ __all__ = [
     "LayoutUnitDescriptor",
     "SourceWorkAssignment",
     "SourceWorkKey",
+    "SourceWorkKind",
+    "source_work_global_valid_count",
     "validate_canonical_work_intervals",
 ]

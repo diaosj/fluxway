@@ -1,14 +1,21 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
+from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types import (
     CheckpointCommitPermit,
     CheckpointCut,
     DrainBoundary,
+    DriverEvent,
     DriverState,
     SpmdCheckpoint,
     TopologySnapshot,
 )
+from fluxway.profiler.record import PAYLOAD_START_COLUMN, TraceArena
+from fluxway.profiler.recorder import TraceRecorder
+from fluxway.profiler.runtime import ProfilerRuntimeFactory
 from fluxway.spmd.driver.snapshot.orchestrator import SnapshotOrchestrator
 from fluxway.spmd.driver.state_machine import DriverStateMachine
 from fluxway.spmd.driver.driver import SPMDDriver
@@ -129,11 +136,12 @@ class _PublicationOrchestrator:
         self.calls.append(("rollback_save", checkpoint_id, permit))
 
 
-def _orchestrator(events, *, state=DriverState.DRAINED):
+def _orchestrator(events, *, state=DriverState.DRAINED, profiler_runtime=None):
     controller = _Controller(events)
     registry = _Registry(events)
     driver = SimpleNamespace(
         spmd_id="reader",
+        _submit_driver_effect=lambda operation, args=(), **_: operation(*args),
         _schedule_driver_component_state=lambda state: events.append(
             ("component_state", state)
         ),
@@ -145,6 +153,9 @@ def _orchestrator(events, *, state=DriverState.DRAINED):
     async def notify(component_state):
         events.append(("component_state", component_state))
 
+    if profiler_runtime is None:
+        profiler_runtime = SimpleNamespace(enabled=False)
+
     return (
         SnapshotOrchestrator(
             spmd_id="reader",
@@ -152,7 +163,7 @@ def _orchestrator(events, *, state=DriverState.DRAINED):
             synchronizer=_Synchronizer(events),
             controller_handle=controller,
             state_machine=state_machine,
-            profiler_runtime=SimpleNamespace(enabled=False),
+            profiler_runtime=profiler_runtime,
             component_registry=registry,
             notify_component_state=notify,
         ),
@@ -196,7 +207,7 @@ def test_snapshot_contains_driver_component_state():
 def test_restore_components_precedes_component_restore():
     events = []
     orchestrator, _, registry = _orchestrator(events, state=DriverState.READY)
-    topology = TopologySnapshot(1, ("data",), (1,), "fluxway-device-mesh-v1")
+    topology = TopologySnapshot(1, ("data",), (1,))
     snapshot = SpmdCheckpoint(
         topology,
         {
@@ -318,3 +329,140 @@ def test_driver_uses_snapshot_publication_protocol_names():
         ("publish_save", "snapshot", permit),
         ("rollback_save", "snapshot", permit),
     ]
+
+
+def test_profiled_driver_snapshot_records_canonical_checkpoint_id():
+    events = []
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=64 * 1024),
+        run_id="test-run",
+        process_name="driver/reader",
+    )
+    profiler_runtime = ProfilerRuntimeFactory(recorder)
+    orchestrator, _, _ = _orchestrator(events, profiler_runtime=profiler_runtime)
+    cut = CheckpointCut.for_position("cut-5", 5)
+
+    asyncio.run(
+        orchestrator.prepare_snapshot(
+            "ckpt-snap-1",
+            "attempt",
+            CheckpointCommitPermit("attempt", 1, b"permit"),
+            cut,
+            "/tmp/repository",
+        )
+    )
+
+    rows = recorder.arena.snapshot()
+    names = [recorder.metadata.name_for(int(row[4])) for row in rows]
+    assert names == ["driver.snapshot"]
+
+    span = rows[0]
+    payload_fields = recorder.metadata.payload_fields_for(int(span[4]))
+    assert payload_fields == ("checkpoint_id", "target_step", "worker_count")
+    assert recorder.metadata.name_for(int(span[PAYLOAD_START_COLUMN])) == "ckpt-snap-1"
+    assert int(span[PAYLOAD_START_COLUMN + 1]) == 5
+    assert int(span[PAYLOAD_START_COLUMN + 2]) == 1
+
+
+def test_prepare_snapshot_requires_position():
+    events = []
+    orchestrator, _, _ = _orchestrator(events)
+    cut = CheckpointCut(cut_id="cut-none", position=None)
+
+    with pytest.raises(ValueError, match="checkpoint cut requires a valid position"):
+        asyncio.run(
+            orchestrator.prepare_snapshot(
+                "ckpt-snap-none",
+                "attempt",
+                CheckpointCommitPermit("attempt", 1, b"permit"),
+                cut,
+                "/tmp/repository",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("source_workers", "target_workers"),
+    [(2, 2), (2, 4)],
+)
+def test_profiled_driver_restore_same_and_resized_topology(
+    source_workers, target_workers
+):
+    checkpoint_id = f"ckpt-restore-{source_workers}-to-{target_workers}"
+    events = []
+    restore_calls = []
+
+    async def restore_dispatch(*args):
+        restore_calls.append(args)
+
+    driver = SimpleNamespace(
+        spmd_id="reader",
+        _submit_driver_effect=lambda op, args=(), **_: op(*args),
+        _schedule_driver_component_state=lambda s: events.append(
+            ("component_state", s)
+        ),
+        _report_error=lambda f: events.append(("driver_error", f)),
+    )
+    machine = DriverStateMachine(driver)
+    machine.require_transition(DriverEvent.INIT_COMPLETE)
+
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=64 * 1024),
+        run_id="test-run",
+        process_name="driver/reader",
+    )
+    profiler_runtime = ProfilerRuntimeFactory(recorder)
+
+    topology = TopologySnapshot(
+        world_size=source_workers,
+        mesh_axis_names=("dp",),
+        mesh_axis_shapes=(source_workers,),
+    )
+    view = SimpleNamespace(
+        world_size=target_workers,
+        mesh=DeviceMesh(("dp",), (target_workers,)),
+    )
+    executor = SimpleNamespace(
+        get_worker_handles=lambda: dict.fromkeys(range(target_workers)),
+        checkpoint_restore=restore_dispatch,
+        config=SimpleNamespace(require_graph_view=lambda: view),
+    )
+    registry = _Registry(events)
+    sync = _Synchronizer(events)
+
+    async def notify(s):
+        events.append(("component_state", s))
+
+    orchestrator = SnapshotOrchestrator(
+        spmd_id="reader",
+        executor=executor,
+        synchronizer=sync,
+        controller_handle=None,
+        state_machine=machine,
+        profiler_runtime=profiler_runtime,
+        component_registry=registry,
+        notify_component_state=notify,
+    )
+
+    cut = CheckpointCut.for_position("cut-111", 111)
+    snapshot = SpmdCheckpoint(source_topology=topology, runtime_state={}, components={})
+
+    asyncio.run(
+        orchestrator.restore_from_manifest(
+            checkpoint_id, cut, snapshot, "/tmp/repository"
+        )
+    )
+
+    assert len(restore_calls) == 1
+    assert restore_calls[0][1] == checkpoint_id
+    assert machine.state is DriverState.READY
+
+    rows = recorder.arena.snapshot()
+    names = [recorder.metadata.name_for(int(row[4])) for row in rows]
+    assert names == ["driver.restore"]
+
+    span = rows[0]
+    payload_fields = recorder.metadata.payload_fields_for(int(span[4]))
+    assert payload_fields == ("checkpoint_id", "worker_count")
+    assert recorder.metadata.name_for(int(span[PAYLOAD_START_COLUMN])) == checkpoint_id
+    assert int(span[PAYLOAD_START_COLUMN + 1]) == target_workers

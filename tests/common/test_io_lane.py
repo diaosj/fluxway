@@ -206,3 +206,40 @@ async def test_lane_rejects_a_different_caller_loop():
             await foreign.call(lane.call, lambda: None)
     finally:
         await asyncio.gather(lane.close(), foreign.close())
+
+
+@pytest.mark.asyncio
+async def test_delayed_lane_call_keeps_event_loop_progress_and_backpressure():
+    loop = asyncio.get_running_loop()
+    entered = loop.create_future()
+    release = Event()
+    lane = IOLane("test-heartbeat-backpressure", capacity=1)
+    heartbeats = 0
+    heartbeat_running = True
+
+    async def heartbeat() -> None:
+        nonlocal heartbeats
+        while heartbeat_running:
+            heartbeats += 1
+            await asyncio.sleep(0)
+
+    def delayed_write() -> None:
+        loop.call_soon_threadsafe(entered.set_result, None)
+        release.wait()
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    first = asyncio.create_task(lane.call(delayed_write))
+    second = asyncio.create_task(lane.call(lambda: None))
+    try:
+        await asyncio.wait_for(asyncio.shield(entered), 2)
+        await asyncio.sleep(0.01)
+        assert heartbeats > 0
+        assert not second.done()
+    finally:
+        heartbeat_running = False
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        release.set()
+        await first
+        await second
+        await lane.close()

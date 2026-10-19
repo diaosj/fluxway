@@ -44,6 +44,9 @@ def _failure(
 def _running_fsm() -> tuple[DriverStateMachine, MagicMock]:
     driver = MagicMock()
     driver.spmd_id = "dense"
+    driver._submit_driver_effect.side_effect = (
+        lambda operation, args=(), **_: operation(*args)
+    )
     fsm = DriverStateMachine(driver)
     assert fsm.trigger(DriverEvent.INIT_COMPLETE)
     assert fsm.trigger(DriverEvent.START)
@@ -73,6 +76,7 @@ def _driver() -> tuple[Any, MagicMock]:
     assert driver.state_machine.trigger(DriverEvent.INIT_COMPLETE)
     assert driver.state_machine.trigger(DriverEvent.START)
     assert driver.state_machine.trigger(DriverEvent.ACTIVATION_COMPLETE)
+    driver._submit_driver_effect = lambda operation, args=(), **_: operation(*args)
     return driver, controller
 
 
@@ -113,6 +117,9 @@ def test_worker_failure_fails_driver_before_running(
 ) -> None:
     driver = MagicMock()
     driver.spmd_id = "dense"
+    driver._submit_driver_effect.side_effect = (
+        lambda operation, args=(), **_: operation(*args)
+    )
     fsm = DriverStateMachine(driver)
     if initial_state is DriverState.READY:
         assert fsm.trigger(DriverEvent.INIT_COMPLETE)

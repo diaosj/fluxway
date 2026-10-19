@@ -27,4 +27,9 @@ assert "placement_recipe" in signature(start).parameters
 
 每一个解析出的 NodeID 都会收到一个复合的 placement-group bundle，由 Ray 的 `ray.io/node-id` 标签选择器固定。IP 地址不能代替节点的身份。具体化过程（materializer）保留规划器分配的 CPU、GPU 和自定义加速器资源；Worker 验证它们实际所在的节点是否符合规划。请通过资源分布和 recipe 约束来描述硬件差异。对于可恢复的多节点作业，需在所有节点上使用兼容的软件和共享的 checkpoint 存储。
 
-有关求解器语义，请参阅 [placement_mathematics_zh.md](placement_mathematics_zh.md)；详细的并行说明请见其它内部参考。
+有关求解器语义，请参阅 [placement_mathematics_zh.md](placement_mathematics_zh.md)。
+
+## 动态运行时资源与 ResourceRegistry
+
+静态硬件配额（如 CPU、GPU、加速器、内存容量）由各 SPMD 的 `ResourceProfile` 声明；而运行期绑定的动态资源（如动态路由表、设备网格实例或运行时 Rank Provider）由 `ResourceRegistry`（`fluxway.common.resource_registry`）统一管理。
+算子与分片策略通过 `ResourceHandle(namespace=..., resource_id=...)` 声明对这些资源的引用，在通过 `bind_resource_registry` 或 `set_active_resource_registry` 激活的注册表上下文中动态解析，避免在 Placement 规划阶段硬编码底层物理实例。

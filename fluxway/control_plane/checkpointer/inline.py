@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import copy
 import inspect
-import msgpack
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
+from fluxway.common import msgpack_codec
 from fluxway.common.types.checkpoint import (
     CheckpointComponentPublication,
     CheckpointObjectRecord,
     CheckpointRuntime,
     CheckpointRuntimeRole,
     CheckpointComponentSpec,
+    CheckpointCommitPermit,
     SaveSession,
     CommitSaveSession,
     RestoreSession,
@@ -79,7 +80,6 @@ class StateCheckpointComponent(
     ) -> None:
         self._descriptor = CheckpointComponentSpec(
             component_id=component_id,
-            format_version=1,
             checkpoint_objects=(),
             save=CheckpointSaveSpec(
                 prepare_scope=CheckpointSaveScope.LEADER,
@@ -143,7 +143,7 @@ class StateCheckpointComponent(
         validate_checkpoint_value(state, "inline_checkpoint_state")
         return WorkerSaveResult(
             record=CheckpointObjectRecord(
-                payload=msgpack.packb(state, use_bin_type=True)
+                payload=msgpack_codec.packb(state, use_bin_type=True)
             )
         )
 
@@ -173,7 +173,6 @@ class StateCheckpointComponent(
             )
         return CheckpointComponentPublication(
             component_id=self.descriptor.component_id,
-            format_version=self.descriptor.format_version,
             partitions=tuple(partitions),
         )
 
@@ -184,6 +183,13 @@ class StateCheckpointComponent(
     async def publish_save(self, session: SaveSession) -> None:
         self._require_permit(session, session.commit_permit)
         self._require_worker_runtime(session)
+
+    async def abort_save(self, permit: CheckpointCommitPermit) -> None:
+        # Inline state has no owner storage outside the global manifest.
+        self._require_control()
+
+    async def acknowledge_save(self, permit: CheckpointCommitPermit) -> None:
+        self._require_control()
 
     async def restore(self, session: RestoreSession) -> None:
         self._require_worker_runtime(session)
@@ -238,7 +244,7 @@ class StateCheckpointComponent(
                     f"inline checkpoint partition not found: {partition_key!r}"
                 )
             selected = matches[0]
-        state = copy.deepcopy(msgpack.unpackb(selected.record.payload, raw=False))
+        state = copy.deepcopy(msgpack_codec.unpackb(selected.record.payload, raw=False))
         await self._restore_state(session.instance, state, session)
 
     async def close(self) -> None:
@@ -247,6 +253,13 @@ class StateCheckpointComponent(
                 f"inline component {self.descriptor.component_id!r} is not open"
             )
         self._runtime = None
+
+    def _require_control(self) -> None:
+        if (
+            self._runtime is None
+            or self._runtime.role is not CheckpointRuntimeRole.CONTROL
+        ):
+            raise RuntimeError("inline checkpoint operations require a control runtime")
 
     def _require_worker_runtime(
         self, context: SaveSession | RestoreSession

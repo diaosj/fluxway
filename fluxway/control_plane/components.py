@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -197,13 +198,16 @@ class _ComponentRegistry:
         return await self.dispatch_request(dispatchable[0].component_id, request)
 
     async def notify_state(self, state: ComponentState) -> None:
+        notifications = []
         for component in tuple(self._components.values()):
             result = component.on_state(state)
             if not inspect.isawaitable(result):
                 raise TypeError(
                     f"component {component.component_id!r} on_state must be awaitable"
                 )
-            await result
+            notifications.append(result)
+        if notifications:
+            await asyncio.gather(*notifications)
 
     def checkpoint_state(self, cut: CheckpointCut) -> dict[str, dict[str, Any]]:
         if not isinstance(cut, CheckpointCut):

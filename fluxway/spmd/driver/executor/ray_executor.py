@@ -3,6 +3,8 @@ from typing import Any
 from collections.abc import Mapping
 
 import ray
+
+# pyrefly: ignore[missing-import]
 from ray.runtime_env import RuntimeEnv
 
 # pyrefly: ignore [missing-import]
@@ -19,6 +21,7 @@ from fluxway.common.types import (
     WorkerSaveResult,
     SPMDConfig,
     TopologySnapshot,
+    RestoreOptionsByRank,
 )
 from fluxway.common.driver_control import (
     DriverControlRequest,
@@ -374,13 +377,14 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
             )
         )
 
-    async def checkpoint_publish_save(self) -> None:
-        await asyncio.gather(
+    async def checkpoint_publish_save(self) -> bool:
+        results = await asyncio.gather(
             *(
                 worker.checkpoint_publish_save.remote()
                 for worker in self._worker_handles.values()
             )
         )
+        return any(results)
 
     async def checkpoint_restore(
         self,
@@ -391,7 +395,17 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
         current_topology: TopologySnapshot,
         runtime_state: Mapping[str, Any],
         publications: Mapping[str, CheckpointComponentPublication],
+        restore_options_by_rank: RestoreOptionsByRank | None = None,
     ) -> None:
+        if restore_options_by_rank is not None:
+            unknown_ranks = set(restore_options_by_rank).difference(
+                self._worker_handles
+            )
+            if unknown_ranks:
+                raise ValueError(
+                    "restore_options_by_rank contains unknown worker ranks: "
+                    f"{sorted(unknown_ranks)!r}"
+                )
         tasks = [
             worker.checkpoint_restore.remote(
                 repository_root,
@@ -401,8 +415,11 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
                 current_topology,
                 runtime_state,
                 publications,
+                None
+                if restore_options_by_rank is None
+                else restore_options_by_rank.get(rank),
             )
-            for worker in self._worker_handles.values()
+            for rank, worker in self._worker_handles.items()
         ]
         await asyncio.gather(*tasks)
 

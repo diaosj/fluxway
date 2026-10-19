@@ -13,13 +13,21 @@ import asyncio
 import types
 from unittest.mock import AsyncMock, Mock
 
+import numpy as np
 import pytest
 
 from fluxway.common.allocation import AllocationRegistry
-from fluxway.common.coherence import CoherenceDirectory, ExecutionFenceState
+from fluxway.common.coherence import (
+    CoherenceDirectory,
+    CoherenceInstance,
+    CoherenceSubject,
+    ExecutionFenceState,
+)
+from fluxway.common.types.tensor import TransportTensor
 from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.spmd.worker.coherence_sequencer import CoherenceSequencer
 from fluxway.spmd.worker.lifecycle import WorkerExecutionLifecycle
+from fluxway.spmd.worker.source_scope import SourceExecutionScope
 from fluxway.spmd.worker.worker import LocalInputPrepareRuntime, SPMDWorker as _ActorCls
 
 
@@ -61,6 +69,12 @@ def _make_worker_stub():
         _allocation_registry=AllocationRegistry(),
         _checkpoint_coordinator=None,
         _checkpoint_repository_root=None,
+        _source_scope=SourceExecutionScope(
+            acquire=AsyncMock(),
+            spawn=asyncio.create_task,
+            completed=lambda _operator: 0,
+            depth=lambda _operator: 1,
+        ),
     )
     stub._execution_lifecycle.topology_ready()
     stub._execution_lifecycle.activate()
@@ -132,6 +146,39 @@ class TestStopWakesDrainCondition:
         await stub.stop()
 
         assert stub._drain_step_count is None
+
+    @pytest.mark.asyncio
+    async def test_stop_after_prior_coherence_fence_does_not_double_cleanup(self):
+        stub = _make_worker_stub()
+        instance = CoherenceInstance(CoherenceSubject(1, 0, 101), 0)
+        tensor = TransportTensor(np.arange(2, dtype=np.int64))
+        tensor._bind_coherence_instances((instance,))
+        tensor._bind_consumer_lease_owner(stub._coherence_sequencer)
+        stub._coherence_sequencer.issue_intent(instance)
+        reservation_ready = asyncio.Event()
+
+        async def retire(_instances, _payload):
+            tensor._consumer_lease_reservation_ref = (
+                stub._coherence_sequencer.reserve_consumer_lease((instance,))
+            )
+            reservation_ready.set()
+            await asyncio.Event().wait()
+
+        stub._coherence_sequencer._retire_payload = retire
+        delivery = asyncio.create_task(
+            stub._coherence_sequencer.commit_payload((instance,), object())
+        )
+        stub._coherence_sequencer.close_intent(instance)
+        await reservation_ready.wait()
+        stub._coherence_input_tensors = {("op", 0): {tensor}}
+
+        user_operator_failure = RuntimeError("user operator failed")
+        stub._coherence_sequencer.fence(user_operator_failure)
+        await stub.stop()
+        assert tensor._runtime_state.name == "RELEASED"
+        assert stub._coherence_sequencer._fenced_error is user_operator_failure
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
 
     @pytest.mark.asyncio
     async def test_stop_sets_running_false(self):

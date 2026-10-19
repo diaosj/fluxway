@@ -4,8 +4,10 @@ Core data type definitions for Fluxway framework.
 Based on ARCHITECTURE.md sections 2.1.1, 3.2.1, 4.2, 4.3
 """
 
-from typing import Any, Annotated, TypeVar
 import os
+from enum import StrEnum
+from typing import Annotated, Any, TypeVar
+
 from pydantic import ConfigDict, Field, model_validator
 
 from fluxway.common.compiled_graph import (
@@ -13,14 +15,11 @@ from fluxway.common.compiled_graph import (
     DependencySpec,
     SPMDGraphView,
 )
-from fluxway.common.schema import FluxwayBaseSchema
 from fluxway.common.operator_spec import OperatorSpec
-from fluxway.common.types.failure import ExecutionFailure
+from fluxway.common.schema import FluxwayBaseSchema
 from fluxway.common.types.checkpoint import CheckpointRetentionPolicy
+from fluxway.common.types.failure import ExecutionFailure
 from fluxway.resources import ResourceProfile
-
-
-from enum import StrEnum
 
 T = TypeVar("T")
 
@@ -32,13 +31,9 @@ DEFAULT_INACTIVITY_TIMEOUT_SECS: float = 600.0
 class DataFlow:
     """Marker for Worker-to-Worker (Data Plane) transport. Supports sharding."""
 
-    pass
-
 
 class ControlFlow:
     """Marker for Driver-to-Driver (Control Plane) transport. Broadcast to all workers."""
-
-    pass
 
 
 # User-facing type aliases
@@ -151,6 +146,8 @@ class SPMDConfig(FluxwayBaseSchema):
     data_plane_max_in_flight: int = 50
 
     heartbeat_interval_s: float = 5.0
+    # Diagnostic only. A quiet progress interval must not affect liveness.
+    execution_progress_warning_s: float = 90.0
     heartbeat_timeout_s: float = 90.0
 
     # Optional profiler runtime configuration. ``None`` is the zero-overhead path:
@@ -370,17 +367,14 @@ class NodeView(FluxwayBaseSchema):
         TODO: Handle node eviction and recovery
         TODO: Implement retry mechanism
         """
-        pass
 
     def update_handle_mapping(self, logical_id: str, actual_handle: ActualHandle):
         """Update handle mapping when node changes."""
         # TODO: Implement mapping update
-        pass
 
     def handle_node_eviction(self, spmd_id: str):
         """Handle node eviction and trigger recovery."""
         # TODO: Implement eviction handling
-        pass
 
 
 # =============================================================================
@@ -407,6 +401,19 @@ class WorkerStatus(StrEnum):
     RUNNING = "running"
     BLOCKED = "blocked"
     ERROR = "error"
+
+
+class ExecutionWaitState(StrEnum):
+    """Worker execution wait classification for diagnostics only."""
+
+    IDLE = "idle"
+    OPERATOR_EXECUTION_ACTIVE = "operator_execution_active"
+    OPERATOR_ADMISSION_WAIT = "operator_admission_wait"
+    SOURCE_ADMISSION_WAIT = "source_admission_wait"
+    OUTBOUND_TRANSPORT_WAIT = "outbound_transport_wait"
+    INPUT_PREPARE_WAIT = "input_prepare_wait"
+    EXECUTION_QUEUE_WAIT = "execution_queue_wait"
+    COMPLETION_BARRIER_OR_DRIVER_WAIT = "completion_barrier_or_driver_wait"
 
 
 class CheckpointActivityPhase(StrEnum):
@@ -522,6 +529,19 @@ class WorkerHeartbeat(_FailureHeartbeat[WorkerStatus]):
     checkpoint_progress_timestamp: float = 0.0
     checkpoint_id: str | None = None
     checkpoint_completed_units: int = 0
+    # Opaque execution metadata for cross-framework diagnostics. Fluxway records
+    # it and never interprets framework-specific phases or compilation states.
+    execution_generation: int = 0
+    execution_operator: str | None = None
+    execution_step: int | None = None
+    execution_epoch: int = 0
+    execution_sequence: int = 0
+    execution_in_flight: bool = False
+    execution_phase: str | None = None
+    execution_phase_age_s: float = 0.0
+    execution_activity_age_s: float = 0.0
+    committed_progress_age_s: float = 0.0
+    execution_wait_state: ExecutionWaitState = ExecutionWaitState.IDLE
 
 
 class DriverHeartbeat(_FailureHeartbeat[DriverStatus]):
@@ -555,26 +575,32 @@ class HeartbeatConfig(FluxwayBaseSchema):
 
 
 DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS: int = 100
+DEFAULT_SOURCE_PLANNING_WINDOW_STEPS: int = 100
+DEFAULT_SOURCE_MAX_PLANNING_RECORDS: int = 1_000_000
+DEFAULT_SOURCE_MAX_PLANNING_UNITS: int = 100_000
+DEFAULT_SOURCE_MAX_PLANNING_DESCRIPTOR_BYTES: int = 64 * 1024 * 1024
 
 
 class SourceControlConfig(FluxwayBaseSchema):
     """Configuration for bounded logical source work acquisition."""
 
-    max_in_flight_steps: int = DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS
-    max_planning_units: int = 100_000
-    max_planning_descriptor_bytes: int = 64 * 1024 * 1024
+    model_config = ConfigDict(extra="forbid")
 
-    @model_validator(mode="after")
-    def _validate_source_control_config(self) -> "SourceControlConfig":
-        if self.max_in_flight_steps < 1:
-            raise ValueError("source_control max_in_flight_steps must be positive")
-        if self.max_planning_units < 1:
-            raise ValueError("source_control max_planning_units must be positive")
-        if self.max_planning_descriptor_bytes < 1:
-            raise ValueError(
-                "source_control max_planning_descriptor_bytes must be positive"
-            )
-        return self
+    max_in_flight_steps: int = Field(
+        default=DEFAULT_SOURCE_MAX_IN_FLIGHT_STEPS, gt=0, strict=True
+    )
+    planning_window_steps: int = Field(
+        default=DEFAULT_SOURCE_PLANNING_WINDOW_STEPS, gt=0, strict=True
+    )
+    max_planning_records: int = Field(
+        default=DEFAULT_SOURCE_MAX_PLANNING_RECORDS, gt=0, strict=True
+    )
+    max_planning_units: int = Field(
+        default=DEFAULT_SOURCE_MAX_PLANNING_UNITS, gt=0, strict=True
+    )
+    max_planning_descriptor_bytes: int = Field(
+        default=DEFAULT_SOURCE_MAX_PLANNING_DESCRIPTOR_BYTES, gt=0, strict=True
+    )
 
 
 class CheckpointConfig(FluxwayBaseSchema):

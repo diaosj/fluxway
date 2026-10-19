@@ -26,8 +26,10 @@ Reader provenance; dispatcher rank is not an ownership cursor. ACKs use the
 bounded `SourceAcknowledgementRuntime` queue and flush during checkpoint drain.
 This removes synchronous per-ACK waits below queue capacity, but acquisition RPC
 latency remains on a grant cache miss. Worker source scopes accept contiguous
-immutable windows after installation. Automatic adapter discovery/refill is outside
-the startup API; see [source coordination](source_coordination.md).
+immutable windows after installation. The startup API starts the source lifecycle;
+the controller's event-driven `SourceProgressSupervisor` performs adapter scans and
+window refill, while the adapter itself does not own refill. See [source
+coordination](source_coordination.md).
 
 Grant batch size depends on the source credit window as well as pipeline depth.
 If a Reader executes once every `L` logical steps and credit covers `C` consecutive

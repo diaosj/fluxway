@@ -418,6 +418,94 @@ async def test_perfetto_writer_rejects_missing_operator_symbol(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_perfetto_writer_allows_optional_execution_phase_operator_id(tmp_path):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    symbols = GraphTraceSymbols.from_compiled_graph(_graph())
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=RECORD_WIDTH * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/TrainMetrics/rank:0",
+    )
+    recorder.execution_phase(
+        phase="execution.activate",
+        op_name=None,
+        step=None,
+        epoch=0,
+        sequence=1,
+        execution_generation=1,
+    )
+
+    output = tmp_path / "execution-phase.pftrace"
+    PerfettoTraceWriter().write(
+        recorder.arena.snapshot(),
+        output,
+        metadata=recorder.metadata,
+        graph_symbols=symbols,
+    )
+    assert output.is_file()
+
+
+@pytest.mark.asyncio
+async def test_perfetto_writer_uses_controller_execution_phase_track(tmp_path):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    symbols = GraphTraceSymbols.from_compiled_graph(_graph())
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=RECORD_WIDTH * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="controller",
+    )
+    recorder.controller_execution_phase(
+        phase="activation.publish",
+        op_name="read",
+        step=0,
+        epoch=0,
+        sequence=1,
+        execution_generation=1,
+    )
+
+    output = tmp_path / "controller-execution-phase.pftrace"
+    PerfettoTraceWriter().write(
+        recorder.arena.snapshot(),
+        output,
+        metadata=recorder.metadata,
+        graph_symbols=symbols,
+    )
+    assert output.is_file()
+
+
+@pytest.mark.asyncio
+async def test_perfetto_writer_rejects_unknown_spmd_execution_phase_operator(
+    tmp_path,
+):
+    if importlib.util.find_spec("perfetto") is None:
+        pytest.skip("perfetto is not installed")
+    symbols = GraphTraceSymbols.from_compiled_graph(_graph())
+    recorder = TraceRecorder(
+        TraceArena(buffer_bytes=RECORD_WIDTH * np.dtype(np.int64).itemsize),
+        run_id="run",
+        process_name="worker/target/rank:0",
+    )
+    recorder.execution_phase(
+        phase="operator.invocation.begin",
+        op_name="missing",
+        step=0,
+        epoch=0,
+        sequence=1,
+        execution_generation=1,
+    )
+
+    with pytest.raises(MissingGraphTraceSymbol, match="missing"):
+        PerfettoTraceWriter().write(
+            recorder.arena.snapshot(),
+            tmp_path / "unknown-spmd-execution-phase.pftrace",
+            metadata=recorder.metadata,
+            graph_symbols=symbols,
+        )
+
+
+@pytest.mark.asyncio
 async def test_graph_annotation_resolver_rejects_trace_graph_mismatch():
     graph = _graph()
     symbols = GraphTraceSymbols.from_compiled_graph(graph)

@@ -1,10 +1,14 @@
 """Local lifecycle transitions coordinated by ExecutionLifecycle."""
 
 import asyncio
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING
 
 from fluxway.common.types import ControllerEvent, ControllerState, ExecutionFailure
 from fluxway.common.utils.logging import get_logger
+from fluxway.control_plane.state_machine.controller_transitions import (
+    ControllerEffect,
+    plan_controller_transition,
+)
 
 if TYPE_CHECKING:
     from fluxway.control_plane.controller import ControllerActor
@@ -20,127 +24,6 @@ class ControllerStateMachine:
     and driver reports. Supports async callbacks for Ray Actor.
     """
 
-    # State transition table: (current_state, event) -> next_state
-    _TRANSITIONS: ClassVar[
-        dict[tuple[ControllerState, ControllerEvent], ControllerState]
-    ] = {
-        # --- Event-driven initialization flow ---
-        (
-            ControllerState.INITIALIZING,
-            ControllerEvent.INIT_COMPLETE,
-        ): ControllerState.PENDING,
-        (
-            ControllerState.INITIALIZING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.PENDING,
-            ControllerEvent.ALL_DRIVERS_READY,
-        ): ControllerState.TOPOLOGY_REGISTERING,
-        (
-            ControllerState.TOPOLOGY_REGISTERING,
-            ControllerEvent.ALL_SPMDS_TOPOLOGY_READY,
-        ): ControllerState.READY,
-        (
-            ControllerState.READY,
-            ControllerEvent.START,
-        ): ControllerState.ACTIVATING,
-        (
-            ControllerState.ACTIVATING,
-            ControllerEvent.ACTIVATION_COMPLETE,
-        ): ControllerState.RUNNING,
-        (ControllerState.RUNNING, ControllerEvent.RESUME): ControllerState.RESUMING,
-        (
-            ControllerState.RESUMING,
-            ControllerEvent.ACTIVATION_COMPLETE,
-        ): ControllerState.RUNNING,
-        (
-            ControllerState.ACTIVATING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.RESUMING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.COMPLETING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        # --- Normal operation ---
-        (
-            ControllerState.RUNNING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.RUNNING,
-            ControllerEvent.ALL_DRIVERS_COMPLETED,
-        ): ControllerState.COMPLETING,
-        (
-            ControllerState.TOPOLOGY_REGISTERING,
-            ControllerEvent.ALL_DRIVERS_COMPLETED,
-        ): ControllerState.COMPLETING,
-        (
-            ControllerState.COMPLETING,
-            ControllerEvent.CLEANUP_FINISHED,
-        ): ControllerState.COMPLETED,
-        (
-            ControllerState.FAILING,
-            ControllerEvent.CLEANUP_FINISHED,
-        ): ControllerState.FAILED,
-        (
-            ControllerState.COMPLETING,
-            ControllerEvent.CLEANUP_FAILED,
-        ): ControllerState.FAILED,
-        (
-            ControllerState.FAILING,
-            ControllerEvent.CLEANUP_FAILED,
-        ): ControllerState.FAILED,
-        # Errors during init phases
-        (
-            ControllerState.PENDING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.TOPOLOGY_REGISTERING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.READY,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.FAILING,
-    }
-
-    _TRANSITIONS.update(
-        {
-            (state, ControllerEvent.CANCEL): ControllerState.CANCELLING
-            for state in (
-                ControllerState.INITIALIZING,
-                ControllerState.PENDING,
-                ControllerState.TOPOLOGY_REGISTERING,
-                ControllerState.READY,
-                ControllerState.ACTIVATING,
-                ControllerState.RESUMING,
-                ControllerState.RUNNING,
-            )
-        }
-    )
-    _TRANSITIONS.update(
-        {
-            (
-                ControllerState.CANCELLING,
-                ControllerEvent.CLEANUP_FINISHED,
-            ): ControllerState.CANCELLED,
-            (
-                ControllerState.CANCELLING,
-                ControllerEvent.CLEANUP_FAILED,
-            ): ControllerState.FAILED,
-            (
-                ControllerState.CANCELLING,
-                ControllerEvent.DRIVER_ERROR,
-            ): ControllerState.FAILING,
-        }
-    )
-
     def __init__(self, controller: "ControllerActor"):  # type: ignore
         """
         Initialize ControllerStateMachine.
@@ -150,6 +33,7 @@ class ControllerStateMachine:
         """
         self._controller = controller
         self._state = ControllerState.INITIALIZING
+        self._state_revision = 0
         self._lock = asyncio.Lock()
         self._terminal_event = asyncio.Event()
 
@@ -159,6 +43,11 @@ class ControllerStateMachine:
     def state(self) -> ControllerState:
         """Get current state (sync access for simple reads)."""
         return self._state
+
+    @property
+    def state_revision(self) -> int:
+        """Monotonic version of the committed Controller state."""
+        return self._state_revision
 
     async def trigger_event(self, event: ControllerEvent, **kwargs) -> bool:
         """
@@ -173,49 +62,70 @@ class ControllerStateMachine:
         Returns:
             True if transition occurred, False otherwise
         """
+        transition = None
+        failure_to_log: ExecutionFailure | None = None
         async with self._lock:
             current = self._state
-            if (
+            repeated_failure = (
                 current is ControllerState.FAILING
                 and event is ControllerEvent.DRIVER_ERROR
-            ):
+            )
+            if repeated_failure:
                 self._record_driver_failure(kwargs)
-                return True
-            key = (current, event)
-
-            if key not in self._TRANSITIONS:
+                failure_to_log = kwargs["failure"]
+            else:
+                transition = plan_controller_transition(current, event)
+            if not repeated_failure and transition is None:
                 logger.warning(
-                    f"Invalid state transition: {current} + {event}. Ignoring event."
+                    "Invalid state transition: %s + %s. Ignoring event.",
+                    current,
+                    event,
                 )
                 return False
-            next_state = self._TRANSITIONS[key]
+            if repeated_failure:
+                next_state = current
+            else:
+                next_state = transition.target_state
 
-            if event == ControllerEvent.DRIVER_ERROR:
+            if not repeated_failure and event == ControllerEvent.DRIVER_ERROR:
                 self._record_driver_failure(kwargs)
-            elif event == ControllerEvent.CLEANUP_FAILED:
+                failure_to_log = kwargs["failure"]
+            elif not repeated_failure and event == ControllerEvent.CLEANUP_FAILED:
                 self._record_reclaim_failure(kwargs)
+                failure_to_log = kwargs["failure"]
 
             # Perform state transition
             old_state = self._state
             self._state = next_state
+            self._state_revision += 1
             if next_state in (
                 ControllerState.COMPLETED,
                 ControllerState.FAILED,
                 ControllerState.CANCELLED,
             ):
                 self._terminal_event.set()
-            profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
-            if profiler_runtime is not None and profiler_runtime.enabled:
-                profiler_runtime.recorder.controller_fsm_transition(
-                    from_state=old_state.name,
-                    event=event.name,
-                    to_state=next_state.name,
-                )
-            logger.debug(
-                f"State transition: {old_state} -> {next_state} (event: {event})"
-            )
+        if transition is None:
+            if failure_to_log is not None:
+                logger.error("Controller error: %s", failure_to_log)
+            return True
 
-        await self._controller._execution_lifecycle.enter_state(next_state)
+        profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
+        if profiler_runtime is not None and profiler_runtime.enabled:
+            profiler_runtime.recorder.controller_fsm_transition(
+                from_state=old_state.name,
+                event=event.name,
+                to_state=next_state.name,
+            )
+        logger.debug(
+            "State transition: %s -> %s (event: %s)", old_state, next_state, event
+        )
+        if failure_to_log is not None:
+            logger.error("Controller error: %s", failure_to_log)
+
+        if transition.effect is ControllerEffect.BEGIN_TERMINAL_CLEANUP:
+            self._controller._execution_lifecycle.begin_terminal_cleanup(next_state)
+        else:
+            await self._controller._execution_lifecycle.enter_state(next_state)
         return True
 
     def get_state(self) -> ControllerState:
@@ -267,7 +177,6 @@ class ControllerStateMachine:
                 f"{spmd_id!r} != {failure.spmd_id!r}"
             )
         self._failures[spmd_id] = failure
-        logger.error(f"Controller error: {failure}")
 
     def _record_reclaim_failure(self, event_data: dict) -> None:
         failure = event_data.get("failure")
@@ -278,12 +187,12 @@ class ControllerStateMachine:
                 "CLEANUP_FAILED requires controller/CONTROLLER_CLEANUP identity."
             )
         self._failures[failure.spmd_id] = failure
-        logger.error(f"Controller reclaim error: {failure}")
 
     async def reset(self) -> None:
         """Reset state machine to initial state."""
         async with self._lock:
             self._state = ControllerState.INITIALIZING
+            self._state_revision = 0
             self._failures.clear()
             self._terminal_event.clear()
         logger.debug("Controller state machine reset")

@@ -48,10 +48,21 @@ class _SourceDescriptor:
     def build_component(self, context):
         raise AssertionError("descriptor is not built in this worker unit test")
 
-    def build_reader_topology(self, *, spmd_id, operator_name, config):
+    def _build_reader_topology(self, *, spmd_id, operator_name, config):
         raise AssertionError(
             "build_reader_topology is not called in this worker unit test"
         )
+
+    def _build_source_scan_adapter(self, **kwargs):
+        raise AssertionError(
+            "scan result adapter is not called in this worker unit test"
+        )
+
+    def _build_source_scan_tail_layout(self, **kwargs):
+        raise AssertionError("tail policy is not called in this worker unit test")
+
+    def build_source_scan_binding(self, **kwargs):
+        raise AssertionError("source binding is not called in this worker unit test")
 
 
 @pytest.mark.asyncio

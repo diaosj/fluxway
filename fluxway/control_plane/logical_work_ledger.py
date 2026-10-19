@@ -66,7 +66,35 @@ class LogicalWorkEpoch:
             range(self.start_step, self.end_step)
         ):
             raise ValueError("logical epoch must cover every step")
-        validate_canonical_work_intervals(tuple(value.interval for value in values))
+        by_step: dict[int, list[SourceWorkAssignment]] = defaultdict(list)
+        for value in values:
+            by_step[value.step].append(value)
+        for step, assignments in by_step.items():
+            batches = {value.global_batch_size for value in assignments}
+            valid_count = sum(
+                value.descriptor.cardinality
+                for value in assignments
+                if not value.is_synthetic_padding
+            )
+            if len(batches) != 1 or any(
+                value.global_valid_count != valid_count for value in assignments
+            ):
+                raise ValueError(
+                    "logical epoch global valid count conflicts with source work"
+                )
+            (batch,) = batches
+            cursor = step * batch
+            for value in sorted(assignments, key=lambda item: item.global_start):
+                if value.global_start != cursor:
+                    raise ValueError(
+                        "logical epoch assignments must cover one contiguous batch"
+                    )
+                cursor += value.descriptor.cardinality
+            if cursor != (step + 1) * batch:
+                raise ValueError("logical epoch assignments must fill the global batch")
+        validate_canonical_work_intervals(
+            tuple(value.interval for value in values if not value.is_synthetic_padding)
+        )
         if not self.digest:
             raise ValueError("logical epoch digest must be non-empty")
 
@@ -134,6 +162,10 @@ class LogicalWorkLedger:
     def committed_cut(self) -> int:
         return self._committed_cut
 
+    @property
+    def epochs(self) -> tuple[LogicalWorkEpoch, ...]:
+        return tuple(self._epochs.values())
+
     def _notify_changed(self) -> None:
         changed = self._changed
         self._changed = asyncio.Event()
@@ -164,12 +196,20 @@ class LogicalWorkLedger:
                         "worker binding references unknown assignment"
                     ) from error
                 descriptor = assignment.descriptor
-                if (binding.source_identity, binding.schema_digest) != (
+                if (
+                    binding.source_identity,
+                    binding.view_identity,
+                    binding.schema_digest,
+                    binding.lineage_digest,
+                ) != (
                     assignment.source_identity,
+                    assignment.view_identity,
                     assignment.schema_digest,
+                    assignment.lineage_digest,
                 ):
                     raise ValueError(
-                        "worker binding source or schema differs from assignment"
+                        "worker binding source, view, schema, or lineage differs "
+                        "from assignment"
                     )
                 if (
                     segment.unit_id,
@@ -220,9 +260,9 @@ class LogicalWorkLedger:
                 epoch, tuple(additions.items()), self._publication_generation
             )
         previous = self._epochs[max(self._epochs)] if self._epochs else None
-        if epoch.epoch != len(self._epochs) or epoch.start_step != (
-            0 if previous is None else previous.end_step
-        ):
+        expected_epoch = 0 if previous is None else previous.epoch + 1
+        expected_start = self._committed_cut if previous is None else previous.end_step
+        if epoch.epoch != expected_epoch or epoch.start_step != expected_start:
             raise ValueError("logical epochs and step windows must be contiguous")
         if previous is not None and previous.terminal:
             raise ValueError("cannot publish after a terminal epoch")
@@ -294,12 +334,24 @@ class LogicalWorkLedger:
             raise ValueError("source acquisition batch exceeds the in-flight window")
         while True:
             async with self._lock:
-                items = tuple(self._bindings[key] for key in identities)
+                try:
+                    items = tuple(self._bindings[key] for key in identities)
+                except KeyError as error:
+                    raise RuntimeError(
+                        "source work epoch was reclaimed after its durable cut"
+                    ) from error
                 if any(item.key.step < self._committed_cut for item in items):
                     raise RuntimeError("source work is below the committed cut")
                 if any(key in self._leased for key in identities):
                     raise RuntimeError("source interval is already leased")
-                limit = self._committed_cut + self._max_in_flight_steps
+                active_end = max(
+                    (epoch.end_step for epoch in self._epochs.values()),
+                    default=self._committed_cut,
+                )
+                limit = min(
+                    active_end,
+                    self._candidate_cut + self._max_in_flight_steps,
+                )
                 eligible = tuple(
                     (key, item)
                     for key, item in zip(identities, items, strict=True)
@@ -374,16 +426,43 @@ class LogicalWorkLedger:
         self._remaining = {
             step: count for step, count in self._remaining.items() if step >= cut
         }
+        self._reclaim_before(cut)
         self._notify_changed()
+
+    def _reclaim_before(self, cut: int) -> None:
+        """Drop durable work history while retaining one continuity anchor."""
+        if not self._epochs:
+            return
+        ordered = tuple(self._epochs.items())
+        removable = tuple(
+            epoch_id for epoch_id, epoch in ordered[:-1] if epoch.end_step <= cut
+        )
+        if not removable:
+            return
+        for epoch_id in removable:
+            self._epochs.pop(epoch_id)
+        removable_ids = set(removable)
+        self._bindings = {
+            key: value
+            for key, value in self._bindings.items()
+            if key[0] not in removable_ids
+        }
+        self._leased = {key for key in self._leased if key[0] not in removable_ids}
+        self._leases = {
+            lease_id: lease
+            for lease_id, lease in self._leases.items()
+            if lease.item.key.epoch not in removable_ids
+        }
+        self._acknowledged = {
+            lease_id: value
+            for lease_id, value in self._acknowledged.items()
+            if value.key.epoch not in removable_ids
+        }
 
     def checkpoint_state(self, *, committed_cut: int | None = None) -> dict[str, Any]:
         target = self._committed_cut if committed_cut is None else committed_cut
         self._validate_cut(target)
-        return {
-            "version": 3,
-            "committed_cut": target,
-            "epochs": [[epoch.epoch, epoch.digest] for epoch in self._epochs.values()],
-        }
+        return {"committed_cut": target}
 
     def prepare_checkpoint(
         self,
@@ -424,29 +503,17 @@ class LogicalWorkLedger:
         self._checkpoint_transactions.abort(checkpoint_id, permit)
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
-        if not isinstance(state, Mapping) or set(state) != {
-            "version",
-            "committed_cut",
-            "epochs",
-        }:
+        if not isinstance(state, Mapping) or set(state) != {"committed_cut"}:
             raise ValueError("source checkpoint fields do not match")
-        cut = state["committed_cut"]
-        _count(cut, "source restore cut")
-        if state["version"] != 3 or state["epochs"] != [
-            [epoch.epoch, epoch.digest] for epoch in self._epochs.values()
-        ]:
-            raise ValueError("source checkpoint does not match rebuilt immutable plans")
-        if cut > max((epoch.end_step for epoch in self._epochs.values()), default=0):
-            raise ValueError("source restore cut exceeds published plans")
+        cut = _count(state["committed_cut"], "source restore cut")
+        self._epochs.clear()
+        self._bindings.clear()
         self._remaining.clear()
-        for item in self._bindings.values():
-            if item.key.step >= cut:
-                self._remaining[item.key.step] = (
-                    self._remaining.get(item.key.step, 0) + 1
-                )
-        self._committed_cut = self._candidate_cut = cut
         self._leases.clear()
         self._leased.clear()
         self._acknowledged.clear()
+        self._committed_cut = cut
+        self._candidate_cut = cut
+        self._publication_generation += 1
         self._checkpoint_transactions = PreparedStateStore()
         self._notify_changed()

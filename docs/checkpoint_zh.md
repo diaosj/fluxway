@@ -1,10 +1,11 @@
 # Checkpoints（快照与恢复）
 
-Source metadata 通过 `fluxway.common.metadata` 使用 canonical MessagePack，
-包括 catalog cursor 校验和组件事务摘要。Planner checkpoint 第 2 版保存 canonical
-request、待拼接尾部及编码 cursor；logical ledger 第 3 版保存 immutable epoch digest
-和 committed cut。物理 Worker descriptor 为瞬态。用户二进制 metadata 经组件
-prepare/apply/restore 后保持不变。
+来源元数据通过 `fluxway.common.metadata` 统一编码，包括不透明来源位置和组件
+事务摘要。目标是将消费书签、逻辑进度、模型及必要算子状态保存到同一检查点，
+恢复后重新规划和预取；来源状态必须遵循[来源协调](source_coordination_zh.md)中的共同检查点契约。
+用户二进制元数据经组件准备、提交和恢复后保持不变。
+全局 `CheckpointManifest` 不携带自有结构版本号。清单根字段由该数据类唯一
+定义，解码时拒绝缺失或额外字段，不维护第二份字段清单。
 
 编码契约不等于连续读取恢复保证。Planner 接受有序不可变窗口，checkpoint 不保存物理
 topology。Worker 接收已经发布的连续 source window；checkpoint API 不负责自动 adapter 补窗。
@@ -23,6 +24,17 @@ checkpoint_id -> component_id -> checkpoint_object_id
 
 Fluxway 拥有并裁决快照事务、进度切面（Cut）、拓扑结构、快照引用以及物理清理决策；而具体组件则负责序列化、物理存储、恢复映射以及物理清理执行。这种解耦使得 Fluxway 核心完全独立于具体的文件系统、对象存储、Lance 存储引擎、元数据 Catalog 及数据格式。
 
+检查点根目录由 `CheckpointDirectory` (`fluxway.control_plane.checkpointer.directory`) 统一管理。
+根目录可以由业务预先创建，也可由 `CheckpointDirectory.open()` 自动创建。根目录必须是实体目录，
+不能是符号链接。Fluxway 创建新目录时写入所有权标记 `CHECKPOINT_ROOT_MARKER` (`.fluxway-checkpoint-root`)，
+内容为 `fluxway-checkpoint-root\n`。打开已有且无标记的目录时不补写标记、不接管目录；已有标记若格式错误或为符号链接，
+直接抛出 `CheckpointDirectoryOwnershipError`。调用 `CheckpointDirectory.clear()` 清理根目录前必须严格校验所有权标记，
+防止误删未纳管的业务路径。
+
+Manifest 清单、清理意图（Cleanup Intent）、事务记录与引用统一采用高效二进制 MessagePack 格式
+通过 `msgpack_codec` (`packb(..., use_bin_type=True)` 与 `unpackb(...)`) 进行持久化，避免未紧凑 JSON
+带来的反序列化和存储开销。未知标记内容和过期清单格式直接报错拒绝，打开目录不会自动迁移其中的旧文件。
+
 ---
 
 ## 1. 保存与恢复（Saving & Restoring）
@@ -39,17 +51,15 @@ stateDiagram-v2
     [*] --> STAGED
     STAGED --> COMMIT_DECIDED: 持久化提交决策写入
     STAGED --> ABANDONED: 决策前失败（Permit 已撤销）
-    COMMIT_DECIDED --> COMMITTED: 发布与应用完成
-    COMMIT_DECIDED --> ABANDONED: 崩溃重启时 fencing
+    COMMIT_DECIDED --> COMMITTED: 发布与应用完成（或重启时回放完成）
+    COMMIT_DECIDED --> ABANDONED: 无 commit marker 时的崩溃重启 fencing
     COMMITTED --> [*]
     ABANDONED --> [*]
 ```
 
-`COMMIT_DECIDED` 仅表示物理写入已经启动但尚未完成，并不是可重放的提交承诺。
-进程崩溃会丢失组件 session、内存协调器和待发布上下文，因此无法重放发布操作。
-重启时 Fluxway 对所有 `STAGED` 与 `COMMIT_DECIDED` 记录统一 fence 并转为
-`ABANDONED`；物理产物交给 GC。只有 `COMMITTED` 记录才能进入
-latest、引用解析、保留清理和恢复流程。
+`COMMIT_DECIDED` 记录物理发布已经启动。
+若崩溃发生在全局 commit marker（`committed.<checkpoint_id>`）写入之前，启动时 fencing 将调用组件的 `abort_save(permit)` 并将记录转为 `ABANDONED`；物理产物交由 GC 处理。若全局 commit marker 已经持久化成功，则该检查点在逻辑上已被决议提交；启动时 fencing 将复用持久化的 permit 回放各组件的 `acknowledge_save(permit)` 并推进事务至 `COMMITTED`，保留已发布的全局检查点。
+只有 `COMMITTED` 记录才能进入 latest、引用解析、保留清理和恢复流程。
 
 每次最新全局 snapshot 包含 `latest` alias、各引用、保存保留清理以及恢复流程。
 
@@ -69,11 +79,9 @@ Optimizer restore 默认为 `True`，显式注册方式如下：
 from fluxway.integrations.sparse_embedding.checkpoint import (
     LocalLanceStorageFactory,
     SparseEmbeddingCheckpointComponent,
-    modulo_partition,
 )
 
 embedding_checkpoint = SparseEmbeddingCheckpointComponent(
-    modulo_partition,
     LocalLanceStorageFactory(),
     load_optimizer_state=True,
 ).registration()
@@ -97,6 +105,8 @@ flowchart LR
     D --> E[发布 Worker 产物]
     E --> F[应用 Controller token]
     F --> G[写入 COMMITTED marker]
+    G --> H[组件确认 Acknowledge]
+    H --> I[完成事务 -> COMMITTED]
 ```
 
 参与者在 prepare 阶段完成所有可能失败的校验；apply 阶段只做已验证的内存
@@ -187,6 +197,8 @@ class MyComponent(
     async def commit_save(self, session) -> CheckpointComponentPublication: ...
     async def rollback_save(self, session): ...
     async def publish_save(self, session): ...
+    async def abort_save(self, permit): ...
+    async def acknowledge_save(self, permit): ...
     async def restore(self, session): ...
 ```
 
@@ -197,6 +209,12 @@ class MyComponent(
 4. `RESTORE` (`restore`)：状态加载与重构；
 5. `OBJECT_LIFECYCLE`：快照对象的读取租约保护（Holds）与清理预留；
 6. `OBJECT_CLEANUP` (`cleanup`)：物理快照废弃与垃圾回收。
+
+`publish_save` 在各 worker 上执行，位于提交决议之后、全局 committed marker
+之前；`rollback_save` 同样需要真实的 worker session。控制侧恢复在 marker 前调用
+`abort_save(permit)`，marker 后调用 `acknowledge_save(permit)`，均传入原来持久化的
+permit。SAVE 实现必须显式提供这两个控制阶段，保证幂等并向上传播失败，使事务保持可重试。内置文件系统组件
+按 attempt ID 组织载荷，控制侧可清理全部 rank，无需重建 worker session。
 
 ---
 
@@ -312,6 +330,12 @@ class DenseSPMD:
    - 托管真正属于单机节点的本地状态（如数据读取游标 Reader offset、本地 RNG 种子、节点私有指标）；
    - 序列化为节点私有物理文件（`state.pkl`），声明 `EXACT_TOPOLOGY` 严格拓扑模式。
 
+3. **超大规模稀疏 Embedding 状态（`SparseEmbeddingCheckpointComponent`）**：
+   - 专用于推荐模型稀疏 Embedding 表的持久化与弹性管理（`fluxway.integrations.sparse_embedding`）；
+   - **多存储后端支持**：原生适配 `LocalLanceStorage`（`LocalLanceStorageFactory`，本地 NVMe 或共享 POSIX 存储）与 `GravitinoLanceStorage`（`GravitinoLanceStorageFactory`，Apache Gravitino 纳管的数据湖 Catalog）；
+   - **拓扑弹性伸缩**：声明 `RestoreTopologyMode.LOGICAL_PARTITION_REMAP`，结合 `LogicalPartitionBinding` 在集群节点或 Worker 数量扩缩容时精准重映射子表分片；
+   - **离线压缩合并**：支持通过 `compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)` 在训练关键路径之外异步合并 Lance 数据碎片。
+
 ---
 
 ## 5. 组件注册、租约与生命周期清理
@@ -377,10 +401,10 @@ Fail-Stop 执行细节：当 `_save()` 在 `COMMIT_DECIDED` 写入前超时或�
 
 ## 7. 拓扑模式（Topology Modes）
 
-Manifest 记录源拓扑信息。恢复时组件显式选择以下三种拓扑模式之一：
-* `EXACT_TOPOLOGY`：要求恢复时的 World Size 与切分严格等于保存时的拓扑，适用于 Rank 本地迭代器或硬绑定的进程状态；
-* `LOGICAL_PARTITION_REMAP`：适用于逻辑分片稳定的系统（如 Embedding 查表按 Modulo 映射重组）；
-* `GLOBAL_RESHARD`：适用于全局分布式张量（如 JAX / PyTorch DTensor），由组件自身在恢复时自动 Reshard 到新网格。
+Manifest 记录源拓扑信息。恢复时组件显式选择 `RestoreTopologyMode` 枚举值之一：
+* `RestoreTopologyMode.EXACT_TOPOLOGY`（`"exact_topology"`）：要求恢复时的 Worker 数量与物理切分严格等于保存时的拓扑，适用于 Rank 本地迭代器或硬绑定的进程状态；
+* `RestoreTopologyMode.LOGICAL_PARTITION_REMAP`（`"logical_partition_remap"`）：保持规范逻辑分片 ID 不变，恢复时通过 `LogicalPartitionBinding` 将各逻辑分片映射到当前存活的物理 Worker 上（如 Embedding 子表重新分配）；
+* `RestoreTopologyMode.GLOBAL_RESHARD`（`"global_reshard"`）：适用于全局分布式张量（如 JAX 原生嵌套 PyTree），由组件自身在恢复时自动 Reshard 到新网格。
 
 Fluxway 绝不对分区函数做隐式猜测，也绝不静默拷贝 Rank 本地状态。所有的弹性恢复语义均由组件适配层严格保证。
 
@@ -389,20 +413,26 @@ Fluxway 绝不对分区函数做隐式猜测，也绝不静默拷贝 Rank 本地
 Fluxway checkpoint controller 保持后端无关。具体后端组件自行校验运行时前置条件。Orbax 组件在保存拓扑包含多个 rank 时要求每个 SPMD rank 对应一个已初始化的 JAX process；单 rank 拓扑使用单进程 Orbax I/O。多 rank 拓扑若 JAX process group 未初始化或数量不匹配，组件必须在保存阶段直接失败，不能静默降级为 rank-one writer。
 
 
+## 来源检查点约束
+
+来源规划器保存与全局 `CheckpointCut.position` 对齐的消费书签，来源账本保存逻辑工作进度。窗口、预取尾部、租约和读取确认缓存属于运行期状态，恢复时按已提交书签和当前读取拓扑重新建立。来源、模型、优化器以及其他影响未来结果的组件必须在同一个检查点切点保存；来源确认本身不是独立的持久化提交。
+
+来源恢复允许重新划分物理任务，但必须保持逻辑批次大小、记录顺序和来源身份。新的租约标识会拒绝旧执行实例的迟到确认。来源激活组件可只保存逻辑描述，物理任务在恢复阶段重新发布。
+
 ## Canonical logical ownership
 
 `SourceWorkKey(epoch, step, assignment_id)` 标识 canonical logical work。
 物理 segment 使用独立区间 lease，ACK 只确认对应区间；candidate cut 只越过连续
 完整确认的 step。Committed cut 由已有协调 checkpoint 事务推进。
 
-Logical ledger checkpoint 第 3 版保存 committed cut 与 immutable epoch digest，
-不保存 rank、lease 或 ACK cache。Planner checkpoint 第 2 版保存 canonical request、
-logical batch cardinality、待拼接尾部和 cursor，不保存 topology。Restore 验证固定
-revision 和 logical batch 大小，再重新绑定；新的 lease ID 拒绝旧 attempt 延迟到达的 ACK。
+保存内容为来源拥有的消费书签、来源绑定和与模型一致的逻辑进度。恢复先验证
+来源绑定与全局批次大小，再按当前窗口参数和读取进程数重新规划、预取。旧窗口
+摘要、预取尾部、租约和读取确认缓存不作为来源持久状态；影响未来结果的算子状态
+仍须共同保存。新的租约标识拒绝旧运行延迟到达的确认。
 
-Driver activation checkpoint 状态为空。Controller 先恢复 planner component、发布
-重绑定分片，再恢复 committed logical cut。Worker 节点按分配的区间进行确切读取。恢复使用新的 Worker，顺序为拓扑就绪、
+来源激活组件保存状态为空。恢复顺序是在控制面安装消费书签和共同保存点，
+再发布重新规划的任务。工作进程按分配区间读取。恢复使用新的 Worker，顺序为拓扑就绪、
 执行激活。Source 布局安装和 per-cut admission 是独立的授权。启动、取消和继续
-示例见 [execution_lifecycle](execution_lifecycle_zh.md)。启动 API 不提供
-adapter 自动 discovery/refill。各 checkpoint component 定义其允许的拓扑变化；source
+示例见 [execution_lifecycle](execution_lifecycle_zh.md)。启动 API 只启动来源生命周期；
+Controller 的事件驱动 `SourceProgressSupervisor` 负责 adapter 扫描和窗口补充。各 checkpoint component 定义其允许的拓扑变化；source
 ledger 正确性不能单独证明模型收敛或传输性能。

@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 
 import pytest
 
+from fluxway.common.ingestion import SourceWorkKind
 from fluxway.common.types import CheckpointCut
 from fluxway.control_plane.ingestion import (
     AlgebraicLayoutCompiler,
-    TailLayoutMode,
+    AssignmentPolicy,
     IngestionLayoutPlanningComponent,
     LayoutCompileRequest,
     LayoutUnitDescriptor,
-    AssignmentPolicy,
     RankDemand,
     ReaderGroupDemand,
     ReaderTopologyDescriptor,
+    TailLayoutMode,
 )
 from fluxway.control_plane.ingestion.compiler import (
     _request_from_dict,
@@ -79,6 +81,23 @@ def test_layout_request_preserves_policy_input_without_post_init_mutation() -> N
     enum_request = request(tail_layout_mode=TailLayoutMode.REJECT_REMAINDER)
     assert string_request.tail_layout_mode == "reject_remainder"
     assert enum_request.tail_layout_mode is TailLayoutMode.REJECT_REMAINDER
+
+
+def test_assignment_key_includes_complete_source_identity() -> None:
+    compiler = AlgebraicLayoutCompiler()
+    original = compiler.compile(request(cardinality=4, worker_demands=(4,)))
+    changed_view = compiler.compile(
+        replace(original.request, view_identity="changed-view")
+    )
+    changed_lineage = compiler.compile(
+        replace(original.request, lineage_digest="changed-lineage")
+    )
+
+    original_assignment = original.work_epoch.assignments[0]
+    assert original_assignment.view_identity == "view"
+    assert original_assignment.lineage_digest == "lineage"
+    assert changed_view.work_epoch.assignments[0].key != original_assignment.key
+    assert changed_lineage.work_epoch.assignments[0].key != original_assignment.key
 
 
 def test_node_affinity_hint_is_optional_and_binds_attested_topology() -> None:
@@ -382,17 +401,12 @@ def test_policy_forbidding_splits_rejects_splittable_unit() -> None:
         )
 
 
-def test_planning_component_checkpoint_round_trip() -> None:
+def test_direct_planning_component_requires_source_position_for_checkpoint() -> None:
     component = IngestionLayoutPlanningComponent("planner")
-    compiled = component.accept(request())
+    component.accept(request())
     cut = CheckpointCut.for_position("cut", 0)
-    state = component.checkpoint_state(cut)
-    restored = IngestionLayoutPlanningComponent("planner", topology=request().topology)
-
-    restored.restore_state(state, cut)
-
-    assert restored.layout_digest == compiled.layout_digest
-    assert restored.accept(request()) == compiled
+    with pytest.raises(ValueError, match="source consumption cursor"):
+        component.checkpoint_state(cut)
 
 
 def _logical_ordinals(compiled) -> set[int]:
@@ -414,6 +428,7 @@ def test_virtual_pad_tail_mode_cannot_discard_remainder() -> None:
         physical_identity="__VIRTUAL_PAD__",
         logical_start=0,
         opaque_token="pad:virtual",
+        work_kind=SourceWorkKind.SYNTHETIC_PADDING,
     )
     topology = ReaderTopologyDescriptor(
         4,

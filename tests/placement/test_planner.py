@@ -11,7 +11,7 @@ from fluxway.common.types import (
 )
 from fluxway.placement.inventory import PlacementInventory
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     affinity_constraints,
     affinity_coverage,
     co_location_mass,
@@ -143,14 +143,13 @@ def scenario(s4_world_size: int) -> tuple[Graph, PlacementRecipe, ClusterSnapsho
     s5 = workers(SPMD5)
     recipe = PlacementRecipe(
         recipe_id="six-spmd",
-        version="1.0.0",
         constraints=(
             subseteq(support(s3), support(s0)),
             subseteq(support(s4), support(s1)),
             subseteq(support(rank(s5, 0)), support(s0)),
             subseteq(support(rank(s5, 1)), support(s1)),
         ),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     nodes = (
         ClusterNode(node_id="gpu-0", resources={"CPU": 16, "GPU": 8}),
@@ -211,9 +210,8 @@ def test_resource_profile_applies_to_multiple_instances_of_same_class() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="shared-profile",
-        version="1.0.0",
         constraints=(equal(cardinality(support(workers(SPMD2))), 1),),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="cpu", resources={"CPU": 2}),)
@@ -236,9 +234,8 @@ def test_planner_rejects_nonexclusive_requested_resources() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="exclusive-cluster",
-        version="1.0.0",
         constraints=(),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot(
         nodes=(
@@ -265,7 +262,6 @@ def test_planner_compiles_resource_and_set_constraints() -> None:
     right = workers(SPMD1)
     recipe = PlacementRecipe(
         recipe_id="constraint-algebra",
-        version="1.0.0",
         constraints=(
             disjoint(support(left), support(right)),
             equal(cardinality(support(left)), 1),
@@ -275,7 +271,7 @@ def test_planner_compiles_resource_and_set_constraints() -> None:
             ),
             equal(allocated_quanta(left), 0),
         ),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (
@@ -304,7 +300,6 @@ def test_planner_minimizes_recipe_resource_quantum_fragmentation() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="fragmentation",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -337,7 +332,6 @@ def test_fragmentation_preserves_unusable_multidimensional_resources() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="multidimensional-fragmentation",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -369,7 +363,6 @@ def test_planner_accepts_resource_scalar_as_custom_objective() -> None:
     worker = workers(SPMD0)
     recipe = PlacementRecipe(
         recipe_id="resource-objective",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(resource_usage(worker, "CPU"))),
     )
@@ -398,7 +391,6 @@ def test_fragmentation_normalizes_memory_by_allocation_quantum() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="memory-fragmentation",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(minimize(resource_fragmentation())),
     )
@@ -447,7 +439,6 @@ def test_weighted_drf_matches_finite_leximin_oracle() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="weighted-drf-oracle",
-        version="1.0.0",
         constraints=(),
         objective=lexicographic(max_min(weighted_dominant_share(all_workers()))),
     )
@@ -476,7 +467,6 @@ def test_majorization_optimum_is_locked_before_later_objectives() -> None:
     relations = affinity_constraints()
     recipe = PlacementRecipe(
         recipe_id="majorization-oracle",
-        version="1.0.0",
         constraints=(subseteq(support(source), support(target)),),
         objective=lexicographic(
             maximize_majorization(target_occupancy(relations)),
@@ -518,9 +508,8 @@ def test_affinity_graph_collects_relations_nested_in_boolean_constraints() -> No
     relation = subseteq(support(elastic), support(target))
     recipe = PlacementRecipe(
         recipe_id="nested-affinity",
-        version="1.0.0",
         constraints=(any_of(relation, negate(negate(relation))),),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (ClusterNode(node_id="cpu", resources={"CPU": 4}),)
@@ -560,7 +549,6 @@ def test_negated_subset_is_not_a_positive_affinity_relation() -> None:
     )
     recipe = PlacementRecipe(
         recipe_id="negative-relation",
-        version="1.0.0",
         constraints=(
             negate(
                 subseteq(
@@ -569,7 +557,7 @@ def test_negated_subset_is_not_a_positive_affinity_relation() -> None:
                 )
             ),
         ),
-        objective=AFFINITY_FIRST_V1,
+        objective=AFFINITY_FIRST,
     )
     snapshot = ClusterSnapshot.from_nodes(
         (
@@ -597,7 +585,6 @@ def test_affinity_scalar_constraints_are_compiled_and_attested() -> None:
     relation = subseteq(support(workers(SPMD0)), support(workers(SPMD1)))
     recipe = PlacementRecipe(
         recipe_id="affinity-scalar-constraints",
-        version="1.0.0",
         constraints=(
             relation,
             equal(affinity_coverage(affinity_constraints()), 1),
@@ -647,7 +634,6 @@ def test_resource_fragmentation_constraint_uses_exact_normalized_value() -> None
     def recipe(expected: int) -> PlacementRecipe:
         return PlacementRecipe(
             recipe_id=f"fragmentation-equals-{expected}",
-            version="1.0.0",
             constraints=(equal(resource_fragmentation(), expected),),
             objective=lexicographic(minimize(resource_fragmentation())),
         )
@@ -661,3 +647,98 @@ def test_resource_fragmentation_constraint_uses_exact_normalized_value() -> None
     assert plan.resource_fragmentation_score == 1
     assert plan.resource_fragmentation_scale == 1
     assert plan.constraint_results[0].satisfied is True
+
+
+@pytest.mark.parametrize(
+    ("resource", "worker_quantity", "node_quantity"),
+    [("CPU", 2, 1), ("GPU", 1, 0)],
+)
+def test_infeasible_error_reports_resource_deficit(
+    resource: str, worker_quantity: int, node_quantity: int
+) -> None:
+    graph = placement_graph(
+        nodes={
+            "worker": graph_node(
+                "worker",
+                SPMD0,
+                1,
+                ResourceProfile(base={resource: worker_quantity}),
+            )
+        }
+    )
+    snapshot = ClusterSnapshot.from_nodes(
+        (ClusterNode(node_id="node", resources={resource: node_quantity}),)
+    )
+    recipe = PlacementRecipe(
+        recipe_id="resource-deficit",
+        constraints=(),
+        objective=AFFINITY_FIRST,
+    )
+
+    with pytest.raises(PlacementInfeasibleError) as error:
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
+
+    message = str(error.value)
+    assert "cause=minimum resource capacity deficit" in message
+    assert f"{resource}={worker_quantity - node_quantity}" in message
+    assert "hint=increase cluster resources" in message
+    assert "workers=worker[count=1" in message
+
+
+def test_infeasible_error_reports_single_worker_node_limit() -> None:
+    graph = placement_graph(
+        nodes={
+            "worker": graph_node("worker", SPMD0, 2, ResourceProfile(base={"CPU": 3}))
+        }
+    )
+    snapshot = ClusterSnapshot.from_nodes(
+        tuple(
+            ClusterNode(node_id=f"node-{index}", resources={"CPU": 2})
+            for index in range(3)
+        )
+    )
+    recipe = PlacementRecipe(
+        recipe_id="single-worker-limit",
+        constraints=(),
+        objective=AFFINITY_FIRST,
+    )
+
+    with pytest.raises(PlacementInfeasibleError) as error:
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
+
+    message = str(error.value)
+    assert "deficits=none" in message
+    assert "single_worker_limits=CPU(worker=3,node=2)" in message
+    assert "cause=hard placement constraint or scaled-resource infeasibility" in message
+
+
+def test_infeasible_error_identifies_hard_constraint_when_resources_fit() -> None:
+    graph = placement_graph(
+        nodes={
+            "left": graph_node("left", SPMD0, 1, ResourceProfile(base={"CPU": 1})),
+            "right": graph_node("right", SPMD1, 1, ResourceProfile(base={"CPU": 1})),
+        }
+    )
+    snapshot = ClusterSnapshot.from_nodes(
+        (ClusterNode(node_id="node", resources={"CPU": 2}),)
+    )
+    recipe = PlacementRecipe(
+        recipe_id="hard-constraint",
+        constraints=(disjoint(support(workers(SPMD0)), support(workers(SPMD1))),),
+        objective=AFFINITY_FIRST,
+    )
+
+    with pytest.raises(PlacementInfeasibleError) as error:
+        PlacementPlanner(solve_timeout_s=10).resolve(
+            placement_inventory(graph), recipe, snapshot
+        )
+
+    message = str(error.value)
+    assert "deficits=none" in message
+    assert "single_worker_limits=none" in message
+    assert "cause=hard placement constraint or scaled-resource infeasibility" in message
+    assert "hint=review affinity/disjoint/equality constraints" in message

@@ -8,7 +8,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types import Node, SPMDConfig
 from fluxway.placement import (
-    AFFINITY_FIRST_V1,
+    AFFINITY_FIRST,
     PlacementGroupTimeoutError,
     PlacementPlanner,
     PlacementRecipe,
@@ -63,9 +63,8 @@ def test_plain_ray_cluster_materializes_recipe(ray_cluster) -> None:
         )
         recipe = PlacementRecipe(
             recipe_id="plain-ray",
-            version="1.0.0",
             constraints=(),
-            objective=AFFINITY_FIRST_V1,
+            objective=AFFINITY_FIRST,
         )
         scheduler = Scheduler(
             graph=graph,
@@ -127,9 +126,8 @@ def test_plain_ray_cluster_materializes_multiple_accelerator_resources(
         )
         recipe = PlacementRecipe(
             recipe_id="plain-ray-multi-accelerator",
-            version="1.0.0",
             constraints=(),
-            objective=AFFINITY_FIRST_V1,
+            objective=AFFINITY_FIRST,
         )
         scheduler = Scheduler(
             graph=graph,
@@ -178,9 +176,8 @@ def test_plain_ray_cluster_surfaces_real_pg_timeout(ray_cluster) -> None:
         )
         recipe = PlacementRecipe(
             recipe_id="plain-ray-timeout",
-            version="1.0.0",
             constraints=(),
-            objective=AFFINITY_FIRST_V1,
+            objective=AFFINITY_FIRST,
         )
         scheduler = Scheduler(
             graph=graph,

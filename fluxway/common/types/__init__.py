@@ -21,6 +21,7 @@ from .configs import (
     # Driver and Worker Status Types
     DriverStatus,
     WorkerStatus,
+    ExecutionWaitState,
     CheckpointActivityPhase,
     ControllerState,
     ControllerEvent,
@@ -83,6 +84,10 @@ from .drain import (
 # Checkpoint domain
 from .checkpoint import (
     CheckpointObjectCleanedUpError,
+    RestoreOption,
+    RestoreOptions,
+    RestoreOptionsByComponent,
+    RestoreOptionsByRank,
     CheckpointObjectKey,
     CheckpointObjectRef,
     CheckpointObjectSpec,
@@ -117,6 +122,7 @@ from .checkpoint import (
     SpmdCheckpoint,
     StepReference,
     TopologySnapshot,
+    validate_restore_options,
 )
 from fluxway.common.operator_spec import OperatorSpec
 from fluxway.common.compiled_graph import DependencySpec
@@ -137,6 +143,7 @@ __all__ = [
     "NodeType",
     "DriverStatus",
     "WorkerStatus",
+    "ExecutionWaitState",
     "CheckpointActivityPhase",
     "ControllerState",
     "ControllerEvent",
@@ -183,6 +190,10 @@ __all__ = [
     "reduce_drain_boundary",
     "CheckpointObjectKey",
     "CheckpointObjectCleanedUpError",
+    "RestoreOption",
+    "RestoreOptions",
+    "RestoreOptionsByComponent",
+    "RestoreOptionsByRank",
     "CheckpointObjectRef",
     "CheckpointObjectSpec",
     "CheckpointComponentCapability",
@@ -216,5 +227,6 @@ __all__ = [
     "SpmdCheckpoint",
     "StepReference",
     "TopologySnapshot",
+    "validate_restore_options",
     "OperatorSpec",
 ]

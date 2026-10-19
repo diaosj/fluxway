@@ -7,6 +7,8 @@ from fluxway.common.ingestion.segment import (
     SourceWorkAcknowledgement,
     SourceWorkItem,
     SourceWorkKey,
+    SourceWorkKind,
+    source_work_global_valid_count,
     SourceWorkLease,
     SplitPolicy,
     CompiledSegment,
@@ -24,6 +26,14 @@ from fluxway.common.ingestion.receiver import (
     IngestionLayoutReceiver,
     ingestion_worker_id,
 )
+from fluxway.common.ingestion.source_scan import (
+    OpaqueSourceCursor,
+    SourceBindingIdentity,
+    SourceScanResult,
+    SourceScanBudget,
+    SourceScanIdentity,
+    SourceScanStatus,
+)
 
 __all__ = [
     "CanonicalWorkInterval",
@@ -32,6 +42,8 @@ __all__ = [
     "SourceWorkAcknowledgement",
     "SourceWorkItem",
     "SourceWorkKey",
+    "SourceWorkKind",
+    "source_work_global_valid_count",
     "SourceWorkLease",
     "SplitPolicy",
     "CompiledSegment",
@@ -44,4 +56,10 @@ __all__ = [
     "WorkerLayoutDescriptor",
     "IngestionLayoutReceiver",
     "ingestion_worker_id",
+    "OpaqueSourceCursor",
+    "SourceBindingIdentity",
+    "SourceScanResult",
+    "SourceScanBudget",
+    "SourceScanIdentity",
+    "SourceScanStatus",
 ]

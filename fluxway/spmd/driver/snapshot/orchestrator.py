@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from fluxway.profiler.runtime import ProfilerRuntimeFactory
 
 from fluxway.common.types.drain import DrainAdmission
 from fluxway.common.types import (
@@ -18,6 +21,7 @@ from fluxway.common.types import (
     TopologySnapshot,
     DrainEvent,
     DrainEventKind,
+    RestoreOptionsByRank,
 )
 from fluxway.common.utils.logging import get_logger
 from fluxway.control_plane.components import DriverComponentRegistry
@@ -34,7 +38,7 @@ class SnapshotOrchestrator:
         synchronizer: Any,
         controller_handle: Any | None,
         state_machine: DriverStateMachine,
-        profiler_runtime: Any,
+        profiler_runtime: ProfilerRuntimeFactory,
         component_registry: DriverComponentRegistry,
         notify_component_state: Callable[[DriverState], Any],
     ) -> None:
@@ -55,6 +59,7 @@ class SnapshotOrchestrator:
         self._pending_repository_root: str | None = None
         self._pending_snapshot: SpmdCheckpoint | None = None
         self._published = False
+        self._published_has_output = False
         self._rollback_task: asyncio.Task[None] | None = None
         self._failed_checkpoint_id: str | None = None
         self._drained_component_notification: asyncio.Task[None] | None = None
@@ -101,6 +106,8 @@ class SnapshotOrchestrator:
         cut: CheckpointCut,
         repository_root: str,
     ) -> None:
+        if cut.position is None:
+            raise ValueError("checkpoint cut requires a valid position")
         self.state_machine.require_transition(DriverEvent.SNAPSHOT_REQUESTED)
         notification = self._drained_component_notification
         if notification is not None:
@@ -108,7 +115,7 @@ class SnapshotOrchestrator:
             self._drained_component_notification = None
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.driver_snapshot(
-                snapshot_id=checkpoint_id,
+                checkpoint_id=checkpoint_id,
                 target_step=cut.position,
                 worker_count=len(self.executor.get_worker_handles()),
             ):
@@ -139,6 +146,7 @@ class SnapshotOrchestrator:
         self._pending_repository_root = repository_root
         self._pending_snapshot = None
         self._published = False
+        self._published_has_output = False
         self._rollback_task = None
         self._failed_checkpoint_id = None
         await self._persist_worker_states()
@@ -238,14 +246,16 @@ class SnapshotOrchestrator:
 
     async def publish_save(
         self, checkpoint_id: str, permit: CheckpointCommitPermit
-    ) -> None:
+    ) -> bool:
         self._require_assembled_snapshot(checkpoint_id)
         if permit != self._pending_permit:
             raise PermissionError("snapshot publication permit is stale")
         if self._published:
-            raise RuntimeError("Driver checkpoint transaction is already published")
-        await self.executor.checkpoint_publish_save()
+            return self._published_has_output
+        has_output = await self.executor.checkpoint_publish_save()
         self._published = True
+        self._published_has_output = has_output
+        return has_output
 
     async def rollback_save(
         self, checkpoint_id: str, permit: CheckpointCommitPermit
@@ -282,6 +292,7 @@ class SnapshotOrchestrator:
         self._pending_repository_root = None
         self._pending_snapshot = None
         self._published = False
+        self._published_has_output = False
 
     def _schedule_component_state(self, state: DriverState) -> asyncio.Task[None]:
         task = asyncio.create_task(self._notify_component_state(state))
@@ -351,6 +362,7 @@ class SnapshotOrchestrator:
         cut: CheckpointCut,
         snapshot: SpmdCheckpoint,
         repository_root: str,
+        restore_options_by_rank: RestoreOptionsByRank | None = None,
     ) -> None:
         if self._profiler_runtime.enabled:
             async with self._profiler_runtime.recorder.driver_restore(
@@ -358,11 +370,19 @@ class SnapshotOrchestrator:
                 worker_count=len(self.executor.get_worker_handles()),
             ):
                 await self._restore_from_manifest_unprofiled(
-                    checkpoint_id, cut, snapshot, repository_root
+                    checkpoint_id,
+                    cut,
+                    snapshot,
+                    repository_root,
+                    restore_options_by_rank,
                 )
             return
         await self._restore_from_manifest_unprofiled(
-            checkpoint_id, cut, snapshot, repository_root
+            checkpoint_id,
+            cut,
+            snapshot,
+            repository_root,
+            restore_options_by_rank,
         )
 
     async def _restore_from_manifest_unprofiled(
@@ -371,6 +391,7 @@ class SnapshotOrchestrator:
         cut: CheckpointCut,
         snapshot: SpmdCheckpoint,
         repository_root: str,
+        restore_options_by_rank: RestoreOptionsByRank | None = None,
     ) -> None:
         self.state_machine.require_transition(DriverEvent.RESTORE_REQUESTED)
         await self._notify_component_state(DriverState.RESTORING)
@@ -385,6 +406,7 @@ class SnapshotOrchestrator:
                 self._current_topology(),
                 snapshot.runtime_state,
                 snapshot.components,
+                restore_options_by_rank,
             )
         except BaseException:
             if self.state_machine.state is DriverState.RESTORING:
@@ -467,5 +489,4 @@ class SnapshotOrchestrator:
             world_size=view.world_size,
             mesh_axis_names=tuple(mesh.axis_names),
             mesh_axis_shapes=tuple(mesh.shape),
-            partition_scheme_version="fluxway-device-mesh-v1",
         )
