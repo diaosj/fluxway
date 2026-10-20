@@ -33,13 +33,17 @@ def test_jax_dlpack_import_preserves_uint64_with_local_scope():
     assert int(adopted[0]) == 2**40
 
 
-def test_jax_readonly_coherence_alias_imports_without_copy():
-    source = np.arange(32, dtype=np.float32)
+def test_jax_readonly_coherence_alias_imports_without_copy(tmp_path):
+    source = np.memmap(
+        tmp_path / "source.bin", mode="w+", dtype=np.float32, shape=(32,)
+    )
+    source[:] = np.arange(source.size, dtype=source.dtype)
     tensor = TransportTensor(source).zero_copy_readonly_alias()
 
     result = JaxBackend().asarray(tensor, copy=False)
 
     np.testing.assert_array_equal(np.asarray(result), source)
+    assert result.unsafe_buffer_pointer() == source.ctypes.data
     assert not tensor.flat_values.flags.writeable
     exported = tensor.dlpack_values_for_consumer()
     assert exported.flags.writeable
