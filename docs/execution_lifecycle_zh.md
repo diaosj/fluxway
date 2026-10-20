@@ -1,271 +1,299 @@
 # 分布式执行生命周期
 
-`fluxway/control_plane/lifecycle.py::ExecutionLifecycle` 是启动、恢复、
-admission 交付、drain 完成、checkpoint 发布、resume 与错误处理顺序的统一入口。
-Controller RPC 方法校验请求并调用该编排器；数值边界仍由 `DrainBoundary` reducer 决定。
+英文版见 [execution_lifecycle.md](execution_lifecycle.md)。
+
+使用 `fluxway.start` 启动编译图，通过返回的 `GraphExecution` 等待完成或观察进度，提前停止时调用 `cancel()`。[使用方式](#使用方式)给出应用接入示例，前面的章节说明这些调用保证的顺序。
+
+`fluxway/control_plane/lifecycle.py` 中的 `ExecutionLifecycle` 协调启动、恢复、准入交付、排空完成、检查点发布、继续执行和故障处理。控制器的远程接口校验请求后调用它，数值边界仍由 `DrainBoundary` 归约。
 
 ## 职责归属
 
-| Owner | 职责 | 不负责 |
+| 对象 | 职责 | 不负责 |
 | --- | --- | --- |
-| Controller FSM | 全局生命周期阶段和终态清理 | 逐 step 的工作身份 |
-| ExecutionLifecycle | 阶段顺序、并发 Driver fan-out | 独立进度或 source ownership |
-| SPMDManager | 活跃 Driver registry、RPC endpoint 校验与排队 | 生命周期顺序或 admission 数值 |
-| DrainBoundary reducer | observed、admitted、drained、committed cut | Driver 就绪状态 |
-| Driver FSM 与 SnapshotOrchestrator | 本地激活和 admission revision 应用 | 自行决定全局继续执行 |
-| Worker | 有限执行 gate、本地队列、checkpoint fence | 在 restore/resume 时创建全局 admission |
-| LogicalWorkLedger | canonical assignment、lease、ACK coverage | tensor 路由 |
-| CompiledSendPlan 与 DataPlane | payload 路由和交付 | 启动、发现或 checkpoint 决策 |
+| 控制器状态机 | 全局阶段与终止清理 | 每一步的任务身份 |
+| `ExecutionLifecycle` | 阶段顺序与驱动器并发调用 | 独立的来源进度或所有权 |
+| `SPMDManager` | 活跃驱动器登记、接口校验与调用排队 | 生命周期顺序或准入数值 |
+| `DrainBoundary` | 已观察、已准入、已排空与已提交位置 | 驱动器是否就绪 |
+| 驱动器状态机与 `SnapshotOrchestrator` | 本地激活与应用准入版本 | 自行决定全局继续执行 |
+| 工作进程 | 有限执行门、本地队列与检查点隔离 | 恢复时创建新的全局准入 |
+| `LogicalWorkLedger` | 规范来源任务、租约与确认覆盖 | 张量路由 |
+| `CompiledSendPlan` 与数据面 | 载荷路由与交付 | 启动、发现或检查点决策 |
 
 ## 存活、进度与执行诊断
 
-`heartbeat_timeout_s` 只定义存活边界。只要 worker 或 driver 继续发布心跳，
-即使已提交的执行进度暂时没有变化，也仍然视为存活。`execution_progress_warning_s`
-只控制诊断告警，不会停止执行；检查点不活跃仍由 checkpoint watchdog 负责。
+`heartbeat_timeout_s` 只判断存活。驱动器或工作进程仍在发布心跳时，即使已提交进度暂时不变，也仍视为存活。`execution_progress_warning_s` 控制诊断告警，不会停止执行；检查点不活跃由检查点看门狗负责。
 
-Worker 会在 heartbeat 和 profiler record 中携带执行元数据：执行 generation、
-SPMD/rank、operator、step、epoch、sequence、当前 phase、phase age、执行活动 age、
-已提交进度 age 以及 typed wait classification。classification 会区分 active
-operator invocation（其中可能包含首次 JAX/XLA 编译）、source admission、operator
-admission、传输、输入准备、队列等待和空的 completion/driver wait。这些状态只用于
-诊断，不触发取消。heartbeat 不能证明 XLA 编译器本身健康；active operator phase
-只能证明 Worker 尚未提交 completion，仍需后端编译回调或后续 completion/failure
-事件才能结束这个不确定性。
+工作进程在心跳和分析记录中附带执行代次、SPMD 与秩、算子、步骤、轮次、序号、当前阶段、阶段持续时间、最近活动时间、提交进度停滞时间及等待分类。分类区分算子调用、来源准入、算子准入、传输、输入准备、排队和空闲等待。
 
-共享事件链覆盖 activation 发布与分发、安装、source-scope 等待/获取、admission、
-本地计划与 operator invocation、传输/屏障活动以及 completion report。
-`execution_progress_warning_s` 会同时报告 committed progress age、activity age 和
-wait state；它不会停止、重试或回退执行。
+算子调用可能包含首次 JAX/XLA 编译。这些分类用于诊断，不决定取消。心跳不能证明编译器健康；需要后续完成、失败事件或后端编译回调，才能判断该阶段的结果。
 
-## Effect 调度与 Python 执行边界
+事件链覆盖激活发布、分发和安装，来源作用域等待与获取，准入，本地计划与算子调用，传输、屏障和完成报告。进度告警同时报告停滞时间、活动情况和等待状态，不会自动重试或回退进度。
 
-Controller 和 Driver reducer 的同步热路径只做输入校验、O(1) 纯转移、提交状态以及向
-有界队列执行一次 `put_nowait`。reducer 锁不等待 RPC、checkpoint 存储、组件代码、Worker
-fan-out 或 source 规划。每个已接受的提交都携带 `ordering_key` 和已提交的
-`state_revision`：
+## 外部操作调度与 Python 执行边界
+
+控制器和驱动器在归约锁内只做校验、常数时间的纯状态转移、状态提交，以及向有界调度器非阻塞入队。锁内不等待远程调用、检查点存储、组件代码、工作进程并发调用或来源规划。每个任务带有 `ordering_key` 和已提交的 `state_revision`：
 
 ```mermaid
 sequenceDiagram
     participant E as 事件调用方
-    participant F as FSM owner
-    participant Q as 有界 effect 队列
-    participant L as async/thread/process lane
-    participant F2 as fact 事件
-    E->>F: event
-    F->>F: 纯计划 + 提交 state_revision
-    F->>Q: put_nowait(submission)
-    Q->>L: 有界 worker
-    L-->>F: outcome(state_revision, value/error)
-    F->>F: 丢弃过期结果或发出 typed fact
-    F-->>F2: 后续 event
+    participant F as 状态拥有者
+    participant Q as 有界任务队列
+    participant L as 异步、线程或进程通道
+    participant F2 as 后续事实事件
+    E->>F: 提交事件
+    F->>F: 纯状态转移并提交版本
+    F->>Q: 非阻塞入队
+    Q->>L: 有限数量执行任务
+    L-->>F: 返回结果与状态版本
+    F->>F: 忽略过期结果或生成类型化事实
+    F-->>F2: 提交后续事件
 ```
 
-`BoundedLifecycleEffectScheduler` 使用固定 worker 数和固定队列容量。同一
-`ordering_key` 严格串行，不同 key 只在 worker 上限内并发。队列满立即抛出
-`LifecycleEffectQueueFullError`，由 owner 执行 admission/backpressure 策略。关闭时先拒绝
-新提交，再等待已接受工作，最后关闭 executor；调用方取消等待不会取消已经接受的 effect。
+`BoundedLifecycleEffectScheduler` 使用固定的队列和执行容量。同一排序键串行，不同键在容量内并发。队列满时立即抛出 `LifecycleEffectQueueFullError`，由状态拥有者决定准入策略。关闭时拒绝新任务，等待已接收任务结束，再关闭执行器。取消调用方的等待不会取消已接收任务。
 
 ```mermaid
 flowchart LR
-    Q[有界队列] --> A[ASYNC lane\n真正的 awaitable I/O]
-    Q --> T[THREAD lane\n短阻塞或释放 GIL 的调用]
-    Q --> P[PROCESS lane\n可 pickle 的纯 Python CPU]
-    Q -. 满 .-> B[明确的背压异常]
+    Q[有界队列] --> A[ASYNC：真正可等待的输入输出]
+    Q --> T[THREAD：短阻塞或释放 GIL 的调用]
+    Q --> P[PROCESS：可序列化的纯 Python 计算]
+    Q -. 容量已满 .-> B[明确抛出背压异常]
 ```
 
-CPython 的 `asyncio` 事件循环是单线程协作式调度器。`async def` 不会自动把同步 I/O 或
-Python CPU 循环移出 actor 线程；这类操作必须明确选择 thread 或 process lane。process
-lane 使用 spawn 上下文，并在线程中异步初始化进程池，避免在事件循环调用栈中启动进程。
-该架构规定调度和顺序；吞吐与尾延迟仍须针对实际 workload 测量。
+CPython 的事件循环采用单线程协作式调度。`async def` 不会将同步输入输出或纯 Python 计算移出事件循环；这些工作需明确选择线程或进程通道。进程池通过 `spawn` 创建，初始化不占用事件循环调用栈。这定义了调度与顺序，不保证某个工作负载的吞吐或尾延迟。
 
-Worker heartbeat 区分 INITIALIZING、READY、RESTORING、RUNNING、BLOCKED、STOPPED 和
-ERROR。Driver heartbeat 分别聚合 `workers_ready`（初始化）与 `topology_ready`
-（通信拓扑注册完成），两者均不触发 Driver START。
-拓扑就绪不能改变 committed checkpoint cut。
+### 本地检查执行通道
+
+下面的内部调度器例子无需 Ray，检查 `THREAD` 任务是否在其他线程执行，以及结果是否带回提交时的状态版本。错误保存在 `outcome.error` 中，拥有者必须传播错误，并在应用结果前检查版本。
+
+```python
+import asyncio
+from threading import get_ident
+
+from fluxway.common.effect_scheduler import (
+    BoundedLifecycleEffectScheduler,
+    LifecycleEffectExecutionMode,
+    LifecycleEffectSubmission,
+)
+
+
+async def check_thread_lane():
+    scheduler = BoundedLifecycleEffectScheduler(queue_size=2, worker_count=2)
+    await scheduler.start()
+    try:
+        outcome = await scheduler.submit(
+            LifecycleEffectSubmission(
+                operation=get_ident,
+                ordering_key="diagnostic",
+                state_revision=7,
+                mode=LifecycleEffectExecutionMode.THREAD,
+            )
+        )
+        if outcome.error is not None:
+            raise outcome.error
+        assert outcome.state_revision == 7
+        assert outcome.value != get_ident()
+    finally:
+        await scheduler.close()
+
+
+asyncio.run(check_thread_lane())
+```
+
+`ASYNC` 任务必须返回可等待对象。`PROCESS` 任务必须可序列化，应在可导入模块中定义，并以 `if __name__ == "__main__":` 保护脚本入口。此例不测量并发性能，也不验证进程通道。
+
+工作进程心跳区分 `INITIALIZING`、`READY`、`RESTORING`、`RUNNING`、`BLOCKED`、`STOPPED` 和 `ERROR`。驱动器汇总 `workers_ready` 与 `topology_ready`，但二者都不能授权开始执行。拓扑就绪不能改变已提交位置。管理器先安装拓扑再登记驱动器，登记后替换拓扑会在修改前被拒绝。
 
 ## 启动与恢复
 
 ```mermaid
 flowchart TD
-    I[初始化资源和 Worker runtime] --> R[READY：拓扑已注册]
+    I[初始化资源与工作进程] --> R[READY：拓扑已登记]
     R --> A[ACTIVATING]
-    A --> S[可选 checkpoint restore]
-    S --> L[激活 source layout]
-    L --> D[并发激活全部 Driver]
-    D --> W[在有限 gate 关闭时启动 source]
+    A --> S[按需恢复检查点]
+    S --> L[激活来源布局]
+    L --> D[并发激活全部驱动器]
+    D --> W[在有限执行门后启动来源]
     W --> U[RUNNING]
-    U --> G[交付已有 admission 或创建 initial admission]
+    U --> G[交付当前准入或创建首次准入]
 ```
 
-ACTIVATING 包含 restore、source layout activation、Driver `activate_execution` 和
-source startup。Driver 在并发发送 Worker 激活 RPC 前进入 ACTIVATING，收到全部确认后
-才进入 RUNNING 并通知组件。Driver 的 ACTIVATING 拒绝 restore；Controller 的
-ACTIVATING 则在 Driver 仍处于 READY 时执行 restore，然后才开始激活 Driver。
-激活不启动由 Controller 管理的
-source 生产。全部 activation 调用完成后 Controller 才进入 RUNNING。
-受控 source 或启用 checkpoint 的 Worker 在 admission 到达前保持有限 gate 关闭；
-没有 drain gate 的普通图在全部 Driver 激活后启动 source。
+控制器的 `ACTIVATING` 包含恢复、来源布局激活、驱动器激活和来源启动。恢复发生在驱动器仍为 `READY` 时；驱动器进入 `ACTIVATING` 后并发激活工作进程，收到全部确认才进入 `RUNNING`，此时不接受恢复请求。
 
-activation 期间到达的 terminal observation 只更新现有 reducer，不向部分就绪的
-Driver 发送 admission。terminal cut 为零也要先激活 Driver；若在 source startup
-阶段前已知零边界，就跳过 source startup 并交付零边界。若在 source startup
-期间才发现零边界，关闭的 gate 阻止受控 source 越界执行。
+组件通知不能启动由控制器管理的来源生产。受控来源或启用检查点的工作进程保持有限执行门关闭，直到收到准入。未使用排空门控的普通图在全部驱动器激活后启动来源。
 
-restore 先重建 canonical plan 与当前物理布局，再恢复 committed cut 和 Worker
-状态，最后激活执行。公开 restore 方法要求处于执行前的 READY/ACTIVATING；运行中的
-图直接拒绝 rewind，不隐含实现另一套在线回退协议。
+激活期间发现来源终点时，只更新当前边界，不向部分激活的驱动器发送准入。终点为零也要完成驱动器激活；若来源启动前已知终点为零，则跳过来源启动并交付零边界。若在启动期间才发现，关闭的执行门阻止受控来源越界执行。
 
-恢复创建新的执行实例及 Driver、Worker actor。Driver 仅在 READY 接受 restore；
-Worker 仅在启动执行和安装 source activation 之前接受 restore。恢复失败时执行
-准入保持关闭。普通 checkpoint save/resume 继续使用原 actor，保留有效的预取授权。
-Actor 身份隔离旧执行实例的延迟消息；source epoch 标识数据窗口，不标识执行实例。
+恢复先重建规范计划与当前物理布局，再恢复已提交位置和工作进程状态，最后激活执行。公开恢复要求处于执行前的 `READY` 或 `ACTIVATING` 阶段，不能倒退正在运行的图。
 
-`WorkerExecutionLifecycle` 唯一持有 Worker phase 与激活事件。拓扑注册仅将
-INITIALIZING 转换为 READY，不打开事件。恢复执行 READY → RESTORING → READY；
-只有显式激活执行 READY → ACTIVE。本地调度读取 ACTIVE，无需逐 step 请求 Controller。
-关闭和失败阶段拒绝迟到激活。算子背压、checkpoint activity、source lease 和 cut
-admission 保持各自独立的状态所有权。
-Tensor consumer reservation 保持独立的 `RESERVED → CLAIMED → RELEASED` 生命周期；
-Sequencer 唯一拥有状态，Tensor 只保存非拥有的 reservation 引用。Worker shutdown 向同一
-状态机提交 cleanup；cleanup 可重复观察完成，但显式重复 `ConsumerLease.release()` 仍抛错。
-shutdown 不得对 claimed reservation 调用 `cancel()`。详见[连贯性协议](coherence_protocol_zh.md#consumer-lease-reservation-所有权)。
-Driver 使用原 FSM 的 STOPPING → STOPPED 完成关闭，迟到的激活确认不能令已关闭的
-Driver 重新进入 RUNNING。Driver 与 Worker 各自持有本地资源释放任务，重复 stop
-等待同一个操作并观察其异常。
+恢复使用新的驱动器和工作进程。驱动器只在 `READY` 接受恢复，工作进程在 `READY → RESTORING → READY` 期间完成恢复；失败时准入保持关闭。普通检查点后的继续执行保留原角色和有效预取授权。角色身份隔离旧执行的延迟消息，来源轮次仅标识数据窗口，不标识执行生命周期。
 
-Driver 转移由唯一的纯关系计算，返回 next state 和局部 effect
-（`BLOCK_WORKERS`、`REPORT_COMPLETION` 或 `REPORT_ERROR`）。Driver 锁只提交状态与失败
-记录；阻塞 Worker、向 Controller 报告和组件通知均在锁外执行。Worker phase 由单一
-lifecycle owner 维护，`close()` 只创建一个 release future；重复 close 只加入同一个
-future，不重复写 phase 或释放资源。
+`WorkerExecutionLifecycle` 独占工作进程阶段和激活事件。登记拓扑只将 `INITIALIZING` 改为 `READY`，不开放激活事件；只有显式激活才进入 `ACTIVE`。失败进入 `FAILED`。本地调度直接读取 `ACTIVE`，不为此调用控制器。关闭或失败后，延迟激活命令也会被拒绝。
 
-`SourceExecutionScope` 是 Worker 的子资源，不另设执行状态机。它持有已安装窗口、
-活跃 step 索引、授权缓存、安装操作和执行中的 lease。相同 activation 共享一个
-受监管的操作；调用者取消不放弃安装，Reader 安装成功后才发布窗口。等待 Reader
-回调时不持有状态锁。该作用域无权改变 admission 或决定 checkpoint cut。
+算子阻塞、检查点活动、来源租约和切点准入仍各自管理。张量消费预留遵循独立的 `RESERVED → CLAIMED → RELEASED` 生命周期，序列器拥有其状态，张量只保留非拥有引用。关闭时提交幂等清理，不能取消已领取的预留；显式重复调用 `ConsumerLease.release()` 仍然报错。见[一致性协议](coherence_protocol_zh.md)。
 
-改变物理 Worker 数量后继续训练，应使用相同 canonical source 和 logical batch
-cardinality 构建新图，并向同一 checkpoint repository 调用
-`await fluxway.start(graph, ..., resume="latest")`。新执行实例开放准入前先停止旧实例。
-不能对已经使用过的 Worker 直接调用 restore 来回退本地队列或模型状态。
+驱动器关闭经过 `STOPPING → STOPPED`，延迟的激活确认不能让它重新进入 `RUNNING`。驱动器和工作进程各自保留唯一资源释放任务，重复停止或关闭会等待同一结果并观察其异常。
 
-## Drain、checkpoint 与继续执行
+驱动器的纯转移关系返回新状态及 `BLOCK_WORKERS`、`REPORT_COMPLETION` 或 `REPORT_ERROR` 等外部操作。锁内只提交状态和失败，锁外才阻塞工作进程、报告控制器或通知组件。
 
-### Source progress supervisor
+`SourceExecutionScope` 是工作进程的子资源，管理已安装窗口、活跃步骤索引、授权缓存、安装操作和执行中的租约批次。重复激活共享受监督的安装操作；调用方取消不会放弃安装，读取器成功安装后才发布。调用读取器时不持锁。这个作用域不能决定准入或检查点位置。
 
-`SourceProgressSupervisor` 是 source window 进度 task 的唯一 owner，独立维护
-`generation` 以及 `STOPPED`、`STARTING`、`RUNNING`、`STOPPING`、`FAILED` 状态。Controller
-进入 `RUNNING` 时启动当前 generation；进入 `RESUMING` 不会创建第二个 task。重复启动会
-加入当前 generation，失败 generation 在当前执行中不可重启。进度报告只负责唤醒 supervisor，
-不会在 Controller FSM 锁内执行规划。规划在 supervisor task 中异步执行，失败沿用 Controller
-的统一失败路径。
+改变工作进程数量后恢复，需要构建新的图，保持同一规范来源和逻辑批大小，并调用 `fluxway.start(..., resume="latest")`。替代执行开放准入前，先停止旧执行。不能在已使用的角色上直接恢复以倒退队列或模型状态。
 
-不变量是 `live_source_progress_tasks(generation) <= 1`。终止清理停止并观察同一个
-supervisor 的结果后，才发布 Controller 终态。这是运行时所有权规则，不改变训练或 source
-数据协议。
+## 排空、检查点与继续执行
+
+### 来源进度监督器
+
+`SourceProgressSupervisor` 是来源窗口进度任务的唯一拥有者，独立维护代次和 `STOPPED`、`STARTING`、`RUNNING`、`STOPPING`、`FAILED` 状态。控制器进入 `RUNNING` 时启动当前代次，进入 `RESUMING` 不会创建另一个任务。
+
+重复启动复用活跃代次，代次失败后只能通过替换执行恢复。进度报告只唤醒监督器，不在控制器状态锁内规划；规划失败进入控制器的统一故障路径。每代最多一个活跃任务：
+
+`live_source_progress_tasks(generation) <= 1`
+
+终止清理停止同一个监督器，在发布控制器终态前观察其失败。这是运行时职责约束，不是模型或来源数据协议。
 
 ```mermaid
 flowchart TD
-    A[当前 admission] --> D[全部注册 Driver 已 drained]
-    D --> C[canonical source ACK coverage]
-    C --> S[按配置和当前 cut 保存 checkpoint]
-    S --> K[提交 boundary]
-    K --> T{达到 terminal cut 或 max steps?}
+    A[当前准入] --> D[全部登记驱动器排空]
+    D --> C[来源任务确认完整]
+    C --> S[按配置和需要保存检查点]
+    S --> K[提交边界]
+    K --> T{到达终点或步骤上限？}
     T -->|是| F[COMPLETING 后进入 COMPLETED]
     T -->|否| R[RESUMING]
-    R --> W[并发 resume 全部 Driver，保留 Worker gate]
+    R --> W[并发继续全部驱动器，保留执行门]
     W --> U[RUNNING]
-    U --> N[交付延后的 terminal boundary 或下一周期 admission]
+    U --> N[交付延迟终点或下一周期准入]
 ```
 
-Driver resume 重置 checkpoint bookkeeping 和 synchronizer drain 状态，不清除
-Worker 执行 gate。RESUMING 期间的 observation 继续参与 reducer，但等待全部 Driver
-resume 完成后才交付。等待 source ACK coverage 期间如果 admission 已改变，旧边界
-不能再发起 snapshot。
+驱动器继续执行时重置检查点记账和排空同步状态，不清除工作进程执行门。`RESUMING` 期间仍归约新观察，但全部驱动器完成继续操作后才交付。等待来源确认期间若准入变化，旧边界不能发起快照。
 
-启动、admission、save、resume 失败进入同一 Controller failure 路径，异常保持可见。
-Worker/Driver 错误也进入该 FSM 的失败路径，由 cleanup 回收资源，不通过重试或
-CPU-copy fallback 隐藏失败。
+启动、准入、保存、继续执行及驱动器或工作进程的失败，均进入同一控制器故障路径，异常保持可见，由清理负责回收资源。
 
-## Admission 交接
+### 观察终点如何缩短边界
 
-生命周期选择当前 immutable admission，由 `SPMDManager.enqueue_driver_calls`
-先校验全部注册参与者和 remote endpoint，再将 RPC 排队并返回聚合 Future。
-缺失 actor handle 或无效 RPC endpoint 使整个预检失败，参与者不会被静默跳过。
-Manager 不保存 Driver 就绪状态副本：操作是否合法，由接收端 Driver FSM 判断。
-拓扑在注册 Driver 前建立并经构造参数传入，注册后修改会在变更前被拒绝。
-提交异常和远端异常在
-await 时抛出，不作为普通结果值返回。接收者唯一来源是 manager 的现有 registry，
-生命周期不再适配 Ray handle 或维护另一份 registry。
+下面的本地归约例子说明，发现来源结束不会直接提交检查点。周期目标从 8 缩短到 5，只有提交事件才推进持久化位置。它不创建角色，也不写检查点。应用应调用 `fluxway.start`，不自行驱动这个内部归约器。
 
-在第一次 await 前完成全部 RPC 排队。
-同 revision 的并发调用共享一个聚合 Future。旧 RPC 尚未结束时可以交付新 revision，
-terminal 收缩无需等待慢接收端。Driver/Worker 拒绝 stale 或 conflicting revision。
+```python
+from fluxway.common.types.drain import (
+    DrainAdmission,
+    DrainBoundary,
+    DrainEvent,
+    DrainEventKind,
+    reduce_drain_boundary,
+)
 
-Driver 先校验本地状态，再记录接受的 admission。并发相同请求等待同一个 application
-task，其失败也会被共享；不能仅凭记录了 receipt 就返回应用成功。生命周期保留所有
-未完成监督任务，并仅缓存最新 delivery 结果供重复调用者等待。这些对象属于瞬态执行状态，
-不参与持久进度判定。
+boundary = DrainBoundary.from_committed_cut(0)
+periodic = reduce_drain_boundary(
+    boundary, DrainEvent(DrainEventKind.PERIODIC_REQUEST, 8)
+)
+terminal = reduce_drain_boundary(
+    periodic.boundary, DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 5)
+)
+boundary = terminal.boundary
+assert boundary.admitted_cut == 5
+assert boundary.committed_cut == 0
 
-生命周期持有每个未完成 admission 的监督任务，调用者通过 shield 等待该任务。
-取消调用者不会取消已发命令或其失败处理。完成任务离开 pending 集合；最新 revision
-结果保留给重复等待者。Manager 跟踪每个已发 RPC，包括聚合调用失败后仍在等待的同伴。
+for kind in (DrainEventKind.DRAIN_COMPLETE, DrainEventKind.SNAPSHOT_BEGIN):
+    boundary = reduce_drain_boundary(boundary, DrainEvent(kind, 5)).boundary
+assert boundary.committed_cut == 0
 
-FSM 提交 phase/failure 状态，再将状态进入副作用交给生命周期。COMPLETING、FAILING、CANCELLING
-登记唯一的终止清理任务后立即返回。终止 component 通知失败也不会跳过资源回收。
-资源回收后 Manager 取消并等待剩余本地 RPC 等待对象，生命周期结算 admission
-监督任务。本地取消不证明远端停止，远端执行仍依赖 actor 停止和资源回收终止。
-COMPLETING 期间的失败改变终态为 FAILED，不重复启动清理。清理通过同一 FSM 提交
-CLEANUP_FINISHED 或 CLEANUP_FAILED。
+boundary = reduce_drain_boundary(
+    boundary, DrainEvent(DrainEventKind.CHECKPOINT_COMMITTED, 5)
+).boundary
+assert boundary.committed_cut == 5
 
-`GraphExecution.cancel()` 请求 CANCELLING，通过 shield 等待同一个清理任务。重复取消和
-完成后的取消都观察同一结果；取消等待者不会取消清理。成功回收进入 CANCELLED，清理失败
-进入 FAILED。`wait()` 对取消抛出 `asyncio.CancelledError`，对失败抛出
-`ExecutionFailedError`。取消不会额外创建 checkpoint；恢复以已提交的协调 checkpoint 为准。
-生命周期也持有 startup 任务。失败或取消先结算未完成 startup，再回收资源，避免等待
-READY 的任务在终态后悬挂。取消 placement 等待会释放已创建的 placement group。
+admission = DrainAdmission(boundary.revision, 5, terminal_cut=5)
+assert not admission.supersedes(admission)
+restored = DrainBoundary.from_committed_cut(5)
+assert restored.admitted_cut is None
+```
 
-reducer 状态锁内不等待 RPC、checkpoint I/O 或 source ACK。Driver fan-out 并发，
-Worker 执行和 tensor 流量保持分布式。该设计证明时序与交付状态保留范围，不等于
-已经测得 Controller 可扩展性或跨节点吞吐。
+相同准入可重复应用；旧版本或同版本的冲突值抛出 `ValueError`。恢复后的边界有已提交位置，但没有新的准入；下一段有限执行范围仍需由生命周期授予。
+
+## 准入交接
+
+生命周期选择当前不可变准入。`SPMDManager.enqueue_driver_calls` 先校验全部登记参与者及其远程接口，再排队调用，返回汇总异步结果。缺少角色句柄或接口无效时，整次预检失败，不跳过参与者。接收端驱动器状态机判断操作是否合法，管理器不另存就绪状态，也不另建接收者清单。
+
+提交或远程调用失败会在等待时抛出，不作为普通结果返回。相同版本的并发调用共享一个汇总结果。旧请求尚未完成时也可交付新版本，因此缩短终点不必等待慢接收者；接收端拒绝过期或冲突版本。
+
+驱动器先校验状态，再记住准入。相同请求共享同一个应用任务及其失败；只记下收到请求不等于应用成功。生命周期持有全部待完成监督任务，只缓存最新版本的结果。这些对象是瞬态交付状态，不是检查点依据。
+
+调用方取消等待不会取消受监督的准入操作或失败处理。完成后任务移出待完成集合，最新版本结果保留供重复调用观察。管理器仍跟踪所有已提交远程调用，包括其他参与者已失败时尚未结束的慢调用。
+
+控制器进入 `COMPLETING`、`FAILING` 或 `CANCELLING` 时，只登记唯一终止清理任务后立即返回。组件终止通知失败也不跳过资源回收。回收后，管理器取消并等待剩余本地远程调用等待对象，生命周期结算准入监督任务。本地取消不代表远端已停止，远端仍依赖角色关闭与资源回收。
+
+完成过程中的失败会将结果改为 `FAILED`，不创建第二个清理任务。清理通过同一状态机报告 `CLEANUP_FINISHED` 或 `CLEANUP_FAILED`。
+
+`GraphExecution.cancel()` 请求取消并等待同一个受保护的清理任务。重复取消和完成后的取消观察同一结果；取消等待者不取消清理。成功回收进入 `CANCELLED`，回收失败进入 `FAILED`。`wait()` 分别抛出 `asyncio.CancelledError` 或 `ExecutionFailedError`。
+
+取消不额外创建检查点，恢复只能使用已提交的协调检查点。启动任务同样由生命周期管理，失败或取消时先结算启动再回收，避免就绪等待悬挂；取消放置等待会释放已分配放置组。
+
+状态锁不等待远程调用、检查点输入输出或来源确认。驱动器调用保持并发，工作进程与张量传输保持分布式。上述约束说明顺序和交付状态的保留范围，不代表已经测得控制器扩展能力或跨节点吞吐。
 
 ## 使用方式
 
-下面的函数接收编译后的 `graph` 和 `PlacementRecipe`。调用前在提交进程初始化 Ray。
-各节点需要兼容的运行环境，并能够访问配置中的 checkpoint repository。
+下面的接入函数接收编译图、`PlacementRecipe` 和仓库路径。调用前在提交进程初始化 Ray，各参与节点需有兼容的依赖并能访问仓库。图中必须登记继续训练所需的全部状态组件。
 
 ```python
-import fluxway
-from fluxway.common.types import AsyncStepConfig, CheckpointConfig
+from typing import Literal
 
-async def train(graph, recipe, *, resume=None):
+import fluxway
+from fluxway.common.types import AsyncStepConfig, CheckpointConfig, Graph
+from fluxway.placement import PlacementRecipe
+
+
+async def train(
+    graph: Graph,
+    recipe: PlacementRecipe,
+    repository_dir: str,
+    *,
+    resume: Literal["latest"] | int | None = None,
+) -> int | None:
     execution = await fluxway.start(
         graph,
         placement_recipe=recipe,
         async_step_config=AsyncStepConfig(max_steps=37),
         checkpoint_config=CheckpointConfig(
-            repository_dir="/shared/checkpoints/training",
+            repository_dir=repository_dir,
             interval_steps=17,
         ),
         resume=resume,
     )
     try:
         await execution.wait()
+        return execution.restored_step
     finally:
         await execution.cancel()
 ```
 
-新执行实例可传入 `resume="latest"` 或已提交的 checkpoint step。拓扑变化必须保持
-logical batch，并满足各 checkpoint component 的拓扑契约。`wait(timeout=...)` 仅限制
-等待时间，不取消执行；提前停止需显式调用 `cancel()`。完成后的 `cancel()` 观察已有
-清理结果，不重复回收资源。
+返回值是启动时恢复的位置；没有恢复状态时为 `None`。例子执行到位置 37，每隔 17 步请求检查点，到达终点时遵循前述排空顺序。
 
-公开启动入口接收编译图。无 source 图使用相同授权顺序，省略 source layout 准备。
-框架不提供独立的动态 eager 图提交 API；算子内部的 eager 计算使用同一执行授权契约。
+新执行可指定 `resume="latest"` 或已提交的检查点步骤。改变拓扑必须保持逻辑批大小，并满足各组件的拓扑契约。`wait(timeout=...)` 仅限制等待时间，提前停止需显式调用 `cancel()`。完成后的 `cancel()` 观察已有清理结果，不重复回收。
+
+### 观察进度或限制等待时间
+
+下面两个函数接收正在运行的执行对象。`observe` 每隔五秒打印按 SPMD 返回的进度，直到完成。`finish_with_deadline` 传播超时异常，并始终请求清理，因此超时后也会停止执行。
+
+```python
+from fluxway import GraphExecution
+
+
+async def observe(execution: GraphExecution) -> None:
+    async for progress in execution.monitor_progress(interval_s=5.0):
+        print(progress)
+
+
+async def finish_with_deadline(execution: GraphExecution, timeout_s: float) -> None:
+    try:
+        await execution.wait(timeout=timeout_s)
+    finally:
+        await execution.cancel()
+```
+
+单独调用 `wait(timeout=...)` 超时后执行仍会继续，`monitor_progress` 也由调用方负责最终清理。取消成功后，正在等待的 `wait()` 抛出 `asyncio.CancelledError`；执行失败时抛出 `ExecutionFailedError`。两条路径都不会创建检查点。
+
+公开入口接收编译图。无来源图使用相同的执行授权顺序，只省略来源布局准备。框架没有独立的动态即时图提交接口，算子内部的即时数值计算仍受同一执行授权约束。
 
 ## 一致性边界
 
-生命周期契约覆盖启动、Driver 乱序激活、终止切点、恢复顺序、并发准入版本、重复应用、
-保存与继续执行的失败传播，以及检查点后的继续执行。来源窗口进度和补充由来源协调契约
-负责，其中 Controller 的事件驱动 `SourceProgressSupervisor` 执行扫描和补窗，公开启动
-API 只启动生命周期。摄取语义见[来源协调](source_coordination_zh.md)。
+生命周期契约覆盖启动、驱动器乱序激活、终点、恢复顺序、并发准入版本、重复应用、保存和继续执行的失败传播。来源窗口进度和补充由控制器的事件驱动监督器负责，公开启动接口只启动生命周期。读取语义与示例见[来源协调](source_coordination_zh.md)。

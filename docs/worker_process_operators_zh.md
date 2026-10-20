@@ -1,95 +1,169 @@
-# Worker 进程算子
+# 工作进程算子
 
-Fluxway 通常会将用户代码与 `SPMDWorker` 的 actor event loop（事件循环）隔离开来。
-在用户算子运行时，scheduler（调度器）、mailbox receiver（信箱接收器）、prepare runtime（准备运行时）和 delivery runtime（交付运行时）必须能够继续推进。
+[英文版](worker_process_operators.md)
 
-每个有状态（stateful）的算子类都会在其规划的 SPMD worker 进程内被实例化一次。当算子的构造依赖于 worker 拓扑或需要初始化进程本地的运行时状态时，请使用 `@fluxway.requires_worker_process`。
+有状态算子实例属于一个 SPMD 工作进程。如果构造函数创建进程本地句柄，
+或者需要最终的工作进程拓扑，例如调用 `jax.distributed.initialize`，使用
+`@requires_worker_process`。普通有状态类不需要这一标记。
+
+## 声明算子并释放资源
+
+下面将无状态的输入准备与有状态的文件写入分开。
+`bind_spmd` 保留原始类供本地检查，并创建用于计算图执行的 SPMD 声明。
+写入器只有一个工作进程，因此输出路径只有一个所有者。该路径必须尚不存在。
+
 
 ```python
-import jax
-import fluxway
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
+import fluxway as fw
+from fluxway.common.operator_policy import AsyncPolicy, StatePolicy
 
 
-@fluxway.requires_worker_process
-class Trainer:
-    def __init__(self):
-        jax.distributed.initialize(
-            coordinator_address=self.rank0_address,
-            num_processes=self.world_size,
-            process_id=self.rank,
-        )
+@fw.requires_worker_process
+class BatchWriter:
+    def __init__(self, output_path: str):
+        self._stream = Path(output_path).open("x", encoding="utf-8")
+
+    def prepare(self, values: np.ndarray) -> dict[str, np.ndarray]:
+        return {"values": np.abs(values)}
+
+    def write(self, values: np.ndarray) -> int:
+        self._stream.writelines(f"{value}\n" for value in values.tolist())
+        return len(values)
+
+    def on_shutdown(self) -> None:
+        self._stream.close()
+
+
+replicated = {"type": "static", "axis": []}
+WriterSPMD = fw.bind_spmd(
+    BatchWriter,
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+    prepare={
+        "input_sharding": {"values": replicated},
+        "output_sharding": {"values": replicated},
+        "async_policy": AsyncPolicy.pipelined(depth=2, state=StatePolicy.thread_safe()),
+    },
+    write={
+        "input_sharding": {"values": replicated},
+        "async_policy": AsyncPolicy.pipelined(depth=2, state=StatePolicy.exclusive()),
+    },
+)
+
+
+def build_writer_graph(output_path: str) -> fw.Graph:
+    builder = fw.Builder()
+    builder.add_node("writer", WriterSPMD, output_path=output_path)
+    builder.add_func_edge(
+        "writer",
+        "prepare",
+        "writer",
+        "write",
+        tensor_map={"values": "values"},
+        local_only=True,
+    )
+    return builder.build("batch-writer")
+
+
+Path("tmp").mkdir(exist_ok=True)
+with TemporaryDirectory(dir="tmp") as directory:
+    output = Path(directory) / "batch.txt"
+    writer = BatchWriter(str(output))
+    try:
+        prepared = writer.prepare(np.array([-1, 2, -3]))
+        assert writer.write(prepared["values"]) == 3
+    finally:
+        writer.on_shutdown()
+    assert output.read_text() == "1\n2\n3\n"
+
+    graph = build_writer_graph(str(Path(directory) / "runtime.txt"))
+    view = graph.require_compiled_graph().spmd("writer")
+    assert view.operator("prepare").spec.async_policy.state.access == "thread_safe"
+    assert view.operator("write").spec.async_policy.state.access == "exclusive"
+    assert view.operator("write").spec.requires_worker_process
 ```
 
-常见原因：
+直接调用会在 CPU 上检查文件内容、资源生命周期和编译后的策略，不会运行 Ray 工作进程。
+计算图展示了本地交接；启动作业前，需要为 `prepare` 连接实际数据源。
+`local_only=True` 表示同一工作进程内的依赖，不是远程调用。
 
-- `jax.distributed.initialize`
-- 进程本地的 GPU 或加速器运行时状态
-- 必须与 SPMD worker 在同一进程中初始化的库
-- 构造时需要最终 rank 和节点信息的原生句柄
+启动时，Fluxway 在每个工作进程内为每个所有者类创建一个实例，并在该类的算子之间共享。
+构造参数取自节点的静态参数，例如上面的 `output_path`。
+在 `__init__` 之前，Fluxway 还会提供 `rank`、`world_size`、`local_rank`、
+`local_world_size`、`node_rank`、`num_nodes`、`spmd_id`、`rank0_address`
+和 `ray_component_limits`。`self.ctx` 携带当前调用的上下文，会随调用变化。
 
-普通有状态算子不需要标记，因为它们的所属实例已经属于 SPMD worker。该标记使构造要求显式化，并能验证进程本地初始化。
+正常关闭工作进程时，即使多个算子共享同一实例，Fluxway 也只调用一次该实例的
+`on_shutdown()`。该方法可以是同步函数，也可以返回可等待对象。
+关闭过程会尝试清理所有实例，并传播清理错误。强制终止进程不能保证执行清理；
+缓冲文件也不提供检查点或崩溃恢复保证。注册表不会替资源所有者关闭对象，见
+[资源所有权](placement_recipe_zh.md#注册工作进程内创建的资源)。
 
-## 运行时语义
+## 用户代码在哪里运行
 
-有状态的所有权并不意味着在 Ray actor 事件循环上内联执行。
-从第一次调用开始，Fluxway 就会将每个普通的 Python `CALL` 节点异步提交到 `WorkerProcessCallRuntime` 中其命名的 lane（通道）上。有状态且具有进程亲和性的可调用对象也使用相同的路径，即使它们返回一个可等待对象（awaitable）：
+| 可调用对象 | 执行方式 |
+| --- | --- |
+| 普通 Python 函数 | 从第一次调用起，异步提交到工作进程内的命名线程通道 |
+| 返回可等待对象的普通函数 | 工作线程继续完成该可等待对象 |
+| 协程函数（`async def`） | 使用 `COROUTINE_ASYNC`，在执行器的事件循环上协作运行 |
 
-- actor 事件循环提交工作并等待 future
-- 普通的 Python 可调用对象在同一进程的 worker 本地线程上运行
-- 如果可调用对象返回一个可等待对象，运行时将在 worker 线程内完成它
-- 诸如 rank/world/step 等 `contextvars` 会被传播
-- 异常会传播回 LocalStepPlan，并正常地毒化（poison）worker
+`@requires_worker_process` 控制构造位置，不改变上表中的选择。
+协程等待时必须让出控制权；在 `async def` 内执行阻塞操作会阻塞执行器的事件循环。
+进程编号和执行步等上下文变量会随调用传入工作线程。异常会传播到本地执行计划并使工作进程失败。
 
-Fluxway 每次调用只选择一次执行 lane。在开启 profiling 的情况下，`user_callable.execute` 记录端到端延迟，包括队列等待时间，而 `user_callable.function_run` 记录实际的算子函数调用，不包括 lane 排队和 worker 上下文设置。对于 worker 执行，`worker_process_call.thread_run` 记录精确的 worker 线程执行区间。Profiling 会观察选定的 lane，但不会再次分发它。
+这样，普通算子运行时，传输接收、信箱更新、输入准备、输出交付和调度器唤醒仍可推进。
+标准 CPython 下，计算密集的 Python 代码仍然竞争 GIL。
+释放 GIL 的原生代码可以重叠；自由线程版 CPython 还可以并行执行 Python 字节码，
+通道和调度规则保持一致。
 
-每个协程函数使用 `COROUTINE_ASYNC` 执行模式，并且可以在 actor 事件循环上协作运行。状态和进程亲和性不会改变这种选择：`StatePolicy` 控制对可变状态的访问，而 `@requires_worker_process` 控制对象的构造和生命周期。协程在等待期间必须交出控制权（yield），并且不能在 `async def` 内部隐藏阻塞式工作；从第一次调用开始，普通的 Python 函数就会被异步提交到其命名的 worker 进程 lane 上。
+## 状态与调度
 
-这保留了以下组件的事件循环推进：
+`AsyncPolicy.depth` 限制本地流水线深度。状态访问需要单独选择：
 
-- `receive_transport_frames`
-- 信箱存入（deposit）和就绪（ready）回调
-- `LocalInputPrepareRuntime`
-- `OutboundDeliveryRuntime`
-- 调度器唤醒和 drain fences（排空屏障）
+- `StatePolicy.exclusive()` 将共用同一状态资源的算子串行化。
+  模型更新和可变存储应保留此默认策略。
+- `StatePolicy.thread_safe()` 移除实例锁。只有算子及其底层资源支持并发调用时才使用。
 
-计算密集型的纯 Python 用户代码仍然会竞争 CPython GIL（全局解释器锁）。该运行时是一种事件循环隔离机制，而不是 CPU 并行加速的保证。JAX、CuPy、原生内核、Ray RPC 等待以及许多 I/O 路径仍然可以重叠，因为它们会释放 GIL 或者是组件驱动的。
+示例中，`prepare` 只转换输入，可以与 `write` 重叠。
+`write` 的多次调用共用文件，因此仍然互斥。进程本地构造并不禁止这样的重叠。
 
-在 Python 3.14 及更高版本的自由线程（free-threaded）CPython 上，同名的 worker 进程 lane 可以并行运行 Python 字节码。Fluxway 没有为解释器的这种能力暴露第二种执行模式；在各个 CPython 版本中，lane 隔离和调度语义保持一致。
+模型更新包含多个阶段时，`SchedulePolicy.phase_graph` 可以允许同一步的辅助工作与更新重叠，
+同时阻止下一训练步读取尚未完成的状态。
+[推荐模型示例](../fluxway/example/recommendation/dense_spmd.py) 中，
+`prepare_dense_inputs` 和 `scatter_sparse_grads` 声明为线程安全，
+`train_core` 和 `update` 保持独占。计算图和[可视化](graph_visualization_zh.md)
+使用同一份编译后的阶段规则。
 
-## 状态和资源规则
+启用性能分析后，`user_callable.execute` 包含排队时间；
+`user_callable.function_run` 只测量函数调用，不包含通道排队和工作进程上下文设置。
+`worker_process_call.thread_run` 记录工作线程的执行区间。
+分析器观察已经选定的通道，不会再次分发调用。
 
-`AsyncPolicy` 控制并发：
+## 初始化错误
 
-- `StatePolicy.exclusive()` 通过 LocalStepPlan 资源 ID 串行化访问。
-- `StatePolicy.thread_safe()` 移除类实例锁，并要求底层的状态/存储对于并发调用是安全的。
-- `local_pipeline_depth` 来自 `AsyncPolicy.depth`。
+类调用 `jax.distributed.initialize` 却缺少标记时，会被拒绝并报
+`Fluxway Worker Process Error`。应使用装饰器，不要直接设置内部字段
+`__fluxway_process_affine__`。该标记不会安装 JAX、创建分布式协调器或修正不一致的工作进程拓扑。
 
-如果一个进程亲和性的类具有可变的 Python 状态，且没有被显式声明为线程安全，请使用默认的 `AsyncPolicy.sync()` 或 `StatePolicy.exclusive()`。
+## 检查点扩展边界
 
-进程亲和性的构造并不禁止本地重叠。一个标有 `@requires_worker_process` 的类可以暴露使用 `StatePolicy.thread_safe()` 的无状态辅助算子，同时保持改变模型/状态的算子是独占的。建议方案 `DenseSPMD` 就使用了这种拆分：
+算子不实现检查点钩子。通过 SPMD 的 `checkpoint_components` 注册
+`CheckpointComponentRegistration`。
+`SAVE` 组件处理 `prepare_save`、`save`、`finish_save`、`commit_save` 和
+`publish_save`；`rollback_save` 处理失败事务。`RESTORE` 组件处理 `restore`。
+对象持有和清理预留属于 `OBJECT_LIFECYCLE`，物理删除属于 `OBJECT_CLEANUP`。
+控制侧通过 `abort_save` 丢弃未完成的保存尝试，在全局提交成功后调用 `acknowledge_save`。
 
-- `prepare_dense_inputs` 和 `scatter_sparse_grads` 在线程安全的本地异步 lane 上运行，因为它们不读取或写入稠密模型状态。
-- `train_core` 和 `update` 保持独占的状态访问，因为它们读取或改变稠密模型/梯度累加器。
-- `SchedulePolicy.phase_graph` 允许 `scatter_sparse_grads(step=N)` 和 `update(step=N)` 重叠，同时防止 `train_core(step=N+1)` 在 `update(step=N)` 提交之前开始。
-
-这些 phase 之间的内部交接可以使用函数式图的 `local=True`。那是一条同一 worker 的传输边，而不是远程调用。
-
-## 失败模式
-
-当一个类调用了 `jax.distributed.initialize` 但没有被装饰时，Fluxway 会快速失败：
-
-```text
-Fluxway Worker Process Error: ... calls jax.distributed.initialize but is not marked with @fluxway.requires_worker_process.
-```
-
-内部协议字段 `__fluxway_process_affine__` 被故意隐藏在装饰器之后。用户代码应使用 `@fluxway.requires_worker_process`。
-
-## Checkpoint 组件
-
-算子不实现 checkpoint hooks。Checkpoint 格式通过 `@spmd(checkpoint_components=(...))` 注册一次，并组合可选的 `CheckpointComponentRegistration` SPI 契约。这将状态序列化、集体发布、物理 URI 生成、恢复、对象保持（object holds）和清理置于一个显式的扩展边界之后。
-
-Worker 协调器（coordinator）调用已注册的 `SAVE` 组件的 `prepare_save`、`save`、`finish_save`、`commit_save` 和 `publish_save` 阶段；`rollback_save` 处理失败的事务。已注册的 `RESTORE` 组件处理 `restore`。Controller（控制器）拥有事务排序和清单（Manifest）发布权；组件拥有其 checkpoint 对象 URI、暂存布局、版本和物理保留操作。对象保持和清理保留属于 `OBJECT_LIFECYCLE`；物理删除属于 `OBJECT_CLEANUP`。
-
-`CheckpointContext` 仅携带逻辑身份：事务、快照、分片（cut）、SPMD/rank、拓扑和组件 ID。它故意没有物理存储定位器。请使用 `context.checkpoint_object_key(...)` 获取逻辑的 checkpoint 对象标识，并从 `save`/`commit_save` 返回组件拥有的、不透明的 `CheckpointObjectRef`。
-
-每个修改阶段都会收到 Fluxway 的 `CheckpointCommitPermit`（提交许可证）；在协调器代际接管后，过期的许可证会被拒绝。有关能力契约、清单模式、拓扑恢复规则、保留租约和内置组件示例，请参阅 [checkpoint.md](checkpoint.md)。
+控制器负责事务顺序和清单发布。组件负责物理 URI、暂存布局、版本和保留操作。
+保存方法接收 `SaveSession`，`commit_save` 接收包含全部工作进程结果的
+`CommitSaveSession`。`restore` 接收 `RestoreSession`，其中包含保存时和目标拓扑以及组件发布结果。
+用 `session.checkpoint_object_ref` 描述由组件管理的对象，再用
+`session.component_checkpoint` 发布这些引用。
+工作进程的 `save` 返回 `WorkerSaveResult`，`commit_save` 返回
+`CheckpointComponentPublication`。变更保存状态的会话携带 `CheckpointCommitPermit`；
+协调器换代后，旧许可会被拒绝。注册示例与完整能力约定见[检查点组件](checkpoint_zh.md)。

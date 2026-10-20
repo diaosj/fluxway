@@ -1,67 +1,246 @@
-# BaseReader and Source Ingestion API
+# Reader API
 
-`BaseReader` converts source records into coordinate-aware `TransportTensor`
-values. A controlled source reads the exact intervals in `self.ctx.source_work_items`.
-The planner owns ordered source intervals and canonical batches; `LogicalWorkLedger`
-owns leases and progress. Dispatcher only selects active workers and routes data.
+[Chinese edition](base_reader_zh.md)
 
-Before a controlled source call, OperatorManager validates a nonempty tuple of
-`SourceWorkItem` values for the current execution step. Items must agree on source,
-schema and global batch size; duplicate assignment intervals are rejected.
-Dispatcher does not derive source row offsets from physical or group-local ranks.
+`BaseReader` turns source records into `TransportTensor` values with global row
+coordinates. A controlled reader reads exactly the intervals in
+`self.ctx.source_work_items`. The planner fixes record order and logical batches;
+`LogicalWorkLedger` owns leases and progress. The dispatcher selects workers and
+routes data.
 
-## Read Lifecycle
+## Read assigned records
 
-1. Controller publishes a canonical plan and Driver delivers transient worker layouts.
-2. Worker takes the current step's leases from its grant cache, fetching a bounded
-   batch of active steps from Controller when needed.
-3. Worker injects those `SourceWorkItem` values into the active `OperatorContext`.
-4. The custom reader reads their pinned revision, locator and logical interval.
-5. Tensor helpers attach the work items' global row coordinates. Worker submits
-   source ACKs through its bounded asynchronous queue.
+Before each controlled read, the runtime validates a nonempty tuple of
+`SourceWorkItem` values for the current step. Source identity, schema and global
+batch size must agree, and duplicate intervals fail. Readers use the captured
+revision and physical locator, never a newly discovered latest revision.
 
-ACK confirms source production. It is not a model-consumption or durable checkpoint
-commit. External side effects need their own transaction or idempotency contract.
+This CPU example supplies the context that the runtime normally injects. One
+reader owns two separate intervals of the same assignment. Constructing work
+items here demonstrates coordinates; it does not register a source or start a
+distributed execution.
 
-## Tensor Helpers
+```python
+import numpy as np
 
-| API | Contract |
+from fluxway.common.decorators import operator, operator_context
+from fluxway.common.ingestion import (
+    LayoutUnitDescriptor,
+    SourceWorkAssignment,
+    SourceWorkItem,
+)
+from fluxway.common.tensor_backend import set_backend
+from fluxway.common.types.configs import OperatorContext
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.reader import BaseReader
+
+
+class FeatureReader(BaseReader):
+    @operator("read")
+    def read(self) -> tuple[TransportTensor, TransportTensor, TransportTensor]:
+        if self.ctx is None or not self.ctx.source_work_items:
+            raise RuntimeError("acquired source work is required")
+        revisions = self.static_args["revision_rows"]
+        rows = np.concatenate(
+            [
+                revisions[
+                    (
+                        item.assignment.descriptor.revision_identity,
+                        item.assignment.descriptor.physical_identity,
+                    )
+                ][item.logical_start : item.logical_end]
+                for item in self.ctx.source_work_items
+            ]
+        )
+        return (
+            self.create_tensor(rows, uniform_dense_partition=True),
+            self.create_row_sparse_tensor(rows.tolist(), width=2, dtype=np.int64),
+            self.create_tensor(
+                [row[: index % 2 + 1].tolist() for index, row in enumerate(rows)],
+                dtype=np.int64,
+            ),
+        )
+
+
+set_backend("hybrid")
+unit = LayoutUnitDescriptor(
+    unit_id="part-0:2:8",
+    revision_identity="revision-7",
+    cardinality=6,
+    cardinality_metric="rows",
+    split_policy="SplittableSpan",
+    locality_key="part-0",
+    physical_identity="part-0",
+    logical_start=2,
+    opaque_token=b"pinned-array",
+)
+assignment = SourceWorkAssignment.create(
+    epoch=0,
+    step=3,
+    source_identity="features",
+    view_identity="view-7",
+    schema_digest="two-columns",
+    lineage_digest="revision-7",
+    descriptor=unit,
+    global_start=24,
+    global_batch_size=8,
+    global_valid_count=8,
+)
+context = OperatorContext(
+    physical_rank=1,
+    physical_world_size=4,
+    logical_rank=1,
+    logical_world_size=4,
+    step=3,
+    source_work_items=(
+        SourceWorkItem(assignment, 2, 4),
+        SourceWorkItem(assignment, 6, 8),
+    ),
+)
+revisions = {("revision-7", "part-0"): np.array([[i, i + 1] for i in range(10)])}
+with operator_context(
+    static_args={"revision_rows": revisions},
+    rank=1,
+    world_size=4,
+    operator_ctx=context,
+):
+    dense, sparse, nested = FeatureReader.read()
+
+assert dense.global_shape == sparse.global_shape == (8, 2)
+assert dense.origin_indices.materialize().tolist() == [24, 25, 28, 29]
+assert sparse.origin_indices.materialize().tolist() == [24, 25, 28, 29]
+assert nested.origin_indices.materialize().tolist() == [24, 25, 28, 29]
+assert nested.logical_shape == (4, None)
+assert nested.global_shape is None
+```
+
+The file rows are `2, 3, 6, 7`; their global rows are `24, 25, 28, 29`.
+Physical rank `1` does not determine either set of coordinates. For a storage
+adapter, resolve each interval relative to its original source metadata; a file
+fragment's local index need not equal the file's physical row number. Nested
+lists retain row coordinates and report local variable-length structure; they
+do not infer a global variable-length shape.
+
+## Tensor helpers
+
+| API | Use |
 | --- | --- |
-| `create_tensor(data, dtype=None, uniform_dense_partition=False)` | Wrap dense or nested data with validated source row coordinates. |
-| `create_row_sparse_tensor(rows, *, width, dtype=None)` | Build row-partitioned sparse values with canonical global shape. |
-| `self.ctx.source_work_items` | Exact acquired intervals for this logical step; never cache across invocations. |
-| `self.rank`, `self.world_size` | Physical placement coordinates; do not derive ownership from them. |
+| `create_tensor(data, dtype=None, uniform_dense_partition=False)` | Wrap dense or nested data and attach source coordinates. |
+| `create_row_sparse_tensor(rows, *, width, dtype=None)` | Encode a variable number of values per row with a declared row width. |
+| `self.ctx.source_work_items` | Read the exact intervals for this invocation; do not cache them. |
+| `self.rank`, `self.world_size` | Inspect physical placement, not source ownership. |
 
-The outer row count must equal the total acquired cardinality, and all items must
-belong to the active step and the same logical batch. Dense uniform and row-sparse
-helpers use the assignment's `global_batch_size` for global rows. Origin indices
-concatenate each item's `global_start` and cardinality, including disjoint intervals.
-Missing context or conflicting metadata raises an exception.
+The outer row count must equal the total acquired cardinality. Every item must
+belong to the current step and one logical batch. Dense uniform and row-sparse
+helpers use the assignment's `global_batch_size` for global rows. Missing context,
+wrong row counts or conflicting metadata raise an exception.
 
-For an explicitly coordinated source without work items, the caller must supply
-`global_source_offset`; BaseReader does not infer it from physical rank. This mode
-alone does not establish checkpoint replay or topology-independent ownership.
+An explicitly coordinated source without work items must supply
+`global_source_offset`. This separate CPU example shows that mode:
 
-## Custom Sources
+```python
+import numpy as np
 
-Implement `IngestionSourceAdapter.scan_next(cursor, budget)` to return bounded
-`SourceScanResult` values with opaque cursors. Cursor payloads are source-owned; Fluxway
-must not decode source-specific fields. `IngestionReadSession.read` supplies exact
-interval chunks, and `IngestionLayoutSession` offloads iteration and validates
-consumed cardinality.
+from fluxway.common.decorators import operator, operator_context
+from fluxway.common.tensor_backend import set_backend
+from fluxway.common.types.configs import OperatorContext
+from fluxway.common.types.tensor import TransportTensor
+from fluxway.reader import BaseReader
 
-See [RecommendationReader](../fluxway/example/recommendation/reader.py) and its
-[source descriptor](../fluxway/example/recommendation/source_adapter.py). The
-current descriptor provides one `build_source_scan_binding` method and `build_component`;
-the binding owns the reader topology, scan adapter, tail policy, and initial opaque cursor.
-The controller creates and caches this binding once for the source session.
-A physical reader cursor is not an independent checkpoint authority.
 
-## Streaming and recovery limits
+class ExplicitReader(BaseReader):
+    @operator("read")
+    def read(self) -> TransportTensor:
+        return self.create_tensor(
+            self.static_args["rows"], uniform_dense_partition=True
+        )
 
-Scan results and pending tails are planned by the control plane. A reader implementation
-alone does not establish event-driven window refill, bounded progress or global training recovery.
-The planner can derive a consumption bookmark at a checkpoint cut inside a window.
-Restore replans from that bookmark; the reader does not save an independent cursor
-or restore an old window. See [source coordination](source_coordination.md) for
-the event-driven source-window progress and joint model/optimizer/source checkpoint contract.
+
+set_backend("hybrid")
+context = OperatorContext(
+    physical_rank=3,
+    physical_world_size=4,
+    logical_rank=1,
+    logical_world_size=2,
+    step=3,
+    global_source_offset=14,
+)
+with operator_context(
+    static_args={"rows": np.array([[10.0], [20.0]])},
+    rank=3,
+    world_size=4,
+    operator_ctx=context,
+):
+    tensor = ExplicitReader.read()
+
+assert tensor.global_shape == (4, 1)
+assert tensor.origin_indices.materialize().tolist() == [14, 15]
+```
+
+Here global row count is local rows times `logical_world_size`. The caller owns
+coordination of these explicit offsets. This mode alone provides neither
+checkpoint replay nor ownership across topology changes.
+
+## Read a compiled layout
+
+`IngestionReadSession.read` accepts a `ScheduledSegmentRead` and an explicit
+`batch_size`, then yields `SegmentReadChunk` values. Each chunk reports its actual row count,
+physical bytes and whether it opened the object. `IngestionLayoutSession` moves
+blocking iteration to a thread and verifies the total count.
+
+The following integration function needs a runtime-issued activation, a storage
+read session and an asynchronous consumer. Exhaustion returns layout completion
+information; early exit or a count mismatch must not report completion.
+
+```python
+from collections.abc import Awaitable, Callable
+from typing import Any
+
+from fluxway.common.ingestion import (
+    IngestionLayoutActivation,
+    SourceLayoutCompletion,
+)
+from fluxway.reader import IngestionLayoutSession, IngestionReadSession
+
+
+async def consume_layout(
+    activation: IngestionLayoutActivation,
+    reader: IngestionReadSession,
+    consume: Callable[[Any], Awaitable[None]],
+    *,
+    batch_size: int,
+) -> SourceLayoutCompletion:
+    session = IngestionLayoutSession(activation, reader, batch_size=batch_size)
+    try:
+        while True:
+            batch = await session.read()
+            if batch is None:
+                return session.acknowledgement
+            await consume(batch)
+    finally:
+        await session.close()
+```
+
+Layout completion is distinct from `SourceWorkAcknowledgement`. During normal
+controlled execution the worker acquires leases, injects work items, calls the
+reader and submits lease acknowledgements through a bounded asynchronous queue.
+Applications do not manually acknowledge a whole descriptor for other workers.
+
+## Source registration and recovery
+
+Implement `IngestionSourceAdapter.scan_next(cursor, budget)` and pure
+`advance_cursor(cursor, records)`. A source descriptor supplies
+`build_source_scan_binding` and `build_component`. The controller creates and
+caches one binding for the session; it owns the reader topology, adapter, tail
+policy and initial opaque cursor. See the executable scanning example in
+[source coordination](source_coordination.md), and the
+[recommendation descriptor](../fluxway/example/recommendation/source_adapter.py)
+and [reader](../fluxway/example/recommendation/reader.py).
+
+A source acknowledgement confirms production, not model consumption or durable
+commit. The planner derives a consumption bookmark at the joint checkpoint cut.
+Restore replans from that bookmark; readers do not save independent durable
+cursors or restore old windows. External side effects need their own transaction
+or idempotency contract. A reader implementation alone does not establish a
+complete refill, drain or recovery loop; those boundaries are defined by
+[source coordination](source_coordination.md).

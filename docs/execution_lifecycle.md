@@ -1,5 +1,12 @@
 # Distributed Execution Lifecycle
 
+[Chinese edition](execution_lifecycle_zh.md)
+
+Start a compiled graph with `fluxway.start`, wait or observe progress through the
+returned `GraphExecution`, and call `cancel()` to stop early. The examples under
+[Usage](#usage) are the application-facing entry points. The earlier sections
+explain the ordering that those calls enforce.
+
 `fluxway/control_plane/lifecycle.py::ExecutionLifecycle` coordinates
 startup, restore, admission delivery, drain completion, checkpoint publication,
 resume and failure routing. Controller RPC methods validate requests and invoke
@@ -89,6 +96,52 @@ context and initializes its pool outside the event-loop call stack. This archite
 defines scheduling and ordering; throughput and tail latency still require workload-
 specific measurement.
 
+### Verify an execution lane locally
+
+This internal scheduler example runs without Ray. It checks that a `THREAD`
+operation executes on another thread and returns the submitted revision. The
+scheduler returns failures in `outcome.error`; its owner must propagate them and
+check the revision before applying a result.
+
+```python
+import asyncio
+from threading import get_ident
+
+from fluxway.common.effect_scheduler import (
+    BoundedLifecycleEffectScheduler,
+    LifecycleEffectExecutionMode,
+    LifecycleEffectSubmission,
+)
+
+
+async def check_thread_lane():
+    scheduler = BoundedLifecycleEffectScheduler(queue_size=2, worker_count=2)
+    await scheduler.start()
+    try:
+        outcome = await scheduler.submit(
+            LifecycleEffectSubmission(
+                operation=get_ident,
+                ordering_key="diagnostic",
+                state_revision=7,
+                mode=LifecycleEffectExecutionMode.THREAD,
+            )
+        )
+        if outcome.error is not None:
+            raise outcome.error
+        assert outcome.state_revision == 7
+        assert outcome.value != get_ident()
+    finally:
+        await scheduler.close()
+
+
+asyncio.run(check_thread_lane())
+```
+
+`ASYNC` operations must return an awaitable. `PROCESS` operations must be
+pickleable; define them in an importable module and protect script startup with
+`if __name__ == "__main__":`. This example does not measure concurrency or test
+the process lane.
+
 Worker heartbeat distinguishes INITIALIZING, READY, RESTORING, RUNNING, BLOCKED,
 STOPPED and ERROR. Driver heartbeat aggregates `workers_ready` (initialization)
 and `topology_ready` (registered communication topology). Neither authorizes START.
@@ -149,7 +202,7 @@ Tensor consumer reservations retain their own `RESERVED → CLAIMED → RELEASED
 the sequencer owns the state and Tensor keeps only a non-owning reservation reference. Worker
 shutdown submits cleanup to that state machine; cleanup is idempotent, while an explicit repeated
 `ConsumerLease.release()` remains an error. Shutdown must not call `cancel()` on a claimed
-reservation. See [coherence protocol](coherence_protocol.md#consumer-lease-reservation-ownership).
+reservation. See [coherence protocol](coherence_protocol.md#sequence-publications-and-leases).
 Driver shutdown moves through STOPPING → STOPPED in its existing FSM. A delayed
 activation acknowledgement cannot transition a stopped Driver to RUNNING. Driver
 and Worker each retain their local resource-release task; repeated stop calls join
@@ -214,6 +267,53 @@ Startup, admission, save and resume failures enter the same Controller failure p
 Exceptions remain visible. Worker/Driver errors also enter that FSM failure path;
 cleanup owns resource reclamation. No retry or CPU-copy fallback hides a failure.
 
+### Follow a shortened terminal boundary
+
+This local reducer example explains why observing the end of input does not
+itself commit a checkpoint. A periodic target of 8 is shortened to 5; only the
+commit event advances the durable position. It creates no actors and writes no
+checkpoint. Applications use `fluxway.start` rather than drive this internal
+reducer themselves.
+
+```python
+from fluxway.common.types.drain import (
+    DrainAdmission,
+    DrainBoundary,
+    DrainEvent,
+    DrainEventKind,
+    reduce_drain_boundary,
+)
+
+boundary = DrainBoundary.from_committed_cut(0)
+periodic = reduce_drain_boundary(
+    boundary, DrainEvent(DrainEventKind.PERIODIC_REQUEST, 8)
+)
+terminal = reduce_drain_boundary(
+    periodic.boundary, DrainEvent(DrainEventKind.TERMINAL_OBSERVATION, 5)
+)
+boundary = terminal.boundary
+assert boundary.admitted_cut == 5
+assert boundary.committed_cut == 0
+
+for kind in (DrainEventKind.DRAIN_COMPLETE, DrainEventKind.SNAPSHOT_BEGIN):
+    boundary = reduce_drain_boundary(boundary, DrainEvent(kind, 5)).boundary
+assert boundary.committed_cut == 0
+
+boundary = reduce_drain_boundary(
+    boundary, DrainEvent(DrainEventKind.CHECKPOINT_COMMITTED, 5)
+).boundary
+assert boundary.committed_cut == 5
+
+admission = DrainAdmission(boundary.revision, 5, terminal_cut=5)
+assert not admission.supersedes(admission)
+restored = DrainBoundary.from_committed_cut(5)
+assert restored.admitted_cut is None
+```
+
+An identical admission is idempotent. An older revision or conflicting values at
+the same revision raise `ValueError`. A restored boundary has a durable position
+but no new admission; the lifecycle must grant the next finite range.
+
 ## Admission handoff
 
 The lifecycle selects the current immutable admission. `SPMDManager.enqueue_driver_calls`
@@ -269,36 +369,79 @@ Controller scalability or cross-node throughput.
 
 ## Usage
 
-The following function accepts a compiled `graph` and a `PlacementRecipe`. Initialize
-Ray on the submitting process before calling it. Every node needs compatible runtime
-dependencies and access to the configured checkpoint repository.
+The following integration function accepts a compiled `graph`, a `PlacementRecipe`,
+and a repository path. Initialize Ray on the submitting process before calling it.
+Every participating node needs compatible dependencies and access to that repository.
+The graph must register all state components required to continue training.
 
 ```python
-import fluxway
-from fluxway.common.types import AsyncStepConfig, CheckpointConfig
+from typing import Literal
 
-async def train(graph, recipe, *, resume=None):
+import fluxway
+from fluxway.common.types import AsyncStepConfig, CheckpointConfig, Graph
+from fluxway.placement import PlacementRecipe
+
+
+async def train(
+    graph: Graph,
+    recipe: PlacementRecipe,
+    repository_dir: str,
+    *,
+    resume: Literal["latest"] | int | None = None,
+) -> int | None:
     execution = await fluxway.start(
         graph,
         placement_recipe=recipe,
         async_step_config=AsyncStepConfig(max_steps=37),
         checkpoint_config=CheckpointConfig(
-            repository_dir="/shared/checkpoints/training",
+            repository_dir=repository_dir,
             interval_steps=17,
         ),
         resume=resume,
     )
     try:
         await execution.wait()
+        return execution.restored_step
     finally:
         await execution.cancel()
 ```
 
+The function returns the position restored at startup, or `None` when nothing was
+restored. Its example runs to position 37 and requests periodic checkpoints every
+17 steps; reaching a terminal boundary follows the drain sequence above.
 Use `resume="latest"` or a committed checkpoint step to start a new execution.
 Topology changes must preserve the logical batch and satisfy each checkpoint
 component's topology contract. `wait(timeout=...)` limits the wait; it does not
 cancel execution. Call `cancel()` explicitly to stop early. A completed execution
 already owns its cleanup; the final `cancel()` safely observes that result.
+
+### Observe progress or bound a wait
+
+Pass a running execution to either function below. `observe` prints the progress
+mapping returned by each SPMD at five-second intervals until completion.
+`finish_with_deadline` propagates `TimeoutError` and always requests cleanup,
+so its deadline also stops execution.
+
+```python
+from fluxway import GraphExecution
+
+
+async def observe(execution: GraphExecution) -> None:
+    async for progress in execution.monitor_progress(interval_s=5.0):
+        print(progress)
+
+
+async def finish_with_deadline(execution: GraphExecution, timeout_s: float) -> None:
+    try:
+        await execution.wait(timeout=timeout_s)
+    finally:
+        await execution.cancel()
+```
+
+A bare `wait(timeout=...)` leaves execution running when it times out.
+`monitor_progress` also leaves cleanup to the caller. Successful cancellation
+makes a pending `wait()` raise `asyncio.CancelledError`; execution failure raises
+`ExecutionFailedError`. Neither path creates a new checkpoint.
 
 The public entry point accepts compiled graphs. Source-free graphs use the same
 authorization sequence and omit source layout preparation. A standalone dynamic

@@ -1,8 +1,28 @@
 # Fluxway Documentation
 
-中文目录见 [README_zh.md](README_zh.md)。This directory contains only stable public protocol, API, architecture, and usage documentation.
+[Chinese edition](README_zh.md)
 
-| Topic | English | 中文 |
+Start with the architecture, then follow the guide for the mechanism you need.
+Each guide pairs a short explanation with code, expected results, and limits.
+
+## Run the examples
+
+Use Linux and Python 3.12 or 3.13. Install Fluxway in your environment:
+
+```bash
+python -m pip install fluxway
+```
+
+Examples that only build graphs, configure policies, or exercise local protocols
+do not start a cluster. Functions that accept a compiled graph or runtime session
+are integration examples: their surrounding text states who supplies those values.
+Initialize Ray before starting execution. All participating nodes need compatible
+dependencies; recovery also requires a checkpoint repository they can access.
+Individual guides name optional dependencies and device requirements.
+
+## Guides
+
+| Topic | English | Chinese |
 | --- | --- | --- |
 | Architecture and lifecycle | [ARCHITECTURE.md](ARCHITECTURE.md) | [ARCHITECTURE_zh.md](ARCHITECTURE_zh.md) |
 | Execution lifecycle | [execution_lifecycle.md](execution_lifecycle.md) | [execution_lifecycle_zh.md](execution_lifecycle_zh.md) |
@@ -18,7 +38,18 @@
 | Placement mathematics | [placement_mathematics.md](placement_mathematics.md) | [placement_mathematics_zh.md](placement_mathematics_zh.md) |
 | Graph visualization | [graph_visualization.md](graph_visualization.md) | [graph_visualization_zh.md](graph_visualization_zh.md) |
 | User profiler | [user_profiler.md](user_profiler.md) | [user_profiler_zh.md](user_profiler_zh.md) |
+| Release process | [releasing.md](releasing.md) | [releasing_zh.md](releasing_zh.md) |
 
-Other documents cover profiling, visualization, and examples. Source identity, checkpoint cuts, and ownership definitions belong to the documents listed above; module documents link to them instead of duplicating those definitions. English and Chinese companions are updated together.
+Read [execution lifecycle](execution_lifecycle.md) to start, observe, and stop a
+graph. Read [checkpoints](checkpoint.md) before adding recovery. Source adapters
+should also follow [source coordination](source_coordination.md) and the
+[source work protocol](source_spmd_formal_protocol.md).
 
-Downstream applications own scenario configuration, remote catalog operations, credentials, and acceptance evidence. This repository documents the generic Fluxway contract.
+## Documentation scope
+
+These guides describe Fluxway's public APIs and protocol boundaries. Internal
+integration examples are labeled explicitly. Local examples illustrate behavior;
+they do not establish cluster throughput, crash recovery, or model convergence.
+Application configuration, remote catalogs, credentials, and acceptance results
+belong in the application repository. English and Chinese companions cover the
+same mechanisms and are maintained together.

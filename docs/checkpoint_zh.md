@@ -1,79 +1,504 @@
-# Checkpoints（快照与恢复）
+# 检查点与恢复
 
-来源元数据通过 `fluxway.common.metadata` 统一编码，包括不透明来源位置和组件
-事务摘要。目标是将消费书签、逻辑进度、模型及必要算子状态保存到同一检查点，
-恢复后重新规划和预取；来源状态必须遵循[来源协调](source_coordination_zh.md)中的共同检查点契约。
-用户二进制元数据经组件准备、提交和恢复后保持不变。
-全局 `CheckpointManifest` 不携带自有结构版本号。清单根字段由该数据类唯一
-定义，解码时拒绝缺失或额外字段，不维护第二份字段清单。
+英文版见 [checkpoint.md](checkpoint.md)。
 
-编码契约不等于连续读取恢复保证。Planner 接受有序不可变窗口，checkpoint 不保存物理
-topology。Worker 接收已经发布的连续 source window；checkpoint API 不负责自动 adapter 补窗。
-流式与 resharding 限制见 [Source 协调协议](source_coordination_zh.md)。能够序列化
-cursor，不能证明 cursor 推进与 work 发布已经在同一个 cut 上提交。
+检查点在同一个已确认的进度边界保存来源位置、模型、优化器和必要算子状态。先在图中注册状态组件，再通过 `fluxway.start` 配置周期保存。启动、等待和清理示例见[执行生命周期](execution_lifecycle_zh.md#使用方式)。
 
-快照（Checkpoint）是 Fluxway 在某一确定进度切面（Progress Cut）上的完整、可恢复状态。其公开标识（Public Identity）保持极简设计：
+Fluxway 决定事务、进度切点、引用和保留策略；各组件负责编码、存储、恢复映射和物理删除。能否改变拓扑恢复，由组件契约决定。
+
+## 注册小状态组件
+
+下面是完整的本地例子，将计数器状态注册到清单中。它不启动执行，也不写检查点。实际保存和恢复时，运行时会将算子拥有者和会话传入回调。
+
+```python
+import fluxway as fw
+from fluxway.checkpoint import (
+    register_checkpoint_component,
+    state_checkpoint_component,
+)
+from fluxway.common.decorators import spmd
+
+
+def restore_counter(owner, state, session):
+    owner.seen = state["seen"]
+
+
+counter_state = state_checkpoint_component(
+    "counter",
+    save=lambda owner, session: {"seen": owner.seen},
+    restore=restore_counter,
+)
+registration = register_checkpoint_component(
+    counter_state,
+    component_lifecycle=counter_state,
+    save=counter_state,
+    restore=counter_state,
+)
+
+
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+    checkpoint_components=(registration,),
+)
+class Counter:
+    def __init__(self):
+        self.seen = 0
+
+    @fw.operator(
+        name="advance", output_sharding={"value": {"type": "static", "axis": []}}
+    )
+    def advance(self) -> dict[str, int]:
+        self.seen += 1
+        return {"value": self.seen}
+
+
+assert registration.descriptor.checkpoint_objects == ()
+assert Counter.get_spmd_config().checkpoint_components == (registration,)
+```
+
+断言检查注册结果，并表明此组件没有物理检查点对象。小状态必须可由检查点元数据编码器表示，大状态应使用存储组件。默认恢复要求 `EXACT_TOPOLOGY`；需要弹性恢复的读取器必须明确实现逻辑位置映射，不能复制其他工作进程的游标。
+
+## 仓库目录与编码
+
+运行时打开配置中的仓库。新建根目录会写入 `CHECKPOINT_ROOT_MARKER`，已有且无标记的目录保持无标记。根目录必须是实体目录；已有标记必须是格式正确的普通文件，不能是符号链接。路径或标记不合法时抛出 `CheckpointDirectoryOwnershipError`。
+
+下面的本地例子只创建和删除自己的临时仓库：
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from fluxway.control_plane.checkpointer import (
+    CHECKPOINT_ROOT_MARKER,
+    CheckpointDirectory,
+)
+
+Path("tmp").mkdir(exist_ok=True)
+with TemporaryDirectory(dir="tmp", prefix="checkpoint-example-") as temporary:
+    root = Path(temporary) / "repository"
+    CheckpointDirectory.open(root)
+    assert (root / CHECKPOINT_ROOT_MARKER).is_file()
+    CheckpointDirectory.clear(root)
+    assert not root.exists()
+
+    prepared = Path(temporary) / "application"
+    prepared.mkdir()
+    CheckpointDirectory.open(prepared)
+    assert not (prepared / CHECKPOINT_ROOT_MARKER).exists()
+```
+
+`clear()` 要求有效的所有权标记，因此会拒绝删除上面无标记的 `application` 目录。打开已有目录不会接管它，也不会迁移其中的文件。
+
+清单、事务、清理意图和引用通过 `msgpack_codec` 保存为二进制 MessagePack。来源封装和事务摘要使用 `fluxway.common.metadata`，用户二进制元数据保持二进制。当前 `CheckpointManifest` 数据类定义清单根字段，解码拒绝缺失或多余字段，不提供按发行版本迁移的兼容层。编码成功不能证明来源游标和已发布任务在同一切点提交。
+
+## 进度与检查点身份
+
+公开身份为：
 
 ```text
 checkpoint_id -> component_id -> checkpoint_object_id
 ```
 
-* `checkpoint_id`：全局唯一标识一次已发布的快照事务；
-* `component_id`：标识拥有该状态的子系统或组件，例如 `dense`、`reader` 或 `embedding`；
-* `checkpoint_object_id`：当一个组件需要写入多个独立恢复的对象时用于区分。单对象组件默认使用 `"state"`。
+- `checkpoint_id` 选择一次完整的已发布检查点。
+- `component_id` 标识状态拥有者，如 `dense` 或 `reader`。
+- `checkpoint_object_id` 区分组件内的保存对象，单个物理状态对象通常使用 `"state"`。
 
-Fluxway 拥有并裁决快照事务、进度切面（Cut）、拓扑结构、快照引用以及物理清理决策；而具体组件则负责序列化、物理存储、恢复映射以及物理清理执行。这种解耦使得 Fluxway 核心完全独立于具体的文件系统、对象存储、Lance 存储引擎、元数据 Catalog 及数据格式。
+`CheckpointCut.position` 是持久化边界，各 SPMD 投影将同一值保存为 `drain_boundary.committed_cut`，发布时拒绝不一致。读取记录、交错单元和优化器更新可能采用不同坐标，各组件负责将共同位置映射为自己的状态。
 
-检查点根目录由 `CheckpointDirectory` (`fluxway.control_plane.checkpointer.directory`) 统一管理。
-根目录可以由业务预先创建，也可由 `CheckpointDirectory.open()` 自动创建。根目录必须是实体目录，
-不能是符号链接。Fluxway 创建新目录时写入所有权标记 `CHECKPOINT_ROOT_MARKER` (`.fluxway-checkpoint-root`)，
-内容为 `fluxway-checkpoint-root\n`。打开已有且无标记的目录时不补写标记、不接管目录；已有标记若格式错误或为符号链接，
-直接抛出 `CheckpointDirectoryOwnershipError`。调用 `CheckpointDirectory.clear()` 清理根目录前必须严格校验所有权标记，
-防止误删未纳管的业务路径。
+邮箱、一致性租约、就绪队列、物理布局、预取缓冲和信用观察属于瞬态状态。排空使边界静止，保存记录该边界，恢复在该位置创建新的运行时。保存租约或邮箱代次不能实现恢复。
 
-Manifest 清单、清理意图（Cleanup Intent）、事务记录与引用统一采用高效二进制 MessagePack 格式
-通过 `msgpack_codec` (`packb(..., use_bin_type=True)` 与 `unpackb(...)`) 进行持久化，避免未紧凑 JSON
-带来的反序列化和存储开销。未知标记内容和过期清单格式直接报错拒绝，打开目录不会自动迁移其中的旧文件。
+### 按步骤和名称选择检查点
 
----
+下面的本地例子只构造请求，不保存检查点：
 
-## 1. 保存与恢复（Saving & Restoring）
+```python
+from fluxway.checkpoint import NameReference, SaveCheckpointRequest, StepReference
 
-检查点发布由名为 `CheckpointTransactionState` 的持久化全局决策协调。
-它属于 Controller/Repository 层，和 Worker 本地的 `CheckpointSaveState`
-完全不同。Manifest 先进入 staged 状态，只有
-写入 committed marker 后才对恢复可见。
+request = SaveCheckpointRequest.for_step(1200, names=("best_model",))
+assert request.cut.position == 1200
+assert StepReference(1200) in request.references
+assert NameReference("best_model") in request.references
+```
 
-Fluxway 采用 **Fail-Stop 协议**，共四个规范事务状态：
+工厂为保存尝试和切点生成唯一标识。发布后，步骤和 `best_model` 名称选择同一个检查点；它们是查询引用，不是物理存储路径。
+
+下面的函数用于控制器接入，不用于正在执行的算子。`save_best` 要求已经完成协调排空，并确认来源任务完整。`restore_best` 是另一条独立路径，要求新的执行尚未激活。通常由图运行时管理这些操作。
+
+```python
+from fluxway.checkpoint import SaveCheckpointRequest
+from fluxway.control_plane.checkpointer import FluxwayCheckpointer
+
+
+async def save_best(checkpointer: FluxwayCheckpointer, drained_step: int) -> str:
+    manifest = await checkpointer.save(
+        SaveCheckpointRequest.for_step(drained_step, names=("best_model",))
+    )
+    return manifest.checkpoint_id
+
+
+async def restore_best(checkpointer: FluxwayCheckpointer) -> int | None:
+    return await checkpointer.restore_named("best_model")
+```
+
+其他选择方式为 `restore_step(step)`、`restore_latest()` 或 `restore_checkpoint(id)`。不能在运行图上连续调用多个恢复方法。`latest()` 和 `list_steps()` 是异步查询。
+
+没有步骤坐标的流式任务，由接入方提供来源书签和命名引用。下面的函数也只构造请求：
+
+```python
+from collections.abc import Mapping
+from uuid import uuid4
+
+from fluxway.checkpoint import NameReference, SaveCheckpointRequest
+from fluxway.common.types.checkpoint import CheckpointCut
+
+
+def stream_checkpoint_request(bookmarks: Mapping[str, bytes]) -> SaveCheckpointRequest:
+    return SaveCheckpointRequest(
+        attempt_id=uuid4().hex,
+        cut=CheckpointCut(
+            cut_id=uuid4().hex,
+            position=None,
+            stream_cuts=dict(bookmarks),
+        ),
+        references=(NameReference("stream-head"),),
+    )
+```
+
+`StepReference` 要求存在位置且与其一致，名称可以选择非步骤检查点。来源拥有者定义书签含义，并将其与其他组件对齐。
+
+## 全局发布事务
+
+控制器和仓库使用持久化决策记录 `CheckpointTransactionState`，它与工作进程的 `CheckpointSaveState` 是两套不同状态。
 
 ```mermaid
 stateDiagram-v2
     [*] --> STAGED
-    STAGED --> COMMIT_DECIDED: 持久化提交决策写入
-    STAGED --> ABANDONED: 决策前失败（Permit 已撤销）
-    COMMIT_DECIDED --> COMMITTED: 发布与应用完成（或重启时回放完成）
-    COMMIT_DECIDED --> ABANDONED: 无 commit marker 时的崩溃重启 fencing
+    STAGED --> COMMIT_DECIDED: 持久化决策
+    STAGED --> ABANDONED: 撤销许可
+    COMMIT_DECIDED --> COMMITTED: 发布与确认完成
+    COMMIT_DECIDED --> ABANDONED: 重启时没有全局提交标记
     COMMITTED --> [*]
     ABANDONED --> [*]
 ```
 
-`COMMIT_DECIDED` 记录物理发布已经启动。
-若崩溃发生在全局 commit marker（`committed.<checkpoint_id>`）写入之前，启动时 fencing 将调用组件的 `abort_save(permit)` 并将记录转为 `ABANDONED`；物理产物交由 GC 处理。若全局 commit marker 已经持久化成功，则该检查点在逻辑上已被决议提交；启动时 fencing 将复用持久化的 permit 回放各组件的 `acknowledge_save(permit)` 并推进事务至 `COMMITTED`，保留已发布的全局检查点。
-只有 `COMMITTED` 记录才能进入 latest、引用解析、保留清理和恢复流程。
+发布依次完成：
 
-每次最新全局 snapshot 包含 `latest` alias、各引用、保存保留清理以及恢复流程。
+1. 捕获不可变状态，准备全部参与者。
+2. 暂存清单与事务，持久化 `COMMIT_DECIDED`。
+3. 发布工作进程产物，应用已准备的控制器令牌。
+4. 写入全局标记 `committed.<checkpoint_id>`。
+5. 确认组件保存，将记录完成为 `COMMITTED`。
 
-Checkpointer 为每个全局 snapshot 生成单调 deadline，并按 Controller
-snapshot 协议传递。自定义的 Controller 实现必须接受 `deadline` 参数，否则将违反当前
-协议；忽略该参数或不带参数重试不是有效的回退机制。
+准备阶段校验捕获状态，应用阶段只安装已验证的内存令牌，不重新序列化；存储和发布错误仍会传播。
 
-Sparse embedding 集成将 `load_optimizer_state` 作为显式训练恢复选项，原样传给
-sparse storage adapter。`true` 要求目标表启用 optimizer；`false` 只恢复 embedding
-权重。推理不使用训练 checkpoint component，而是创建禁用 optimizer 的 sparse
-store 并加载 weight snapshot。
+提交决策前失败或超时，会撤销许可并将尝试改为 `ABANDONED`，暂存产物可留待后续清理。崩溃后，启动隔离检查全局标记：没有标记时调用组件的 `abort_save(permit)`；已有标记时，使用原持久化许可调用 `acknowledge_save(permit)`，完成至 `COMMITTED`。这两个控制方法必须幂等并传播异常，以便恢复重试。
 
-继续 sparse 训练时，embedding 和 optimizer state 应由同一组件保存恢复。
-Optimizer restore 默认为 `True`，显式注册方式如下：
+只有 `COMMITTED` 记录可以恢复，并进入引用解析、最新记录和保留流程。一次全局快照使用同一个单调时钟截止时间，并行传给全部参与者；控制器接入必须接受该参数。
+
+### 仓库输入输出与关闭
+
+控制器在自己的事件循环调用 `prepare_checkpoint_transaction` 和 `apply_prepared_checkpoint_transaction`。存储线程不能修改其账本，也不能唤醒其异步等待者。
+
+每个检查点协调器持有 `CheckpointRepositorySession`，独占输入输出线程与事件循环。单个在途元数据槽位为目录打开、协调器代次申请、事务、查询与保留记录排序，不承载张量载荷，也不使用调用方的默认执行器。
+
+内部接入通过 `await FluxwayCheckpointer.create(controller, repository_dir, interval_steps=...)` 创建协调器。应用使用 `CheckpointConfig`，由运行时管理它。
+
+取消等待不会丢弃已接收的仓库操作，容量在操作结束时才释放。等待取消后发生的异常会保留，并在后续操作或关闭时报告。
+
+`close()` 拒绝新保存，等待当前保存与清理结束，关闭组件，最后停止并等待仓库线程。重复关闭观察同一结果，取消其中一个等待者不会取消清理。这隔离的是调度容量，不保证存储延迟，也不能消除 Python 的 GIL 竞争。
+
+## 组件能力
+
+本文使用 `fluxway.checkpoint` 中的编写辅助函数和会话类型。内置存储组件位于 `fluxway.control_plane.checkpointer`，完整扩展接口位于其 `component` 模块。
+
+| 能力 | 接口 | 职责 |
+| --- | --- | --- |
+| 描述符 | `CheckpointComponent` | 声明身份、保存对象与拓扑 |
+| `COMPONENT_LIFECYCLE` | `CheckpointComponentLifecycle` | 打开与关闭 |
+| `FINALIZE` | `CheckpointComponentFinalize` | 在存储准备前完成内存状态归整 |
+| `SAVE` | `CheckpointComponentSave` | 完整保存事务，含发布、放弃和确认 |
+| `RESTORE` | `CheckpointComponentRestore` | 应用选中的组件发布记录 |
+| `OBJECT_LIFECYCLE` | `CheckpointObjectLifecycle` | 读取保护与持久化清理预留 |
+| `OBJECT_CLEANUP` | `CheckpointObjectCleanup` | 执行已预留的物理清理 |
+
+注册对象中非空的接口字段决定能力。计数器例子通过 `register_checkpoint_component` 显式注册，内置组件提供 `registration()`。描述符声明的保存或恢复能力与实现不符时直接报错。
+
+`SAVE` 是完整契约，不能独立选择其中部分阶段：
+
+```text
+FINALIZING -> FINALIZE 回调 -> SAVE.prepare -> PREPARED
+           -> SAVE.save -> SAVE.finish -> SAVE.commit -> SAVE.publish
+```
+
+驱动器等本地全部秩到达 `PREPARED` 后才开始保存，不存在控制器范围的统一内存归整阶段。
+
+### 先归整内存，再预留存储
+
+`finalize_save` 在每个秩执行，即使存储准备或提交只在主秩执行。它将已排空的算法状态整理为可保存状态，不做存储输入输出。失败会停止执行，因为本地状态可能已经改变。`prepare_save` 负责预留暂存路径或存储租约，可回滚。
+
+下面的本地注册例子在捕获前合并缓冲计数。训练接入可以按相同契约提供自己的部分梯度累积处理函数。
+
+```python
+from dataclasses import dataclass
+
+from fluxway.control_plane.checkpointer import StateCheckpointComponent
+
+
+@dataclass
+class BufferedCounter:
+    committed: int = 0
+    pending: int = 0
+
+
+def finalize_counter(owner, session):
+    owner.committed += owner.pending
+    owner.pending = 0
+
+
+def restore_counter(owner, state, session):
+    owner.committed = state["committed"]
+    owner.pending = 0
+
+
+counter = StateCheckpointComponent(
+    "buffered-counter",
+    save_state=lambda owner, session: {"committed": owner.committed},
+    restore_state=restore_counter,
+    finalize_state=finalize_counter,
+)
+registration = counter.registration()
+assert registration.finalize is counter
+```
+
+使用此注册的算子拥有者需具有 `BufferedCounter` 中的字段。例子只检查注册能力，不执行协调保存。
+
+### 选择存储组件
+
+| 状态 | 组件 | 恢复拓扑 |
+| --- | --- | --- |
+| 清单内的小元数据 | `state_checkpoint_component` | 默认 `EXACT_TOPOLOGY` |
+| 工作进程内的可信 Python 状态 | `WorkerLocalCheckpointComponent` | `EXACT_TOPOLOGY` |
+| SafeTensors 张量状态 | `SafeTensorsCheckpointComponent` | `EXACT_TOPOLOGY` |
+| JAX 集体共享嵌套状态 | `OrbaxCheckpointComponent` | `GLOBAL_RESHARD` |
+| 原生稀疏表 | `SparseEmbeddingCheckpointComponent` | `LOGICAL_PARTITION_REMAP` |
+
+下面的本地注册例子要求算子拥有者具有 `cursor` 属性：
+
+```python
+from fluxway.common.types.checkpoint import RestoreTopologyMode
+from fluxway.control_plane.checkpointer import WorkerLocalCheckpointComponent
+
+
+def restore_local(owner, state, session):
+    owner.cursor = state["cursor"]
+
+
+local = WorkerLocalCheckpointComponent(
+    "worker-local",
+    save_state=lambda owner, session: {"cursor": owner.cursor},
+    restore_state=restore_local,
+)
+registration = local.registration()
+
+assert registration.descriptor.restore.topology is RestoreTopologyMode.EXACT_TOPOLOGY
+assert registration.object_lifecycle is local
+assert registration.object_cleanup is local
+```
+
+内置组件提供读取保护和清理能力。工作进程本地状态使用 Python 的 `pickle` 格式，只应读取可信仓库。读取游标、随机数状态或本地指标不能自动复制到不同拓扑。
+
+使用 JAX 状态时安装 `fluxway[jax]`。下面的注册要求 `owner.training` 是由 JAX 数组组成的嵌套状态，包含继续训练所需的全部模型与优化器值。布局回调描述当前目标形状、数据类型和分片。
+
+```python
+import jax
+import jax.numpy as jnp
+
+from fluxway.common.types.checkpoint import RestoreTopologyMode
+from fluxway.control_plane.checkpointer import OrbaxCheckpointComponent
+
+
+def target_layout(state):
+    return jax.tree_util.tree_map(
+        lambda value: jax.ShapeDtypeStruct(
+            value.shape, value.dtype, sharding=value.sharding
+        ),
+        state,
+    )
+
+
+def restore_training(owner, state, session):
+    owner.training = state
+
+
+dense = OrbaxCheckpointComponent(
+    "dense",
+    save_state=lambda owner, session: owner.training,
+    restore_state=restore_training,
+    restore_layout=lambda owner, session: target_layout(owner.training),
+)
+registration = dense.registration()
+training = {
+    "model_state": {"weight": jnp.ones((2,), dtype=jnp.float32)},
+    "optimizer_state": {"moment": jnp.zeros((2,), dtype=jnp.float32)},
+}
+layout = target_layout(training)
+
+assert layout["model_state"]["weight"].shape == (2,)
+assert registration.descriptor.restore.topology is RestoreTopologyMode.GLOBAL_RESHARD
+```
+
+此例构造注册并检查目标形状，实际输入输出由运行时执行。Orbax 使用 `ocp.args.StandardSave` 和集体共享记录。多秩 SPMD 要求每秩对应一个已初始化 JAX 进程，进程组缺失或不匹配时在准备阶段报错；单秩使用单进程输入输出。私有状态应另注册为工作进程本地组件。
+
+### 不透明存储对象与提交授权
+
+存储接入在保存阶段收到 `SaveSession`，提交时收到 `CommitSaveSession`，后者增加全部秩的 `WorkerSaveResult`。恢复会话 `RestoreSession` 携带保存时和当前拓扑，以及选中的组件发布记录。
+
+下面的接入辅助函数接收运行时提供的会话，以及存储拥有者提供的字节：
+
+```python
+from fluxway.checkpoint import (
+    CheckpointComponentPublication,
+    CommitAuthority,
+    CommitSaveSession,
+    SaveSession,
+    WorkerSaveResult,
+)
+
+
+def storage_authority(session: SaveSession, scope: str) -> CommitAuthority:
+    return session.commit_authority(scope)
+
+
+def saved_fragment(session: SaveSession, fragment: bytes) -> WorkerSaveResult:
+    return session.worker_save_result(fragment)
+
+
+def committed_object(
+    session: CommitSaveSession, object_id: str, version_id: str, locator: bytes
+) -> CheckpointComponentPublication:
+    state = session.checkpoint_object_ref(object_id, version_id, locator)
+    return session.component_checkpoint((state,))
+```
+
+存储拥有者为自己的提交或比较交换协议选择 `scope`，并提供描述符中已声明的 `object_id`，然后使用返回的授权。存储提交成功后才能调用 `committed_object`。`version_id` 标识逻辑对象版本，`locator` 用拥有者定义的二进制格式定位物理状态。Fluxway 原样传递定位信息，不解码其格式。
+
+一个逻辑对象版本可以包含多个物理分区，由 `partition_key` 区分。分区由存储组件定义，Fluxway 不根据分区名称推导弹性恢复。
+
+保存请求的 `attempt_id`、发布后的 `checkpoint_id` 和提交许可 `CheckpointCommitPermit` 各有用途。协调器代次使接管前的旧许可失效。许可撤销后，延迟决策无法修改仓库，会抛出 `PermissionError`。许可令牌不写入清单，恢复和关闭也不需要许可。应用不能自行伪造提交许可。
+
+## 保留策略与读取保护
+
+在 `CheckpointConfig` 配置保留策略，不在单个对象描述符上配置：
+
+```python
+from fluxway.checkpoint import CheckpointRetentionPolicy
+from fluxway.common.types import CheckpointConfig
+
+config = CheckpointConfig(
+    repository_dir="checkpoints/training",
+    interval_steps=100,
+    retention_policy=CheckpointRetentionPolicy(retain_last=3),
+)
+assert config.retention_policy.retain_last == 3
+```
+
+此例每隔 100 步请求保存，保留最近三个符合条件的完整恢复产物。`retention_domains` 可按组件所属域选择策略，但同一恢复产物的必要对象不能各自淘汰。有限保留策略要求物理对象组件提供清理能力，缺少能力时注册失败。
+
+组件只能依据 Fluxway 的持久化清理预留删除保存对象；物理状态应注册对象生命周期和清理实现。不能同时启用 Orbax `CheckpointManager` 等独立历史删除器，因为它无法协调清单、其他组件和活跃读取保护。
+
+读取保护在其他消费者读取时保留一个有效对象。下面的内部接入函数接收已发布对象引用，以及存储专用的异步读取函数：
+
+```python
+from collections.abc import Awaitable, Callable
+
+from fluxway.checkpoint import CheckpointObjectRef
+from fluxway.control_plane.checkpointer import FluxwayCheckpointer
+
+
+async def read_protected(
+    checkpointer: FluxwayCheckpointer,
+    spmd_id: str,
+    checkpoint_object: CheckpointObjectRef,
+    consumer_id: str,
+    request_id: str,
+    ttl_seconds: float,
+    read: Callable[[CheckpointObjectRef], Awaitable[bytes]],
+) -> bytes:
+    lease = await checkpointer.hold_checkpoint_object(
+        spmd_id, checkpoint_object, consumer_id, ttl_seconds, request_id
+    )
+    try:
+        return await read(checkpoint_object)
+    finally:
+        await checkpointer.release_checkpoint_hold(spmd_id, lease)
+```
+
+读取回调返回或抛出异常前，必须结束或等待底层读取完成，取消时也一样。读取必须在租约有效期内完成。长时间读取需调用 `renew_checkpoint_hold(spmd_id, lease, ttl_seconds)` 续期，并使用返回的新租约。保护记录持久化并检查代次，属于共享读取保护，不是互斥锁。
+
+`best_model` 等名称在移动到新检查点前保护当前选中记录。清理候选按检查点序号排序；必要候选仍有读取保护时，发布抛出 `CheckpointCleanupBlocked`。物理清理失败会留下持久化的 `CheckpointCleanupIntent`，由 `repair_cleanup_intents()` 重试并传播错误。一条意图包含删除一个完整恢复产物所需的全部预留，清理在控制维护通道执行。
+
+## 拓扑
+
+恢复范围决定选择哪些已保存 SPMD，拓扑模式决定每个组件如何映射状态，两者不能互相代替。
+
+| 模式 | 要求 |
+| --- | --- |
+| `EXACT_TOPOLOGY` | 秩数量、网格轴名称和网格形状一致 |
+| `LOGICAL_PARTITION_REMAP` | 由组件映射规范逻辑分区 |
+| `GLOBAL_RESHARD` | 将集体共享状态恢复到当前布局 |
+
+清单记录来源拓扑，恢复同时传入已保存和当前拓扑。Fluxway 不根据物理秩猜测分区函数。
+
+下面的本地配置选择已保存的 `training` 状态，并绑定到 `evaluation`。它本身不授权改变拓扑：
+
+```python
+from fluxway.common.types import CheckpointConfig
+
+config = CheckpointConfig(
+    repository_dir="checkpoints/training",
+    interval_steps=100,
+    restore_scope=("training",),
+    restore_spmd_bindings={"training": "evaluation"},
+)
+assert config.restore_spmd_bindings["training"] == "evaluation"
+```
+
+组件专用恢复计划经 `restore_options` 传递，结构为 `SPMD 标识 -> 当前秩 -> 组件标识 -> 非空字节`。组件拥有者编码这些字节，Fluxway 校验映射结构并原样传递，不解码其格式。
+
+下面的接入函数要求编译图、已初始化的 Ray、放置配方，以及针对目标工作进程生成的恢复选项：
+
+```python
+import fluxway
+from fluxway.common.types import CheckpointConfig, Graph
+from fluxway.common.types.checkpoint import RestoreOptions
+from fluxway.placement import PlacementRecipe
+
+
+async def resume_training(
+    graph: Graph,
+    recipe: PlacementRecipe,
+    repository_dir: str,
+    options: RestoreOptions,
+) -> fluxway.GraphExecution:
+    return await fluxway.start(
+        graph,
+        placement_recipe=recipe,
+        checkpoint_config=CheckpointConfig(
+            repository_dir=repository_dir,
+            interval_steps=100,
+        ),
+        resume="latest",
+        restore_options=options,
+    )
+```
+
+调用方持有返回的执行对象，需按[执行生命周期](execution_lifecycle_zh.md#使用方式)等待或取消。恢复选项必须伴随恢复请求；未知 SPMD 或工作进程秩会报错，不会被跳过。
+
+### 稀疏训练状态
+
+可选的 `fluxway[recommendation]` 集成依赖原生 `sparse_embedding` 包及其存储依赖。下面的注册将嵌入值和优化器状态一起恢复：
 
 ```python
 from fluxway.integrations.sparse_embedding.checkpoint import (
@@ -87,352 +512,16 @@ embedding_checkpoint = SparseEmbeddingCheckpointComponent(
 ).registration()
 ```
 
-通过 `@spmd(checkpoint_components=(embedding_checkpoint,))` 传入注册对象。
-算子 owner 的 `store` 属性提供 native embedding store。恢复状态应按逻辑 key
-和维度比较；elastic restore 可以改变物理 page ID 和 slot。只恢复权重而不恢复
-Adam moments 和 update step，不等于恢复了相同的训练状态。
+通过 `@spmd(checkpoint_components=(embedding_checkpoint,))` 传入注册对象。算子拥有者的 `store` 属性提供原生表。`load_optimizer_state=True` 要求目标表启用优化器；推理使用权重快照和禁用优化器的表。恢复结果应按逻辑键和维度比较，物理页号与槽位可能改变。
 
-若失败发生在 `COMMIT_DECIDED` **之前**（含 deadline 超时），本次尝试
-立即被 fence：`CheckpointCommitPermit` 撤销，逻辑可见性永久阻断，
-事务转为 `ABANDONED`。Staging 产物与未提交存储 fragment 的物理清理
-延迟到 GC 处理，不是正确性前提。
+`LocalLanceStorageFactory` 支持本地或共享 POSIX 存储，`GravitinoLanceStorageFactory` 接收应用提供的运行时目录设置。训练之外可通过 `compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)` 合并片段。原生存储拥有者定义稀疏分区计划、谱系和恢复。凭据通过运行时配置传入。
 
-```mermaid
-flowchart LR
-    A[捕获不可变状态封装] --> B[准备全部参与者]
-    B --> C[暂存 Manifest]
-    C --> D[写入 COMMIT_DECIDED]
-    D --> E[发布 Worker 产物]
-    E --> F[应用 Controller token]
-    F --> G[写入 COMMITTED marker]
-    G --> H[组件确认 Acknowledge]
-    H --> I[完成事务 -> COMMITTED]
-```
+## 来源恢复边界
 
-参与者在 prepare 阶段完成所有可能失败的校验；apply 阶段只做已验证的内存
-状态交换，不重新序列化检查点状态。
+`SourceWorkKey(epoch, step, assignment_id)` 标识逻辑任务，物理分段使用独立区间租约。确认只推进连续、完整确认的步骤，只有协调检查点推进已提交位置。新的租约会隔离旧执行的延迟确认。
 
-对于常规的同步训练任务，使用 `SaveCheckpointRequest.for_step(step)` 发起快照。它会自动创建唯一的保存尝试（Attempt ID）、Step 切面以及对应的 Step 引用。当某个快照需要同时被标记为 `best_model`、`final` 等别名时，可通过 `names` 指定：
+来源组件必须能在共同持久化位置重建输出。目标区间为 `Committed = [0, position)` 和 `Replay = [position, ...)`；记录或交错单元到位置的映射仍由来源拥有者定义。来源账本检查不能单独证明模型与优化器的崩溃恢复。
 
-```python
-manifest = await checkpointer.save(
-    SaveCheckpointRequest.for_step(1200, names=("best_model",))
-)
+保存共同切点上的消费书签、来源绑定、逻辑进度，以及重现后续输出所需的全部有状态算子。恢复校验绑定和逻辑批大小，按当前窗口限制与读取拓扑重新规划，再启动新的工作进程。旧窗口摘要、领先水位、预取缓冲、租约、确认缓存和物理绑定均重建，驱动器激活检查点状态为空。
 
-await checkpointer.restore_step(1200)
-await checkpointer.restore_named("best_model")
-await checkpointer.restore_latest()
-```
-
-Step 引用是一种便捷的检索索引，而非强制的物理路径约定。文件系统组件通常会生成易读的 `steps/<step>/...` 目录结构，而其他组件亦可将同一快照持久化到 Catalog 或对象存储中。恢复时始终通过解析已发布的全局 Manifest 进行，应用层代码无需提供任何物理存储路径。
-
-对于非纯 Step 驱动的流式计算任务，可构造带有 `CheckpointCut`（包含流切面与命名引用）的 `SaveCheckpointRequest`。切面是 Manifest 中唯一的全局进度事实。
-
-### 持久化位点与瞬态运行状态（Durable Position & Transient Execution）
-
-Cut 在运行期的核心语义是 `position`（全局持久化位点）：即所有算子持久化游标所对齐的单一确定边界。`CheckpointCut.position` 是 Manifest 的权威值；每个 SPMD 运行期投影将其记录为 `drain_boundary.committed_cut`，发布阶段将拒绝任何不一致的位点。Reader 消费游标、虚拟交错（Virtual-Interleave）单元以及模型更新步数可能采用不同的局部坐标系，各组件负责将持久化位点映射为自身的快照状态。
-
-Worker 的运行期游标、Mailbox 邮箱、一致性租约（Coherence Leases）、Ready 就绪队列以及 Credit 观察值均属于**瞬态状态（Transient State）**。Drain 操作负责使持久化位点达到静止；Save 记录该静止位点；Restore 则在恢复时于该位点启动全新的空运行期环境。没有任何瞬态邮箱/一致性代际或信用重置属于快照契约的暴露接口。
-
-### 数据源弹性与 Exactly-Once 语义
-
-数据源（Source）快照定义在逻辑输出位点之上，而非绑定于具体的 Reader 类、物理 Rank 或迭代器实现。Source 组件持久化的状态必须能够精确重构其在 `CheckpointCut.position` 处的输出；Checkpointer 仅调用通用的组件 SPI，不对 Reader 进行任何特殊感知。对于 `GLOBAL_RESHARD` 组件，恢复状态与物理拓扑无关，当前的虚拟拥有者由 `(position, world_size, interleave_unit_size)` 动态推导。
-
-这保证了快照相关的严格不变式：
-$$\text{Committed} = [0, \text{position}) \quad \text{与} \quad \text{Replay} = [\text{position}, \infty)$$
-两者交集严格为空，即使虚拟交错 Worker 的数量在恢复后发生改变依然成立。内部 Reader 的分批逻辑位于 Fluxway 的黑盒边界之外，其到逻辑输出位点的映射属于 Source 组件自身的状态契约。
-
----
-
-### 执行归属与关闭顺序
-
-Controller 拥有 checkpoint 编排和参与者的内存状态转换。
-`prepare_checkpoint_transaction` 与 `apply_prepared_checkpoint_transaction`
-在其事件循环执行。存储操作不得从其他线程修改 Controller ledger，或唤醒其 asyncio 等待者。
-
-每个 Checkpointer 持有一个 `CheckpointRepositorySession`，拥有独立的 I/O
-事件循环和线程。目录打开、coordinator generation 申请、manifest 与事务记录操作、
-恢复查询及 retention 元数据读写均使用该会话。仓库元数据使用一个在途槽位保证串行顺序；
-这个槽位不承载 tensor payload，也不共享调用方的默认 executor。
-纯 Python 规划和用户计算不属于该 I/O 资源的职责。
-
-内部协调器通过
-`await FluxwayCheckpointer.create(controller, repository_dir, interval_steps=...)`
-创建，`latest()` 与 `list_steps()` 也必须等待。应用通常通过图运行时配置 checkpoint，
-由运行时创建并关闭协调器。
-
-取消仓库操作的等待者后，已接收操作仍由会话持有直到结束，容量也只在结束时释放。
-等待者取消后发生的异常会被保留，并由后续提交或关闭报告；已经交付给活跃等待者的异常，
-则允许事务补偿继续使用该通道。
-
-`close()` 先拒绝新保存事务，等待正在执行的保存，再收拢 cleanup、关闭组件资源，
-最后停止仓库事件循环并等待线程退出。取消关闭等待者不会取消资源回收；
-再次等待 `close()` 会观察同一个结果。后台 cleanup 即使已经退出运行任务集合，
-其失败仍由生命周期持有并报告。
-
-这层归属隔离的是仓库 I/O 调度和 executor 容量，不提供针对持有 GIL 的序列化、
-原生全局锁或共享存储硬件的硬延迟保证，也不规定组件内部 executor 的实现。
-
-## 2. 组件 SPI 与能力正交组合（Capability Composition）
-
-`CheckpointComponent` 仅提供元数据描述符（Descriptor）。运行期行为由相互独立的正交 SPI 契约组合而成；组件无需暴露所有契约。
-
-```python
-class MyComponent(
-    CheckpointComponent,
-    CheckpointComponentLifecycle,
-    CheckpointComponentFinalize,
-    CheckpointComponentSave,
-    CheckpointComponentRestore,
-):
-    @property
-    def descriptor(self) -> CheckpointComponentSpec: ...
-
-    async def open(self, runtime): ...
-    async def close(self): ...
-    async def finalize_save(self, session): ...
-    async def prepare_save(self, session): ...
-    async def save(self, session) -> WorkerSaveResult: ...
-    async def finish_save(self, session): ...
-    async def commit_save(self, session) -> CheckpointComponentPublication: ...
-    async def rollback_save(self, session): ...
-    async def publish_save(self, session): ...
-    async def abort_save(self, permit): ...
-    async def acknowledge_save(self, permit): ...
-    async def restore(self, session): ...
-```
-
-六大能力名称与六大 SPI 契约严格一一对应：
-1. `COMPONENT_LIFECYCLE` (`open` / `close`)：组件资源生命周期；
-2. `FINALIZE` (`finalize_save`)：本地运行态向规范静态的结清收敛；
-3. `SAVE`：原子保存事务（`prepare` -> `save` -> `finish` -> `commit` -> `rollback` -> `publish`）；
-4. `RESTORE` (`restore`)：状态加载与重构；
-5. `OBJECT_LIFECYCLE`：快照对象的读取租约保护（Holds）与清理预留；
-6. `OBJECT_CLEANUP` (`cleanup`)：物理快照废弃与垃圾回收。
-
-`publish_save` 在各 worker 上执行，位于提交决议之后、全局 committed marker
-之前；`rollback_save` 同样需要真实的 worker session。控制侧恢复在 marker 前调用
-`abort_save(permit)`，marker 后调用 `acknowledge_save(permit)`，均传入原来持久化的
-permit。SAVE 实现必须显式提供这两个控制阶段，保证幂等并向上传播失败，使事务保持可重试。内置文件系统组件
-按 attempt ID 组织载荷，控制侧可清理全部 rank，无需重建 worker session。
-
----
-
-## 3. Worker 事务生命周期：FINALIZING 与 PREPARED 的本质区别
-
-在 Worker 内部，`WorkerCheckpointCoordinator.prepare_save()` 严格将 **内存算法状态规范化** 与 **外部存储资源预留** 分离：
-
-```text
-WorkerCheckpointCoordinator.prepare_save()
-  │
-  ├─ 1. FINALIZING 阶段 (CheckpointComponentFinalize.finalize_save)
-  │      └─ 本地内存/显存模型规范化 (例如: 结清未满窗口的残余累积梯度)
-  │         [执行范围: ALL_RANKS, 故障语义: Fail-Stop 强停, 存储 I/O: 无]
-  │
-  ├─ 2. 存储 Staging 预留阶段 (CheckpointComponentSave.prepare_save)
-  │      └─ 创建临时 Staging 目录 / 预留云存储租约 (例如: mkdir, 排他锁)
-  │         [执行范围: LEADER 或 ALL_RANKS, 故障语义: 可回滚, 存储 I/O: 有]
-  │
-  ├─ 3. 状态转为 PREPARED
-  │
-  ▼  [Driver SPMD-Local 屏障: 等待本 SPMD 内所有 Rank 全部达到 PREPARED]
-SAVING 阶段 (CheckpointComponentSave.save)
-  └─ 并发序列化并上传分片 (此时所有 Worker 显存/内存已 100% 冻结且自洽)
-```
-
-### 关键维度深度对比
-
-| 评估维度 | FINALIZING 阶段 (`finalize_save`) | PREPARED 阶段 (`prepare_save`) |
-| :--- | :--- | :--- |
-| **操作对象** | 本地显存 / 内存 / 优化器一二阶动量 | 磁盘 Staging 目录 / 对象存储 Bucket / 租约 |
-| **执行范围 (Scope)** | **必须为 `ALL_RANKS`**（全节点参与） | 可配置为 `LEADER`（仅 Rank 0）或 `ALL_RANKS` |
-| **故障语义 (Failure)** | **Fail-Stop 强停**（`SNAPSHOT_FAILED -> ERROR`） | **可安全回滚**（Abort 并删除临时 Staging 目录） |
-| **核心职责** | 将动态运算态（在途梯度）结清为静止规范态 | 为落盘数据预留物理存储资源与坑位 |
-| **存储 I/O** | **绝对无存储 I/O** | 包含文件系统与远端网络 I/O |
-
-* `FINALIZE` 必须在任何存储组件创建目录或写入字节前执行。它是已 Drain 的训练运行期在序列化模型之前应用**部分累加窗口（Partial Accumulation Window）**的标准扩展点；
-* 完整 Worker 事务顺序为：
-  ```text
-  FINALIZING -> 所有本地 FINALIZE -> SAVE.prepare -> PREPARED -> SAVE.save -> SAVE.finish -> SAVE.commit -> SAVE.publish
-  ```
-* Driver 自然等待所有 Rank 达到 `PREPARED` 后才触发 `SAVE.save`，天然构成分布式本地屏障，无需 Controller 引入额外的全图调度阶段。
-
----
-
-## 4. 分层 API 架构（Layered Developer Experience）
-
-为了避免底层状态机与事务概念侵入业务层，Fluxway 采用严格的分层关注点分离：
-
-```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Level 1: 业务算法与模型开发者（95% 的用户）                                   │
-│ 体验：零状态机概念。只传入普通的 Python Callables。                            │
-│ 示例：OrbaxCheckpointComponent(..., finalize_state=flush_fn)              │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ 框架自动能力派发
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Level 2: 存储插件开发者（5% 的用户，如扩展 Lance/Parquet 引擎）                │
-│ 体验：按需实现 CheckpointComponentSave / CheckpointComponentFinalize SPI   │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ 内部事务保护与防御断言
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Level 3: Fluxway 引擎内核（Coordinator / Orchestrator）                    │
-│ 体验：FINALIZING、PREPARED、SAVING、COMMITTED 强防御性状态机断言              │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-### 业务端注册示例（以 Dense 模型为例）
-
-业务方仅需按需声明回调，完全不感知底层事务状态：
-
-```python
-@spmd(
-    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
-    mesh_axis_names=("dp",),
-    checkpoint_components=(
-        OrbaxCheckpointComponent(
-            "dense",
-            save_state=lambda owner, ctx: owner.save_checkpoint_state(ctx),
-            restore_state=lambda owner, state, ctx: owner.restore_checkpoint_state(
-                state, ctx
-            ),
-            restore_layout=lambda owner, ctx: owner.restore_checkpoint_layout(ctx),
-            finalize_state=lambda owner, ctx: owner.finalize_checkpoint_state(ctx),
-        ).registration(),
-    ),
-)
-class DenseSPMD:
-    def finalize_checkpoint_state(self, context: SaveSession) -> None:
-        if self._pending_accum_steps > 0:
-            scale = 1.0 / self._pending_accum_steps
-            params = nnx.state(self.model)
-            # 按实际累积微步数 k 进行无偏均值更新
-            updated = jtu.tree_map(
-                lambda p, g: p - 0.01 * (g * scale), params, self.grad_accum
-            )
-            nnx.update(self.model, updated)
-            self.grad_accum = jtu.tree_map(jnp.zeros_like, self.grad_accum)
-            self._pending_accum_steps = 0
-```
-
-### 物理存储组件的职责分离（Separation of Concerns）
-
-对于落盘到物理存储的状态，Fluxway 遵循严格的单一职责与正交解耦原则：
-
-1. **全局模型与优化器状态（`OrbaxCheckpointComponent`）**：
-   - 托管全局分布式的原生嵌套 PyTree（如 `{"model_state": nnx.state(self.model)}` 与优化器状态）；
-   - 直接使用原生的 `ocp.args.StandardSave(state)` 进行集体保存（Collective Save），**禁止进行物理叶子展平或拆分**；
-   - 声明 `GLOBAL_RESHARD` 拓扑模式，恢复时原生支持拓扑重排（Resharding）；下游评测与服务化可以直接调用标准 `ocp.Checkpointer.restore()` 读取 `model_state`，无需额外导出 model-only 产物。
-
-2. **Rank 私有本地状态（`WorkerLocalCheckpointComponent`）**：
-   - 托管真正属于单机节点的本地状态（如数据读取游标 Reader offset、本地 RNG 种子、节点私有指标）；
-   - 序列化为节点私有物理文件（`state.pkl`），声明 `EXACT_TOPOLOGY` 严格拓扑模式。
-
-3. **超大规模稀疏 Embedding 状态（`SparseEmbeddingCheckpointComponent`）**：
-   - 专用于推荐模型稀疏 Embedding 表的持久化与弹性管理（`fluxway.integrations.sparse_embedding`）；
-   - **多存储后端支持**：原生适配 `LocalLanceStorage`（`LocalLanceStorageFactory`，本地 NVMe 或共享 POSIX 存储）与 `GravitinoLanceStorage`（`GravitinoLanceStorageFactory`，Apache Gravitino 纳管的数据湖 Catalog）；
-   - **拓扑弹性伸缩**：声明 `RestoreTopologyMode.LOGICAL_PARTITION_REMAP`，结合 `LogicalPartitionBinding` 在集群节点或 Worker 数量扩缩容时精准重映射子表分片；
-   - **离线压缩合并**：支持通过 `compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)` 在训练关键路径之外异步合并 Lance 数据碎片。
-
----
-
-## 5. 组件注册、租约与生命周期清理
-
-采用有限保留策略 `CheckpointRetentionPolicy(retain_last=N)` 的 Fluxway artifact，
-其所有拥有物理对象的组件必须同时注册 `CheckpointObjectLifecycle` 与
-`CheckpointObjectCleanup` 能力，否则注册将拒绝通过（禁止静默忽略清理）。Retention
-只通过 `CheckpointConfig` 的默认策略或 `retention_domains` 映射配置，不再出现在单个
-`CheckpointObjectSpec` 上：
-
-Retention 的 owner 是 Fluxway 的完整 restore artifact 协议层。构成同一可恢复 artifact
-的所有 required object 共同服从 `CheckpointConfig` 选择的 artifact retention policy；组件
-注册只暴露对象身份、恢复要求和自身的存储能力。Orbax 集成使用低层 `ocp.Checkpointer` 负责 state I/O，不应同时启用
-组件可以声明 `retention_domain`，由 `CheckpointConfig` 统一将 domain 解析到策略；所有
-domain 仍由同一个 retention coordinator 执行。一个可恢复 artifact 的 required object
-不能跨 domain 独立清理。
-Orbax `CheckpointManager` 的历史删除，因为它无法协调 sparse object、Fluxway lease、
-manifest 和跨组件 cleanup intent。物理删除只能由 Fluxway retention coordinator 发起。
-
-用户自定义组件可以拥有序列化格式以及读写 I/O，但必须显式选择生命周期模式。
-`FLUXWAY_MANAGED`（可恢复 checkpoint 的默认模式）要求组件实现
-`CheckpointObjectLifecycle`，并且只能在 Fluxway 持久化 cleanup reservation 的
-maintenance lane 中删除；Fluxway 是唯一 retention/删除 owner。若组件坚持自行维护
-物理删除和 catalog，必须显式选择 `EXTERNAL_MANAGED`；此时 Fluxway 只保存 opaque
-locator，不承诺自动 retention、cleanup 或普通 `latest`/`StepReference` restore。
-不能静默降级为永久保留。禁止同时启用 provider 自带历史清理（例如 Orbax
-`CheckpointManager`）。
-
-```python
-CheckpointComponentSpec(
-    component_id="dense",
-    save=CheckpointSaveSpec(),
-    restore=CheckpointRestoreSpec(),
-    checkpoint_objects=(
-        CheckpointObjectSpec("model_state"),
-        CheckpointObjectSpec("optimizer_state"),
-    ),
-)
-```
-
-* 保留压力可以按声明的快照对象计算，但物理下线以完整 restore artifact 为单位；只有该 artifact 的全部必需恢复对象都被同一个持久化清理 intent 覆盖时，Manifest 才会被移出 active catalog；
-* `CheckpointHold` 用于在其他消费者读取时提供共享读保护，带代际校验与自动续约；
-* 当超出保留数量时，Fluxway 自动发起原子清理预留，检查 Hold，并在新 Manifest 发布后生成持久化 `CheckpointCleanupIntent`。一个 intent 对应完整可恢复 artifact，包含删除它所需的全部 provider reservation；物理清理只在 control maintenance lane 执行，与 worker 拓扑和训练步延迟解耦。被 Hold 阻塞的清理将抛出 `CheckpointCleanupBlocked` 并挂起重试，绝不静默假成功。
-
----
-
-## 6. 提交许可（Commit Permits）与防脑裂
-
-每次保存拥有三重独立身份标识：
-* `checkpoint_id`：最终发布的逻辑快照 ID；
-* `attempt_id`：当前单次保存尝试的 ID；
-* `CheckpointCommitPermit`：当前 Coordinator 发布该尝试的权威代际 Token。
-
-Fluxway 会持久化 Coordinator 代际。新主接管仓库将直接废除旧 Coordinator 的 Permit。组件在 Save Session 中获取 Permit，并可调用 `session.commit_authority(scope)` 将其传递给具备 CAS（Compare-And-Swap）或租约能力的底层存储后端。Permit Token 永远不会被持久化到 Manifest 中，Restore 与 `close()` 操作也无需 Permit。
-
-Fail-Stop 执行细节：当 `_save()` 在 `COMMIT_DECIDED` 写入前超时或报错，
-调用 `abandon_transaction` 会原子地撤销 Permit 并将记录转为 `ABANDONED`。
-已在后台线程中完成 I/O 的延迟写线程若尝试调用 `decide_transaction`，
-会发现 Permit 已消失并抛出 `PermissionError`，从而无法在取消后继续改变
-仓库状态。
-
----
-
-## 7. 拓扑模式（Topology Modes）
-
-Manifest 记录源拓扑信息。恢复时组件显式选择 `RestoreTopologyMode` 枚举值之一：
-* `RestoreTopologyMode.EXACT_TOPOLOGY`（`"exact_topology"`）：要求恢复时的 Worker 数量与物理切分严格等于保存时的拓扑，适用于 Rank 本地迭代器或硬绑定的进程状态；
-* `RestoreTopologyMode.LOGICAL_PARTITION_REMAP`（`"logical_partition_remap"`）：保持规范逻辑分片 ID 不变，恢复时通过 `LogicalPartitionBinding` 将各逻辑分片映射到当前存活的物理 Worker 上（如 Embedding 子表重新分配）；
-* `RestoreTopologyMode.GLOBAL_RESHARD`（`"global_reshard"`）：适用于全局分布式张量（如 JAX 原生嵌套 PyTree），由组件自身在恢复时自动 Reshard 到新网格。
-
-Fluxway 绝不对分区函数做隐式猜测，也绝不静默拷贝 Rank 本地状态。所有的弹性恢复语义均由组件适配层严格保证。
-
-### 组件自有的运行时契约
-
-Fluxway checkpoint controller 保持后端无关。具体后端组件自行校验运行时前置条件。Orbax 组件在保存拓扑包含多个 rank 时要求每个 SPMD rank 对应一个已初始化的 JAX process；单 rank 拓扑使用单进程 Orbax I/O。多 rank 拓扑若 JAX process group 未初始化或数量不匹配，组件必须在保存阶段直接失败，不能静默降级为 rank-one writer。
-
-
-## 来源检查点约束
-
-来源规划器保存与全局 `CheckpointCut.position` 对齐的消费书签，来源账本保存逻辑工作进度。窗口、预取尾部、租约和读取确认缓存属于运行期状态，恢复时按已提交书签和当前读取拓扑重新建立。来源、模型、优化器以及其他影响未来结果的组件必须在同一个检查点切点保存；来源确认本身不是独立的持久化提交。
-
-来源恢复允许重新划分物理任务，但必须保持逻辑批次大小、记录顺序和来源身份。新的租约标识会拒绝旧执行实例的迟到确认。来源激活组件可只保存逻辑描述，物理任务在恢复阶段重新发布。
-
-## Canonical logical ownership
-
-`SourceWorkKey(epoch, step, assignment_id)` 标识 canonical logical work。
-物理 segment 使用独立区间 lease，ACK 只确认对应区间；candidate cut 只越过连续
-完整确认的 step。Committed cut 由已有协调 checkpoint 事务推进。
-
-保存内容为来源拥有的消费书签、来源绑定和与模型一致的逻辑进度。恢复先验证
-来源绑定与全局批次大小，再按当前窗口参数和读取进程数重新规划、预取。旧窗口
-摘要、预取尾部、租约和读取确认缓存不作为来源持久状态；影响未来结果的算子状态
-仍须共同保存。新的租约标识拒绝旧运行延迟到达的确认。
-
-来源激活组件保存状态为空。恢复顺序是在控制面安装消费书签和共同保存点，
-再发布重新规划的任务。工作进程按分配区间读取。恢复使用新的 Worker，顺序为拓扑就绪、
-执行激活。Source 布局安装和 per-cut admission 是独立的授权。启动、取消和继续
-示例见 [execution_lifecycle](execution_lifecycle_zh.md)。启动 API 只启动来源生命周期；
-Controller 的事件驱动 `SourceProgressSupervisor` 负责 adapter 扫描和窗口补充。各 checkpoint component 定义其允许的拓扑变化；source
-ledger 正确性不能单独证明模型收敛或传输性能。
+控制器先安装书签和共同切点，再发布新规划分段。拓扑就绪先于恢复，显式执行激活在恢复之后；来源布局安装与每个切点的准入是不同授权。控制器的 `SourceProgressSupervisor` 负责扫描和补窗。可运行来源示例及本地证据限制见[来源协调](source_coordination_zh.md)和[来源任务协议](source_spmd_formal_protocol_zh.md)。

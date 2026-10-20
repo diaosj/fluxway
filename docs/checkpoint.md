@@ -1,97 +1,631 @@
 # Checkpoints
 
-Source metadata uses canonical MessagePack through `fluxway.common.metadata`,
-including opaque source cursor envelope validation and component transaction digests.
-Source components participate in the same transaction as model and operator state.
-The target source state is a consumption bookmark and cut-aligned logical progress;
-prefetched layouts are reconstructed. These component images have one current field
-set; they do not carry a Fluxway release
-version or a numeric migration layer.
-The global `CheckpointManifest` also has no schema version field. Its dataclass
-defines the accepted root fields; decoding rejects missing or extra fields.
-Physical Worker descriptors are transient. User-owned binary metadata
-survives component prepare/apply/restore without conversion to text.
+[Chinese edition](checkpoint_zh.md)
 
-This encoding contract does not by itself establish continuous source recovery. The
-planner accepts ordered immutable windows and excludes physical topology from
-checkpoints. Workers accept contiguous published source windows; event-driven window
-replenishment remains part of the source coordination contract. A serialized
-cursor alone does not prove that cursor advancement and work publication were committed
-at the same cut.
+A checkpoint saves the source position, model, optimizer, and required operator
+state at one agreed progress boundary. Register the state components on the graph,
+then configure periodic saves through `fluxway.start`. See
+[execution lifecycle](execution_lifecycle.md#usage) for startup, waiting, and cleanup.
 
-A checkpoint is the complete, restorable state of one Fluxway execution at one
-progress cut. Its public identity is intentionally small:
+Fluxway owns the transaction, progress cut, references, and retention decisions.
+Each component owns its encoding, storage, restore mapping, and physical deletion.
+The component contract determines which topology changes are supported.
+
+## Register a small state component
+
+This complete local example registers a counter in the manifest. It does not
+start execution or write a checkpoint. During a real save and restore, the runtime
+passes the operator owner and a session to the callbacks.
+
+```python
+import fluxway as fw
+from fluxway.checkpoint import (
+    register_checkpoint_component,
+    state_checkpoint_component,
+)
+from fluxway.common.decorators import spmd
+
+
+def restore_counter(owner, state, session):
+    owner.seen = state["seen"]
+
+
+counter_state = state_checkpoint_component(
+    "counter",
+    save=lambda owner, session: {"seen": owner.seen},
+    restore=restore_counter,
+)
+registration = register_checkpoint_component(
+    counter_state,
+    component_lifecycle=counter_state,
+    save=counter_state,
+    restore=counter_state,
+)
+
+
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+    checkpoint_components=(registration,),
+)
+class Counter:
+    def __init__(self):
+        self.seen = 0
+
+    @fw.operator(
+        name="advance", output_sharding={"value": {"type": "static", "axis": []}}
+    )
+    def advance(self) -> dict[str, int]:
+        self.seen += 1
+        return {"value": self.seen}
+
+
+assert registration.descriptor.checkpoint_objects == ()
+assert Counter.get_spmd_config().checkpoint_components == (registration,)
+```
+
+The assertions verify registration and show that the component owns no physical
+checkpoint objects. Small state must be representable by the checkpoint metadata
+codec. Use a storage component for large state. The default topology contract is
+`EXACT_TOPOLOGY`; a reader that needs elastic recovery must implement an explicit
+logical-position mapping rather than copy another worker's cursor.
+
+## Repository directories and encoding
+
+The runtime opens the configured repository. A new root receives
+`CHECKPOINT_ROOT_MARKER`; an existing unmarked directory remains unmarked.
+The root must be a real directory. A present marker must be a regular,
+non-symlink file with the current format. Invalid paths or markers raise
+`CheckpointDirectoryOwnershipError`.
+
+This local example creates and removes only its own temporary repository:
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from fluxway.control_plane.checkpointer import (
+    CHECKPOINT_ROOT_MARKER,
+    CheckpointDirectory,
+)
+
+Path("tmp").mkdir(exist_ok=True)
+with TemporaryDirectory(dir="tmp", prefix="checkpoint-example-") as temporary:
+    root = Path(temporary) / "repository"
+    CheckpointDirectory.open(root)
+    assert (root / CHECKPOINT_ROOT_MARKER).is_file()
+    CheckpointDirectory.clear(root)
+    assert not root.exists()
+
+    prepared = Path(temporary) / "application"
+    prepared.mkdir()
+    CheckpointDirectory.open(prepared)
+    assert not (prepared / CHECKPOINT_ROOT_MARKER).exists()
+```
+
+`clear()` requires a valid ownership marker, so it rejects the unmarked
+`application` directory. Opening an existing directory neither claims ownership
+nor migrates its contents.
+
+Manifests, transaction records, cleanup intents, and references use binary
+MessagePack through `msgpack_codec`. Source envelopes and transaction digests use
+`fluxway.common.metadata`. Binary user metadata stays binary. The current
+`CheckpointManifest` dataclass defines the root fields; decoding rejects missing
+or extra fields. There is no release-version migration layer. Encoding alone
+does not prove that a source cursor and its published work share one committed cut.
+
+## Progress and checkpoint identity
+
+The public identity is:
 
 ```text
 checkpoint_id -> component_id -> checkpoint_object_id
 ```
 
-`checkpoint_id` identifies the whole published checkpoint. `component_id`
-identifies the subsystem that owns state, such as `dense`, `reader`, or
-`embedding`. A component that writes more than one independently restorable
-object gives each one a `checkpoint_object_id`. A single-object component uses
-`"state"` by default.
+- `checkpoint_id` selects the whole published checkpoint.
+- `component_id` names the state owner, such as `dense` or `reader`.
+- `checkpoint_object_id` distinguishes a component's saved objects; a single
+  physical state object usually uses `"state"`.
 
-Fluxway owns the checkpoint transaction, progress cut, topology, checkpoint
-references, and cleanup decisions. A component owns serialization, physical
-storage, restore mapping, and physical cleanup. This keeps Fluxway independent
-of filesystems, object stores, Lance, catalogs, and data formats.
+`CheckpointCut.position` is the durable boundary. Each SPMD projection stores
+that same value as `drain_boundary.committed_cut`; publication rejects a mismatch.
+Reader records, interleave units, and optimizer updates can use different
+coordinates. Their components must map the shared position to their own state.
 
-The checkpoint root directory is managed by `CheckpointDirectory` (`fluxway.control_plane.checkpointer.directory`).
-It can be pre-created externally or created automatically by Fluxway via `CheckpointDirectory.open()`.
-It must be a regular directory and cannot be a symlink. When Fluxway creates a new root directory, it writes the
-`CHECKPOINT_ROOT_MARKER` (`.fluxway-checkpoint-root`) ownership marker containing `fluxway-checkpoint-root\n`.
-Opening an existing unmarked directory does not add a marker or claim ownership. If an existing directory contains this
-marker, it must be a regular, non-symlink file with a valid format; any mismatch raises `CheckpointDirectoryOwnershipError`.
-Destructive cleanup via `CheckpointDirectory.clear()` strictly validates ownership before removing the
-directory to prevent accidental deletion of unmanaged paths.
+Mailboxes, coherence leases, ready queues, physical layouts, prefetch buffers,
+and credit observations are transient. Drain makes the boundary quiescent.
+Save records it; restore creates a fresh runtime there. A saved lease or mailbox
+generation is not a supported restore mechanism.
 
-Manifest records, cleanup intents, transactions, and references are serialized to disk using compact binary MessagePack
-via `msgpack_codec` (`packb(..., use_bin_type=True)` and `unpackb(...)`) rather than uncompacted JSON, ensuring fast
-metadata reads and bounded coordinator storage overhead. Unknown marker contents and old manifest fields fail; opening a
-repository does not migrate its files.
+### Step and named requests
 
-## Saving and restoring
+The following local example creates a request, not a saved checkpoint:
 
-Checkpoint publication is coordinated by one durable decision record named
-`CheckpointTransactionState`. This Controller/Repository state machine is
-separate from the Worker-local `CheckpointSaveState`.
-The manifest is staged first; it is not visible to restore until the commit marker
-is written.
+```python
+from fluxway.checkpoint import NameReference, SaveCheckpointRequest, StepReference
 
-Fluxway uses a **fail-stop protocol** with four canonical transaction states:
+request = SaveCheckpointRequest.for_step(1200, names=("best_model",))
+assert request.cut.position == 1200
+assert StepReference(1200) in request.references
+assert NameReference("best_model") in request.references
+```
+
+The factory creates unique attempt and cut IDs. The step and `best_model` name
+select the same checkpoint after publication; they are lookups rather than
+physical storage paths.
+
+The following functions are for Controller integrations, not running operator
+code. `save_best` requires a coordinated drained position and complete source
+ACK coverage. `restore_best` is a separate operation on a fresh execution before
+activation. The graph runtime normally owns both operations.
+
+```python
+from fluxway.checkpoint import SaveCheckpointRequest
+from fluxway.control_plane.checkpointer import FluxwayCheckpointer
+
+
+async def save_best(checkpointer: FluxwayCheckpointer, drained_step: int) -> str:
+    manifest = await checkpointer.save(
+        SaveCheckpointRequest.for_step(drained_step, names=("best_model",))
+    )
+    return manifest.checkpoint_id
+
+
+async def restore_best(checkpointer: FluxwayCheckpointer) -> int | None:
+    return await checkpointer.restore_named("best_model")
+```
+
+Use `restore_step(step)`, `restore_latest()`, or `restore_checkpoint(id)` as
+alternative selectors. Do not invoke several restore methods in sequence on a
+running graph. `latest()` and `list_steps()` are asynchronous queries.
+
+For a stream without a step coordinate, the integration supplies source-owned
+bookmarks and a named reference. This helper only constructs the request:
+
+```python
+from collections.abc import Mapping
+from uuid import uuid4
+
+from fluxway.checkpoint import NameReference, SaveCheckpointRequest
+from fluxway.common.types.checkpoint import CheckpointCut
+
+
+def stream_checkpoint_request(bookmarks: Mapping[str, bytes]) -> SaveCheckpointRequest:
+    return SaveCheckpointRequest(
+        attempt_id=uuid4().hex,
+        cut=CheckpointCut(
+            cut_id=uuid4().hex,
+            position=None,
+            stream_cuts=dict(bookmarks),
+        ),
+        references=(NameReference("stream-head"),),
+    )
+```
+
+`StepReference` requires a position and must match it. A name can select a
+non-step checkpoint. The source owner defines the bookmarks' meaning and must
+align them with the other components.
+
+## Global publication transaction
+
+The Controller and repository use `CheckpointTransactionState`. This durable
+decision record is distinct from the worker's `CheckpointSaveState`.
 
 ```mermaid
 stateDiagram-v2
     [*] --> STAGED
-    STAGED --> COMMIT_DECIDED: durable decision written
-    STAGED --> ABANDONED: pre-decision failure (permit revoked)
-    COMMIT_DECIDED --> COMMITTED: publish + apply complete (or replayed on restart)
-    COMMIT_DECIDED --> ABANDONED: startup fencing without commit marker
+    STAGED --> COMMIT_DECIDED: Persist decision
+    STAGED --> ABANDONED: Revoke permit
+    COMMIT_DECIDED --> COMMITTED: Publish and acknowledge
+    COMMIT_DECIDED --> ABANDONED: Restart without commit marker
     COMMITTED --> [*]
     ABANDONED --> [*]
 ```
 
-`COMMIT_DECIDED` records that physical checkpoint publication has started.
-If a crash occurs before the global commit marker (`committed.<checkpoint_id>`) is written,
-startup fencing invokes `abort_save(permit)` on registered components and moves the record
-to `ABANDONED`; physical artifacts are left for GC. If the global commit marker has already been
-written, the checkpoint commit is logically decided and complete; startup fencing replays
-`acknowledge_save(permit)` with the persisted permit and advances the transaction to `COMMITTED`.
-Only `COMMITTED` records enter `latest`, reference resolution, retention cleanup, and restore.
+Publication follows this order:
 
-The checkpointer creates one monotonic deadline for each global snapshot and
-passes it to all participant invocations in parallel. A custom Controller implementation
-that does not accept the `deadline` parameter violates the current snapshot protocol; dropping the parameter or retrying without it is not a valid fallback.
+1. Capture immutable state and prepare all participants.
+2. Stage the manifest and transaction, then persist `COMMIT_DECIDED`.
+3. Publish worker artifacts and apply the prepared Controller tokens.
+4. Write the global `committed.<checkpoint_id>` marker.
+5. Acknowledge component saves and finish the record as `COMMITTED`.
 
-The sparse-embedding integration exposes `load_optimizer_state` as an explicit
-training-restore option. It is passed directly to the sparse storage adapter;
-`true` requires an optimizer-enabled target store, while `false` restores only
-embedding values. Inference does not use the training component: it creates an
-optimizer-disabled sparse store and loads a weight snapshot.
+Preparation validates captured state; apply installs validated in-memory tokens
+without serializing them again. Storage and publication errors still propagate.
 
-For continued sparse training, register the optimizer state with the embedding
-state. Optimizer restore defaults to `True`; the explicit form is:
+Before the commit decision, failure or deadline expiry revokes the permit and
+moves the attempt to `ABANDONED`. Staging artifacts can remain for later cleanup.
+After a crash, startup fencing examines the global marker: without it, components
+receive `abort_save(permit)`; with it, they receive the original persisted permit
+in `acknowledge_save(permit)` and the transaction finishes as `COMMITTED`.
+Both control methods must be idempotent and propagate errors so recovery can retry.
+
+Only `COMMITTED` records are restorable and enter reference resolution, `latest`,
+or retention. Each global snapshot has one monotonic deadline passed to all
+participants in parallel. Controller integrations must accept that deadline.
+
+### Repository I/O and shutdown
+
+The Controller owns `prepare_checkpoint_transaction` and
+`apply_prepared_checkpoint_transaction` on its event loop. A storage thread must
+not mutate its ledger or wake its asyncio waiters.
+
+Each checkpointer owns a `CheckpointRepositorySession` with a dedicated I/O
+thread and event loop. One in-flight metadata slot orders directory opening,
+coordinator-generation claims, transactions, queries, and retention records.
+It does not carry tensor payloads or use the caller's default executor.
+
+Internal integrations create it with
+`await FluxwayCheckpointer.create(controller, repository_dir, interval_steps=...)`.
+Applications use `CheckpointConfig` and let the runtime manage it.
+
+Cancelling a wait does not abandon accepted repository work. Capacity is released
+when that work finishes. Errors after waiter cancellation remain observable in a
+later operation or close.
+
+`close()` rejects new saves, joins the active save and cleanup operations, closes
+components, then stops and joins the repository thread. Repeated close calls
+observe the same result; cancellation of one waiter does not stop cleanup.
+This isolates scheduling capacity, not storage latency or Python GIL contention.
+
+## Component capabilities
+
+Use `fluxway.checkpoint` for the authoring helpers and session types shown here.
+Bundled storage components live in `fluxway.control_plane.checkpointer`; complete
+extension interfaces live in its `component` module.
+
+| Capability | Interface | Responsibility |
+| --- | --- | --- |
+| Descriptor | `CheckpointComponent` | Declare identity, saved objects, and topology |
+| `COMPONENT_LIFECYCLE` | `CheckpointComponentLifecycle` | `open`, `close` |
+| `FINALIZE` | `CheckpointComponentFinalize` | `finalize_save` before storage preparation |
+| `SAVE` | `CheckpointComponentSave` | Whole save transaction, including publish, abort, and acknowledge |
+| `RESTORE` | `CheckpointComponentRestore` | Apply the selected component publication |
+| `OBJECT_LIFECYCLE` | `CheckpointObjectLifecycle` | Holds and durable cleanup reservations |
+| `OBJECT_CLEANUP` | `CheckpointObjectCleanup` | Execute reserved physical cleanup |
+
+A registration's non-null interface fields determine its capabilities.
+`register_checkpoint_component` makes them explicit, as in the counter example.
+Bundled components provide `registration()`. A missing save or restore
+implementation that disagrees with the descriptor is an error.
+
+`SAVE` is one contract, not independently selectable phases:
+
+```text
+FINALIZING -> FINALIZE callbacks -> SAVE.prepare -> PREPARED
+           -> SAVE.save -> SAVE.finish -> SAVE.commit -> SAVE.publish
+```
+
+The Driver waits for every local rank to reach `PREPARED` before starting
+`save`. No Controller-wide finalize phase exists.
+
+### Finalize memory before reserving storage
+
+`finalize_save` runs on every rank, even when storage preparation or commit is
+leader-only. It canonicalizes drained algorithm state without storage I/O.
+A failure stops execution because local state may already have changed.
+`prepare_save` reserves staging paths or storage leases and can be rolled back.
+
+This local registration example flushes a buffered count before capture.
+A training integration can supply its own partial-gradient finalizer under the
+same contract.
+
+```python
+from dataclasses import dataclass
+
+from fluxway.control_plane.checkpointer import StateCheckpointComponent
+
+
+@dataclass
+class BufferedCounter:
+    committed: int = 0
+    pending: int = 0
+
+
+def finalize_counter(owner, session):
+    owner.committed += owner.pending
+    owner.pending = 0
+
+
+def restore_counter(owner, state, session):
+    owner.committed = state["committed"]
+    owner.pending = 0
+
+
+counter = StateCheckpointComponent(
+    "buffered-counter",
+    save_state=lambda owner, session: {"committed": owner.committed},
+    restore_state=restore_counter,
+    finalize_state=finalize_counter,
+)
+registration = counter.registration()
+assert registration.finalize is counter
+```
+
+An operator using this registration must provide the `BufferedCounter` fields.
+The example checks the capability; it does not run a coordinated save.
+
+### Choose a storage component
+
+| State | Component | Restore topology |
+| --- | --- | --- |
+| Small metadata in the manifest | `state_checkpoint_component` | `EXACT_TOPOLOGY` by default |
+| Trusted Python state local to a worker | `WorkerLocalCheckpointComponent` | `EXACT_TOPOLOGY` |
+| Tensor state in SafeTensors | `SafeTensorsCheckpointComponent` | `EXACT_TOPOLOGY` |
+| Collective JAX PyTree | `OrbaxCheckpointComponent` | `GLOBAL_RESHARD` |
+| Native sparse table | `SparseEmbeddingCheckpointComponent` | `LOGICAL_PARTITION_REMAP` |
+
+This local registration requires an operator owner with a `cursor` attribute:
+
+```python
+from fluxway.common.types.checkpoint import RestoreTopologyMode
+from fluxway.control_plane.checkpointer import WorkerLocalCheckpointComponent
+
+
+def restore_local(owner, state, session):
+    owner.cursor = state["cursor"]
+
+
+local = WorkerLocalCheckpointComponent(
+    "worker-local",
+    save_state=lambda owner, session: {"cursor": owner.cursor},
+    restore_state=restore_local,
+)
+registration = local.registration()
+
+assert registration.descriptor.restore.topology is RestoreTopologyMode.EXACT_TOPOLOGY
+assert registration.object_lifecycle is local
+assert registration.object_cleanup is local
+```
+
+The bundled component supplies hold and cleanup support. Worker-local state uses
+Python pickle and must be read from a trusted repository. A local reader cursor,
+RNG, or metric history cannot be automatically copied to a different topology.
+
+For JAX state, install `fluxway[jax]`. The following registration expects
+`owner.training` to be a nested PyTree of JAX arrays containing every model and
+optimizer value needed to continue training. The layout callback describes the
+current target shapes, dtypes, and shardings.
+
+```python
+import jax
+import jax.numpy as jnp
+
+from fluxway.common.types.checkpoint import RestoreTopologyMode
+from fluxway.control_plane.checkpointer import OrbaxCheckpointComponent
+
+
+def target_layout(state):
+    return jax.tree_util.tree_map(
+        lambda value: jax.ShapeDtypeStruct(
+            value.shape, value.dtype, sharding=value.sharding
+        ),
+        state,
+    )
+
+
+def restore_training(owner, state, session):
+    owner.training = state
+
+
+dense = OrbaxCheckpointComponent(
+    "dense",
+    save_state=lambda owner, session: owner.training,
+    restore_state=restore_training,
+    restore_layout=lambda owner, session: target_layout(owner.training),
+)
+registration = dense.registration()
+training = {
+    "model_state": {"weight": jnp.ones((2,), dtype=jnp.float32)},
+    "optimizer_state": {"moment": jnp.zeros((2,), dtype=jnp.float32)},
+}
+layout = target_layout(training)
+
+assert layout["model_state"]["weight"].shape == (2,)
+assert registration.descriptor.restore.topology is RestoreTopologyMode.GLOBAL_RESHARD
+```
+
+This example builds the registration; actual I/O is performed by the runtime.
+Orbax uses `ocp.args.StandardSave` and a collective shared record. Multiple SPMD
+ranks require one initialized JAX process per rank. An absent or mismatched process
+group fails during preparation. Single-rank saves use single-process I/O.
+Keep rank-private state in a separate worker-local component.
+
+### Opaque storage objects and commit authority
+
+A storage integration receives `SaveSession` during save and
+`CommitSaveSession` during commit. The latter adds every rank's
+`WorkerSaveResult`. `RestoreSession` carries the saved and current topologies
+and selected component publication.
+
+These integration helpers consume sessions supplied by the runtime and bytes
+supplied by the storage owner:
+
+```python
+from fluxway.checkpoint import (
+    CheckpointComponentPublication,
+    CommitAuthority,
+    CommitSaveSession,
+    SaveSession,
+    WorkerSaveResult,
+)
+
+
+def storage_authority(session: SaveSession, scope: str) -> CommitAuthority:
+    return session.commit_authority(scope)
+
+
+def saved_fragment(session: SaveSession, fragment: bytes) -> WorkerSaveResult:
+    return session.worker_save_result(fragment)
+
+
+def committed_object(
+    session: CommitSaveSession, object_id: str, version_id: str, locator: bytes
+) -> CheckpointComponentPublication:
+    state = session.checkpoint_object_ref(object_id, version_id, locator)
+    return session.component_checkpoint((state,))
+```
+
+The storage owner chooses `scope` for its commit/CAS protocol and supplies an
+`object_id` declared in its descriptor. It uses the returned commit authority.
+Call `committed_object` only after that storage commit succeeds.
+`version_id` identifies the logical object version; `locator` identifies the
+physical state using an owner-defined binary format. Fluxway transports the
+locator without decoding it.
+
+One logical object version can include several physical partitions, distinguished
+by `partition_key`. The storage component defines those partitions; Fluxway does
+not infer elastic restore from their names.
+
+The save request's `attempt_id`, the published `checkpoint_id`, and
+`CheckpointCommitPermit` have different roles. Coordinator generations fence old
+permits after takeover. A revoked permit cannot authorize a late decision;
+repository mutation fails with `PermissionError`. Permit tokens are not put in
+manifests, and restore or close needs no permit. Never fabricate a permit in
+application code.
+
+## Retention and read protection
+
+Configure retention on `CheckpointConfig`, not on individual object descriptors:
+
+```python
+from fluxway.checkpoint import CheckpointRetentionPolicy
+from fluxway.common.types import CheckpointConfig
+
+config = CheckpointConfig(
+    repository_dir="checkpoints/training",
+    interval_steps=100,
+    retention_policy=CheckpointRetentionPolicy(retain_last=3),
+)
+assert config.retention_policy.retain_last == 3
+```
+
+This example requests a save every 100 steps and keeps the latest three eligible
+restore artifacts. A `retention_domains` mapping can select policies by component
+domain, but required objects in one restorable artifact cannot be evicted
+independently. Components must expose cleanup capabilities for finite retention;
+missing support is a registration error.
+
+Components delete saved objects only against Fluxway's durable cleanup
+reservations. Register object lifecycle and cleanup implementations for physical
+state. Do not enable an independent history deleter, such as Orbax
+`CheckpointManager`, alongside Fluxway retention; it cannot coordinate the
+manifests, other components, or active holds.
+
+A hold protects a live saved object while another consumer reads it.
+The following internal integration function accepts a published object reference
+and a storage-specific asynchronous reader:
+
+```python
+from collections.abc import Awaitable, Callable
+
+from fluxway.checkpoint import CheckpointObjectRef
+from fluxway.control_plane.checkpointer import FluxwayCheckpointer
+
+
+async def read_protected(
+    checkpointer: FluxwayCheckpointer,
+    spmd_id: str,
+    checkpoint_object: CheckpointObjectRef,
+    consumer_id: str,
+    request_id: str,
+    ttl_seconds: float,
+    read: Callable[[CheckpointObjectRef], Awaitable[bytes]],
+) -> bytes:
+    lease = await checkpointer.hold_checkpoint_object(
+        spmd_id, checkpoint_object, consumer_id, ttl_seconds, request_id
+    )
+    try:
+        return await read(checkpoint_object)
+    finally:
+        await checkpointer.release_checkpoint_hold(spmd_id, lease)
+```
+
+The reader callback must finish or join its physical reads before returning or
+raising, including on cancellation. The read must finish within the lease lifetime.
+A long reader must renew the hold
+with `renew_checkpoint_hold(spmd_id, lease, ttl_seconds)` and keep the returned
+lease. Holds are persistent, generation-checked read protection, not exclusive locks.
+
+Names such as `best_model` protect their selected checkpoint until the name moves.
+Candidates are ordered by checkpoint sequence. If required candidates are held,
+publication raises `CheckpointCleanupBlocked`. Failed physical cleanup leaves a
+durable `CheckpointCleanupIntent`; `repair_cleanup_intents()` retries it and
+propagates errors. Each intent covers all reservations needed to delete one
+complete restore artifact. Cleanup runs on the control maintenance lane.
+
+## Topology
+
+Restore scope and topology mode answer different questions: scope chooses the
+saved SPMDs, while each component's mode determines how its state can be mapped.
+
+| Mode | Requirement |
+| --- | --- |
+| `EXACT_TOPOLOGY` | Same rank count, mesh axis names, and mesh shape |
+| `LOGICAL_PARTITION_REMAP` | Component-owned mapping of canonical logical partitions |
+| `GLOBAL_RESHARD` | Collective shared state restored into the current layout |
+
+The manifest records source topology and restore supplies both saved and current
+topologies. Fluxway does not infer a partition function from physical ranks.
+
+This local configuration selects saved `training` state and binds it to
+`evaluation`. It does not authorize a topology change by itself:
+
+```python
+from fluxway.common.types import CheckpointConfig
+
+config = CheckpointConfig(
+    repository_dir="checkpoints/training",
+    interval_steps=100,
+    restore_scope=("training",),
+    restore_spmd_bindings={"training": "evaluation"},
+)
+assert config.restore_spmd_bindings["training"] == "evaluation"
+```
+
+Component-specific restore plans use `restore_options`, shaped as
+`SPMD ID -> current rank -> component ID -> non-empty bytes`. The component owner
+encodes those bytes. Fluxway checks the mapping and transports it without decoding
+the owner's format.
+
+This integration function requires a compiled graph, initialized Ray, a placement
+recipe, and owner-produced options for the target workers:
+
+```python
+import fluxway
+from fluxway.common.types import CheckpointConfig, Graph
+from fluxway.common.types.checkpoint import RestoreOptions
+from fluxway.placement import PlacementRecipe
+
+
+async def resume_training(
+    graph: Graph,
+    recipe: PlacementRecipe,
+    repository_dir: str,
+    options: RestoreOptions,
+) -> fluxway.GraphExecution:
+    return await fluxway.start(
+        graph,
+        placement_recipe=recipe,
+        checkpoint_config=CheckpointConfig(
+            repository_dir=repository_dir,
+            interval_steps=100,
+        ),
+        resume="latest",
+        restore_options=options,
+    )
+```
+
+The caller owns the returned execution and must wait or cancel it as described in
+[execution lifecycle](execution_lifecycle.md#usage). Options require a restore
+request; unknown SPMDs or worker ranks fail instead of being skipped.
+
+### Sparse training state
+
+The optional `fluxway[recommendation]` integration requires the native
+`sparse_embedding` package and its storage dependencies. This registration
+restores embedding values and optimizer state together:
 
 ```python
 from fluxway.integrations.sparse_embedding.checkpoint import (
@@ -105,442 +639,43 @@ embedding_checkpoint = SparseEmbeddingCheckpointComponent(
 ).registration()
 ```
 
-Pass this registration through `@spmd(checkpoint_components=(embedding_checkpoint,))`.
-The operator owner exposes its native embedding store as `store`. Compare restored
-state by logical key and dimension; physical page IDs and slots can change during
-elastic restore. Restoring weights without Adam moments and update steps does not
-restore the same training state.
-
-If a failure occurs **before** `COMMIT_DECIDED` (including deadline timeout),
-the attempt is immediately fenced: the `CheckpointCommitPermit` is revoked,
-logical visibility is prevented, and the transaction transitions to `ABANDONED`.
-Physical cleanup of staging artifacts and uncommitted storage fragments is
-deferred to GC; it is not a correctness requirement.
-
-```mermaid
-flowchart LR
-    A[Capture immutable state envelope] --> B[Prepare all participants]
-    B --> C[Stage manifest + decision record]
-    C --> D[Write COMMIT_DECIDED]
-    D --> E[Publish worker artifacts]
-    E --> F[Apply Controller tokens]
-    F --> G[Write COMMITTED marker]
-    G --> H[Acknowledge component save]
-    H --> I[Complete transaction -> COMMITTED]
-```
-
-Participant preparation performs all fallible validation. Apply is a validated
-in-memory state swap and does not reserialize checkpoint state. This keeps the
-global transaction seam explicit while retaining source-neutral component
-ownership.
-
-### Execution ownership and shutdown
-
-The Controller owns checkpoint orchestration and in-memory participant transitions.
-`prepare_checkpoint_transaction` and `apply_prepared_checkpoint_transaction` run on
-its event loop. Storage operations never mutate Controller ledger state or wake its
-asyncio waiters from a foreign thread.
-
-Each checkpointer owns a `CheckpointRepositorySession` with a dedicated I/O event
-loop and thread. Directory opening, coordinator-generation claims, manifest and
-transaction operations, restore queries, and retention metadata use this session.
-The session serializes repository metadata operations with one in-flight slot;
-it does not carry tensor payloads or share the caller's default executor. Pure
-Python planning and user computation are outside this I/O resource's contract.
-
-Internal coordinators are created with
-`await FluxwayCheckpointer.create(controller, repository_dir, interval_steps=...)`.
-`latest()` and `list_steps()` are also awaited. Applications normally configure
-checkpointing through the graph runtime, which creates and closes the coordinator.
-
-Cancelling a repository operation's waiter leaves the accepted operation owned by
-the session until completion. Its capacity is released only at completion. A failure
-after waiter cancellation is retained and raised by subsequent submissions or close;
-a failure delivered to a live waiter can be handled by transaction compensation.
-
-`close()` fences new saves, waits for the active save, joins cleanup operations,
-closes component resources, and stops and joins the repository thread. Cancelling a
-close waiter does not cancel that cleanup; awaiting `close()` again observes the
-same result. Completed cleanup failures remain observable even after their tasks
-leave the running-task set.
-
-This ownership isolates repository I/O scheduling and executor capacity. It does
-not provide a hard latency bound for GIL-holding serialization, native global locks,
-or shared storage hardware, and does not specify component-internal executors.
-
-Use `SaveCheckpointRequest.for_step(step)` for normal synchronous training.
-It creates a unique save attempt, a step cut, and the step reference. Add names
-when a checkpoint should also be selected as `best_model`, `final`, or another
-application name.
-
-```python
-manifest = await checkpointer.save(
-    SaveCheckpointRequest.for_step(1200, names=("best_model",))
-)
-
-await checkpointer.restore_step(1200)
-await checkpointer.restore_named("best_model")
-await checkpointer.restore_latest()
-```
-
-A step reference is a convenient lookup, not a storage-path convention. The
-filesystem components happen to create a readable `steps/<step>/...` layout;
-other components may store the same checkpoint in a catalog or object store.
-Restore always resolves the published manifest, so it never needs a physical
-path from application code.
-
-For a non-step execution, construct `SaveCheckpointRequest` with a
-`CheckpointCut` containing stream cuts and a named reference. The cut is the
-only progress fact in the manifest.
-
-### Durable position and transient execution
-
-The runtime meaning of the cut is a `position`: the single boundary at
-which every operator's persisted cursor is defined. `CheckpointCut.position` is
-the manifest's canonical value; each SPMD runtime projection stores the same
-value as `drain_boundary.committed_cut`, and publication rejects any mismatch.
-Reader cursors,
-virtual-interleave units, and model update counts may use different coordinate
-systems; each component maps the durable position to its own checkpoint state.
-
-Worker execution cursors, mailbox entries, coherence leases, ready queues, and
-credit observations are transient. Drain makes the durable position quiescent;
-save records that position, and restore starts a new empty execution runtime at
-it. No mailbox/coherence generation or credit-reset restore API is part of the
-checkpoint contract.
-
-### Source elasticity and exactly-once
-
-Source checkpointing is defined over logical output positions, not over a
-reader class, physical rank, or iterator implementation. A source component
-must persist state that reconstructs its output at the durable
-`CheckpointCut.position`; the checkpointer only applies the component SPI and
-does not inspect or special-case the reader. For a `GLOBAL_RESHARD` component,
-the restored state is topology-independent and the current virtual owner is
-derived from the current `(position, world_size, interleave_unit_size)`.
-
-This gives the checkpoint-relative invariant
-`Committed = [0, position)` and `Replay = [position, ...)`, with an empty
-intersection, even when the number of virtual-interleave workers changes.
-Internal reader records or batches are outside Fluxway's inference boundary;
-their mapping to logical output positions belongs to the source component's
-state contract.
-
-## Component SPI and Capability Composition
-
-`CheckpointComponent` only supplies the descriptor. Runtime behavior is
-composed from independent SPI contracts; a component does not need to expose
-every contract.
-
-```python
-class MyComponent(
-    CheckpointComponent,
-    CheckpointComponentLifecycle,
-    CheckpointComponentFinalize,
-    CheckpointComponentSave,
-    CheckpointComponentRestore,
-):
-    @property
-    def descriptor(self) -> CheckpointComponentSpec: ...
-
-    async def open(self, runtime): ...
-    async def close(self): ...
-    async def finalize_save(self, session): ...
-    async def prepare_save(self, session): ...
-    async def save(self, session) -> WorkerSaveResult: ...
-    async def finish_save(self, session): ...
-    async def commit_save(self, session) -> CheckpointComponentPublication: ...
-    async def rollback_save(self, session): ...
-    async def publish_save(self, session): ...
-    async def abort_save(self, permit): ...
-    async def acknowledge_save(self, permit): ...
-    async def restore(self, session): ...
-```
-
-The six capability names map directly to the six SPI contracts:
-`COMPONENT_LIFECYCLE` (`open`/`close`), `FINALIZE` (`finalize_save`), `SAVE`, `RESTORE`,
-`OBJECT_LIFECYCLE` (holds and cleanup reservations), and `OBJECT_CLEANUP`
-(`cleanup`). `SAVE` is one atomic transaction contract; its phases are not
-independent capabilities. `commit_save` creates the component publication;
-`publish_save` runs on each worker after the commit decision and before the global
-committed marker. `rollback_save` also requires a live worker session. Control
-recovery calls `abort_save(permit)` before the marker, or
-`acknowledge_save(permit)` after it, with the original persisted permit. Both
-control phases must be idempotent and propagate failures so the transaction stays
-retryable. Built-in filesystem components group payloads by attempt ID so
-control cleanup can remove every rank without reconstructing a worker session.
-
-### Worker Transaction: FINALIZING vs PREPARED
-
-The worker transaction separates **in-memory algorithm canonicalization** from **storage resource allocation**:
-
-```text
-WorkerCheckpointCoordinator.prepare_save()
-  │
-  ├─ 1. FINALIZING Stage (CheckpointComponentFinalize.finalize_save)
-  │      └─ In-memory model canonicalization (e.g., flush partial gradient accumulation)
-  │         [Scope: ALL_RANKS, Semantics: Fail-Stop, Storage I/O: None]
-  │
-  ├─ 2. Storage Staging Stage (CheckpointComponentSave.prepare_save)
-  │      └─ Staging path / lease reservation (e.g., mkdir, storage lock)
-  │         [Scope: LEADER / ALL_RANKS, Semantics: Rollbackable, Storage I/O: Yes]
-  │
-  ├─ 3. State -> PREPARED
-  │
-  ▼  [Driver SPMD-Local Barrier: Driver waits for all ranks to reach PREPARED]
-SAVING Stage (CheckpointComponentSave.save)
-  └─ Concurrent serialization & fragment upload (memory is 100% frozen and clean)
-```
-
-| Dimension | FINALIZING Stage (`finalize_save`) | PREPARED Stage (`prepare_save`) |
-| :--- | :--- | :--- |
-| **Target Object** | Local RAM / VRAM / Optimizer moments | Disk staging directory / Cloud storage path / Lease |
-| **Execution Scope** | Mandatory `ALL_RANKS` (every worker) | Configurable `LEADER` (Rank 0) or `ALL_RANKS` |
-| **Failure Semantics** | **Fail-Stop** (`SNAPSHOT_FAILED -> ERROR`) | **Rollbackable** (abort & delete staging directory) |
-| **Primary Duty** | Canonicalize dynamic runtime state into frozen state | Allocate physical storage resources |
-| **Storage I/O** | None | Yes |
-
-`FINALIZE` canonicalizes worker-local algorithm state before that worker's
-storage component reserves staging or writes bytes. It runs on every worker rank,
-regardless of a `SAVE` component's leader-only scopes. This is the extension
-point for a drained training runtime that must apply a partial accumulation
-window before serializing model state. It must not perform storage I/O, and a
-failure is fail-stop because an implementation may have mutated local state.
-
-The worker transaction order is:
-```text
-FINALIZING -> all local FINALIZE -> SAVE.prepare -> PREPARED -> SAVE.save -> SAVE.finish -> SAVE.commit -> SAVE.publish
-```
-The Driver waits for all ranks to reach `PREPARED` before `SAVE.save`; no Controller-wide finalize phase exists or is required.
-
-### Layered API Architecture
-
-Fluxway enforces a strict separation of concerns across developer personas so business users are never exposed to internal coordinator state machines:
-
-```text
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Level 1: Business & Model Author (95% of Users)                          │
-│ DX: Zero state machine concepts. Implement simple Python callables.      │
-│ e.g., OrbaxCheckpointComponent(..., finalize_state=flush_fn)             │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ Direct capability dispatch
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Level 2: Storage Plugin Author (5% of Users)                             │
-│ DX: Implement CheckpointComponentSave / CheckpointComponentFinalize SPIs │
-└────────────────────────────────────┬─────────────────────────────────────┘
-                                     │ Internal transactional state guards
-                                     ▼
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Level 3: Fluxway Core Engine (Coordinator / Orchestrator)                │
-│ DX: FINALIZING, PREPARED, SAVING, COMMITTED defensive state assertions   │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
-Register each implemented SPI explicitly. The registration's non-null SPI
-fields are the only source of truth for `registration.capabilities`:
-
-```python
-registration = CheckpointComponentRegistration(
-    component=component,
-    component_lifecycle=component,
-    finalize=component,
-    save=component,
-    restore=component,
-)
-```
-
-All stable authoring imports live in `fluxway.checkpoint`.
-
-`SaveSession` is passed to worker-side save methods. It contains the component
-instance, `checkpoint_id`, save attempt, commit permit, progress cut, SPMD,
-rank, source topology, and component identity. `CommitSaveSession` adds every
-worker's `WorkerSaveResult`. `RestoreSession` contains the selected checkpoint,
-the saved topology, current topology, and the `CheckpointComponentPublication` to restore.
-
-Use session helpers instead of building manifest records by hand:
-
-```python
-async def save(self, session):
-    staging = await self.storage.write(session.instance)
-    return session.worker_save_result(staging)
-
-async def commit_save(self, session):
-    locator = await self.storage.commit(
-        session.worker_results,
-        session.commit_authority("embedding"),
-    )
-    state = session.checkpoint_object_ref(
-        "state", locator.version_id, locator.to_bytes()
-    )
-    return session.component_checkpoint((state,))
-```
-
-`storage_locator` is opaque bytes. Fluxway stores it and passes it back at
-restore or cleanup, but never decodes it. A user-side integration adapter may
-translate it to a filesystem location, a catalog version, or a storage-specific
-locator. The returned `CheckpointObjectRef` is the manifest's logical record of
-that saved object. Fluxway does not import the integrated component's package, and the
-integrated package does not import Fluxway.
-
-For small manifest-only state such as a reader cursor, use the convenience
-factory. It has no physical checkpoint object and therefore no physical cleanup
-policy.
-
-```python
-from fluxway.checkpoint import state_checkpoint_component
-
-reader = state_checkpoint_component(
-    "reader",
-    save=lambda reader, session: reader.save_checkpoint_state(session),
-    restore=lambda reader, state, session: reader.restore_checkpoint_state(state),
-)
-```
-
-Use `WorkerLocalCheckpointComponent`, `SafeTensorsCheckpointComponent`, or
-`OrbaxCheckpointComponent` when state belongs in physical storage. `OrbaxCheckpointComponent`
-persists collective shared global nested PyTrees (`model_state` and `opt_state`) using
-native `ocp.args.StandardSave(state)` and declares `GLOBAL_RESHARD`. Rank-private state (such as
-input reader cursors, local RNG, or per-worker metrics) must be registered under
-`WorkerLocalCheckpointComponent` with `EXACT_TOPOLOGY`.
-
-For large-scale sparse tables in recommendation models, `SparseEmbeddingCheckpointComponent`
-(`fluxway.integrations.sparse_embedding`) provides native table persistence:
-- **Storage backends**: `LocalLanceStorage` (`LocalLanceStorageFactory`) for local disk or shared POSIX storage, and `GravitinoLanceStorage` (`GravitinoLanceStorageFactory`) for Apache Gravitino-managed lakehouse catalogs.
-- **Topology elasticity**: Declares `RestoreTopologyMode.LOGICAL_PARTITION_REMAP` and uses `LogicalPartitionBinding` to remap table shards when worker counts scale up or down.
-- **Compaction**: Fragments can be compacted off the training critical path using `compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)`.
-
-## Component registration and cleanup
-
-A Fluxway-managed artifact with finite `CheckpointRetentionPolicy(retain_last=N)`
-must have cleanup capabilities for every component that owns physical objects.
-Registration fails when those capabilities are absent; there is no silent no-op
-cleanup mode. Retention is configured on `CheckpointConfig` (the default policy or
-`retention_domains` mapping), never on an individual `CheckpointObjectSpec`.
-
-Retention is owned by Fluxway at restore-artifact scope. All required objects that
-make up one restorable artifact share the policy selected on `CheckpointConfig`; component
-registrations expose only object identity, restore requirements, and storage capabilities.
-Components may optionally declare a `retention_domain`; `CheckpointConfig` resolves every
-domain to a policy through one retention coordinator. Required objects in one restorable
-artifact may not be evicted independently across domains.
-Orbax integration uses the low-level `ocp.Checkpointer` for state I/O. Orbax
-`CheckpointManager` history deletion must not be enabled alongside Fluxway
-retention, because it cannot coordinate sparse objects, Fluxway leases, manifests,
-or cross-component cleanup intents. Physical deletion is initiated only by the
-Fluxway retention coordinator.
-
-Custom components may own serialization and read/write I/O, but they must choose
-an explicit lifecycle mode. In `FLUXWAY_MANAGED` (the default for restorable
-checkpoints), the component exposes `CheckpointObjectLifecycle` and performs
-deletion only from Fluxway's durable cleanup reservation in the maintenance
-lane. Fluxway remains the sole retention/deletion owner. A component that keeps
-its own deletion/catalog protocol must opt into `EXTERNAL_MANAGED`; Fluxway then
-stores only an opaque locator and does not claim automatic retention, cleanup, or
-ordinary `latest`/`StepReference` restore semantics. It cannot be silently
-downgraded to permanent retention. Enabling a provider's independent history
-cleanup (for example Orbax `CheckpointManager`) alongside Fluxway is forbidden.
-
-```python
-CheckpointComponentSpec(
-    component_id="dense",
-    save=CheckpointSaveSpec(),
-    restore=CheckpointRestoreSpec(),
-    checkpoint_objects=(
-        CheckpointObjectSpec("model_state"),
-        CheckpointObjectSpec("optimizer_state"),
-    ),
-)
-```
-
-Retention is evaluated from declared checkpoint objects, but eviction is at
-the complete restore-artifact boundary. The component returns one logical
-`version_id` for all physical partitions of an object; `partition_key`
-distinguishes those partitions and is not a worker rank. Fluxway never evicts a
-manifest unless every required restore object in that artifact is covered by
-the same durable cleanup intent.
-
-A `CheckpointHold` protects one live checkpoint object while another consumer
-reads it. Holds are shared read protection, not locks. They are persistent,
-generation-checked, and expire unless renewed. A named reference such as
-`best_model` is kept forever until the name moves to a newer checkpoint.
-
-When a finite policy has excess versions, Fluxway selects candidates by
-checkpoint sequence. The component atomically reserves eligible versions,
-checks holds, and then cleans physical state after the new manifest is
-published. A held candidate prevents publication with `CheckpointCleanupBlocked`.
-A cleanup failure leaves a durable `CheckpointCleanupIntent` and is retried by
-`repair_cleanup_intents()`; it is never treated as successful. One intent is
-the complete restore artifact and contains all provider reservations required
-to remove it. Cleanup runs in the control maintenance lane, independent of
-worker topology and training-step latency.
-
-## Commit permits
-
-Each save has three different identities:
-
-- `checkpoint_id`: the published checkpoint;
-- `attempt_id`: this request to save;
-- `CheckpointCommitPermit`: authority for the current coordinator to publish
-  that attempt.
-
-Fluxway persists coordinator generations. Taking over a repository invalidates
-older permits. Components receive the permit in every save-side session and can
-pass `session.commit_authority(scope)` to a storage system with its own CAS or
-commit authority. A permit token is never written to the manifest. Restore and
-`close()` do not need a permit.
-
-Fail-stop enforcement: when `_save()` times out or errors before
-`COMMIT_DECIDED`, calling `abandon_transaction` atomically revokes the permit
-and transitions the record to `ABANDONED`. Any delayed background thread that
-finishes its I/O and tries to call `decide_transaction` finds the permit
-already gone and raises `PermissionError`, preventing it from mutating the
-repository after cancellation.
-
-## Topology
-
-The manifest records source topology. Restore receives both source and current
-topologies. A component explicitly chooses one `RestoreTopologyMode`:
-
-- `RestoreTopologyMode.EXACT_TOPOLOGY` (`"exact_topology"`): requires identical rank count and worker assignments, used for rank-local iterator or process state;
-- `RestoreTopologyMode.LOGICAL_PARTITION_REMAP` (`"logical_partition_remap"`): preserves canonical logical partition IDs and uses `LogicalPartitionBinding` to map them to the active physical workers (e.g. sparse embedding table partitions);
-- `RestoreTopologyMode.GLOBAL_RESHARD` (`"global_reshard"`): collective shared state (e.g. Orbax standard tensors) automatically resharded across the new mesh.
-
-Fluxway never guesses a partition function or silently copies rank-local state.
-The user-side adapter supplies any component-specific restore policy.
-
-### Component-owned runtime contracts
-
-Fluxway's checkpoint controller remains backend-neutral. Backend-specific components validate their own runtime prerequisites. The Orbax component requires one initialized JAX process per SPMD rank when the saved topology has multiple ranks; a single-rank topology uses single-process Orbax I/O. A multi-rank topology with an uninitialized or mismatched JAX process group fails during component save preparation instead of silently degrading to a rank-one writer.
-
-
-## Canonical logical ownership
-
-`SourceWorkKey(epoch, step, assignment_id)` identifies canonical logical work.
-Physical segments carry independent interval leases. ACK confirms only the leased
-interval; candidate cut advances over consecutive fully acknowledged steps.
-Only the coordinated checkpoint transaction advances committed cut.
-
-The restore contract saves the source-owned consumption bookmark, source
-binding and logical progress at the shared model cut. Restore validates the binding
-and logical batch size, then replans and prefetches using current window limits and
-reader topology. Window digests, pending prefetch buffers, leases and ACK caches are
-not durable source state. Stateful operators retain everything needed to reproduce
-their future output. New lease IDs fence delayed acknowledgements.
-
-The planner persists a consumption bookmark and the ledger persists logical progress
-at the shared cut. Old windows, leading watermarks, leases and prefetch buffers are
-recreated during restore. The source, model and optimizer components participate in the
-same checkpoint transaction; their individual state mappings remain component-owned.
-
+Pass it in `@spmd(checkpoint_components=(embedding_checkpoint,))`.
+The operator owner exposes its native table as `store`.
+`load_optimizer_state=True` requires an optimizer-enabled target table.
+Inference uses a weight snapshot and an optimizer-disabled table instead.
+Compare restored values by logical key and dimension; page IDs and slots may change.
+
+`LocalLanceStorageFactory` supports local or shared POSIX storage.
+`GravitinoLanceStorageFactory` accepts runtime catalog settings supplied by the
+application. Compaction can run outside training through
+`compact_sparse_checkpoints(repository_root, spmd_id, lineage_name=...)`.
+The native storage owner defines sparse partition plans, lineage, and restore.
+Keep credentials in runtime configuration.
+
+## Source recovery boundary
+
+`SourceWorkKey(epoch, step, assignment_id)` identifies logical work. Physical
+segments have separate interval leases. ACK advances only over contiguous,
+fully acknowledged steps; only the coordinated checkpoint advances the committed
+cut. New leases fence delayed acknowledgements from an older execution.
+
+A source component must reconstruct output at the shared durable position.
+The intended split is `Committed = [0, position)` and
+`Replay = [position, ...)`; mapping records or interleave units into that
+position remains the source owner's responsibility. Source ledger checks alone
+do not prove crash recovery of a model and optimizer.
+
+Save the consumption bookmark, source binding, logical progress, and every
+stateful operator needed to reproduce future output at the common cut.
+Restore validates the binding and logical batch size, replans with current window
+limits and reader topology, then starts fresh workers. Old window digests,
+watermarks, prefetch buffers, leases, ACK caches, and physical bindings are rebuilt.
 Driver activation checkpoint state is empty.
-Controller restore installs source bookmarks and the shared logical cut
-before publishing newly planned segments. Workers read acquired assignment intervals.
-Restore uses fresh Workers: topology readiness precedes restore, and explicit
-execution activation follows it. Source layout installation and per-cut admission
-are separate authorizations. See [execution lifecycle](execution_lifecycle.md) for
-start, cancellation and continuation examples. The startup API starts the source
-lifecycle; the controller's event-driven `SourceProgressSupervisor` performs adapter
-scans and window refill. Each checkpoint component defines the topology changes it
-accepts; a source ledger proof alone cannot establish model convergence or transport
-performance.
+
+The Controller installs bookmarks and the shared cut before publishing newly
+planned segments. Topology readiness precedes restore, and explicit execution
+activation follows it. Source layout installation and per-cut admission are
+separate permissions. The controller's `SourceProgressSupervisor` owns adapter
+scans and window refill. See [source coordination](source_coordination.md) and
+the [source work protocol](source_spmd_formal_protocol.md) for runnable source
+examples and the limits of local evidence.

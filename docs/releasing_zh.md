@@ -1,63 +1,110 @@
-# Fluxway 版本发布指南
+# 发布 Fluxway
 
-> **核心速览**
->
-> * **唯一版本源**：版本号仅由 `pyproject.toml` 中的 `project.version` 决定。默认的 `0+unreleased` 仅供本地开发使用，发布流水线会直接拒绝。
-> * **发布触发**：推送 `v*` 格式的 Git Tag 会自动触发 GitHub Actions 运行完整 CI、构建 sdist 和 wheel、推送到 PyPI，并自动生成 GitHub Release。
-> * **免密安全发布**：采用 PyPI Trusted Publishing (OIDC 身份互信)，无需维护长期有效的 PyPI API Token 或仓库密钥。
+[英文版](releasing.md)
 
----
+`pyproject.toml` 中的 `project.version` 是发布版本号的唯一来源。
+`0+unreleased` 可以用于本地开发和打包检查，但发布检查会拒绝它。
+正式发布需要规范的三段 PEP 440 版本号，例如 `1.2.3` 或 `1.2.3rc1`，
+并使用对应的 `v1.2.3` 或 `v1.2.3rc1` 标签。
 
-## 1. 首次配置（仅需一次）
+## 首次配置发布权限
 
-1. 在 GitHub 仓库的 **Settings -> Environments** 中新建名为 `pypi` 的环境，限定部署分支仅允许匹配 `v*` 的 Tag。
-2. 在 PyPI 项目设置中（若为新项目，则在 PyPI 账号的 Publishing 设置中添加 Pending Publisher）配置 **GitHub Trusted Publisher**：
-   * **PyPI project**: `fluxway`
-   * **GitHub owner**: `fluxway-project`
-   * **Repository**: `fluxway`
-   * **Workflow filename**: `release.yml`
-   * **Environment**: `pypi`
+发布流程通过 OIDC 使用 [PyPI 可信发布](https://docs.pypi.org/trusted-publishers/)。
+在 GitHub 和 PyPI 项目设置中配置以下值：
 
-*(无需添加任何 API Token 或 Secret。详见：[PyPI Trusted Publishing 官方文档](https://docs.pypi.org/trusted-publishers/))*
+| 设置 | 值 |
+| --- | --- |
+| GitHub 部署环境 | `pypi`，仅允许 `v*` 标签 |
+| PyPI 项目 | `fluxway` |
+| GitHub 所有者 | `fluxway-project` |
+| 仓库 | `fluxway` |
+| 工作流文件名 | `release.yml` |
+| 可信发布环境 | `pypi` |
 
----
+尚未创建的 PyPI 项目可以使用待创建项目的发布者配置。
+无需长期有效的 PyPI API 令牌。工作流只向发布任务授予 `id-token: write` 权限。
 
-## 2. 标准发布步骤
+## 在本地准备版本
 
-1. **修改版本号（提 PR）**：
-   * 创建 PR 将 `pyproject.toml` 中的 `project.version` 修改为标准规范版本号（如 `0.1.0` 或预发布版 `0.1.0rc1`）。
-   * 若有破坏性改动（Breaking Changes），在 PR 说明中附上升级迁移指南。
-2. **合并 PR**：
-   * 确保 CI 校验全部通过且 Review 完成后，将 PR 合并入 `main` 主分支。
-3. **打 Tag 并推送**：
-   * 拉取主分支最新代码，执行本地检查，打 Tag 并推送到远程：
-     ```bash
-     git checkout main && git pull
-     python scripts/distribution.py release v<version>
-     git tag -a v<version> -m "Release v<version>"
-     git push origin v<version>
-     ```
-4. **自动化流水线**：
-   * 推送 Tag 后，GitHub Actions 中的 `Release` 工作流将全自动执行：
-     1. 验证 Tag 与 `pyproject.toml` 中的版本一致，且当前 Commit 属于 `main` 分支。
-     2. 运行全量 CI（代码格式化、多 Python 版本测试矩阵、打包合规性校验）。
-     3. 构建源码包 (sdist) 与二进制包 (wheel)，并在干净隔离的环境中验证安装。
-     4. 通过 OIDC 权限免密推送包到 PyPI。
-     5. 自动创建 GitHub Release，附带构建产物并生成更新日志。
+使用 Linux 和 Python 3.12 或 3.13，按[贡献指南](../CONTRIBUTING_zh.md)
+安装开发与构建依赖。通过经过审核的拉取请求修改版本，并写明破坏性变更和迁移步骤。
 
----
+从仓库根目录运行以下检查。它们对应可移植的持续集成检查；
+排除的测试需要原生 `sparse_embedding` 和 Lance 依赖。
 
-## 3. 质量与打包保障机制
 
-* **代码规范严格要求**：Ruff Lint 和 Format 零告警通过。
-* **跨环境测试矩阵**：覆盖 Python 3.12 与 3.13，涵盖 JAX、Orbax、Grain、Flax、SafeTensors、Profiler 与可视化工具链路。
-* **打包完整性检查**：严格执行 Twine 检查、`py.typed` 类型标记确认、开源 License 包含以及干净环境下的隔离导入测试。
-* **模块化依赖解耦**：核心 wheel 包安装极简轻量；缺失可选依赖（如特定后端）时抛出明确指导安装的异常，而非静默崩溃。
+```bash
+bash scripts/format.sh --check
+JAX_PLATFORMS=cpu python -m pytest -ra --strict-markers --strict-config \
+  --ignore=tests/checkpointer/test_retention.py \
+  --ignore=tests/example/test_sparse_checkpoint_e2e.py
+python -m pytest --confcutdir=tests/packaging tests/packaging
+```
 
----
+检查发布版本时不需要创建标签。将预期标签作为下列函数的参数，它必须与 `project.version` 一致。
 
-## 4. 常见异常与排查处理
 
-* **严禁覆盖版本或移动 Tag**：PyPI 严格禁止覆盖已上传的同名同版本文件。若发布的包存在问题，切勿强行推 Tag，请更新 `project.version`（例如发 patch 版本）走新发布流程。
-* **PyPI 上传失败**：先查阅 Action 失败日志。若为 OIDC 权限或配置未生效导致且 PyPI 尚未产生该文件，调整 GitHub/PyPI 配置后在 Actions 界面重试失败任务即可。
-* **PyPI 成功但 GitHub Release 失败**：切勿全量重新触发流水线（因为 PyPI 会拒绝重复文件上传）。可直接在 GitHub Release 页面手动上传本次 Action 构建好的 wheel/sdist 产物，或单独重试 GitHub Release 步骤。
+```bash
+check_release_tag() {
+    python scripts/distribution.py release "$1"
+}
+```
+
+有效候选版本会打印 `version=<version>`，以及 `prerelease=true` 或 `prerelease=false`。
+非规范版本、本地版本、开发版本和不匹配的标签都会触发 `ValueError`。
+这些检查不确认该版本是否已存在于 PyPI。
+
+## 构建并检查产物
+
+使用全新目录，避免混入旧产物。下列命令与贡献指南和持续集成使用相同校验器，
+输出保存在 `tmp/` 中。`mktemp` 创建父目录，构建命令创建其中的 `dist` 子目录。
+
+
+```bash
+mkdir -p tmp
+release_check_dir=$(mktemp -d "$PWD/tmp/release-check.XXXXXX")
+python -m build --outdir "$release_check_dir/dist"
+python -m twine check --strict "$release_check_dir"/dist/*
+python scripts/distribution.py check "$release_check_dir/dist"
+python -m venv "$release_check_dir/wheel-env"
+"$release_check_dir/wheel-env/bin/python" -m pip install "$release_check_dir"/dist/*.whl
+"$release_check_dir/wheel-env/bin/python" -m pip check
+"$release_check_dir/wheel-env/bin/python" -I scripts/check_installed.py
+```
+
+安装包时可能需要下载核心依赖。
+全部成功后，可以确认：
+
+- 目录恰好包含一个二进制分发包和一个源码分发包，且与项目元数据一致。
+- 运行时 Python 文件、`py.typed` 和许可证均已包含。
+- 二进制分发包不包含测试、脚本或临时文件。
+- 二进制分发包从隔离环境导入，安装元数据一致，并能处理 NumPy 传输张量。
+- 核心导入不会加载可选的 JAX、Orbax 或 etils 后端。
+
+本地成功不能替代 Python 3.12/3.13 持续集成矩阵或分布式运行验证。
+使用缺少可选后端的功能时，会收到明确的安装错误。
+
+## 理解发布触发条件
+
+审核合并后，获得授权的维护者在 `main` 可达的提交上创建对应的 `v*` 标签并推送。
+该推送触发[发布工作流](../.github/workflows/release.yml)，依次执行：
+
+1. 检查提交可由 `main` 到达，且标签与版本号一致。
+2. 调用共用的持续集成工作流，检查格式、两个 Python 环境的 CPU 测试、构建及隔离安装。
+3. 通过 OIDC 将已验证的产物上传到 PyPI。
+4. 使用相同产物和自动生成的说明创建 GitHub 发布版本。
+
+预发布版本会标记为预发布，不设置为最新版本。
+本文的本地命令不会创建标签、推送提交、上传包或发布版本。
+
+## 处理发布失败
+
+重试前先查看失败任务，并确定究竟有哪些文件已经发布。保持发布标签不变。
+
+| 状态 | 下一步 |
+| --- | --- |
+| OIDC 或环境配置失败，尚未上传文件 | 修正发布者配置，重试失败的发布任务 |
+| 仅上传部分文件，或已发布的包有缺陷 | 经过审核后发布新版本，不覆盖文件或移动标签 |
+| PyPI 已成功，GitHub 发布失败 | 只重试 GitHub 发布任务，或将已验证的工作流产物附加到该发布版本 |
+
+PyPI 不允许重复上传同名文件。因此，上传成功后重新运行整个工作流，可能因文件重复而失败。

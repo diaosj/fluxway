@@ -1,55 +1,104 @@
 # Fluxway 架构
 
-本文档是 [ARCHITECTURE.md](ARCHITECTURE.md) 的中文对应版本。
-这两个文件描述了相同的稳定实现与协议边界。
+英文版见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-## 运行时所有权 (Runtime ownership)
+Fluxway 将算子声明编译为计算图，分配工作进程，协调执行与恢复。控制面决定何时允许执行，数据面传递执行所需的张量。
 
-编译后的计算图是 SPMD 声明、算子身份、依赖关系、张量传输、placement 资源清单和 worker 路由的唯一事实来源。Worker 接收不可变的图投影，不重建分片（sharding）或张量身份元数据。
+图中一个 SPMD 节点表示一组在网格上运行相同程序的工作进程，边连接算子输出与输入。
 
-Controller（控制器）拥有图生命周期、placement、driver、心跳、排空（drain）、检查点编排以及故障传播的所有权。Driver 监督 worker 并转发控制命令。Worker 拥有本地执行、准入（admission）、挂起（pending）step 的生命周期、传输交付（transport delivery）以及本地执行计划的所有权。
+## 构建并检查计算图
 
-`ExecutionLifecycle` 集中管理启动、恢复、drain/checkpoint 后的继续执行、准入交付以及故障排序。Driver 心跳仅报告就绪状态。
-有关状态流和所有权表，请参阅 [分布式执行生命周期](execution_lifecycle_zh.md)。
+下面是完整的本地例子，无需启动 Ray。依赖边将生产端的 `value` 输出连接到消费端的 `item` 输入。
 
-Controller 和 Driver 状态机使用纯转移关系。转移只提交状态和失败记录，effect 在释放
-锁后由唯一 lifecycle owner 执行。Source progress 只有一个带 generation 的 supervisor，
-terminal cleanup 只有一个共享 future，Worker close 只有一个 release future。Ray、
-checkpoint、transport 和资源释放工作不会进入状态 reducer 的临界区，因此不会制造重复
-task 或占用 Controller 状态锁。
+```python
+import fluxway as fw
+from fluxway.common.decorators import spmd
 
-生命周期 effect 统一由 `BoundedLifecycleEffectScheduler` 执行，使用有界队列和固定 worker
-明确限制容量。`ASYNC` 只用于真正的 awaitable I/O；短阻塞或释放 GIL 的调用使用固定
-thread lane，可 pickle 的纯 Python CPU 工作使用 spawn 进程 lane。同一 key 严格有序，不同
-key 在固定上限内并发，队列满立即抛出背压异常。结果携带 `state_revision`，owner 在发出
-fact event 前丢弃过期结果。CPython 事件循环仍是单线程协作式调度，因此仅把函数声明为
-`async def` 不能证明它不会阻塞。
 
-## 连贯性与数据面 (Coherence and data plane)
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
+class Producer:
+    @fw.operator(
+        name="produce", output_sharding={"value": {"type": "static", "axis": []}}
+    )
+    def produce(self) -> dict[str, int]:
+        return {"value": 1}
 
-端点本地的 MESI 目录（endpoint-local MESI directory）是唯一的连贯性状态拥有者。`CoherenceInstance(subject, epoch)` 是其标识；`CoherenceDirectory.admit` 是同步准入接缝，而 `CoherenceSequencer` 负责对每个 subject 的意图进行排序。目录操作是 event-loop 本地的，不持有 worker 任务或 transport 队列。
 
-`TransportTensor` 是规范的张量 ABI。张量切片、数据帧组装（frame assembly）、批处理、路由和谱系（lineage）属于传输/数据面（transport/data-plane）层，而不是 worker 调度器。要求提供精确的 step 输入；不能用另一个 step 替代作为 fallback。
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
+class Consumer:
+    @fw.operator(
+        name="consume", input_sharding={"item": {"type": "static", "axis": []}}
+    )
+    def consume(self, item: int) -> None:
+        self.last_value = item
 
-## 编译后的传输计划 (Compiled transfer plans)
 
-`TensorTransfer.unit_routing` 声明完整单元的关联，独立于源算子。`CompiledDependency` 验证并绑定该关系；`CompiledSendPlan` 将其与普通的分片和接收路由一起降低（lowers）为执行指令。执行组（Execution groups）将物理身份与逻辑布局坐标分离。所有数据负载均使用现有的 DataPlane。参见 [传输计划](transfer_planning_zh.md)。
+builder = fw.Builder()
+builder.add_node("source", Producer)
+builder.add_node("sink", Consumer)
+builder.add_func_edge(
+    "source", "produce", "sink", "consume", tensor_map={"value": "item"}
+)
+graph = builder.build("two-operators")
+compiled = graph.require_compiled_graph()
 
-## 连贯性扇出发布 (Coherence fanout publication)
+assert len(compiled.dependencies) == 1
+assert graph.nodes["source"].spmd_config.graph_view is compiled.spmd("source")
+assert compiled.spmd("source").outgoing[0] is compiled.dependencies[0]
+```
 
-一个 worker 的 local step 将其完整的不可变 target-batch 元组提交给 `CoherenceBatchRetireRuntime.retire_publication()`。该 runtime 对发布实例集合执行一次准入，注册每个独有的子接收凭证（receipt），并并发启动所有 target 入队。`CoherenceSequencer` 仅保留 subject epoch 的准入和终端回收（terminal retirement）排序；它不会将同一实例的兄弟只读交付序列化。
+两个身份检查引用的都是同一份编译结果。工作进程和传输规划使用这份图的投影，不各自构造另一份元数据。例子只检查构图，不调用算子；执行方法见[执行生命周期](execution_lifecycle_zh.md#使用方式)。
 
-对于 CPU/Ray 载体（carrier），接收器完成（receiver completion）意味着数据帧已被准入并存入接收器邮箱。随后接收器拥有其具体化的载体，而发布端仅在所有子结果终止之前保留生产者的出站引用。同一 worker 的别名（aliases）仍受其 consumer lease 保护。这避免了通用的可变大小环形缓冲区，并且不宣称跨进程的零拷贝。一个 target 的失败会取消未完成的兄弟目标，并通过其单一的 receipt 所有者使整个发布失败。
+## 运行时职责
 
-## 排空与恢复 (Drain and restore)
+编译图是 SPMD 声明、算子身份、依赖、张量传输、资源清单和工作进程路由的唯一来源。工作进程接收不可变的图投影，不重建分片或张量身份。
 
-一个 `DrainBoundary` reducer 拥有已观察（observed）、已准入（admitted）、已排空（drained）和已提交（committed）的分界线（cuts）。Controller 从该 reducer 派生出 `DrainAdmission(revision, target, terminal_cut)`，并仅在控制消息和完成报告中携带它。Driver 和 Worker 在开启新的有限闸门（gate）之前会拒绝过期或冲突的准入。完成（Completion）需要注册的参与者集合和活跃的准入身份。
+| 对象 | 负责的工作 |
+| --- | --- |
+| 控制器 | 图生命周期、资源放置、驱动器、心跳、排空、检查点编排与故障传播 |
+| 驱动器 | 监督工作进程，转发控制命令 |
+| 工作进程 | 本地执行、准入、待执行步骤、传输交付和本地计划 |
+| `ExecutionLifecycle` | 启动、恢复、准入交付、检查点后继续执行及故障处理的顺序 |
 
-Controller 的修改锁仅包含状态归约，不包含 Driver RPC、源 ACK 等待或 checkpoint 取消等待。源 ACK 覆盖率在 drain 之后、checkpoint 准备之前进行检查。恢复（Restore）会重建规范的执行计划和物理绑定，应用已提交的分界线，并在该分界线处关闭 Worker 闸门来恢复模型/运行时状态。Driver `resume` 会重置 checkpoint 簿记而不清除 Worker 闸门；下一次准入将提供其有限的目标。
+驱动器心跳只报告就绪情况，不授权开始执行。详细状态流见[执行生命周期](execution_lifecycle_zh.md)。
 
-## 检查点事务所有权 (Checkpoint transaction ownership)
+控制器和驱动器使用纯状态转移：锁内只提交状态与失败记录，释放锁后才执行外部操作。来源进度由唯一的监督器管理；终止清理和工作进程资源释放各自复用同一个异步结果，重复请求不会创建重复任务。
 
-Controller/Repository 检查点协调使用 `CheckpointTransactionState`，这与 Worker 本地的 `CheckpointSaveState` 不同：
+`BoundedLifecycleEffectScheduler` 以有界队列和固定数量的执行任务处理外部操作。同一排序键串行，不同键在容量内并发；队列满时抛出异常。真正可等待的输入输出使用 `ASYNC`，短阻塞调用或释放 GIL 的调用使用 `THREAD`，可序列化的纯 Python 计算使用 `PROCESS`。结果带有 `state_revision`，状态拥有者忽略过期结果。仅写成 `async def` 不会把阻塞代码移出事件循环。
+
+## 一致性与数据面
+
+端点本地的 MESI 目录独占一致性状态，以 `CoherenceInstance(subject, epoch)` 标识一个实例。`CoherenceDirectory.admit` 创建或返回该实例的目录项，`CoherenceSequencer` 负责同一主体的意图排序。目录在所属事件循环内使用，不持有工作进程任务或传输队列。
+
+`TransportTensor` 是统一的张量表示。切片、数据帧组装、批处理、路由和谱系属于传输与数据面，不属于工作进程调度器。输入必须匹配指定步骤，不能取其他步骤的数据代替。示例见[数据面运行时](dataplane_runtime_zh.md)。
+
+## 编译传输计划
+
+`TensorTransfer.unit_routing` 声明完整单元的路由关系，不依赖特定来源算子。`CompiledDependency` 验证并绑定该关系，`CompiledSendPlan` 将它与分片和回执路由一起编译为执行指令。执行组区分物理身份和逻辑布局坐标，所有载荷仍由数据面传递。示例见[传输计划](transfer_planning_zh.md)。
+
+## 多目标发布
+
+一个工作进程步骤将全部目标批次作为不可变元组，提交给 `CoherenceBatchRetireRuntime.retire_publication()`。运行时一次准入所需实例，登记每个子回执，并发向全部目标发送；同一实例的只读交付不会被主体排序器逐个串行化。
+
+CPU 与 Ray 承载方式下，接收完成表示数据帧已通过准入并进入接收邮箱。接收端负责物化后的载荷，生产端引用保留到所有子结果结束；同一工作进程内的别名仍受消费租约保护。这不保证跨进程零复制。任一目标失败都会取消尚未结束的同批交付，由唯一回执拥有者使整个发布失败。接入示例见[一致性协议](coherence_protocol_zh.md)。
+
+## 排空与恢复
+
+`DrainBoundary` 统一归约已观察、已准入、已排空和已提交的边界。控制器据此产生 `DrainAdmission(revision, target, terminal_cut)`，通过控制消息和完成报告交接。驱动器与工作进程先拒绝过期或冲突版本，再开放有限执行范围。排空完成要求全部已登记参与者在当前准入版本下报告完成。
+
+控制器锁内不等待远程调用、来源确认或检查点取消。排空后、准备检查点前，需要确认来源任务已完整确认。恢复先重建逻辑计划与物理绑定，应用已提交位置，再恢复模型与运行状态；此时工作进程的执行门保持关闭。驱动器继续执行时只重置检查点记账，新的准入才提供下一段执行范围。
+
+## 检查点事务
+
+控制器与仓库使用 `CheckpointTransactionState`，工作进程使用另一套 `CheckpointSaveState`，两者不能混用：
 
 ```mermaid
 flowchart LR
@@ -59,38 +108,60 @@ flowchart LR
     D --> A
 ```
 
-`COMMIT_DECIDED` 记录物理发布已经启动。若崩溃发生在全局 commit marker 写入之前，启动时 fencing 将调用 `abort_save(permit)` 并将记录转为 `ABANDONED`；若 commit marker 已持久化成功，启动时 fencing 将回放组件的 `acknowledge_save(permit)` 并推进事务至 `COMMITTED`。只有 `COMMITTED` 的清单（manifests）才是可恢复和可见的。Manifest 清单、事务和清理意图统一使用 MessagePack（`msgpack_codec`）二进制格式持久化，而非未紧凑的 JSON，保障低延迟元数据交互与紧凑存储。
+`COMMIT_DECIDED` 表示物理发布已经开始。若崩溃前未写入全局提交标记，重启时调用 `abort_save(permit)` 并置为 `ABANDONED`；若标记已写入，则重放 `acknowledge_save(permit)`，完成到 `COMMITTED` 的转移。只有 `COMMITTED` 清单可用于恢复。清单、事务和清理意图通过 `msgpack_codec` 保存为二进制 MessagePack，不保证固定存储大小或延迟。注册与恢复示例见[检查点](checkpoint_zh.md)。
 
-## 放置与执行 (Placement and execution)
+## 放置与执行
 
-Placement 声明来自于编译后的 SPMD 声明和 `ResourceProfile`。`PlacementRecipe` 表达约束和字典序（lexicographic）目标，而不重复声明资源所有权。每个解出的 NodeID 映射到共享异构 placement group 中的一个复合 bundle。Ray 的 `ray.io/node-id` bundle 标签选择器在 `STRICT_SPREAD` 下固定确切的身份；IP 资源标记不是节点身份。CPU、GPU 和自定义加速器资源保留规划器（planner）选择的数量。Worker 验证其实际的 NodeID 是否符合规划。多机执行要求兼容的节点环境，启用恢复时需要共享的检查点存储库。
+资源声明来自编译后的 SPMD 和 `ResourceProfile`。`PlacementRecipe` 表达约束和按优先级排序的目标，不另建资源清单。每个已求解的节点身份对应共享异构放置组中的一个组合资源包。Ray 通过 `ray.io/node-id` 标签在 `STRICT_SPREAD` 下固定节点；IP 地址资源标记不能充当节点身份。实际 CPU、GPU 和其他加速器用量保留求解结果，工作进程启动后校验实际节点身份。
 
-运行期绑定的动态资源（如动态路由表、设备网格实例或运行时 Rank Provider）由 `ResourceRegistry`（`fluxway.common.resource_registry`）统一管理，通过 `ResourceHandle(namespace, resource_id)` 引用，并在 `bind_resource_registry` 激活的上下文中动态解析。`LogicalPartitionBinding` 建立逻辑分片坐标到物理 Rank 的映射，使 Placement 和路由解耦于底层物理 Worker 编号重排。
+多节点执行要求环境兼容；启用恢复时，各参与者还需访问检查点仓库。例子见[放置配方](placement_recipe_zh.md)和[放置数学](placement_mathematics_zh.md)。
 
-Worker 的准入拥有者（admission owner）包含闸门（gating）和挂起状态的提升（pending-state promotion）。`SourcePipelineMaintenance.request()` 合并填充 Worker 源 step 队列的请求；`fill()` 在将工作入队之前检查运行状态、pipeline 深度、drain 边界和总 step 目标。这种队列维护不会发现数据源修订版本或发布新的摄取窗口。执行通道（execution lane）消耗其拥有的队列项，评估准入，分发计划，并完成 `task_done()`。
+动态路由表、设备网格等运行时资源由 `ResourceRegistry` 管理，通过 `ResourceHandle(namespace, resource_id)` 引用。`bind_resource_registry` 提供当前上下文。`LogicalPartitionBinding` 根据逻辑分片选择工作进程内的值，也可按指定布局轴投影；它不提供物理秩重映射，拓扑恢复仍由组件契约约束。
 
-## 摄取布局与数据源协调 (Ingestion layout and source coordination)
+工作进程中的准入拥有者管理执行门和待执行状态。`SourcePipelineMaintenance.request()` 合并补队列请求；`fill()` 检查运行阶段、流水深度、排空边界和总步骤上限后才入队。它不扫描来源或发布新窗口。执行任务消费队列、检查准入、运行计划，并完成队列记账。
 
-`IngestionSourceAdapter` 为有界扫描请求返回不可变的 `SourceScanResult`。Controller 的
-`SourceProgressSupervisor` 拥有事件驱动的扫描和 activation 发布。编译器首先创建规范分配
-（由 `SourceWorkKey(epoch, step, assignment_id)` 标识），然后将它们绑定到瞬态
-`WorkerLayoutDescriptor` 值中当前的读取器配额。`LogicalWorkLedger` 独自拥有租约（leases）、
-ACK 边界（frontiers）和已提交的分界线（committed cuts）。Driver 激活 checkpoint 状态为空。
-恢复（Restore）在应用逻辑上已提交的分界线之前重建计划和绑定。
+## 摄取布局与来源协调
 
-`IngestionLayoutPlanningComponent` 拥有专用 `IOLane` 上的描述符构造和适配器扫描的所有权，并在持久的生成（spawn）进程池上进行纯编译。已接受的操作在其调用者取消后仍然存活。关闭（Close）操作拒绝新工作，合并（join）已接受的操作，并在单独的生命周期通道上合并编译器，最后关闭适配器通道。Planner 和 ledger 的发布是在所有者循环的一个区段内安装的，没有挂起；验证和安装成本仍然随窗口大小而增长。I/O 线程隔离了阻塞调用，但不解除 Python CPU 工作的 GIL 限制。
+适配器 `IngestionSourceAdapter` 按有界请求返回不可变的 `SourceScanResult`。控制器中的 `SourceProgressSupervisor` 负责事件驱动的扫描与激活发布。编译器先构建由 `SourceWorkKey(epoch, step, assignment_id)` 标识的规范任务，再按当前读取配额绑定为瞬态的 `WorkerLayoutDescriptor`。只有 `LogicalWorkLedger` 管理租约、确认前沿和已提交位置，驱动器不保存激活检查点状态。
 
-`SourceExecutionScope` 拥有 Worker 窗口的安装、活跃 step 索引和瞬态授权（transient grants）的所有权。获取（Acquisition）批量处理活跃 step 直至算子 pipeline 深度；权限返回当前信用允许的完整 step 前缀。常规的 checkpoint 继续执行（continuation）保留了该 scope。恢复（Restore）在 source 激活之前使用全新的 actor。ACK 提交使用有界的异步队列；满容量会施加反压。Controller 启动时会激活一个布局并启动来源进度生命周期；`SourceProgressSupervisor` 负责事件驱动的适配器扫描和补充，适配器本身不拥有补窗。已提交的 planning 窗口和物理绑定仍被保留，因此元数据随着安装的窗口数量而增长。
-支持的协议详见 [数据源协调](source_coordination_zh.md) 和 [形式化协议](source_spmd_formal_protocol_zh.md)。
+`IngestionLayoutPlanningComponent` 在独立的 `IOLane` 执行描述符构建和适配器扫描，在常驻的独立进程池执行纯编译。已接收操作不随调用方取消而丢弃。关闭时拒绝新请求，等待已接收操作与编译器结束，再关闭适配器通道。规划和账本发布在同一拥有者事件循环内完成，中间不挂起；其校验成本仍随窗口大小增加。输入输出线程隔离阻塞调用，不消除 Python 计算的 GIL 限制。
 
-## 进程诊断与信号捕获 (Process diagnostics and signal capture)
+`SourceExecutionScope` 管理工作进程窗口安装、活跃步骤索引和瞬态授权。它按算子流水深度批量请求，只获取信用额度允许的完整步骤前缀。普通检查点继续使用当前作用域；恢复使用新的执行角色，随后才激活来源。确认通过有界异步队列提交，容量满时施加背压。
 
-为了可靠地归因于外部抢占、驱逐或操作系统信号造成的 worker 进程退出，Fluxway 在 `fluxway.diagnostics` 中提供了非阻塞的进程级诊断拦截：
+公开启动入口启动生命周期，控制器监督器负责补窗；适配器自身不调度补窗。规划器支持暂时无新数据和待补齐尾部。持久化切点会回收已完成的控制器窗口、账本绑定和扫描观察，并保留连续性锚点；工作进程安装窗口与驱动器激活摘要仍被保留，因此按窗口增长的元数据仍需验证。示例与限制见[来源协调](source_coordination_zh.md)和[来源任务协议](source_spmd_formal_protocol_zh.md)。
 
-- **Bootstrap 钩子注入**：`prepare_worker_runtime_env` 通过 Ray 的 `WORKER_PROCESS_SETUP_HOOK_ENV_VAR` 注入 `worker_process_setup_hook`，在 worker 执行前初始化信号拦截器，同时链式调用用户钩子。
-- **Ray SIGTERM 拦截**：拦截 Ray 内部的 `set_sigterm_handler` 以记录先前的处理器和 Ray 自身的 SIGTERM 回调，而不改变 Ray 的卸载协议。
-- **非阻塞信号传递**：信号处理器将事件入队并通过非阻塞管道 (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`) 唤醒后台发射器守护线程，防止在 OS 中断上下文中死锁或阻塞 I/O。
-- **保真委托**：处理器总是将信号转发给先前的处理器（`callable`，通过 `raise_signal` 的 `SIG_DFL`，或 `SIG_IGN`），保留原生进程的终止语义。
-- **线程安全**：信号处理器仅安装在进程的主线程上；异步 actor worker 线程发布诊断元数据而不尝试无效的信号注册。
+## 进程诊断与信号捕获
 
-完整分节规范详见 [coherence_protocol_zh.md](coherence_protocol_zh.md)、[placement_recipe_zh.md](placement_recipe_zh.md)、[placement_mathematics_zh.md](placement_mathematics_zh.md)。
+`fluxway.diagnostics` 用于记录外部抢占、驱逐或系统信号造成的进程退出：
+
+- 启动器通过 `prepare_worker_runtime_env` 注入诊断挂钩，并串联用户提供的可导入挂钩。
+- 诊断层记录 Ray 的终止处理函数，并保留其原有退出流程。
+- 信号处理函数只登记事件，通过非阻塞管道唤醒后台输出线程，不在信号处理期间执行阻塞输出。
+- 信号继续交给原处理方式，保留默认终止、忽略或自定义处理语义。
+- 只在进程主线程安装信号处理函数，异步执行线程仅发布诊断元数据。
+
+工作进程启动器会自动准备环境。下面是启动器作者使用的本地配置例子，不会在提交进程安装信号处理函数：
+
+```python
+from fluxway.diagnostics import prepare_worker_runtime_env
+
+original = {"env_vars": {"PYTHONUNBUFFERED": "1"}}
+prepared = prepare_worker_runtime_env(original)
+
+assert original == {"env_vars": {"PYTHONUNBUFFERED": "1"}}
+assert prepared["env_vars"]["PYTHONUNBUFFERED"] == "1"
+assert len(prepared["env_vars"]) == 2
+```
+
+新增变量选择 Fluxway 启动挂钩。用户挂钩须使用可导入的模块路径；可调用对象或手动设置的 Ray 挂钩环境变量会被拒绝。`SIGKILL` 等无法拦截的信号不能由进程内部记录。
+
+## 各机制示例
+
+| 要做的事 | 文档 |
+| --- | --- |
+| 启动、观察、取消与恢复执行 | [执行生命周期](execution_lifecycle_zh.md) |
+| 注册状态、保存、恢复与配置保留策略 | [检查点](checkpoint_zh.md) |
+| 限制扫描预算与跟踪来源任务 | [来源协调](source_coordination_zh.md) |
+| 编译路由与传递张量 | [传输计划](transfer_planning_zh.md)、[数据面运行时](dataplane_runtime_zh.md) |
+| 准入实例与释放消费租约 | [一致性协议](coherence_protocol_zh.md) |
+| 放置工作进程与绑定运行时资源 | [放置配方](placement_recipe_zh.md) |
