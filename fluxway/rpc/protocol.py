@@ -6,7 +6,7 @@ Control plane operations (scheduling, heartbeats) still use native Ray.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from inspect import isawaitable
 from typing import Any, ClassVar
 
@@ -36,12 +36,12 @@ class ReceiverIngressCompletion:
             raise TypeError("producer_retention_released must be bool.")
 
 
-class PayloadDeviceClass(str, Enum):
+class PayloadDeviceClass(StrEnum):
     CPU = "cpu"
     CUDA = "cuda"
 
 
-class AxonCompletionMode(str, Enum):
+class AxonCompletionMode(StrEnum):
     RECEIVER_SUCCESS = "receiver_success"
     SEND_ENQUEUED = "send_enqueued"
 

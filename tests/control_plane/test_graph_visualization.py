@@ -235,13 +235,17 @@ def test_visualize_graph_projects_graph_and_compiled_graph(tmp_path):
     assert overlap_graph["tasksData"]["edgeOverlaysDataListRightPane"] == []
     assert dependency_graph["layoutConfigs"] == {
         "edgeSep": 24,
+        "keepLayersWithASingleChild": None,
         "nodeSep": 36,
         "rankSep": 96,
     }
     assert dependency_graph["groupNodeConfigs"]
     assert dependency_graph["groupNodeConfigs"][0] == {
+        "backgroundColor": None,
+        "borderColor": None,
         "layoutDirection": 1,
         "namespaceRegex": "^$",
+        "textColor": None,
     }
     overlap_namespaces = {
         node["label"]: node["namespace"] for node in overlap_graph["nodes"]

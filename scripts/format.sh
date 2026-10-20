@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Get the directory of the script and change to the project root
 cd "$(dirname "$0")/.."
 
-# Resolve ruff: prefer python -m ruff for virtualenv compatibility
-if command -v ruff &>/dev/null; then
-    RUFF="ruff"
-else
-    RUFF="python -m ruff"
+lint_args=(--fix)
+format_args=()
+if (( $# )); then
+    if [[ $# -ne 1 || "$1" != --check ]]; then
+        printf 'Usage: bash scripts/format.sh [--check]\n' >&2
+        exit 2
+    fi
+    lint_args=()
+    format_args=(--check)
 fi
 
-# Format the codebase using ruff
-$RUFF format fluxway/ tests/ setup.py
-$RUFF check fluxway/ tests/ setup.py --fix
+python -m ruff check . "${lint_args[@]}"
+python -m ruff format . "${format_args[@]}"

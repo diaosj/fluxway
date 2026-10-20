@@ -423,8 +423,10 @@ class CoherenceDirectory:
                         "cannot read while invalidation is active.",
                     ),
                     guard(
-                        lambda entry, context: entry.local_writer is not None
-                        and context.execution == entry.local_writer,
+                        lambda entry, context: (
+                            entry.local_writer is not None
+                            and context.execution == entry.local_writer
+                        ),
                         TransitionStatus.ERROR,
                         "active writer cannot acquire a separate read grant.",
                     ),
@@ -449,17 +451,20 @@ class CoherenceDirectory:
                         "cannot write invalid data.",
                     ),
                     guard(
-                        lambda entry, _: entry.local_writer is not None
-                        or entry.ownership_child_id is not None
-                        or bool(entry.local_reader_count)
-                        or bool(entry.child_share_bitmap)
-                        or bool(entry.child_delivery_inflight),
+                        lambda entry, _: (
+                            entry.local_writer is not None
+                            or entry.ownership_child_id is not None
+                            or bool(entry.local_reader_count)
+                            or bool(entry.child_share_bitmap)
+                            or bool(entry.child_delivery_inflight)
+                        ),
                         TransitionStatus.PENDING,
                         "read grants active",
                     ),
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        is ParentAuthority.SHARED,
+                        lambda entry, _: (
+                            entry.parent_grant.authority is ParentAuthority.SHARED
+                        ),
                         TransitionStatus.PENDING,
                         "parent ownership required",
                     ),
@@ -489,14 +494,18 @@ class CoherenceDirectory:
                         "ownership request pending",
                     ),
                     guard(
-                        lambda entry, context: context.publishes_local_payload
-                        and entry.parent_grant.authority is not ParentAuthority.NONE,
+                        lambda entry, context: (
+                            context.publishes_local_payload
+                            and entry.parent_grant.authority is not ParentAuthority.NONE
+                        ),
                         TransitionStatus.ERROR,
                         "local payload publication cannot replace a parent grant.",
                     ),
                     guard(
-                        lambda entry, context: not context.publishes_local_payload
-                        and entry.state is CoherenceState.INVALID,
+                        lambda entry, context: (
+                            not context.publishes_local_payload
+                            and entry.state is CoherenceState.INVALID
+                        ),
                         TransitionStatus.ERROR,
                         "cannot delegate invalid data.",
                     ),
@@ -512,16 +521,19 @@ class CoherenceDirectory:
             CoherenceEvent.RxBusRd: TransitionSpec(
                 (
                     guard(
-                        lambda entry, _: entry.local_writer is not None
-                        or entry.ownership_child_id is not None
-                        or entry.state is CoherenceState.MODIFIED,
+                        lambda entry, _: (
+                            entry.local_writer is not None
+                            or entry.ownership_child_id is not None
+                            or entry.state is CoherenceState.MODIFIED
+                        ),
                         TransitionStatus.ERROR_BACKPRESSURE,
                         "cannot accept parent read grant while ownership is active.",
                     ),
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        is not ParentAuthority.NONE
-                        or entry.parent_grant.return_in_flight,
+                        lambda entry, _: (
+                            entry.parent_grant.authority is not ParentAuthority.NONE
+                            or entry.parent_grant.return_in_flight
+                        ),
                         TransitionStatus.ERROR,
                         "parent authority is already active.",
                     ),
@@ -536,8 +548,9 @@ class CoherenceDirectory:
             CoherenceEvent.PublishLocal: TransitionSpec(
                 (
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        is not ParentAuthority.NONE,
+                        lambda entry, _: (
+                            entry.parent_grant.authority is not ParentAuthority.NONE
+                        ),
                         TransitionStatus.ERROR,
                         "local payload publication cannot replace a parent grant.",
                     ),
@@ -557,8 +570,10 @@ class CoherenceDirectory:
             CoherenceEvent.TxGrantReturn: TransitionSpec(
                 (
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        not in (ParentAuthority.SHARED, ParentAuthority.OWNERSHIP),
+                        lambda entry, _: (
+                            entry.parent_grant.authority
+                            not in (ParentAuthority.SHARED, ParentAuthority.OWNERSHIP)
+                        ),
                         TransitionStatus.ERROR,
                         "has no parent grant to return.",
                     ),
@@ -573,9 +588,11 @@ class CoherenceDirectory:
             CoherenceEvent.TxOwnershipGrant: TransitionSpec(
                 (
                     guard(
-                        lambda entry, _: bool(entry.local_reader_count)
-                        or bool(entry.child_share_bitmap)
-                        or bool(entry.child_delivery_inflight),
+                        lambda entry, _: (
+                            bool(entry.local_reader_count)
+                            or bool(entry.child_share_bitmap)
+                            or bool(entry.child_delivery_inflight)
+                        ),
                         TransitionStatus.ERROR_BACKPRESSURE,
                         "shared grants are still active.",
                     ),
@@ -591,15 +608,18 @@ class CoherenceDirectory:
             CoherenceEvent.RxOwnershipGrant: TransitionSpec(
                 (
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        is not ParentAuthority.SHARED,
+                        lambda entry, _: (
+                            entry.parent_grant.authority is not ParentAuthority.SHARED
+                        ),
                         TransitionStatus.ERROR,
                         "ownership requires shared parent authority.",
                     ),
                     guard(
-                        lambda entry, _: bool(entry.local_reader_count)
-                        or bool(entry.child_share_bitmap)
-                        or entry.ownership_child_id is not None,
+                        lambda entry, _: (
+                            bool(entry.local_reader_count)
+                            or bool(entry.child_share_bitmap)
+                            or entry.ownership_child_id is not None
+                        ),
                         TransitionStatus.ERROR_BACKPRESSURE,
                         "local or child grants are still active.",
                     ),
@@ -609,8 +629,10 @@ class CoherenceDirectory:
             CoherenceEvent.TxOwnershipCancel: TransitionSpec(
                 (
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        is not ParentAuthority.OWNERSHIP,
+                        lambda entry, _: (
+                            entry.parent_grant.authority
+                            is not ParentAuthority.OWNERSHIP
+                        ),
                         TransitionStatus.ERROR,
                         "no parent ownership to cancel.",
                     ),
@@ -630,11 +652,12 @@ class CoherenceDirectory:
                         "invalidation is already active.",
                     ),
                     guard(
-                        lambda entry, _: entry.parent_grant.authority
-                        is ParentAuthority.OWNERSHIP
-                        or entry.state is CoherenceState.MODIFIED
-                        or entry.local_writer is not None
-                        or entry.ownership_child_id is not None,
+                        lambda entry, _: (
+                            entry.parent_grant.authority is ParentAuthority.OWNERSHIP
+                            or entry.state is CoherenceState.MODIFIED
+                            or entry.local_writer is not None
+                            or entry.ownership_child_id is not None
+                        ),
                         TransitionStatus.ERROR,
                         "modified ownership cannot be invalidated without writeback.",
                     ),
@@ -649,11 +672,13 @@ class CoherenceDirectory:
                         "invalidation was not started.",
                     ),
                     guard(
-                        lambda entry, _: bool(entry.local_reader_count)
-                        or entry.local_writer is not None
-                        or entry.ownership_child_id is not None
-                        or bool(entry.child_share_bitmap)
-                        or bool(entry.child_delivery_inflight),
+                        lambda entry, _: (
+                            bool(entry.local_reader_count)
+                            or entry.local_writer is not None
+                            or entry.ownership_child_id is not None
+                            or bool(entry.child_share_bitmap)
+                            or bool(entry.child_delivery_inflight)
+                        ),
                         TransitionStatus.ERROR_BACKPRESSURE,
                         "local or child grants are still active.",
                     ),

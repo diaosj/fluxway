@@ -1,0 +1,9 @@
+graft docs
+graft tests
+include README_zh.md CONTRIBUTING.md CONTRIBUTING_zh.md
+include scripts/distribution.py
+include scripts/check_installed.py
+include scripts/format.sh
+include .github/workflows/*.yml
+prune tmp
+global-exclude __pycache__ *.py[cod]

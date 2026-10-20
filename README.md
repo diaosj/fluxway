@@ -1,8 +1,28 @@
 # fluxway
 
-Fluxway is a Flexible Large-scale Unified eXchange designed to maximize Workload Accelerated Yield across heterogeneous compute clusters. By replacing SPMD with Asynchronous State Machine MPMD, Fluxway dismantles the barriers between hardware constraints and model scale. Easy to train and infer gigantic Sparse Embeddings, Experts, Omni Models.
+[中文文档](README_zh.md)
+
+Fluxway breaks through the global synchronization barriers and rigid cluster topologies of traditional SPMD by adopting **asynchronous state-machine MPMD**. It not only decouples **CPU memory I/O and GPU/TPU compute**, but also decouples **heterogeneous GPUs across different generations and memory tiers**. Through **elastic M:N topology matching** and **lock-free, zero-bubble overlap**, Fluxway unlocks peak efficiency across heterogeneous clusters.
+
+### Key Workloads & Scenarios
+
+* **Gigantic Recommendation Systems**: TB/PB-scale sparse embeddings with CPU-side deduplication & multi-hop transfer fully overlapped with GPU dense computation.
+* **Large-scale Conditional Memory & Engram Architectures**: Disaggregate static memory lookups ($\mathcal{O}(1)$ N-gram hash tables & external knowledge bases) from dynamic neural reasoning. Massive parameters reside in host/tiered storage with deterministic prefetching completely hidden behind GPU Transformer layers.
+* **Decoupled MoE (Mixture of Experts)**: Physically disaggregate Attention backbones and Expert pools across heterogeneous GPUs with zero-bubble dynamic token routing.
+* **Disaggregated Prefill & Decode (PD Separation)**: Elastic asymmetric scaling between compute-bound Prefill nodes and memory-bandwidth-bound Decode workers with zero-copy KV cache exchange.
+* **Multimodal World Models & End-to-End Networks (World Models & Omni)**: Asymmetric pipelining of spatiotemporal physics simulators/encoders and autoregressive LLM backbones across diverse accelerators without pipeline stalls.
+* **Asynchronous RL & Alignment (RLHF / Self-Play)**: Non-blocking concurrency between high-throughput Rollout generation workers and Learner training clusters.
+
+### Why Fluxway over Google Pathways?
+
+Unlike monolithic distributed graph runtimes like [Google Pathways](https://arxiv.org/abs/2203.12533) that enforce rigid static graph abstractions and opaque compilation pipelines, Fluxway offers:
+* **Flexible Native Python Component Orchestration**: Freely compose pipelines using standard Python functions, classes, and decorators. Operators seamlessly integrate with JAX, PyTorch, DLPack, and custom C++/CUDA kernels without proprietary walled-garden constraints.
+* **Eager Execution Mode**: Full support for intuitive eager workflows and interactive debugging. Developers can prototype, inspect intermediate tensors, and evolve models dynamically without suffering through tedious, black-box full-graph recompilations.
 
 ## Documentation
+
+- [Contributing](CONTRIBUTING.md) ([中文](CONTRIBUTING_zh.md)): local checks and CI coverage.
+- [Releasing](docs/releasing.md) ([中文](docs/releasing_zh.md)): version tags, wheel builds, and PyPI publishing.
 
 ### Core Architecture & Execution
 - [Architecture](docs/ARCHITECTURE.md) ([中文](docs/ARCHITECTURE_zh.md)): control-plane and runtime ownership.

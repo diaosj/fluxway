@@ -10,8 +10,6 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from etils import epath
-
 from fluxway.common import msgpack_codec
 
 from fluxway.common.types.checkpoint import (
@@ -49,13 +47,21 @@ def _barrier_sync_key(context: SaveSession | RestoreSession, operation: str) -> 
 
 
 def _jax_process_count() -> int:
-    try:
-        import jax
+    import jax
 
-        distributed = jax.distributed
-        return int(jax.process_count()) if distributed.is_initialized() else 1
-    except (ImportError, AttributeError, RuntimeError):
-        return 1
+    return int(jax.process_count()) if jax.distributed.is_initialized() else 1
+
+
+def _import_orbax():
+    try:
+        import orbax.checkpoint as ocp
+
+        return ocp
+    except ImportError as err:
+        raise ImportError(
+            "OrbaxCheckpointComponent requires 'orbax-checkpoint' and 'jax'. "
+            "Please install them via 'pip install fluxway[jax]'."
+        ) from err
 
 
 def _require_collective_contract(world_size: int) -> bool:
@@ -109,7 +115,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
 
     def _get_handler(self):
         if self._handler is None:
-            import orbax.checkpoint as ocp
+            ocp = _import_orbax()
 
             self._handler = ocp.StandardCheckpointHandler()
         return self._handler
@@ -121,7 +127,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
     async def save(self, session: SaveSession) -> WorkerSaveResult:
         self._require_permit(session, session.commit_permit)
         self._require_worker(session)
-        import orbax.checkpoint as ocp
+        ocp = _import_orbax()
 
         state = await self._save_state(session.instance, session)
         if self.descriptor.output_path is not None:
@@ -159,7 +165,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
                 )
                 try:
                     checkpointer.save(
-                        epath.Path(model_staging),
+                        model_staging,
                         force=False,
                         args=ocp.args.StandardSave(state["model_state"]),
                     )
@@ -190,7 +196,7 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
             )
             try:
                 checkpointer.save(
-                    epath.Path(shared_staging),
+                    shared_staging,
                     force=False,
                     args=ocp.args.StandardSave(state),
                 )
@@ -342,15 +348,13 @@ class OrbaxCheckpointComponent(FilesystemCheckpointComponent):
         restore_layout: Any,
         context: RestoreSession,
     ) -> Any:
-        import orbax.checkpoint as ocp
+        ocp = _import_orbax()
 
         collective = _require_collective_contract(context.restore_topology.world_size)
 
         if len(record.checkpoint_objects) != 1:
             raise ValueError("Orbax shared record must contain one checkpoint_object")
-        checkpoint_path = epath.Path(
-            self._file_path(record.checkpoint_objects[0].storage_locator)
-        )
+        checkpoint_path = self._file_path(record.checkpoint_objects[0].storage_locator)
 
         def read() -> Any:
             options = ocp.options.MultiprocessingOptions(

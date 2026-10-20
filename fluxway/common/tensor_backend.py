@@ -36,6 +36,8 @@ def force_writable(arr: Any) -> Any:
     Only call this when you *know* the backing memory is writable (which is
     always the case for DLPack tensors produced by sparse_embedding or
     Fluxway transport).
+
+    CUDA inputs require CuPy; backend and conversion errors propagate.
     """
     # Fast path: already writable or not an ndarray type we handle
     if not hasattr(arr, "flags") or not hasattr(arr.flags, "writeable"):
@@ -64,52 +66,32 @@ def force_writable(arr: Any) -> Any:
 
         return np.asarray(_WritableCPUView(arr))
 
-    # GPU path: CuPy arrays
-    try:
-        import cupy as cp
+    if not hasattr(arr, "__cuda_array_interface__"):
+        return arr
 
-        if isinstance(arr, cp.ndarray):
-            if arr.flags.writeable:
-                return arr
-            try:
-                arr.flags.writeable = True
-                return arr
-            except ValueError:
-                pass
+    import cupy as cp
 
-            # Patch __cuda_array_interface__
-            class _WritableGPUView:
-                __slots__ = ("__cuda_array_interface__", "_source")
+    if isinstance(arr, cp.ndarray):
+        if arr.flags.writeable:
+            return arr
+        try:
+            arr.flags.writeable = True
+            return arr
+        except ValueError:
+            pass
 
-                def __init__(self, source: cp.ndarray):
-                    iface = source.__cuda_array_interface__
-                    ptr, _ = iface["data"]
-                    new_iface = dict(iface)
-                    new_iface["data"] = (ptr, False)
-                    self.__cuda_array_interface__ = new_iface
-                    self._source = source  # prevent GC
+    class _WritableGPUView:
+        __slots__ = ("__cuda_array_interface__", "_source")
 
-            return cp.asarray(_WritableGPUView(arr))
+        def __init__(self, source: Any):
+            iface = source.__cuda_array_interface__
+            ptr, _ = iface["data"]
+            new_iface = dict(iface)
+            new_iface["data"] = (ptr, False)
+            self.__cuda_array_interface__ = new_iface
+            self._source = source
 
-        if hasattr(arr, "__cuda_array_interface__"):
-
-            class _WritableForeignGPUView:
-                __slots__ = ("__cuda_array_interface__", "_source")
-
-                def __init__(self, source: Any):
-                    iface = source.__cuda_array_interface__
-                    ptr, _ = iface["data"]
-                    new_iface = dict(iface)
-                    new_iface["data"] = (ptr, False)
-                    self.__cuda_array_interface__ = new_iface
-                    self._source = source
-
-            return cp.asarray(_WritableForeignGPUView(arr))
-    except Exception:
-        pass
-
-    # Fallback: non-ndarray types (JAX, Torch, etc.) — return as-is
-    return arr
+    return cp.asarray(_WritableGPUView(arr))
 
 
 def prepare_dlpack_input(value: Any) -> Any:
@@ -1168,12 +1150,16 @@ class JaxBackend(TensorBackend):
             if copy is True and isinstance(x, np.ndarray):
                 return self._jnp.array(np.array(x, copy=True), device=resolved_device)
             if (
-                copy is not False
-                and hasattr(x, "flags")
+                hasattr(x, "flags")
                 and hasattr(x.flags, "writeable")
                 and not x.flags.writeable
                 and not coherent_readonly
             ):
+                if copy is False:
+                    raise BufferError(
+                        "Cannot export readonly array with copy=False without a "
+                        "proven writable allocation."
+                    )
                 return self._jnp.asarray(x, device=resolved_device)
             if hasattr(x, "__dlpack__"):
                 return self._jax.dlpack.from_dlpack(

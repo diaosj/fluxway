@@ -14,8 +14,8 @@ from fluxway.spmd.driver.state_machine.driver_fsm import DriverStateMachine
 def _make_fsm() -> tuple[DriverStateMachine, MagicMock]:
     driver = MagicMock()
     driver.spmd_id = "test_spmd"
-    driver._submit_driver_effect.side_effect = (
-        lambda operation, args=(), **_: operation(*args)
+    driver._submit_driver_effect.side_effect = lambda operation, args=(), **_: (
+        operation(*args)
     )
     fsm = DriverStateMachine(driver)
     # Advance to RUNNING so snapshot path is reachable

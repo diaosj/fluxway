@@ -24,6 +24,19 @@ from fluxway.control_plane.checkpointer import (
 from fluxway.control_plane.checkpointer import orbax_component as orbax_module
 
 
+@pytest.mark.parametrize("error_type", [RuntimeError, AttributeError])
+def test_orbax_jax_topology_errors_propagate(monkeypatch, error_type):
+    import jax
+
+    def fail():
+        raise error_type("distributed initialization failed")
+
+    monkeypatch.setattr(jax.distributed, "is_initialized", fail)
+
+    with pytest.raises(error_type, match="distributed initialization failed"):
+        orbax_module._jax_process_count()
+
+
 @pytest.mark.asyncio
 async def test_worker_local_records_require_exact_topology(tmp_path):
     async def save(module, context):

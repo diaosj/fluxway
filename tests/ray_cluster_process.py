@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -8,6 +10,23 @@ from contextlib import contextmanager
 from pathlib import Path
 from multiprocessing import Pipe
 from multiprocessing.connection import Connection
+from unittest.mock import patch
+
+
+@contextmanager
+def _ray_authentication():
+    from ray._private.authentication_test_utils import reset_auth_token_state
+
+    try:
+        with patch.dict(
+            os.environ,
+            {"RAY_AUTH_MODE": "token", "RAY_AUTH_TOKEN": secrets.token_urlsafe()},
+        ):
+            os.environ.pop("RAY_AUTH_TOKEN_PATH", None)
+            reset_auth_token_state()
+            yield
+    finally:
+        reset_auth_token_state()
 
 
 @contextmanager
@@ -17,7 +36,7 @@ def local_ray_cluster(**options):
     if ray.is_initialized():
         raise RuntimeError("isolated cluster requires a disconnected Ray client")
     connection, child = Pipe()
-    with tempfile.TemporaryFile(mode="w+") as output:
+    with _ray_authentication(), tempfile.TemporaryFile(mode="w+") as output:
         process = subprocess.Popen(
             [
                 sys.executable,
