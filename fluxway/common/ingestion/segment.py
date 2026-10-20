@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import Any, Literal
@@ -294,6 +294,23 @@ class SourceWorkAssignment:
     def interval(self) -> CanonicalWorkInterval:
         return self.descriptor.canonical_work_interval(self.source_identity)
 
+    @property
+    def cardinality(self) -> int:
+        return self.descriptor.cardinality
+
+    @property
+    def batch_provenance(self) -> tuple[int, int, str, str, str, str, int, int]:
+        return (
+            self.epoch,
+            self.step,
+            self.source_identity,
+            self.view_identity,
+            self.schema_digest,
+            self.lineage_digest,
+            self.global_batch_size,
+            self.global_valid_count,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class SourceWorkItem:
@@ -346,42 +363,18 @@ class SourceWorkItem:
         return self.logical_end - self.logical_start
 
 
-@dataclass(frozen=True, slots=True)
-class _BatchProvenance:
-    epoch: int
-    step: int
-    source_identity: str
-    view_identity: str
-    schema_digest: str
-    lineage_digest: str
-    global_batch_size: int
-    global_valid_count: int
-
-
 def source_work_global_valid_count(work_items: Sequence[SourceWorkItem]) -> int:
     if not work_items:
         raise ValueError("global valid count requires source work items")
     if any(not isinstance(item, SourceWorkItem) for item in work_items):
         raise TypeError("global valid count requires SourceWorkItem values")
-    provenances = {
-        _BatchProvenance(
-            epoch=item.assignment.epoch,
-            step=item.assignment.step,
-            source_identity=item.assignment.source_identity,
-            view_identity=item.assignment.view_identity,
-            schema_digest=item.assignment.schema_digest,
-            lineage_digest=item.assignment.lineage_digest,
-            global_batch_size=item.assignment.global_batch_size,
-            global_valid_count=item.global_valid_count,
-        )
-        for item in work_items
-    }
+    provenances = {item.assignment.batch_provenance for item in work_items}
     if len(provenances) != 1:
         raise ValueError(
             "source work items have conflicting batch provenance or global valid count"
         )
     (single_provenance,) = provenances
-    return single_provenance.global_valid_count
+    return single_provenance[7]
 
 
 @dataclass(frozen=True, slots=True)
@@ -420,6 +413,35 @@ def validate_canonical_work_intervals(
     for left, right in itertools.pairwise(ordered):
         if left.identity == right.identity and right.logical_start < left.logical_end:
             raise ValueError("duplicate canonical work intervals overlap")
+
+
+def assert_strict_interval_partition(
+    target_start: int,
+    target_end: int,
+    items: Sequence[Any],
+    *,
+    start_fn: Callable[[Any], int],
+    end_fn: Callable[[Any], int],
+    overlap_or_gap_error: str,
+    boundary_error: str,
+) -> None:
+    if target_end < target_start:
+        raise ValueError("target interval boundaries are inverted")
+    if not items:
+        if target_start == target_end:
+            return
+        raise ValueError(boundary_error)
+
+    sorted_items = sorted(items, key=start_fn)
+    cursor = target_start
+    for item in sorted_items:
+        start = start_fn(item)
+        end = end_fn(item)
+        if start != cursor or end <= start:
+            raise ValueError(overlap_or_gap_error)
+        cursor = end
+    if cursor != target_end:
+        raise ValueError(boundary_error)
 
 
 @dataclass(frozen=True, slots=True)
@@ -487,6 +509,7 @@ __all__ = [
     "SourceWorkAssignment",
     "SourceWorkKey",
     "SourceWorkKind",
+    "assert_strict_interval_partition",
     "source_work_global_valid_count",
     "validate_canonical_work_intervals",
 ]

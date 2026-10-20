@@ -22,7 +22,7 @@ from .components import (
 )
 from .ledger_client import SourceWorkClient
 from .source_control import SourceControlRuntime
-from .logical_work_ledger import LogicalWorkEpoch, LogicalWorkLedger
+from .logical_work_ledger import LogicalWorkEpoch, LogicalWorkLedger, StepBatchLayout
 from .ingestion import (
     AlgebraicLayoutCompiler,
     CanonicalWorkInterval,
@@ -82,6 +82,7 @@ __all__ = [
     "SourceControlRuntime",
     "LogicalWorkEpoch",
     "LogicalWorkLedger",
+    "StepBatchLayout",
     "EncodedWorkerLayoutDescriptor",
     "DirectIngestionSourceDescriptor",
     "IngestionLayoutActivation",

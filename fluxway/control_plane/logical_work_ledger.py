@@ -20,6 +20,7 @@ from fluxway.common.ingestion.segment import (
     SourceWorkAssignment,
     SourceWorkKey,
     _count,
+    assert_strict_interval_partition,
     validate_canonical_work_intervals,
 )
 from fluxway.common.metadata import metadata_digest
@@ -29,6 +30,63 @@ from fluxway.control_plane.checkpoint_transaction import (
     PreparedCheckpointTransaction,
     PreparedStateStore,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class StepBatchLayout:
+    """Deterministic batch geometry and valid/padding direct-sum partition for one step."""
+
+    step: int
+    global_batch_size: int
+    global_valid_count: int
+    assignments: tuple[SourceWorkAssignment, ...]
+
+    @property
+    def valid_assignments(self) -> tuple[SourceWorkAssignment, ...]:
+        return tuple(item for item in self.assignments if not item.is_synthetic_padding)
+
+    @property
+    def padding_assignments(self) -> tuple[SourceWorkAssignment, ...]:
+        return tuple(item for item in self.assignments if item.is_synthetic_padding)
+
+    @classmethod
+    def from_assignments(
+        cls, step: int, assignments: Sequence[SourceWorkAssignment]
+    ) -> StepBatchLayout:
+        if not assignments:
+            raise ValueError("step must contain at least one assignment")
+        batches = {item.global_batch_size for item in assignments}
+        if len(batches) != 1:
+            raise ValueError(
+                "logical epoch global valid count conflicts with source work"
+            )
+        (batch_size,) = batches
+        valid_assignments = tuple(
+            item for item in assignments if not item.is_synthetic_padding
+        )
+        valid_count = sum(item.cardinality for item in valid_assignments)
+        if any(item.global_valid_count != valid_count for item in assignments):
+            raise ValueError(
+                "logical epoch global valid count conflicts with source work"
+            )
+        batch_start = step * batch_size
+        batch_end = (step + 1) * batch_size
+
+        assert_strict_interval_partition(
+            batch_start,
+            batch_end,
+            assignments,
+            start_fn=lambda item: item.global_start,
+            end_fn=lambda item: item.global_start + item.cardinality,
+            overlap_or_gap_error="logical epoch assignments must cover one contiguous batch",
+            boundary_error="logical epoch assignments must fill the global batch",
+        )
+        return cls(
+            step=step,
+            global_batch_size=batch_size,
+            global_valid_count=valid_count,
+            assignments=tuple(assignments),
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -69,29 +127,8 @@ class LogicalWorkEpoch:
         by_step: dict[int, list[SourceWorkAssignment]] = defaultdict(list)
         for value in values:
             by_step[value.step].append(value)
-        for step, assignments in by_step.items():
-            batches = {value.global_batch_size for value in assignments}
-            valid_count = sum(
-                value.descriptor.cardinality
-                for value in assignments
-                if not value.is_synthetic_padding
-            )
-            if len(batches) != 1 or any(
-                value.global_valid_count != valid_count for value in assignments
-            ):
-                raise ValueError(
-                    "logical epoch global valid count conflicts with source work"
-                )
-            (batch,) = batches
-            cursor = step * batch
-            for value in sorted(assignments, key=lambda item: item.global_start):
-                if value.global_start != cursor:
-                    raise ValueError(
-                        "logical epoch assignments must cover one contiguous batch"
-                    )
-                cursor += value.descriptor.cardinality
-            if cursor != (step + 1) * batch:
-                raise ValueError("logical epoch assignments must fill the global batch")
+        for step in range(self.start_step, self.end_step):
+            StepBatchLayout.from_assignments(step, by_step[step])
         validate_canonical_work_intervals(
             tuple(value.interval for value in values if not value.is_synthetic_padding)
         )
@@ -238,15 +275,15 @@ class LogicalWorkLedger:
                 additions[identity] = item
                 coverage[key].append(segment)
         for key, assignment in assignments.items():
-            cursor = assignment.interval.logical_start
-            for segment in sorted(coverage[key], key=lambda value: value.logical_start):
-                if segment.logical_start != cursor:
-                    raise ValueError(
-                        "assignment binding has overlapping or missing intervals"
-                    )
-                cursor = segment.logical_end
-            if cursor != assignment.interval.logical_end:
-                raise ValueError("assignment binding does not cover its interval")
+            assert_strict_interval_partition(
+                assignment.interval.logical_start,
+                assignment.interval.logical_end,
+                coverage[key],
+                start_fn=lambda segment: segment.logical_start,
+                end_fn=lambda segment: segment.logical_end,
+                overlap_or_gap_error="assignment binding has overlapping or missing intervals",
+                boundary_error="assignment binding does not cover its interval",
+            )
         prior = self._epochs.get(epoch.epoch)
         if prior is not None:
             existing = {
@@ -447,17 +484,6 @@ class LogicalWorkLedger:
             for key, value in self._bindings.items()
             if key[0] not in removable_ids
         }
-        self._leased = {key for key in self._leased if key[0] not in removable_ids}
-        self._leases = {
-            lease_id: lease
-            for lease_id, lease in self._leases.items()
-            if lease.item.key.epoch not in removable_ids
-        }
-        self._acknowledged = {
-            lease_id: value
-            for lease_id, value in self._acknowledged.items()
-            if value.key.epoch not in removable_ids
-        }
 
     def checkpoint_state(self, *, committed_cut: int | None = None) -> dict[str, Any]:
         target = self._committed_cut if committed_cut is None else committed_cut
@@ -517,3 +543,11 @@ class LogicalWorkLedger:
         self._publication_generation += 1
         self._checkpoint_transactions = PreparedStateStore()
         self._notify_changed()
+
+
+__all__ = [
+    "LogicalWorkEpoch",
+    "LogicalWorkLedger",
+    "PreparedLogicalWorkPublication",
+    "StepBatchLayout",
+]

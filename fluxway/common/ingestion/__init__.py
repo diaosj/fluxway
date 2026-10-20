@@ -12,6 +12,7 @@ from fluxway.common.ingestion.segment import (
     SourceWorkLease,
     SplitPolicy,
     CompiledSegment,
+    assert_strict_interval_partition,
     validate_canonical_work_intervals,
 )
 from fluxway.common.ingestion.protocol import (
@@ -47,6 +48,7 @@ __all__ = [
     "SourceWorkLease",
     "SplitPolicy",
     "CompiledSegment",
+    "assert_strict_interval_partition",
     "validate_canonical_work_intervals",
     "EncodedWorkerLayoutDescriptor",
     "SourceLayoutCompletion",
