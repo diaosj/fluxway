@@ -1,143 +1,153 @@
-# User Profiler
+# User profiling
 
-Fluxway automatically records every operator call as `user_callable.execute`.
-Use `fw.profiler.scope()` and `fw.profiler.event()` only for smaller regions
-inside your operator.
+[Chinese edition](user_profiler_zh.md)
+
+Fluxway records the whole operator call as `user_callable.execute`. Add
+`profiler.scope()` for smaller timed regions and `profiler.event()` for facts at
+one instant. You do not need another decorator around the operator.
+
+## Add a scope and a marker
+
+This helper can run inside an operator. It supplies its own inputs for a local
+check. The direct call below verifies the calculation; recording activates only
+when Fluxway invokes an operator with profiling enabled.
 
 ```python
 import fluxway as fw
 
 
-def lookup(self, ids):
+def lookup(ids: list[int], table: dict[int, float]) -> list[float]:
+    attrs = {}
     if fw.profiler.enabled():
-        id_count = len(ids)
-    else:
-        id_count = 0
+        attrs["ids_preview"] = ",".join(str(value) for value in ids[:8])
 
-    with fw.profiler.scope("embedding_lookup", table="item", id_count=id_count):
-        values = self.table.lookup(ids)
+    with fw.profiler.scope("embedding_lookup", table="item", count=len(ids), **attrs):
+        values = [table[item_id] for item_id in ids]
 
-    fw.profiler.event("cache_hit", hit=True)
+    fw.profiler.event("lookup_complete", result_count=len(values))
     return values
+
+
+assert lookup([2, 1], {1: 0.5, 2: 1.5}) == [1.5, 0.5]
+assert not fw.profiler.enabled()
 ```
 
-## API
+The scope appears as a duration slice named `user.embedding_lookup`; the event
+appears as an instant marker named `user.lookup_complete`. `enabled()` is true
+only inside an active Fluxway user call. Use it before building expensive
+attributes, as the preview example does.
 
-`fw.profiler.scope(name: str, **attrs)` records a duration slice named
-`user.<name>`.
+Names must be nonempty strings without control characters. Do not include the
+`user.` prefix yourself. Attribute values must be `str`, `int`, `float`, `bool`,
+or `None`; complex objects raise `TypeError` while recording is active.
+`op_id`, `step`, `rank`, `execution_mode`, and `attrs_id` are reserved keys.
+When profiling is inactive, scopes and events do nothing and do not validate,
+intern, or serialize attributes. Large tensors and structured payloads belong
+in application logs.
 
-`fw.profiler.event(name: str, **attrs)` records an instant marker named
-`user.<name>`.
+## Enable collection for a job
 
-`fw.profiler.enabled()` returns `True` only while profiler is enabled and the
-current code is running inside a Fluxway user callable.
+Install the export dependency:
 
-Attributes may be `str`, `int`, `float`, `bool`, or `None`. Complex objects
-raise `TypeError` when profiler is enabled. When profiler is disabled, scope and
-event are no-ops and attributes are not validated, interned, or serialized.
+```bash
+python -m pip install "fluxway[profiler]"
+```
 
-Use `enabled()` before constructing expensive attributes:
+The function below requires an initialized Ray cluster, a complete graph with a
+finite source, and its placement recipe. Use a trace directory shared by the
+controller and caller so the final file check refers to the same filesystem.
+All nodes must satisfy the project's dependency and clock-synchronization
+requirements. This function starts the job; it is not a local recording example.
 
 ```python
-attrs = {}
-if fw.profiler.enabled():
-    attrs["ids_preview"] = ",".join(str(x) for x in ids[:8])
+from pathlib import Path
 
-with fw.profiler.scope("prepare_ids", **attrs):
-    ids = normalize(ids)
+from fluxway import Graph, PlacementRecipe, start
+from fluxway.profiler import ProfilerConfig
+
+
+async def profile_job(
+    graph: Graph,
+    recipe: PlacementRecipe,
+    trace_directory: str | Path,
+    run_id: str,
+    *,
+    skip_initial_steps: int = 0,
+    steady_state_only: bool = False,
+) -> Path:
+    config = ProfilerConfig(
+        trace_dir=str(trace_directory),
+        run_id=run_id,
+        skip_initial_steps=skip_initial_steps,
+        steady_state_only=steady_state_only,
+    )
+    execution = await start(graph, placement_recipe=recipe, profiler_config=config)
+    try:
+        await execution.wait()
+    finally:
+        await execution.cancel()
+    assert config.output_path.is_file()
+    return config.output_path
 ```
 
-## Trace Display
+The controller collects worker snapshots and writes the trace during completion.
+By default, the result is `trace_directory/run_id/trace.pftrace`; `output_file`
+can override that location. Open the file with [Perfetto](https://ui.perfetto.dev/).
+Without shared storage, retrieve it from the controller machine instead of
+checking a caller-local path.
 
-Worker duration slices use this Perfetto hierarchy:
+`skip_initial_steps` excludes early operator steps. `steady_state_only` keeps
+records in the steady-state execution interval; a filter that removes every
+record raises an error. Collection uses a fixed per-process buffer configured
+by `buffer_bytes_per_process`. With its default strict exhaustion policy,
+insufficient capacity raises `ProfilerBufferExhausted`. Clock uncertainty beyond
+the configured limit also fails collection instead of presenting misleading
+timings.
+
+## Read the trace
+
+Worker tracks follow this hierarchy:
 
 ```text
 SPMDs/<spmd_id>/rank:<rank>/<subsystem>/<leaf>/lane:<lane>
-
-Controller lifecycle events use a sibling root branch:
-
 Controller/<subsystem>/<leaf>
-
-`Controller` and `SPMDs` are the two top-level execution owners. Controller
-records use a separate control-plane recorder entrypoint but share the same
-fixed-width recorder and export pipeline.
 ```
 
-Expand a rank to inspect its compute, transport, mailbox, and scheduler
-subsystems. The leaf identifies the recorded behavior. `lane:<lane>` separates
-overlapping slices on the same leaf so Perfetto preserves each slice's original
-duration. Lane allocation is deterministic and uses the minimum number of
-lanes required by the leaf's maximum concurrency; it does not create one track
-per step.
+`SPMDs` and `Controller` are separate top-level owners. Expand a rank to inspect
+compute, transport, mailbox, and scheduler work. The final `lane:<lane>` separates
+overlapping slices on one leaf without changing their duration. Lane allocation
+is deterministic and uses the minimum lanes needed for that leaf's maximum
+concurrency, rather than a new track for each step.
 
-Scheduler activity is grouped by responsibility under `scheduler/task`,
-`scheduler/queue`, `scheduler/step`, and `scheduler/loop`. Checkpoint component
-operations use `checkpoint/storage`, while snapshot coordination uses
-`checkpoint/hook`. A `worker` level is not repeated below `rank:<rank>`.
+Scheduler leaves are grouped under `scheduler/task`, `scheduler/queue`,
+`scheduler/step`, and `scheduler/loop`. Checkpoint component work uses
+`checkpoint/storage`; snapshot coordination uses `checkpoint/hook`.
+A redundant `worker` level is not inserted below the rank.
 
-Custom user scopes and events use the leaf:
+Custom scopes and markers appear under
+`compute/user_custom/<execution_mode>`. Here, `execution_mode` identifies the
+runtime call mode, while the final lane number identifies overlapping trace
+slices. Each record is correlated with the surrounding call's `op_id`, `step`,
+`rank`, and `execution_mode`. User attributes appear as readable debug
+annotations; the internal `attrs_id` does not.
 
-```text
-compute/user_custom/<execution_mode>
-```
+## Match events to the compiled graph
 
-The `<execution_mode>` component is a runtime call mode. It is distinct from
-the final Perfetto concurrency track `lane:<lane>`.
+The surrounding `user_callable.execute` slice carries `graph_id`, `spmd_id`,
+`op_id`, `function_id`, `input_signature_id`, and `output_signature_id`.
+Search the same values in [Model Explorer](graph_visualization.md). Step and
+execution mode are runtime facts, not compiled graph fields.
 
-Payload fields are correlated with the surrounding call:
+At export, `CompiledGraph` supplies operator functions, declared data/control/
+static port names, and explicit parameter-to-field paths. An empty parameter map
+stays empty; names are not guessed. A `transfer_code` identifies one source-to-
+target port transfer; `logical_tuuid` identifies the producer output. One output
+may feed multiple target ports, sharing a logical tensor ID but using separate
+transfer codes.
 
-- `op_id`
-- `step`
-- `rank`
-- `execution_mode`
-
-User attributes are expanded as readable Perfetto debug annotations. The
-internal `attrs_id` is not shown.
-
-The surrounding `user_callable.execute` slice carries the immutable execution
-plan identity fields:
-
-- `graph_id`
-- `spmd_id`
-- `op_id`
-- `function_id`
-- `input_signature_id`
-- `output_signature_id`
-
-The same values are searchable in Model Explorer. `step` and `execution_mode`
-are runtime facts and do not belong to the compiled graph.
-
-Perfetto also derives readable graph annotations from the installed
-`CompiledGraph` when the trace is exported. Events carrying `op_id` show the
-operator function and every declared data, control, and static input/output
-name. When the compiled `OperatorSpec` contains `input_param_map` or
-`output_param_map`, Perfetto also shows those Python parameter-to-field paths.
-An empty parameter map is displayed as no parameter-path annotation; Fluxway
-does not guess parameter names from ports. Events carrying `transfer_code` show
-the complete source and target operator, function, and port. `logical_tuuid`
-identifies the producer output.
-
-One producer output may feed several target ports. Those events share one
-`logical_tuuid` but have different `transfer_code` values, so each target port
-is displayed independently instead of being overwritten by a single tensor
-name map.
-
-The recorder hot path continues to store only fixed-width integer records.
-Graph names are not copied into each event and no graph lookup happens while an
-operator runs. The frozen profiler symbol projection is built once from the
-current `CompiledGraph` during trace export. Events carrying an explicit
-operator, transfer, or logical-tensor identity must resolve it and raise
-`MissingGraphTraceSymbol` when it is absent. Lifecycle metadata such as
-`execution.phase` may intentionally carry an empty operator id; it is annotated
-as non-operator metadata and does not enter the compiled-operator index. Fluxway
-does not emit an incomplete name as a fallback.
-
-## Rules
-
-- Do not add a decorator around the whole operator. Fluxway already records that
-  as `user_callable.execute`.
-- Use `scope` for code regions that take time.
-- Use `event` for point-in-time facts such as a cache hit, sampled branch, or
-  algorithm phase marker.
-- Attribute values must be scalar. Put large tensors, arrays, dicts, lists, or
-  object reprs in your own logs instead of the profiler.
+The recorder stores fixed-width integer records on the hot path. Graph names
+are resolved once during export through the frozen symbol projection. Explicit
+operator, transfer, or tensor IDs must resolve or raise `MissingGraphTraceSymbol`.
+Lifecycle events such as `execution.phase` may intentionally have no operator
+ID and remain non-operator metadata. Controller records use a separate entry
+point with the same recorder format and export pipeline.

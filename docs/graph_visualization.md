@@ -1,227 +1,193 @@
-# Computation Graph Visualization
+# Computation graph visualization
 
-Fluxway projects a compiled computation graph into Google Model Explorer. It
-does not generate an SVG, DOT graph, or a separate visualization service.
+[Chinese edition](graph_visualization_zh.md)
 
-## Installation
+Fluxway exports a compiled graph for Google Model Explorer. Export does not run
+the graph, open a browser, or start a server. It writes a single
+`model_explorer.json` file; this file is for inspection, not job reconstruction.
+
+## Install and export a complete example
+
+Install the optional viewer dependency:
 
 ```bash
-pip install "fluxway[visualization]"
+python -m pip install "fluxway[visualization]"
 ```
 
-The visualization extra installs `ai-edge-model-explorer`.
-
-## Export And View
+Run this example from the repository root. The output directory
+`tmp/graph-example` must not already exist. It builds one tensor dependency and
+one ordering-only dependency, then checks both exported views. No Ray cluster
+or GPU is required.
 
 ```python
-from fluxway import view_graph, visualize_graph
+import json
+from pathlib import Path
 
-bundle = visualize_graph(graph, "./output/training-graph")
-view_graph(bundle)
-```
+import numpy as np
+import fluxway as fw
 
-`visualize_graph` reads two existing Python objects:
 
-- `Graph` supplies the human-readable SPMD description.
-- `CompiledGraph` supplies frozen SPMD declarations, compiled operators,
-  dependencies, dependency codes, ports, TUUIDs, callable identities, and
-  `AsyncPolicy`.
+class Arithmetic:
+    def produce(self) -> dict[str, np.ndarray]:
+        return {"values": np.array([1, 2, 3])}
 
-The function writes exactly one file:
+    def consume(self, values: np.ndarray) -> None:
+        if values.sum() != 6:
+            raise ValueError("unexpected input")
 
-```text
-./output/training-graph/model_explorer.json
-```
+    def finish(self) -> None:
+        return None
 
-This JSON file is a Model Explorer export artifact. Fluxway does not use it to
-rebuild operators, dependencies, callables, or worker state. Ray continues to
-transport the native Python compiled graph and its user callables.
 
-`view_graph` starts the Model Explorer server and blocks until it is stopped.
-Export and viewing are separate, so a headless training process never opens a
-browser or starts an HTTP server implicitly.
-
-An existing output directory raises `FileExistsError`. Passing `overwrite=True`
-requires the existing directory to contain a valid Fluxway Model Explorer
-projection, then replaces the directory atomically. If the directory swap
-fails, the previous projection is restored and the exception is propagated.
-
-## Two Views
-
-The exported Model Explorer collection contains two views of the same compiled
-operators and dependencies.
-
-| View | Question it answers |
-|---|---|
-| `Dependencies` | Which operator must precede which other operator, and what data moves between them? |
-| `Potential overlap` | Which operators may become ready together, and which causal relations constrain that overlap? |
-
-There are not two graph definitions. Both views are projections of the same
-`CompiledGraph` and compiled `AsyncPolicy` schedule. The views deliberately use
-different edge representations because they answer different questions.
-
-SPMDs are Model Explorer namespaces and compiled operators are op nodes.
-Selecting an operator exposes its `graph_id`, SPMD identity, function identity,
-input/output signature IDs, mesh, resource range, dependency rank, and schedule
-policy.
-
-Searchable correlation fields include:
-
-- `graph_id`
-- `graph_generation`
-- `spmd_id`
-- `op_id`
-- `function_id`
-- `input_signature_id`
-- `output_signature_id`
-- `dependency_code`
-
-Model Explorer may remove a namespace containing only one operator from the
-overview. Fluxway therefore also places SPMD metadata on every operator. Enable
-Model Explorer's `Retention layers with a single op node child` setting when each
-SPMD must remain visible as a layer.
-
-## Dependency And Transfer
-
-A dependency means that a target operator cannot begin the corresponding step
-until the source operator has satisfied that dependency. A transfer means that
-a tensor also moves along the dependency.
-
-```text
-dependency: source operator -> target operator
-transfers:  zero or more source port -> target port -> TUUID mappings
-```
-
-Zero transfers is valid. It is an ordering-only dependency and is implemented
-by the transport compiler as a header-only frame rather than a tensor payload.
-The visualization creates input/output metadata for that control relation so it
-is visible in the same Model Explorer graph as tensor transfers.
-
-The `Dependencies` view contains exactly one native edge per compiled
-dependency. When one dependency carries multiple tensors, the source and
-artifact metadata contain a structured `transfers` list with every transfer code,
-logical TUUID, source port, and target port. It has no overlays.
-
-The `Potential overlap` view contains one thin, unlabeled native layout edge
-for each same-step causal operator pair. These edges use Model Explorer's
-default ports and have no tensor metadata. The view aggregates compiled
-dependencies and phase schedule relations by ordered operator pair. Tensor and
-ordering dependencies do not create colored overlays because their same-step
-causality is already represented by the native layout edge and their complete
-metadata belongs to the `Dependencies` view. Only nonzero-step phase relations
-create a teal overlay. They cannot become native edges because they must not
-change the same-step layout rank.
-
-## Visual Language
-
-Operator box colors describe structural roles in the compiled dependency graph.
-
-| Box | Meaning |
-|---|---|
-| Green | Source: no incoming dependency |
-| Blue | Transform: both incoming and outgoing dependencies |
-| Amber | Sink: no outgoing dependency |
-| Purple | Member of a dependency cycle |
-| Gray | Isolated operator |
-
-The `Dependencies` view has no overlays. Its native Model Explorer edges are
-the complete dependency projection and carry all tensor port metadata.
-
-In `Potential overlap`, faint native edges are the complete same-step causal
-layout. The only colored overlay is a nonzero-step phase constraint that cannot
-participate in that layout.
-
-| Color | Meaning |
-|---|---|
-| Teal `#007B83` | Nonzero-step phase dependency from `AsyncPolicy` |
-
-Model Explorer's edge schema supports color, width, and labels, but has no
-dashed or dotted stroke field. Fluxway does not emit unsupported JSON fields
-that the viewer would silently ignore.
-
-## Async Scheduling Facts
-
-`AsyncPolicy` is the only source of asynchronous execution facts. Every
-operator node exposes the policy values compiled for that operator, including:
-
-- `async_mode`, `async_depth`, `async_commit`, and `async_max_staleness`
-- `state_access` and `state_resource`
-- `schedule_kind`, `schedule_base_priority`, and `schedule_phase`
-- `schedule_phase_order` and `schedule_phase_dependencies`
-- `schedule_lane`, `schedule_lane_order`, and `schedule_lane_priorities`
-- `schedule_phase_priorities`
-
-A phase-to-lane mapping is represented by each phase operator's
-`schedule_phase` and `schedule_lane`. The ordered phase and lane collections are
-also shown, so the Model Explorer details pane can reconstruct the full policy
-without a second set of constants in the visualization module.
-
-`compile_phase_schedule` is the shared schedule-semantics module. The worker
-uses its precomputed gates on the execution hot path, while visualization uses
-the same compiled relations. Phase ordering is therefore not reimplemented in
-the visualization adapter.
-
-These fields describe scheduling rules, not measured execution. Perfetto traces
-remain the authority for actual queueing, transport, and device timing.
-
-## Potential Overlap
-
-Fluxway computes overlap groups without recursively traversing Python objects:
-
-1. Combine compiled dependencies with same-step phase relations.
-2. Collapse every same-step causal cycle into one component.
-3. Compute the longest dependency rank on the resulting acyclic graph.
-4. Put operators with the same rank into the same outer namespace.
-5. Put schedule lanes inside each rank, following `lane_order` where present.
-6. Retention each SPMD as the innermost namespace.
-
-Every same-step causal relation between different components increases the
-target rank. Cross-step phase relations are visible as teal overlays but do not
-increase same-step rank. Operators in one rank are shown as a group rather than
-being connected pairwise; pairwise overlap lines would grow quadratically.
-Members of one group may become ready concurrently, but the view does not claim
-that they overlap at runtime. Resource contention, conditions, different step
-numbers, and backpressure can still serialize them.
-
-## Remote Use
-
-Bind the viewer to loopback and use SSH forwarding:
-
-```python
-view_graph(
-    "./output/training-graph",
-    host="127.0.0.1",
-    port=8080,
-    open_browser=False,
+replicated = {"type": "static", "axis": []}
+ArithmeticSPMD = fw.bind_spmd(
+    Arithmetic,
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+    produce={"output_sharding": {"values": replicated}},
+    consume={"input_sharding": {"values": replicated}},
+    finish={},
 )
+builder = fw.Builder()
+builder.add_node("source", ArithmeticSPMD)
+builder.add_node("target", ArithmeticSPMD)
+builder.add_func_edge(
+    "source",
+    "produce",
+    "target",
+    "consume",
+    tensor_map={"values": "values"},
+)
+builder.add_func_edge(
+    "target",
+    "consume",
+    "target",
+    "finish",
+    local_only=True,
+)
+graph = builder.build("arithmetic")
+bundle = fw.visualize_graph(graph, Path("tmp/graph-example"))
+
+projection = json.loads((bundle / "model_explorer.json").read_text())
+assert [view["id"] for view in projection["graphs"]] == [
+    "Dependencies",
+    "Potential overlap",
+]
+assert len(projection["graphs"][0]["nodes"]) == 3
+assert [path.name for path in bundle.iterdir()] == ["model_explorer.json"]
+print(bundle.resolve())
 ```
+
+`visualize_graph` reads the graph's descriptions and its existing
+`CompiledGraph`: operators, ports, dependencies, transfer codes, logical tensor
+IDs, callable identities, resource declarations, and `AsyncPolicy`. It does not
+reconstruct these facts from the JSON. Runtime transport still uses native
+Python objects.
+
+An existing directory raises `FileExistsError`. To replace a previous Fluxway
+export, explicitly pass `overwrite=True`. Fluxway first validates that directory
+as an export bundle, then replaces it atomically. If the directory swap fails,
+the previous export is restored and the error propagates.
+
+## View locally or through SSH
+
+`view_graph(bundle)` starts the Model Explorer server and blocks until stopped.
+For a headless machine, use the function below with an existing bundle directory.
+It keeps the server on loopback and does not open a browser.
+
+```python
+from pathlib import Path
+
+from fluxway import view_graph
+
+
+def serve_graph(bundle_directory: str | Path) -> None:
+    view_graph(
+        bundle_directory,
+        host="127.0.0.1",
+        port=8080,
+        open_browser=False,
+    )
+```
+
+Call `serve_graph("tmp/graph-example")` on the machine that holds the bundle.
+On your own machine, pass your SSH destination as the argument to this function:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 user@training-host
+forward_graph() {
+    ssh -N -L 8080:127.0.0.1:8080 "$1"
+}
 ```
 
-The exported file can also be copied to another machine and opened directly:
+Keep that terminal open and visit `http://127.0.0.1:8080`. Both ends must have
+port 8080 available. To view the export without keeping the remote server
+running, use the following function. Its arguments are the SSH destination,
+absolute remote bundle directory, and local JSON output path. The local machine
+must have Model Explorer installed.
 
 ```bash
-scp user@training-host:./output/training-graph/model_explorer.json \
-  "$HOME/Downloads/training-graph.json"
-model-explorer "$HOME/Downloads/training-graph.json"
+copy_and_view_graph() {
+    scp "$1:$2/model_explorer.json" "$3" &&
+        model-explorer "$3"
+}
 ```
 
-To compare the graph with a trace, copy the `.pftrace` file and load it with
-Perfetto:
+## Read the two views
 
-```bash
-scp user@training-host:./output/recommendation-traces/run.pftrace \
-  "$HOME/Downloads/run.pftrace"
-```
+| View | What it shows |
+| --- | --- |
+| `Dependencies` | One edge per compiled dependency, with all tensor transfers listed in its metadata |
+| `Potential overlap` | Same-step causal layout, grouped by dependency rank and schedule lane |
 
-Use `graph_id`, `spmd_id`, `op_id`, and `function_id` to correlate Model Explorer
-nodes with trace events.
+Both views come from the same compiled graph. An ordering-only dependency has
+zero tensor transfers; runtime transport represents it with a header-only frame.
+In the example, `produce` to `consume` carries `values`, while `consume` to
+`finish` only establishes order.
 
-## Scale Boundary
+In `Potential overlap`, faint native edges show same-step causal pairs. Teal
+`#007B83` overlays show nonzero-step phase constraints from `AsyncPolicy`.
+Cross-step constraints do not alter the same-step dependency rank. The
+`Dependencies` view has no overlays.
 
-The iterative component and dependency-rank algorithms avoid Python recursion
-and support graphs with more than 10,000 operators during export. Browser layout
-is a separate Model Explorer cost: very dense graphs can take substantially
-longer to open even when Fluxway exports them quickly.
+Box colors describe structural roles: green for a source, blue for a transform,
+amber for a sink, purple for a dependency-cycle member, and gray for an isolated
+operator. Model Explorer does not support dashed or dotted edge strokes.
+
+## Inspect policies and correlate traces
+
+SPMDs are namespaces and operators are nodes. Select a node to inspect its mesh,
+resource range, function, ports, dependency rank, and schedule policy. Model
+Explorer may collapse a namespace with one operator; enable its option to retain
+single-child layers when you need every SPMD visible.
+
+| Fields | Purpose |
+| --- | --- |
+| `graph_id`, `graph_generation`, `spmd_id`, `op_id`, `function_id` | Identify the compiled graph and callable |
+| `input_signature_id`, `output_signature_id`, `dependency_code` | Identify ports and dependencies |
+| `async_mode`, `async_depth`, `async_commit`, `async_max_staleness` | Describe concurrency limits |
+| `state_access`, `state_resource` | Describe state serialization |
+| `schedule_kind`, `schedule_base_priority`, `schedule_phase`, `schedule_lane` | Describe scheduling choices |
+| `schedule_phase_order`, `schedule_phase_dependencies`, `schedule_phase_priorities` | Describe phase relations |
+| `schedule_lane_order`, `schedule_lane_priorities` | Describe lane ordering and priority |
+
+These fields come from compiled `AsyncPolicy`; visualization does not maintain a
+second schedule definition. Workers and exports use the shared
+`compile_phase_schedule` semantics. Search the same graph, SPMD, operator, and
+function IDs in [Perfetto traces](user_profiler.md) to compare rules with measured
+execution.
+
+## Interpret overlap and scale
+
+Fluxway combines graph dependencies with same-step phase relations, collapses
+causal cycles, and computes the longest dependency rank on the resulting acyclic
+graph. Equal-rank operators form a group; lanes appear inside that group and
+SPMDs inside each lane. Cross-step relations remain overlays.
+
+A group means its members may become ready together. Resource contention,
+conditions, step numbers, and backpressure can still serialize them. Actual
+queueing, transport, and device timing must be read from a trace.
+
+The component and rank algorithms are iterative and support exports with more
+than 10,000 operators. Browser layout has its own cost; a dense graph can still
+take much longer to display than to export.

@@ -1,149 +1,185 @@
-# Worker-Process Operators
+# Worker-process operators
 
-Fluxway normally keeps user code away from the `SPMDWorker` actor event loop.
-The scheduler, mailbox receiver, prepare runtime, and delivery runtime must keep
-making progress while user operators run.
+[Chinese edition](worker_process_operators_zh.md)
 
-Every stateful operator class is instantiated once inside its planned SPMD
-worker process. Use `@fluxway.requires_worker_process` when construction
-depends on worker topology or initializes process-local runtime state.
+A stateful operator instance belongs to one SPMD worker process. Use
+`@requires_worker_process` when its constructor creates process-local handles or
+needs the final worker topology, such as `jax.distributed.initialize`.
+Ordinary stateful classes do not need this marker.
+
+## Declare an operator and release its resources
+
+This example separates a stateless preparation step from a stateful file write.
+`bind_spmd` leaves the original class available for local checks and creates an
+SPMD declaration for graph execution. The writer has one worker, so its output
+path has one owner. That path must not already exist.
 
 ```python
-import jax
-import fluxway
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
+import fluxway as fw
+from fluxway.common.operator_policy import AsyncPolicy, StatePolicy
 
 
-@fluxway.requires_worker_process
-class Trainer:
-    def __init__(self):
-        jax.distributed.initialize(
-            coordinator_address=self.rank0_address,
-            num_processes=self.world_size,
-            process_id=self.rank,
-        )
+@fw.requires_worker_process
+class BatchWriter:
+    def __init__(self, output_path: str):
+        self._stream = Path(output_path).open("x", encoding="utf-8")
+
+    def prepare(self, values: np.ndarray) -> dict[str, np.ndarray]:
+        return {"values": np.abs(values)}
+
+    def write(self, values: np.ndarray) -> int:
+        self._stream.writelines(f"{value}\n" for value in values.tolist())
+        return len(values)
+
+    def on_shutdown(self) -> None:
+        self._stream.close()
+
+
+replicated = {"type": "static", "axis": []}
+WriterSPMD = fw.bind_spmd(
+    BatchWriter,
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+    prepare={
+        "input_sharding": {"values": replicated},
+        "output_sharding": {"values": replicated},
+        "async_policy": AsyncPolicy.pipelined(depth=2, state=StatePolicy.thread_safe()),
+    },
+    write={
+        "input_sharding": {"values": replicated},
+        "async_policy": AsyncPolicy.pipelined(depth=2, state=StatePolicy.exclusive()),
+    },
+)
+
+
+def build_writer_graph(output_path: str) -> fw.Graph:
+    builder = fw.Builder()
+    builder.add_node("writer", WriterSPMD, output_path=output_path)
+    builder.add_func_edge(
+        "writer",
+        "prepare",
+        "writer",
+        "write",
+        tensor_map={"values": "values"},
+        local_only=True,
+    )
+    return builder.build("batch-writer")
+
+
+Path("tmp").mkdir(exist_ok=True)
+with TemporaryDirectory(dir="tmp") as directory:
+    output = Path(directory) / "batch.txt"
+    writer = BatchWriter(str(output))
+    try:
+        prepared = writer.prepare(np.array([-1, 2, -3]))
+        assert writer.write(prepared["values"]) == 3
+    finally:
+        writer.on_shutdown()
+    assert output.read_text() == "1\n2\n3\n"
+
+    graph = build_writer_graph(str(Path(directory) / "runtime.txt"))
+    view = graph.require_compiled_graph().spmd("writer")
+    assert view.operator("prepare").spec.async_policy.state.access == "thread_safe"
+    assert view.operator("write").spec.async_policy.state.access == "exclusive"
+    assert view.operator("write").spec.requires_worker_process
 ```
 
-Common reasons:
+The direct call checks the file contents and resource lifetime on the CPU; it
+also checks the compiled policies. It does not run Ray workers. The graph shows
+the local handoff; connect a real source to `prepare` before starting a job.
+`local_only=True` means a dependency within the same worker, not a remote call.
 
-- `jax.distributed.initialize`
-- process-local GPU or accelerator runtime state
-- libraries that must be initialized in the same process as the SPMD worker
-- native handles whose construction requires final rank and node information
+At startup Fluxway constructs one instance per owner class in each worker and
+shares it across that class's operators. Constructor parameters come from the
+node's static arguments, such as `output_path` above. Before `__init__`, Fluxway
+also supplies `rank`, `world_size`, `local_rank`, `local_world_size`, `node_rank`,
+`num_nodes`, `spmd_id`, `rank0_address`, and `ray_component_limits`.
+`self.ctx` carries the current invocation's context and can vary between calls.
 
-Ordinary stateful operators need no marker because their owner instance already
-belongs to the SPMD worker. The marker makes the construction requirement
-explicit and enables validation of process-local initialization.
+On graceful worker shutdown, Fluxway calls each owner's `on_shutdown()` once,
+even when several operators share it. The hook may be synchronous or return an
+awaitable. Shutdown attempts all owners and propagates cleanup errors. Forced
+process termination cannot guarantee a hook; buffered output is not a
+checkpoint or a crash-recovery guarantee. A resource registry does not close
+registered objects for you; see [resource ownership](placement_recipe.md#register-resources-created-inside-a-worker).
 
-## Runtime Semantics
+## Where user code runs
 
-Stateful ownership does not mean inline execution on the Ray actor event loop.
-Fluxway asynchronously submits every ordinary Python `CALL` node to its named
-lane in `WorkerProcessCallRuntime` from the first invocation. Stateful and
-process-affine callables use the same path even when they return an awaitable:
+| Callable | Execution |
+| --- | --- |
+| Ordinary Python function | Submitted asynchronously to a named worker-local thread lane, from its first call |
+| Ordinary function returning an awaitable | The worker thread also completes the awaitable |
+| Coroutine function (`async def`) | Uses `COROUTINE_ASYNC` and runs cooperatively on the actor event loop |
 
-- the actor event loop submits work and awaits a future
-- ordinary Python callables run in the same process on worker-local threads
-- if the callable returns an awaitable, the runtime completes it inside the
-  worker thread
-- `contextvars` such as rank/world/step are propagated
-- exceptions propagate back to the LocalStepPlan and poison the worker normally
+`@requires_worker_process` controls construction, not this choice. A coroutine
+must yield while waiting; blocking work inside `async def` blocks the actor
+loop. Context variables, including rank and step, follow the call into worker
+threads. Exceptions propagate to the local step plan and fail the worker.
 
-Fluxway selects the execution lane once per call. With profiling enabled,
-`user_callable.execute` records end-to-end latency including queue wait, while
-`user_callable.function_run` records the actual operator function invocation,
-excluding lane queueing and worker context setup. For worker execution,
-`worker_process_call.thread_run` records the exact worker-thread execution
-interval. Profiling observes the selected lane and does not dispatch it again.
+This separation lets transport reception, mailbox updates, input preparation,
+outbound delivery, and scheduler wakeups progress while ordinary operators run.
+CPU-bound Python still competes for the GIL on standard CPython. Native code
+that releases the GIL can overlap. Free-threaded CPython can also run Python
+bytecode in parallel, with the same lane and scheduling rules.
 
-Every coroutine function uses the `COROUTINE_ASYNC` execution mode and may run
-cooperatively on the actor event loop. State and process affinity do not change
-this selection: `StatePolicy` controls access to mutable state, while
-`@requires_worker_process` controls object construction and lifetime. A
-coroutine must yield during waits and must not hide blocking work inside
-`async def`; ordinary Python functions are submitted asynchronously to their
-named worker-process lane from the first invocation.
+## State and scheduling
 
-This preserves event-loop progress for:
+`AsyncPolicy.depth` bounds local pipelining. State access is a separate decision:
 
-- `receive_transport_frames`
-- mailbox deposit and ready callbacks
-- `LocalInputPrepareRuntime`
-- `OutboundDeliveryRuntime`
-- scheduler wakeups and drain fences
+- `StatePolicy.exclusive()` serializes operators sharing the same state resource.
+  Keep this for model updates and mutable stores; it is the default.
+- `StatePolicy.thread_safe()` removes that instance lock. Use it only when the
+  operator and its underlying resources support concurrent calls.
 
-Pure Python CPU-heavy user code still competes for the CPython GIL. The runtime
-is an event-loop isolation mechanism, not a promise of CPU parallel speedup.
-JAX, CuPy, native kernels, Ray RPC waits, and many I/O paths can still overlap
-because they release the GIL or are component driven.
+In the example, `prepare` only transforms its input and can overlap with `write`.
+Calls to `write` remain exclusive because they share a file. A process-local
+constructor does not prohibit this overlap.
 
-On free-threaded CPython 3.14 and later, the same named worker-process lanes can
-run Python bytecode in parallel. Fluxway does not expose a second execution
-mode for this interpreter capability; lane isolation and scheduling semantics
-remain identical across CPython builds.
+For multi-phase model updates, `SchedulePolicy.phase_graph` can allow helper
+work and updates from one step to overlap while preventing the next training
+step from reading unfinished state. The
+[recommendation example](../fluxway/example/recommendation/dense_spmd.py) uses
+thread-safe `prepare_dense_inputs` and `scatter_sparse_grads`, with exclusive
+`train_core` and `update`. The graph and [visualization](graph_visualization.md)
+use the same compiled phase rules.
 
-## State And Resource Rules
+With profiling enabled, `user_callable.execute` includes queue wait;
+`user_callable.function_run` measures the function invocation without lane
+queueing or worker context setup. `worker_process_call.thread_run` records the
+worker-thread interval. Profiling observes the selected lane without dispatching
+it a second time.
 
-`AsyncPolicy` controls concurrency:
+## Initialization errors
 
-- `StatePolicy.exclusive()` serializes access through LocalStepPlan resource ids.
-- `StatePolicy.thread_safe()` removes the class-instance lock and requires the
-  underlying state/store to be safe for concurrent calls.
-- `local_pipeline_depth` comes from `AsyncPolicy.depth`.
+A class that calls `jax.distributed.initialize` without the marker is rejected
+with a `Fluxway Worker Process Error`. Use the decorator instead of setting the
+internal `__fluxway_process_affine__` field. The marker does not supply JAX,
+create a distributed coordinator, or make mismatched worker topology valid.
 
-If a process-affine class has mutable Python state and is not explicitly
-thread-safe, use the default `AsyncPolicy.sync()` or `StatePolicy.exclusive()`.
+## Checkpoint extension boundary
 
-Process-affine construction does not forbid local overlap. A
-`@requires_worker_process` class
-may expose stateless helper operators with `StatePolicy.thread_safe()` while
-keeping model/state mutating operators exclusive. The recommendation
-`DenseSPMD` uses this split:
-
-- `prepare_dense_inputs` and `scatter_sparse_grads` run on thread-safe local
-  async lanes because they do not read or write dense model state.
-- `train_core` and `update` keep exclusive state access because they read or
-  mutate the dense model/gradient accumulator.
-- `SchedulePolicy.phase_graph` allows `scatter_sparse_grads(step=N)` and
-  `update(step=N)` to overlap, while preventing `train_core(step=N+1)` from
-  starting before `update(step=N)` commits.
-
-Internal handoff between those phases can use functional graph `local=True`.
-That is a same-worker transport edge, not a remote call.
-
-## Failure Mode
-
-Fluxway fails fast when a class calls `jax.distributed.initialize` but is not
-decorated:
-
-```text
-Fluxway Worker Process Error: ... calls jax.distributed.initialize but is not marked with @fluxway.requires_worker_process.
-```
-
-The internal protocol field `__fluxway_process_affine__` is intentionally hidden
-behind the decorator. User code should use `@fluxway.requires_worker_process`.
-
-## Checkpoint Components
-
-Operators do not implement checkpoint hooks. A checkpoint format is registered once
-through `@spmd(checkpoint_components=(...))` and composes the optional
-`CheckpointComponentRegistration` SPI contracts. This keeps state serialization,
-collective publication, physical URI generation, restore, object holds, and cleanup
-behind one explicit extension boundary.
-
-The worker coordinator invokes a registered `SAVE` component's
-`prepare_save`, `save`, `finish_save`, `commit_save`, and `publish_save` phases;
-`rollback_save` handles failed transactions. A registered `RESTORE` component
-handles `restore`. The Controller owns transaction ordering and Manifest
-publication; a component owns its checkpoint object URI, staging layout, version,
-and physical retention operations. Object holds and cleanup reservations belong to
+Operators do not implement checkpoint hooks. Register a
+`CheckpointComponentRegistration` through the SPMD's `checkpoint_components`.
+A `SAVE` component handles `prepare_save`, `save`, `finish_save`, `commit_save`,
+and `publish_save`; `rollback_save` handles failed transactions. A `RESTORE`
+component handles `restore`. Object holds and cleanup reservations belong to
 `OBJECT_LIFECYCLE`; physical deletion belongs to `OBJECT_CLEANUP`.
+The control runtime calls `abort_save` to discard an incomplete attempt and
+`acknowledge_save` after the global commit succeeds.
 
-`CheckpointContext` carries logical identity only: transaction, snapshot, cut,
-SPMD/rank, topology, and component ID. It deliberately has no physical storage_locator.
-Use `context.checkpoint_object_key(...)` for a logical checkpoint object identity and return the
-component-owned opaque `CheckpointObjectRef` from `save`/`commit_save`.
-
-Every mutating phase receives Fluxway's `CheckpointCommitPermit`; stale permits are
-rejected after coordinator generation takeover. See [checkpoint.md](checkpoint.md)
-for the capability contract, Manifest schema,
-topology restore rules, retention leases, and built-in component examples.
+The controller orders transactions and publishes the manifest. Components own
+physical URIs, staging layouts, versions, and retention operations.
+Save methods receive `SaveSession`; `commit_save` receives `CommitSaveSession`
+with all worker results. `restore` receives `RestoreSession` with the saved and
+target topologies and component publication. Use `session.checkpoint_object_ref`
+to describe a component-owned object and `session.component_checkpoint` to
+publish those references. Worker `save` returns `WorkerSaveResult`, while
+`commit_save` returns `CheckpointComponentPublication`. Mutating save sessions
+carry `CheckpointCommitPermit`; stale permits are rejected after a coordinator
+generation change. See [checkpoint components](checkpoint.md) for registration
+examples and the complete capability contract.

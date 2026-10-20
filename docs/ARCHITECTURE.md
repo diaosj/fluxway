@@ -1,7 +1,68 @@
 # Fluxway Architecture
 
-This document is the English companion to [ARCHITECTURE_zh.md](ARCHITECTURE_zh.md).
-Both files describe the same stable implementation and protocol boundaries.
+[Chinese edition](ARCHITECTURE_zh.md)
+
+Fluxway compiles operator declarations into one graph, places its workers, and
+coordinates execution and recovery. The control plane decides when work may run;
+the data plane moves the tensors required by that work.
+
+Each SPMD graph node represents workers running the same program over a mesh.
+Edges connect operator outputs to inputs.
+
+## Build and inspect a graph
+
+This complete example compiles two CPU operators without starting Ray. The edge
+maps the producer's `value` output to the consumer's `item` input.
+
+```python
+import fluxway as fw
+from fluxway.common.decorators import spmd
+
+
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
+class Producer:
+    @fw.operator(
+        name="produce", output_sharding={"value": {"type": "static", "axis": []}}
+    )
+    def produce(self) -> dict[str, int]:
+        return {"value": 1}
+
+
+@spmd(
+    resource_profile=fw.ResourceProfile(base={"CPU": 1}),
+    mesh_axis_names=("data",),
+    mesh_axis_shapes=(1,),
+)
+class Consumer:
+    @fw.operator(
+        name="consume", input_sharding={"item": {"type": "static", "axis": []}}
+    )
+    def consume(self, item: int) -> None:
+        self.last_value = item
+
+
+builder = fw.Builder()
+builder.add_node("source", Producer)
+builder.add_node("sink", Consumer)
+builder.add_func_edge(
+    "source", "produce", "sink", "consume", tensor_map={"value": "item"}
+)
+graph = builder.build("two-operators")
+compiled = graph.require_compiled_graph()
+
+assert len(compiled.dependencies) == 1
+assert graph.nodes["source"].spmd_config.graph_view is compiled.spmd("source")
+assert compiled.spmd("source").outgoing[0] is compiled.dependencies[0]
+```
+
+Both assertions about identity refer to the same compiled objects. Workers and
+transfer planning use projections of that graph. This check validates graph
+construction; it does not invoke either operator. To run the graph, follow
+[execution lifecycle](execution_lifecycle.md#usage).
 
 ## Runtime ownership
 
@@ -38,7 +99,7 @@ cooperative, so an `async def` declaration alone is not a non-blocking guarantee
 
 The endpoint-local MESI directory is the sole coherence state owner. A
 `CoherenceInstance(subject, epoch)` is the identity; `CoherenceDirectory.admit`
-is the synchronous admission seam, while `CoherenceSequencer` orders per-subject
+creates or returns that instance's entry, while `CoherenceSequencer` orders per-subject
 intents. Directory operations are event-loop local and do not own worker tasks
 or transport queues.
 
@@ -105,8 +166,8 @@ before the global commit marker is written, startup fences the transaction via `
 to `ABANDONED`. If the commit marker was already written, startup fencing replays component
 `acknowledge_save(permit)` and advances the transaction to `COMMITTED`. Only `COMMITTED` manifests
 are restorable and visible. Manifests, transactions, and cleanup intents are persisted
-using compact binary MessagePack via `msgpack_codec` rather than uncompacted JSON,
-ensuring low coordinator latency and bounded storage size.
+using binary MessagePack via `msgpack_codec`. This format does not imply a fixed
+storage size or a latency guarantee.
 
 ## Placement and execution
 
@@ -123,8 +184,10 @@ checkpoint repository when recovery is enabled.
 Runtime-bound dynamic resources (such as dynamic routing tables, device meshes, or rank
 providers) are managed through `ResourceRegistry` (`fluxway.common.resource_registry`)
 and referenced via `ResourceHandle(namespace, resource_id)`. The active registry context is established
-by `bind_resource_registry`. `LogicalPartitionBinding` associates logical coordinate
-partitions with physical ranks, decoupling placement and routing from physical worker renumbering.
+by `bind_resource_registry`. `LogicalPartitionBinding` selects worker-local values
+by logical partition, optionally projecting selected layout axes. It does not define
+a physical-rank remapping or authorize topology changes during restore; those remain
+part of the component's [checkpoint contract](checkpoint.md#topology).
 
 The worker admission owner contains gating and pending-state promotion.
 `SourcePipelineMaintenance.request()` coalesces requests to fill the Worker source
@@ -162,8 +225,10 @@ source activation. ACK submission uses a bounded asynchronous queue; full capaci
 applies backpressure. Controller startup activates one layout. The planner component
 supports idle observations and pending tails. The startup API starts this lifecycle;
 the controller supervisor performs event-driven adapter scans and replenishment,
-while the adapter itself does not own refill. Committed planning windows and
-physical bindings remain retained, so metadata grows with installed window count.
+while the adapter itself does not own refill. Durable cuts reclaim completed
+Controller windows, ledger bindings, and scan observations, retaining a continuity
+anchor. Worker-installed windows and Driver activation digests remain retained,
+so per-window metadata growth still requires validation.
 See [source coordination](source_coordination.md) and
 [formal protocol](source_spmd_formal_protocol.md) for the supported contracts.
 
@@ -171,13 +236,40 @@ See [source coordination](source_coordination.md) and
 
 To reliably attribute worker process exits caused by external preemption, evictions, or operating system signals, Fluxway provides non-blocking process-level diagnostic interception in `fluxway.diagnostics`:
 
-- **Bootstrap hook injection**: `prepare_worker_runtime_env` injects `worker_process_setup_hook` via Ray's `WORKER_PROCESS_SETUP_HOOK_ENV_VAR`, initializing signal interceptors before worker execution while chaining user hooks.
+- **Bootstrap hook injection**: `prepare_worker_runtime_env` injects `worker_process_setup_hook` via Ray's `WORKER_PROCESS_SETUP_HOOK_ENV_VAR`, initializing signal interceptors before worker execution while chaining importable user hooks.
 - **Ray SIGTERM interception**: Intercepts Ray's internal `set_sigterm_handler` to record previous handlers and Ray's own SIGTERM callback without altering Ray's teardown protocol.
 - **Non-blocking signal delivery**: Signal handlers enqueue events and wake a background emitter daemon thread via a non-blocking pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`), preventing deadlocks or blocking I/O inside OS interrupt context.
 - **Faithful delegation**: Handlers always forward signals to prior handlers (`callable`, `SIG_DFL` via `raise_signal`, or `SIG_IGN`), preserving native process termination semantics.
 - **Thread safety**: Signal handlers are only installed on the process main thread; asynchronous actor worker threads publish diagnostic metadata without attempting invalid signal registrations.
 
-See [coherence_protocol.md](coherence_protocol.md),
-[placement_recipe.md](placement_recipe.md),
-[placement_mathematics.md](placement_mathematics.md), and the detailed Chinese
-companion for the complete section-by-section specification.
+The worker launcher prepares this environment automatically. The following local
+example is for authors integrating a worker launcher; it creates configuration
+without registering signal handlers in the submitting process.
+
+```python
+from fluxway.diagnostics import prepare_worker_runtime_env
+
+original = {"env_vars": {"PYTHONUNBUFFERED": "1"}}
+prepared = prepare_worker_runtime_env(original)
+
+assert original == {"env_vars": {"PYTHONUNBUFFERED": "1"}}
+assert prepared["env_vars"]["PYTHONUNBUFFERED"] == "1"
+assert len(prepared["env_vars"]) == 2
+```
+
+The added variable selects the Fluxway bootstrap hook. Supply user hooks as
+importable module paths; a callable object or a manually supplied Ray hook
+environment variable is rejected. The reporter preserves existing signal
+semantics; it cannot report signals that the operating system does not let a
+process intercept, such as `SIGKILL`.
+
+## Mechanism examples
+
+| Task | Guide |
+| --- | --- |
+| Start, observe, cancel, and resume execution | [Execution lifecycle](execution_lifecycle.md) |
+| Register state, save, restore, and configure retention | [Checkpoints](checkpoint.md) |
+| Bound scans and track source assignments | [Source coordination](source_coordination.md) |
+| Compile routing and move tensor payloads | [Transfer planning](transfer_planning.md), [data-plane runtime](dataplane_runtime.md) |
+| Admit instances and release consumer leases | [Coherence protocol](coherence_protocol.md) |
+| Place workers and bind runtime resources | [Placement recipe](placement_recipe.md) |
