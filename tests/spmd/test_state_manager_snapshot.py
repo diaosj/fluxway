@@ -70,3 +70,12 @@ class TestSnapshotRoundTrip:
         m2 = StateManager()
         m1.save_snapshot("snap_iso", _make_payload())
         assert "snap_iso" not in m2.list_snapshots()
+
+    def test_save_and_load_snapshot_keyword_arguments(self):
+        manager = StateManager()
+        payload = _make_payload()
+        manager.save_snapshot(checkpoint_id="chk_kw_001", spmd_states=payload)
+        loaded = manager.load_snapshot(checkpoint_id="chk_kw_001")
+        assert loaded == payload
+        manager.delete_snapshot(checkpoint_id="chk_kw_001")
+        assert "chk_kw_001" not in manager.list_snapshots()

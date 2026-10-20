@@ -3,83 +3,206 @@ Operator Manager for SPMD Worker.
 
 Responsibilities:
 1. Store and manage operators (e.g., train_step, rollout, reward)
-2. Parse topology from OperatorMeta at initialization (no runtime registration)
-3. Compute expected tensor shards based on input_sharding + input_pre_sharding
-4. Compute output routing based on output_sharding + output_post_sharding (4 cases)
+2. Parse compiled topology at initialization
+3. Compute expected tensor shards from the compiled topology
+4. Compute output routing from the compiled topology
 5. Execute operators
 """
 
-from dataclasses import dataclass, field
-from typing import Any, TYPE_CHECKING
-from collections.abc import Callable
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, TYPE_CHECKING, cast
+from collections.abc import Awaitable, Callable, Iterator
 from fluxway.common.utils.logging import get_logger
-import asyncio
 import threading
 import inspect as _inspect
 
-from fluxway.common.decorators import _resolve_owner_class
-from fluxway.common.types.configs import ArgumentType
-from fluxway.common.types.sharding import ShardingSpec, PhysicalLayout
-from fluxway.common.types import EdgeShardingInfo
+from fluxway.common.operator_policy import ArgumentType
+from fluxway.common.compiled_graph import (
+    CompiledDependency,
+    CompiledLogicalTensor,
+    CompiledOperator,
+    CompiledTensorTransfer,
+    SPMDGraphView,
+)
+from fluxway.common.types.sharding import (
+    PhysicalLayout,
+    ReferentialRouting,
+    ShardingSpec,
+)
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_spec import OperatorSpec
+from fluxway.profiler.user_api import function_scope
+from fluxway.common.operator_instances import OperatorInstanceContainer
+from fluxway.common.ingestion import SourceWorkItem
 from fluxway.spmd.worker.operator_manager.dispatcher import (
     ExecutionDispatcher,
-    create_dispatcher,
 )
 
 if TYPE_CHECKING:
-    from fluxway.common.types import SPMDConfig, OperatorMeta
+    from fluxway.common.types import SPMDConfig
 
 logger = get_logger(__name__)
 
 
+def _validated_source_work_items(
+    op_name: str, step: int, values: Any | None
+) -> tuple[SourceWorkItem, ...]:
+    if not isinstance(values, tuple) or not values:
+        raise ValueError(
+            f"source-control operator {op_name!r} requires canonical source work"
+        )
+    if any(not isinstance(value, SourceWorkItem) for value in values):
+        raise TypeError(
+            f"source-control operator {op_name!r} requires SourceWorkItem values"
+        )
+    items = cast(tuple[SourceWorkItem, ...], values)
+    if any(item.key.step != step for item in items):
+        raise ValueError(
+            f"source-control operator {op_name!r} received work for another step"
+        )
+    assignment = items[0].assignment
+    signature = (
+        assignment.source_identity,
+        assignment.view_identity,
+        assignment.schema_digest,
+        assignment.lineage_digest,
+        assignment.global_batch_size,
+    )
+    if any(
+        (
+            item.assignment.source_identity,
+            item.assignment.view_identity,
+            item.assignment.schema_digest,
+            item.assignment.lineage_digest,
+            item.assignment.global_batch_size,
+        )
+        != signature
+        for item in items
+    ):
+        raise ValueError(
+            f"source-control operator {op_name!r} received incompatible work"
+        )
+    intervals = tuple(
+        (item.key, item.logical_start, item.logical_end) for item in items
+    )
+    if len(set(intervals)) != len(intervals):
+        raise ValueError(
+            f"source-control operator {op_name!r} received duplicate work intervals"
+        )
+    return items
+
+
 # =============================================================================
-# Topology Info (parsed from OperatorMeta, not runtime registered)
+# Runtime topology
 # =============================================================================
 
 
-@dataclass
-class ResolvedTopologyInfo:
-    """
-    Runtime-resolved topology info for a predecessor or successor SPMD.
+@dataclass(frozen=True, slots=True)
+class ResolvedDependencyRoute:
+    dependency: CompiledDependency
+    transfer: CompiledTensorTransfer
+    logical_tensor: CompiledLogicalTensor
+    peer_is_source: bool
 
-    This is an internal worker-side object produced by
-    OperatorManager._parse_operator_metadata().  It enriches the
-    serialisable SPMDTopologyInfo DTO (from configs.py) with
-    fields that are only meaningful inside a live worker process:
+    def __post_init__(self) -> None:
+        if self.transfer.dependency_code != self.dependency.code:
+            raise ValueError(
+                f"Transfer code {self.transfer.transfer_code} belongs to dependency "
+                f"code {self.transfer.dependency_code}, not {self.dependency.code}."
+            )
+        if not any(item is self.transfer for item in self.dependency.transfers):
+            raise ValueError(
+                f"Transfer code {self.transfer.transfer_code} is not owned by "
+                f"dependency code {self.dependency.code}."
+            )
+        if self.logical_tensor.logical_tuuid != self.transfer.logical_tuuid:
+            raise ValueError(
+                f"Transfer code {self.transfer.transfer_code} logical TUUID "
+                f"{self.transfer.logical_tuuid} does not match canonical logical "
+                f"tensor {self.logical_tensor.logical_tuuid}."
+            )
 
-    * mesh / world_size - resolved from parsed ShardingSpec
-    * tuuid_sharding - raw dicts converted to ShardingSpec objects
-    * target_op, is_interleaved, interleave_unit_size - merged
-      from all EdgeShardingInfo entries on the edge
-    * is_self_loop - derived from SPMD identity comparison
+    @property
+    def spmd_id(self) -> str:
+        key = (
+            self.dependency.spec.source
+            if self.peer_is_source
+            else self.dependency.spec.target
+        )
+        return key.spmd_id
 
-    Do **not** use this class on the control plane or across Ray object
-    boundaries; use ``configs.SPMDTopologyInfo`` for serialisable topology.
-    """
+    @property
+    def transfer_code(self) -> int:
+        return self.transfer.transfer_code
 
-    spmd_id: str
-    world_size: int = 1
+    @property
+    def logical_tuuid(self) -> int:
+        return self.transfer.logical_tuuid
 
-    mesh: DeviceMesh | None = None
-    # Sharding by TUUID (Logical)
-    tuuid_sharding: dict[int, ShardingSpec] = field(default_factory=dict)
-    # Map from logical path to TUUID
-    tuuid_map: dict[str, int] = field(default_factory=dict)
+    @property
+    def source_sharding(self) -> ShardingSpec:
+        return self.transfer.source_sharding
 
-    # Condition function for conditional edges (only for successors)
-    condition_fn: Callable[..., bool] | None = None
-    # Whether this is a step-interleaved data stream. Every interleaved worker unit has its own step and is regarded as a separated sender, a fake SPMD.
-    is_interleaved: bool = False
-    # Size of the interleaved group
-    interleave_unit_size: int = 1
-    # Whether this is a self-loop edge (source_node == target_node)
-    is_self_loop: bool = False
-    # Link to the symmetric edge – carried over from configs.SPMDTopologyInfo
-    symmetric_to: tuple | None = None
-    # For hierarchical sharding resolution
-    input_param_map: dict[str, list[str]] = field(default_factory=dict)
-    output_param_map: dict[str, list[str]] = field(default_factory=dict)
+    @property
+    def target_sharding(self) -> ShardingSpec:
+        return self.transfer.target_sharding
+
+    @property
+    def effective_source_sharding(self) -> ShardingSpec:
+        return self.logical_tensor.require_effective_sharding()
+
+    @property
+    def effective_target_sharding(self) -> ShardingSpec:
+        return self.dependency.target_operator.effective_input_sharding[
+            self.target_name
+        ]
+
+    @property
+    def source_name(self) -> str:
+        return self.transfer.spec.source.name
+
+    @property
+    def target_name(self) -> str:
+        return self.transfer.spec.target.name
+
+    @property
+    def source_op(self) -> str:
+        return self.dependency.spec.source.op_id
+
+    @property
+    def target_op(self) -> str:
+        return self.dependency.spec.target.op_id
+
+    @property
+    def world_size(self) -> int:
+        if self.peer_is_source:
+            return self.dependency.source_world_size
+        return self.dependency.target_world_size
+
+    @property
+    def mesh(self) -> DeviceMesh:
+        if self.peer_is_source:
+            return self.dependency.source_mesh
+        return self.dependency.target_mesh
+
+    @property
+    def condition(self) -> Callable[[Any], bool | Awaitable[bool]] | None:
+        return self.dependency.spec.condition
+
+    @property
+    def local_only(self) -> bool:
+        return self.dependency.spec.local_only
+
+    @property
+    def symmetric_to(self) -> tuple[str, str, str, str] | None:
+        return self.dependency.spec.symmetric_to
+
+    @property
+    def is_self_loop(self) -> bool:
+        return (
+            self.dependency.spec.source.spmd_id == self.dependency.spec.target.spmd_id
+        )
 
 
 class OperatorManager:
@@ -87,7 +210,7 @@ class OperatorManager:
     Manages operator execution, sharding computation, and routing.
 
     Key design:
-    - All topology info is parsed from OperatorMeta at initialization
+    - All topology info is parsed from the compiled program at initialization
     - No runtime predecessor/successor registration needed
     - Handler management is NOT here (handled by Worker)
     """
@@ -98,10 +221,13 @@ class OperatorManager:
         rank: int,
         spmd_id: str = "",
         *,
+        static_args: dict[str, Any],
+        instance_container: OperatorInstanceContainer,
         local_rank: int | None = None,
         local_world_size: int | None = None,
         node_rank: int = 0,
         num_nodes: int = 1,
+        control_plane_handle: Any | None = None,
     ):
         """
         Initialize OperatorManager.
@@ -111,296 +237,166 @@ class OperatorManager:
             rank: This worker's rank
             spmd_id: SPMD identifier (for self-loop detection)
         """
-        self._config = config  # Store config for explicit meta access
-        self._mesh = config.mesh  # DeviceMesh from config
+        self._config = config
+        self._plan: SPMDGraphView = config.require_graph_view()
+        self._ray_component_limits = self._plan.resource_profile.ray_component_limits
+        if spmd_id and spmd_id != config.spmd_id:
+            raise ValueError(
+                f"OperatorManager SPMD ID {spmd_id!r} does not match config "
+                f"{config.spmd_id!r}."
+            )
+        self._mesh = self._plan.mesh
         self._rank = rank
-        self._world_size = config.num_workers
-        self._spmd_id = spmd_id
+        self._world_size = self._plan.world_size
+        self._spmd_id = self._plan.spmd_id
         self._local_rank = local_rank
         self._local_world_size = local_world_size
         self._node_rank = node_rank
         self._num_nodes = num_nodes
+        self._control_plane_handle = control_plane_handle
+        if not isinstance(instance_container, OperatorInstanceContainer):
+            raise TypeError("OperatorManager requires an OperatorInstanceContainer")
+        self._instance_container = instance_container
 
-        # Resolve operator callables from operator_metas (owner class + method name).
-        # config.operators only provides the op_name → method_name mapping.
-        self._operators: dict[str, Callable] = {}
-        for op_name, meta in (config.operator_metas or {}).items():
-            method_name = config.operators.get(op_name, op_name)
-            if meta.owner_class_qualname:
-                owner_cls = _resolve_owner_class(
-                    meta.owner_class_module, meta.owner_class_qualname
+        self._operators: dict[str, Any] = {}
+        self._compiled_operators: dict[str, CompiledOperator] = {}
+        self._operator_is_coroutine_function: dict[str, bool] = {}
+        for compiled_operator in self._plan.operators:
+            op_name = compiled_operator.key.op_id
+            spec = compiled_operator.spec
+            if config.operator_specs.get(op_name) is not spec:
+                raise ValueError(
+                    f"Operator {self._spmd_id}.{op_name} declaration does not "
+                    "match its compiled graph."
                 )
-                op_func = getattr(owner_cls, method_name)
-                if not hasattr(op_func, "_fluxway_operator_meta"):
-                    from fluxway.common.decorators import _OperatorWrapper
+            owner_cls = spec.owner
+            if owner_cls is None:
+                raise ValueError(
+                    f"operator {self._spmd_id}.{op_name} has no owner class"
+                )
+            op_func = getattr(owner_cls, spec.method_name)
+            if not hasattr(op_func, "_fluxway_operator_spec"):
+                from fluxway.common.decorators import _OperatorWrapper
 
-                    wrapper = _OperatorWrapper(op_func, meta)
-                    # We bind the wrapper to the class using the descriptor protocol
-                    # without mutating the owner_cls globally!
-                    op_func = wrapper.__get__(None, owner_cls)
-                self._operators[op_name] = op_func
-            else:
-                # Free-function operator: no owner class, registered directly
-                self._operators[op_name] = None  # type: ignore[assignment]
+                op_func = _OperatorWrapper(op_func, spec).__get__(None, owner_cls)
+            self._operators[op_name] = op_func
+            self._compiled_operators[op_name] = compiled_operator
+            self._operator_is_coroutine_function[op_name] = (
+                _inspect.iscoroutinefunction(op_func)
+            )
 
         # Initialize per-operator dictionaries
         self._input_sharding: dict[str, dict[int, ShardingSpec]] = {}
-        self._output_sharding: dict[str, dict[int, ShardingSpec]] = {}
         self._expected_control_arg_names: dict[str, list[str]] = {}
         self._expected_tensor_names: dict[str, list[str]] = {}
-        self._predecessor_topology: dict[str, dict[str, ResolvedTopologyInfo]] = {}
-        self._successor_topology: dict[str, dict[str, ResolvedTopologyInfo]] = {}
-        self._expected_tensor_shards_cache: dict[str, dict[int, int]] = {}
+        self._predecessor_topology: dict[str, dict[int, ResolvedDependencyRoute]] = {}
+        self._successor_topology: dict[str, dict[int, ResolvedDependencyRoute]] = {}
+        self._expected_transfer_shards_cache: dict[str, dict[int, int]] = {}
         self._periodic_trigger_cache: dict[str, bool] = {}
         self._operator_input_types: dict[str, dict[str, type]] = {}
         self._dispatchers: dict[str, ExecutionDispatcher] = {}
-        # Global dispatch table: {tensor_tuuid: [op_name1, op_name2]}
-        self._tuuid_to_op_inputs: dict[int, list[str]] = {}
-        self._tuuid_to_op_outputs: dict[int, tuple[str, str]] = {}
-        self._logical_path_to_tuuid: dict[tuple[str, str], int] = {}
+        self._input_transfer_codes: dict[str, dict[str, int]] = {}
+        self._incoming_routes_by_code: dict[int, ResolvedDependencyRoute] = {}
+        self._transfer_target_by_code: dict[int, str] = {}
+        self._outgoing_tensor_dependencies_by_source_op: dict[
+            str, tuple[CompiledDependency, ...]
+        ] = {}
+        self._ordering_dependencies_by_source_op: dict[
+            str, tuple[CompiledDependency, ...]
+        ] = {}
+        self._ordering_target_by_code: dict[int, str] = {}
+        self._expected_ordering_counts: dict[str, dict[int, int]] = {}
+        self._dependency_decision_target_by_code: dict[int, str] = {}
+        self._dependency_decision_expected_count_by_code: dict[int, int] = {}
+        self._expected_dependency_decisions: dict[str, dict[int, int]] = {}
+        self._dependency_transfer_codes: dict[int, tuple[int, ...]] = {}
+        self._transfer_dependency_codes: dict[str, dict[int, int]] = {}
 
         for op_name in self._operators:
             self._input_sharding[op_name] = {}
-            self._output_sharding[op_name] = {}
             self._expected_control_arg_names[op_name] = []
             self._expected_tensor_names[op_name] = []
             self._predecessor_topology[op_name] = {}
             self._successor_topology[op_name] = {}
+            self._input_transfer_codes[op_name] = {}
             self._operator_input_types[op_name] = {}
+            self._transfer_dependency_codes[op_name] = {}
 
-        # Cache for TUUID to arg name mapping (for debugging/errors)
-        self._output_tuuid_to_name_cache: dict[str, dict[int, str] | None] = {}
-
-        # Static arguments from config
-        self._static_args: dict[str, Any] = {}
-        if config.static_args:
-            self._static_args.update(config.static_args)
+        self._static_args = static_args
 
         # Thread lock
         self._lock = threading.Lock()
 
-        # Central TUUID registry for resolving all routing logic (Source of Truth)
-        # Only production-side routing (outputs/predecessors) are registered here.
-        self._tuuid_registry: dict[int, ShardingSpec] = {}
-
-        # Context-isolated resolution caches
-        self._resolved_input_cache: dict[tuple[str, int], PhysicalLayout] = {}
-        self._resolved_producer_cache: dict[int, ShardingSpec] = {}
+        self._target_layout_cache: dict[int, PhysicalLayout] = {}
 
         # Performance Caches
-        # (op_name, tuuid, pre_spmd_id, rank, step_mod) -> List[int]
-        self._producer_cache: dict[tuple[str, int, str, int, int], list[int]] = {}
-        # (tuuid, pre_spmd_id) -> PhysicalLayout (projected)
-        self._effective_layout_cache: dict[tuple[int, str], PhysicalLayout] = {}
+        self._producer_cache: dict[tuple[int, int, int], list[int]] = {}
+        self._source_layout_cache: dict[int, PhysicalLayout] = {}
+        self._source_dispatchers: dict[Any, ExecutionDispatcher] = {}
 
-        # Parse topology from OperatorMeta
+        self._compile_dependency_decisions()
+        self._compile_ordering_dependencies()
+
+        # Parse the compiled topology
         self._parse_operator_metadata()
 
-        # Populate output sharding (TUUID-keyed) for all local operators
-        for op_name in self._operators:
-            self._output_sharding[op_name] = self.get_output_sharding(op_name)
-
         # Pre-compute expected tensor shards after routing strategies are ready
-        self._precompute_expected_tensor_shards()
+        self._precompute_expected_transfer_shards()
 
         # Pre-compute operator input types from function signatures
         self._precompute_operator_input_types()
 
-    def _resolve_input_spec(self, op_name: str, tuuid: int) -> PhysicalLayout | None:
-        """
-        Resolve a consumer-side input requirement for a specific operator.
-        Returns a PhysicalLayout bound to the current mesh.
-        """
-        key = (op_name, tuuid)
-        if key in self._resolved_input_cache:
-            return self._resolved_input_cache[key]
-
-        # Check local requirement map (ShardingSpec)
-        routing = self._input_sharding.get(op_name, {}).get(tuuid)
-
-        # Resolution logic
-        if routing is None:
-            return None
-
-        if routing.is_referential:
-            if routing.routing.tuuid is None:
-                raise ValueError(
-                    f"[Fluxway Topology Resolution Error] Incomplete referential routing for input '{tuuid}' in operator '{op_name}'. "
-                    f"The logical path '{routing.routing.path}' failed to resolve to a concrete TUUID. "
-                    "This usually happens when the path points to an operator or field that is not defined in the graph as a predecessor."
-                )
-            # Resolve the producer's logical routing first
-            producer_routing = self._resolve_producer_spec(routing.routing.tuuid)
-            if producer_routing:
-                # bind to PhysicalLayout on current mesh
-                layout = producer_routing.bind(self._mesh)
-                self._resolved_input_cache[key] = layout
-                return layout
-            return None
-
-        # Concrete requirement, bind it
-        layout = routing.bind(self._mesh)
-        self._resolved_input_cache[key] = layout
-        return layout
-
-    def _resolve_producer_spec(
+    def _get_target_layout(
         self,
-        tuuid: int,
-        provider_map: dict[int, ShardingSpec] | None = None,
-        _trace: set[int] | None = None,
-    ) -> ShardingSpec | None:
-        """Resolve a producer-side implementation (Logical Truth)."""
-        if provider_map is None and tuuid in self._resolved_producer_cache:
-            return self._resolved_producer_cache[tuuid]
+        op_name: str,
+        transfer_code: int,
+    ) -> PhysicalLayout:
+        cached = self._target_layout_cache.get(transfer_code)
+        if cached is not None:
+            return cached
 
-        spec = provider_map.get(tuuid) if provider_map is not None else None
-        if spec is None:
-            spec = self._tuuid_registry.get(tuuid)
-
-        if spec is None:
-            return None
-
-        if spec.is_referential:
-            if spec.routing.tuuid is None:
-                raise ValueError(f"Incomplete producer ref for TUUID {tuuid}")
-
-            current_trace = _trace or set()
-            if tuuid in current_trace:
-                raise RuntimeError(f"Circular sharding reference at TUUID {tuuid}")
-            current_trace.add(tuuid)
-
-            resolved = self._resolve_producer_spec(
-                spec.routing.tuuid, _trace=current_trace
-            )
-            if resolved and provider_map is None:
-                self._resolved_producer_cache[tuuid] = resolved
-            return resolved
-
-        if provider_map is None:
-            self._resolved_producer_cache[tuuid] = spec
-        return spec
-
-    def _register_sharding_specs(self, specs: dict[int, ShardingSpec]) -> None:
-        """
-        Register a batch of ShardingSpec into the global registry.
-        """
-        for tuuid, routing in specs.items():
-            existing = self._tuuid_registry.get(tuuid)
-            if existing and not existing.is_referential:
-                continue
-            self._tuuid_registry[tuuid] = routing
-
-    def _get_effective_layout(
-        self, routing: ShardingSpec | None, info: ResolvedTopologyInfo
-    ) -> PhysicalLayout | None:
-        """
-        Extract the effective layout for routing/assembly.
-        """
-        if routing is None:
-            return None
-
-        mesh = info.mesh if info.mesh else self._mesh
-
-        if not info.is_interleaved:
-            return routing.bind(mesh)
-
-        # INTERLEAVED SOURCE ABSTRACTION:
-        # Override the data dimension to correctly represent the unit size.
-        unit_size = info.interleave_unit_size
-        other_dims_size = 1
-        for s in mesh.shape[1:]:
-            other_dims_size *= s
-
-        if unit_size % other_dims_size != 0:
-            raise ValueError(
-                f"[Fluxway Interleave Error] Topology '{info.spmd_id}' specifies interleave_unit_size={unit_size}, "
-                f"which is not divisible by the sub-mesh size {other_dims_size} (axes {mesh.axis_names[1:]}). "
-                "Ensure that the unit size is a multiple of the size of the non-sharded dimensions."
-            )
-
-        first_axis_size = unit_size // other_dims_size
-        new_shape = (first_axis_size,) + mesh.shape[1:]
-
-        sub_mesh = DeviceMesh(device_shape=new_shape, axis_names=mesh.axis_names)
-        return routing.bind(sub_mesh)
+        route = self.get_predecessor_route(op_name, transfer_code)
+        layout = route.effective_target_sharding.bind(self._mesh)
+        self._target_layout_cache[transfer_code] = layout
+        return layout
 
     def resolve_tensor_producers(
         self,
         op_name: str,
-        tensor_tuuid: int,
-        pre_spmd_id: str,
+        transfer_code: int,
         current_rank: int,
         step: int = 0,
     ) -> list[int]:
-        """
-        Locate the physical source ranks producing a specific tensor shard by its TUUID.
-        Uses memoization to avoid re-calculating fixed sharding overlaps.
-        """
-        pre_info = self._predecessor_topology.get(op_name, {}).get(pre_spmd_id)
-        if not pre_info:
-            return []
+        route = self.get_predecessor_route(op_name, transfer_code)
 
-        # Determine Cache Key (handles Interleaved source periodicity)
-        step_mod = 0
-        if pre_info.is_interleaved:
-            total_units = pre_info.world_size // pre_info.interleave_unit_size
-            step_mod = step % total_units
-
-        cache_key = (op_name, tensor_tuuid, pre_spmd_id, current_rank, step_mod)
+        source_key = route.dependency.source_operator.key
+        if source_key not in self._source_dispatchers:
+            self._source_dispatchers[source_key] = ExecutionDispatcher(
+                route.dependency.source_operator.execution_layout
+            )
+        source_dispatcher = self._source_dispatchers[source_key]
+        cycle = route.dependency.source_operator.execution_layout.cycle
+        cycle_index = step % len(cycle)
+        cache_key = (transfer_code, current_rank, cycle_index)
         if cache_key in self._producer_cache:
             return self._producer_cache[cache_key]
-
-        # Resolve layouts
-        input_layout = self._resolve_input_spec(op_name, tensor_tuuid)
-        producer_routing = self._resolve_producer_spec(
-            tensor_tuuid, provider_map=pre_info.tuuid_sharding
-        )
-
-        eff_key = (tensor_tuuid, pre_spmd_id)
-        if eff_key in self._effective_layout_cache:
-            effective_pre_layout = self._effective_layout_cache[eff_key]
+        unit_relation = route.dependency.unit_relation(transfer_code)
+        if unit_relation is not None:
+            producers = [
+                cycle[cycle_index][rank]
+                for rank in unit_relation.producers_by_target[current_rank]
+            ]
         else:
-            effective_pre_layout = self._get_effective_layout(
-                producer_routing, pre_info
+            input_layout = self._get_target_layout(op_name, transfer_code)
+            effective_pre_layout = self.get_transfer_source_layout(
+                op_name, transfer_code
             )
-            self._effective_layout_cache[eff_key] = effective_pre_layout
-
-        # Calculate Overlap
-        unit_base_rank = 0
-        if pre_info.is_interleaved:
-            unit_base_rank = step_mod * pre_info.interleave_unit_size
-
-        producers: list[int] = []
-        if effective_pre_layout:
-            if input_layout is None:
-                raise ValueError(
-                    f"[Fluxway Assembly Error] Missing consumer-side PhysicalLayout for TUUID {tensor_tuuid} in operator '{op_name}'. "
-                    "Strict sharding mode requires all data inputs to have a valid routing specification."
-                )
-
-            relative_producers = effective_pre_layout.resolve_producers(
-                input_layout, current_rank
-            )
-
-            if relative_producers:
-                unique_producers = {}
-                for r in relative_producers:
-                    identity = effective_pre_layout.get_logical_identity(r)
-                    if identity not in unique_producers:
-                        unique_producers[identity] = r + unit_base_rank
-                producers = list(unique_producers.values())
-        else:
-            # Locate the field name for helpful error message
-            tuuid_name = pre_info.tuuid_map.get(str(tensor_tuuid), str(tensor_tuuid))
-            for path, tid in pre_info.tuuid_map.items():
-                if tid == tensor_tuuid:
-                    tuuid_name = path
-                    break
-
-            raise ValueError(
-                f"[Fluxway Topology Error] Missing producer routing for TUUID {tensor_tuuid} (path: '{tuuid_name}') "
-                f"coming from predecessor '{pre_spmd_id}' into operator '{op_name}'. "
-                "Verify that the predecessor correctly defines its output sharding in @operator or the graph builder."
+            producers = source_dispatcher.resolve_active_producers(
+                effective_pre_layout,
+                input_layout,
+                current_rank,
+                cycle_index,
+                route.world_size,
             )
 
         self._producer_cache[cache_key] = producers
@@ -411,443 +407,197 @@ class OperatorManager:
     # =========================================================================
 
     def _parse_operator_metadata(self) -> None:
-        """
-        Parse operator metadata from @operator decorator and config.topology.
-        """
-        if self._config and self._config.topology:
-            for op_name, top in self._config.topology.items():
-                self._predecessor_topology.setdefault(op_name, {})
-                for pred_id, info in top.predecessors.items():
-                    # Link build-time UUIDs to runtime ShardingSpecs
-                    sharding = {}
-                    if info.tuuid_sharding:
-                        if info.mesh is None:
-                            logger.warning(
-                                f"[OperatorManager] Predecessor '{pred_id}' for '{op_name}' has no mesh defined. "
-                                f"Falling back to local mesh {self._mesh}, which may cause incorrect shard count precomputation."
-                            )
-                        pred_mesh = info.mesh if info.mesh is not None else self._mesh
-                        sharding = self._build_sharding_specs(
-                            info.tuuid_sharding, pred_mesh
-                        )
-
-                    self._predecessor_topology[op_name][pred_id] = ResolvedTopologyInfo(
-                        spmd_id=info.spmd_id,
-                        world_size=info.world_size,
-                        mesh=info.mesh,
-                        tuuid_sharding=sharding,
-                        tuuid_map=info.tuuid_map or {},
-                        condition_fn=info.condition_fn,
-                        symmetric_to=info.symmetric_to,
-                        is_interleaved=getattr(info, "is_interleaved", False),
-                        interleave_unit_size=getattr(info, "interleave_unit_size", 1),
-                        is_self_loop=(info.spmd_id == self._spmd_id),
-                    )
-                    # Sync edge sharding to global registry
-                    self._register_sharding_specs(sharding)
-
-                self._successor_topology.setdefault(op_name, {})
-                for succ_id, info in top.successors.items():
-                    sharding = {}
-                    if info.tuuid_sharding:
-                        succ_mesh = info.mesh if info.mesh is not None else self._mesh
-                        sharding = self._build_sharding_specs(
-                            info.tuuid_sharding, succ_mesh
-                        )
-
-                    self._successor_topology[op_name][succ_id] = ResolvedTopologyInfo(
-                        spmd_id=info.spmd_id,
-                        world_size=info.world_size,
-                        mesh=info.mesh,
-                        tuuid_sharding=sharding,
-                        tuuid_map=info.tuuid_map or {},
-                        condition_fn=info.condition_fn,
-                        symmetric_to=info.symmetric_to,
-                        is_interleaved=getattr(info, "is_interleaved", False),
-                        interleave_unit_size=getattr(info, "interleave_unit_size", 1),
-                        is_self_loop=(info.spmd_id == self._spmd_id),
-                    )
-                    # Note: We do NOT register successor requirements into the global
-                    # Production Truth registry. They are only context for routing.
-
-        if self._mesh is None:
-            raise ValueError(f"OperatorManager[{self._spmd_id}]: mesh is None")
-
-        # Enrich with logical sharding from @operator
-        for op_name in self._operators:
-            meta = self._get_operator_metadata(op_name)
-            if meta is None:
+        outgoing: dict[str, list[CompiledDependency]] = {}
+        for dependency in self._plan.incoming:
+            if not dependency.transfers:
                 continue
+            op_name = dependency.spec.target.op_id
+            if op_name not in self._operators:
+                raise ValueError(
+                    f"Dependency {dependency.spec.key!r} targets inactive operator."
+                )
+            for transfer in dependency.transfers:
+                route = ResolvedDependencyRoute(
+                    dependency=dependency,
+                    transfer=transfer,
+                    logical_tensor=self._plan.logical_tensor(transfer.logical_tuuid),
+                    peer_is_source=True,
+                )
+                code = transfer.transfer_code
+                if code in self._incoming_routes_by_code:
+                    raise ValueError(f"Duplicate incoming transfer code {code}.")
+                target_name = transfer.spec.target.name
+                target_path = f"{op_name}.{target_name}"
+                if target_path in self._input_transfer_codes[op_name]:
+                    existing = self._input_transfer_codes[op_name][target_path]
+                    raise ValueError(
+                        f"Operator {op_name!r} input {target_path!r} is bound to "
+                        f"transfer codes {existing} and {code}."
+                    )
+                if code in self._transfer_target_by_code:
+                    raise ValueError(f"Duplicate transfer target code {code}.")
+                self._predecessor_topology[op_name][code] = route
+                self._incoming_routes_by_code[code] = route
+                self._transfer_target_by_code[code] = op_name
+                self._input_transfer_codes[op_name][target_path] = code
+                self._input_sharding[op_name][code] = transfer.target_sharding
 
-            self._dispatchers[op_name] = create_dispatcher(meta)
+        for dependency in self._plan.outgoing:
+            if not dependency.transfers:
+                continue
+            op_name = dependency.spec.source.op_id
+            if op_name not in self._operators:
+                raise ValueError(
+                    f"Dependency {dependency.spec.key!r} sources inactive operator."
+                )
+            outgoing.setdefault(op_name, []).append(dependency)
+            for transfer in dependency.transfers:
+                route = ResolvedDependencyRoute(
+                    dependency=dependency,
+                    transfer=transfer,
+                    logical_tensor=self._plan.logical_tensor(transfer.logical_tuuid),
+                    peer_is_source=False,
+                )
+                code = transfer.transfer_code
+                if code in self._successor_topology[op_name]:
+                    raise ValueError(f"Duplicate outgoing transfer code {code}.")
+                self._successor_topology[op_name][code] = route
+        self._outgoing_tensor_dependencies_by_source_op.update(
+            {op_name: tuple(items) for op_name, items in outgoing.items()}
+        )
 
-            # Resolve sharding specs for all local input parameters
-            local_input_specs = self._build_sharding_specs(
-                meta.input_sharding, self._mesh
+        for op_name in self._operators:
+            compiled = self._get_compiled_operator(op_name)
+            self._dispatchers[op_name] = ExecutionDispatcher(compiled.execution_layout)
+            self._expected_control_arg_names[op_name] = compiled.get_arguments(
+                is_output=False,
+                arg_type=ArgumentType.CONTROL,
             )
-
-            # Collect all available TUUIDs from predecessors to create a logical path -> TUUID lookup
-            global_path_to_tuuid: dict[str, int] = {}
-            for pre_info in self._predecessor_topology.get(op_name, {}).values():
-                # Bind Local Spec with TUUID by [Injected Argument Name -> TUUID] dict.
-                # The local function arguments name is the pre_info.tuuid_map key, which was binded in _validate_and_link_edge
-                global_path_to_tuuid.update(pre_info.tuuid_map)
-
-            # Structured Expansion: Map top-level specs to physical TUUIDs using input_param_map
-            # input_param_map is the 'source of truth' for the parameter tree structure
-            for param_name, spec in local_input_specs.items():
-                # Get list of logical field paths belonging to this parameter (e.g., 'ctx.val', 'ctx.id')
-                nested_fields = meta.input_param_map.get(param_name, [param_name])
-                for field_path in nested_fields:
-                    if field_path in global_path_to_tuuid:
-                        tuuid = global_path_to_tuuid[field_path]
-                        self._input_sharding[op_name][tuuid] = spec
-                        # Register in global registry ONLY if it doesn't collide with a producer.
-                        # Actually, we SHOULD NOT register input requirements into the global registry
-                        # at all, as they represent the consumer's perspective, not the truth of the TUUID.
-                        # self._register_sharding_specs({tuuid: spec})
-
-            # Strict Validation: Ensure every data tensor required by the operator has a spec
-            for field_path in self._expected_tensor_names[op_name]:
-                if field_path in global_path_to_tuuid:
-                    tuuid = global_path_to_tuuid[field_path]
-                    if tuuid not in self._input_sharding[op_name]:
-                        raise ValueError(
-                            f"[Fluxway Topology Error] Field '{field_path}' in operator '{op_name}' "
-                            f"(TUUID {tuuid}) has no sharding specification. "
-                            f"Check @operator definition for parameter containing this field."
-                        )
-
-            # Resolve local output TUUIDs and register them
-            self._output_sharding[op_name] = self.get_output_sharding(op_name)
-            self._register_sharding_specs(self._output_sharding[op_name])
-
-            self._expected_control_arg_names[op_name] = list(
-                meta.get_arguments(is_output=False, arg_type=ArgumentType.CONTROL) or []
+            expected_names = compiled.get_arguments(
+                is_output=False,
+                arg_type=ArgumentType.DATA,
             )
-            self._expected_tensor_names[op_name] = list(
-                meta.get_arguments(is_output=False, arg_type=ArgumentType.DATA) or []
-            )
-
-            input_types = self._operator_input_types.get(op_name, {})
-            pre_topology = self._predecessor_topology.get(op_name, {})
-
-            # Combine all available fields from all predecessors
-            available_paths = set()
-            for pre_info in pre_topology.values():
-                available_paths.update(pre_info.tuuid_map.keys())
-
-            for p_name, p_type in input_types.items():
-                if p_name in self._static_args:
-                    continue
-
-                # Use treedef from meta if available, otherwise it's a primitive tensor
-                tdef = meta.input_treedefs.get(p_name)
-                if tdef:
-                    # Flatten treedef to get expected leaves/paths
-                    # We reuse tree_flatten_type logic to identify expected paths
-                    # For @data_type, build paths based on definition order
-                    expected_fields = meta.input_param_map.get(p_name, [])
-                    for field in expected_fields:
-                        if field not in available_paths:
-                            raise ValueError(
-                                f"[Fluxway Init Error] Operator '{op_name}' requires field '{field}' "
-                                f"as part of parameter '{p_name}', but it's not provided by any predecessor.\n"
-                                f"Available fields: {sorted(available_paths)}\n"
-                                f"Check your graph configuration."
-                            )
-                else:
-                    # Single primitive tensor
+            if len(set(expected_names)) != len(expected_names):
+                raise ValueError(
+                    f"Operator {op_name!r} has duplicate data input names."
+                )
+            self._expected_tensor_names[op_name] = expected_names
+            expected_paths = {f"{op_name}.{name}" for name in expected_names}
+            actual_paths = set(self._input_transfer_codes[op_name])
+            if actual_paths != expected_paths:
+                raise ValueError(
+                    f"Operator {op_name!r} tensor input bindings differ from its "
+                    f"declaration: expected={sorted(expected_paths)}, "
+                    f"actual={sorted(actual_paths)}."
+                )
+        for op_name in self._operators:
+            for route in (
+                *self.get_predecessor_routes(op_name),
+                *self.get_successor_routes(op_name),
+            ):
+                for spec in (route.source_sharding, route.target_sharding):
                     if (
-                        p_name not in available_paths
-                        and p_name not in self._expected_control_arg_names[op_name]
+                        isinstance(spec.routing, ReferentialRouting)
+                        and spec.routing.tuuid is None
                     ):
                         raise ValueError(
-                            f"[Fluxway Init Error] Operator '{op_name}' requires parameter '{p_name}', "
-                            "but it's not in predecessor outputs, not in control states, "
-                            "nor in static arguments.\n"
-                            f"Available predecessor outputs: {sorted(available_paths)}\n"
-                            f"Registered control args: {self._expected_control_arg_names[op_name]}\n"
-                            f"Static arguments: {list(self._static_args.keys())}"
+                            f"operator {op_name!r} contains unresolved referential "
+                            f"routing path {spec.routing.path!r}"
                         )
-
-        # Phase 1: Logical Path & TUUID Discovery
-        # Build an exhaustive index of (OpName, FieldName) -> TUUID.
-        for op_name in self._operators:
-            meta = self._get_operator_metadata(op_name)
-
-            # 1.1 Local Outputs
-            out_uuids = self.get_output_tuuids(op_name)
-            out_names = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
-            if out_names and out_uuids:
-                for name, tuuid in zip(out_names, out_uuids, strict=True):  # type: ignore
-                    self._logical_path_to_tuuid[(op_name, name)] = tuuid
-                    self._tuuid_to_op_outputs[tuuid] = (op_name, name)
-
-            # 1.2 Local Input Dispatch Mapping
-            input_map = self._input_sharding.get(op_name, {})
-            for u in input_map:
-                if u not in self._tuuid_to_op_inputs:
-                    self._tuuid_to_op_inputs[u] = []
-                if op_name not in self._tuuid_to_op_inputs[u]:
-                    self._tuuid_to_op_inputs[u].append(op_name)
-
-            # 1.3 Topology Knowledge (Predecessors & Successors)
-            for pre_info in self._predecessor_topology.get(op_name, {}).values():
-                for name, u in pre_info.tuuid_map.items():
-                    self._logical_path_to_tuuid[(pre_info.spmd_id, name)] = u
-                    self._tuuid_to_op_outputs[u] = (pre_info.spmd_id, name)
-
-            for succ_info in self._successor_topology.get(op_name, {}).values():
-                for name, u in succ_info.tuuid_map.items():
-                    self._logical_path_to_tuuid[(succ_info.spmd_id, name)] = u
-
-        # Phase 2: Strategy Truth Registration
-        for op_name in self._operators:
-            self._register_all_algebraic_specs(self._input_sharding.get(op_name, {}))
-            self._register_all_algebraic_specs(self._output_sharding.get(op_name, {}))
-            for pre_info in self._predecessor_topology.get(op_name, {}).values():
-                self._register_all_algebraic_specs(pre_info.tuuid_sharding)
-            for succ_info in self._successor_topology.get(op_name, {}).values():
-                self._register_all_algebraic_specs(succ_info.tuuid_sharding)
-
-        # Phase 3: Path Resolution (Binding)
-        for op_name in self._operators:
-
-            def res_fn(path: str, context_op=op_name) -> int | None:
-                return self.resolve_path(context_op, path)
-
-            self._resolve_referential_uuids_in_map(
-                self._input_sharding.get(op_name, {}), res_fn
-            )
-            self._resolve_referential_uuids_in_map(
-                self._output_sharding.get(op_name, {}), res_fn
-            )
-            for pre_info in self._predecessor_topology.get(op_name, {}).values():
-                self._resolve_referential_uuids_in_map(pre_info.tuuid_sharding, res_fn)
-            for succ_info in self._successor_topology.get(op_name, {}).values():
-                self._resolve_referential_uuids_in_map(succ_info.tuuid_sharding, res_fn)
-
-            meta = self._get_operator_metadata(op_name)
-            if meta:
-                meta.resolve_async_strategy(res_fn)
-
-        # Phase 4: Strategy Inheritance
-        for op_name in self._operators:
-            self._resolve_referential_strategies_in_map(
-                self._input_sharding.get(op_name, {})
-            )
-            self._resolve_referential_strategies_in_map(
-                self._output_sharding.get(op_name, {})
-            )
-            for pre_info in self._predecessor_topology.get(op_name, {}).values():
-                self._resolve_referential_strategies_in_map(pre_info.tuuid_sharding)
-            for succ_info in self._successor_topology.get(op_name, {}).values():
-                self._resolve_referential_strategies_in_map(succ_info.tuuid_sharding)
-
-            meta = self._get_operator_metadata(op_name)
+            for transfer_code in self._predecessor_topology[op_name]:
+                self._get_target_layout(op_name, transfer_code)
             logger.debug(
                 f"Resolved operator {op_name}: "
                 f"expected_tensors={self.get_expected_tensor_names(op_name)}"
             )
 
-    def _resolve_referential_uuids_in_map(
-        self,
-        sharding_map: dict[int, "ShardingSpec"],
-        resolver_fn: Callable[[str], int | None],
-    ) -> None:
-        """Helper to resolve referential paths to TUUIDs in a specific map."""
-        for spec in sharding_map.values():
-            if spec.is_referential:
-                spec.routing.resolve(resolver_fn)
+    @staticmethod
+    def _require_sharding_specs(raw_specs: Any) -> dict[Any, ShardingSpec]:
+        specs = dict(raw_specs)
+        invalid = {
+            key: type(value).__name__
+            for key, value in specs.items()
+            if not isinstance(value, ShardingSpec)
+        }
+        if invalid:
+            raise TypeError(
+                f"compiled sharding contains non-ShardingSpec values: {invalid}"
+            )
+        return specs
 
-    def _register_all_algebraic_specs(
-        self, sharding_map: dict[int, "ShardingSpec"]
-    ) -> None:
-        """Helper to populate the global TUUID registry with concrete sharding information."""
-        from fluxway.common.types.sharding import AlgebraicRouting
-
-        for tuuid, spec in sharding_map.items():
-            if isinstance(spec.routing, AlgebraicRouting):
-                self._tuuid_registry[tuuid] = spec
-
-    def _resolve_referential_strategies_in_map(
-        self, sharding_map: dict[int, "ShardingSpec"]
-    ) -> None:
-        """Helper to resolve referential sharding in a specific map."""
-        from fluxway.common.types.sharding import ShardingSpec
-
-        for _, spec in sharding_map.items():
-            if isinstance(spec, ShardingSpec) and spec.is_referential:
-                mirror_tuuid = spec.routing.tuuid
-                if mirror_tuuid is None:
-                    continue
-
-                # Follow the chain to the ultimate producer truth
-                truth_spec = self._resolve_producer_spec(mirror_tuuid)
-                if truth_spec:
-                    if truth_spec.is_referential:
-                        continue
-
-                    # Inject the ultimate algebraic truth into our referential spec
-                    spec.routing.resolve_sharding(truth_spec.routing)
-
-    def resolve_path(self, op_name: str, path: str) -> int:
-        """
-        Unified resolver for logical paths to TUUIDs.
-
-        Logic:
-        1. If path is 'op.field', looks in Phase 1 index.
-        2. If path is just 'field', looks in context op's input/output map.
-        """
-        if (op_name, path) in self._logical_path_to_tuuid:
-            return self._logical_path_to_tuuid[(op_name, path)]
-
-        if "." in path:
-            target_op, field = path.split(".", 1)
-            if (target_op, field) in self._logical_path_to_tuuid:
-                return self._logical_path_to_tuuid[(target_op, field)]
-        else:
-            target_op, field = op_name, path
-
-        # Fallback to topology search if index missed
-        pre_topo = self.get_predecessor_topology(target_op)
-        for pre_info in pre_topo.values():
-            if field in pre_info.tuuid_map:
-                return pre_info.tuuid_map[field]
-
-        # 2. Search in successors (find field produced as output by target_op)
-        succ_topo = self.get_successor_topology(target_op)
-        for succ_info in succ_topo.values():
-            if field in succ_info.tuuid_map:
-                return succ_info.tuuid_map[field]
-
-        # Aggregate available fields for helpful error message
-        available_pre = set()
-        for p_info in pre_topo.values():
-            available_pre.update(p_info.tuuid_map.keys())
-
-        available_succ = set()
-        for s_info in succ_topo.values():
-            available_succ.update(s_info.tuuid_map.keys())
-
-        raise ValueError(
-            f"[OperatorManager] Cannot resolve logical path '{path}' to a TUUID. "
-            f"Target operator '{target_op}' provides as inputs: {sorted(available_pre)}, "
-            f"produced as outputs: {sorted(available_succ)}"
+    @staticmethod
+    def _compiled_output_sharding(
+        operator: CompiledOperator,
+    ) -> dict[int, ShardingSpec]:
+        output_names = operator.get_arguments(
+            is_output=True,
+            arg_type=ArgumentType.DATA,
         )
+        if len(output_names) != len(operator.output_uuids):
+            raise ValueError(
+                f"Operator {operator.key!r} output names and logical TUUIDs differ "
+                "in length."
+            )
+        name_to_tuuid = dict(zip(output_names, operator.output_uuids, strict=True))
+        result: dict[int, ShardingSpec] = {}
+        for name, spec in operator.output_sharding.items():
+            try:
+                logical_tuuid = name_to_tuuid[name]
+            except KeyError as exc:
+                raise ValueError(
+                    f"Operator {operator.key!r} has output sharding for unknown "
+                    f"tensor {name!r}."
+                ) from exc
+            result[logical_tuuid] = spec
+        return result
 
-    def register_eager_inputs(
-        self,
-        op_name: str,
-        tuuid_sharding: dict[int, ShardingSpec],
-        expected_counts: dict[int, int] | None = None,
-    ) -> None:
-        """
-        Dynamically register TUUIDs and their sharding specs for Eager mode.
-        """
-        with self._lock:
-            if op_name not in self._input_sharding:
-                self._input_sharding[op_name] = {}
-            if op_name not in self._expected_tensor_shards_cache:
-                self._expected_tensor_shards_cache[op_name] = {}
+    def _get_operator_spec(self, op_name: str) -> OperatorSpec:
+        return self._get_compiled_operator(op_name).spec
 
-            for u, spec in tuuid_sharding.items():
-                self._input_sharding[op_name][u] = spec
+    def _get_compiled_operator(self, op_name: str) -> CompiledOperator:
+        try:
+            return self._compiled_operators[op_name]
+        except KeyError as exc:
+            raise ValueError(f"operator {op_name!r} is not in SPMDGraphView") from exc
 
-                # Update global TUUID -> Op dispatch table
-                if u not in self._tuuid_to_op_inputs:
-                    self._tuuid_to_op_inputs[u] = []
-                if op_name not in self._tuuid_to_op_inputs[u]:
-                    self._tuuid_to_op_inputs[u].append(op_name)
-
-                # Update expected shard counts for the mailbox
-                if expected_counts and u in expected_counts:
-                    self._expected_tensor_shards_cache[op_name][u] = expected_counts[u]
-                else:
-                    # Eager mode routing logic would need a mesh to compute counts.
-                    # We might need to bind or assume replication.
-                    self._expected_tensor_shards_cache[op_name][u] = 1
-
-            # Sync to global registry
-            self._register_sharding_specs(tuuid_sharding)
-
-        logger.debug(
-            f"[OperatorManager] Registered eager inputs for {op_name}: "
-            f"{list(tuuid_sharding.keys())}"
-        )
-
-    def _build_sharding_specs(
-        self, raw_specs: dict[Any, Any], mesh: "DeviceMesh"
-    ) -> dict[Any, "ShardingSpec"]:
-        from fluxway.common.types.sharding import ShardingSpec, ShardingConfig
-
-        parsed = {}
-        for key, raw_spec in raw_specs.items():
-            if isinstance(raw_spec, dict):
-                parsed[key] = ShardingConfig.model_validate(raw_spec).to_routing()
-            elif isinstance(raw_spec, ShardingSpec):
-                parsed[key] = raw_spec
-        return parsed
-
-    def _get_operator_metadata(self, op_name: str) -> "OperatorMeta":
-        """
-        Get metadata attached to an operator.
-        All metadata must be explicitly provided in SPMDConfig.operator_metas.
-        """
-        if op_name in self._config.operator_metas:
-            meta = self._config.operator_metas[op_name]
-            if meta is not None:
-                return meta
-
-        raise ValueError(
-            f"Operator '{op_name}' has no registered metadata in SPMDConfig. "
-            "In strict TUUID mode, all operators must have explicit OperatorMeta."
-        )
-
-    def _precompute_expected_tensor_shards(self) -> None:
-        """
-        Pre-compute expected tensor shard counts for all operator types.
-
-        This is computed once after _input_sharding, _predecessor_topology, and
-        _input_routing_strategies are all initialized.
-
-        The result is cached in _expected_tensor_shards_cache.
-        Also caches the pre-computed shard counts in _expected_tensor_shards_cache.
-
-        Special case: if the operator has a periodic barrier, all expected counts
-        are set to the barrier's 'n' value (default=1).
-        """
+    def _precompute_expected_transfer_shards(self) -> None:
         for op_name in self._operators:
             expected: dict[int, int] = {}
-
-            # Check if periodic_trigger is enabled for this operator
             is_periodic = self.is_periodic_trigger(op_name)
+            for route in self.get_predecessor_routes(op_name):
+                code = route.transfer_code
+                source_spec = route.effective_source_sharding
+                if is_periodic:
+                    from fluxway.common.operator_policy import PeriodicBarrierConfig
 
-            # Map input names to UUIDs and sum up expected shards
-            pre_topology = self._predecessor_topology.get(op_name, {})
-
-            for pre_id, pre_info in pre_topology.items():
-                for u, spec in pre_info.tuuid_sharding.items():
-                    if is_periodic:
-                        # If periodic_trigger is enabled, expect N shards to trigger execution (default N=1)
-                        from fluxway.common.types.configs import PeriodicBarrierConfig
-
-                        meta = self._get_operator_metadata(op_name)
-                        n = 1
-                        if meta and isinstance(
-                            meta.barrier_config, PeriodicBarrierConfig
-                        ):
-                            n = meta.barrier_config.n
-                        expected[u] = n
-                    else:
-                        # Use the unified topology model to resolve physical producers.
-                        producers = self.resolve_tensor_producers(
-                            op_name, u, pre_id, self._rank, step=0
+                    meta = self._get_operator_spec(op_name)
+                    if not isinstance(meta.barrier_config, PeriodicBarrierConfig):
+                        raise TypeError(
+                            f"periodic operator {op_name!r} requires "
+                            "PeriodicBarrierConfig"
                         )
-                        expected[u] = expected.get(u, 0) + len(producers)
+                    expected[code] = meta.barrier_config.n
+                elif (
+                    route.transfer.uses_receipt_routing
+                    or source_spec.is_content_addressable
+                ):
+                    if route.world_size <= 0:
+                        raise ValueError(
+                            f"Transfer code {code} has invalid source world size "
+                            f"{route.world_size}."
+                        )
+                    expected[code] = route.dependency.source_participating_count
+                else:
+                    expected[code] = len(
+                        self.resolve_tensor_producers(
+                            op_name,
+                            code,
+                            self._rank,
+                            step=0,
+                        )
+                    )
 
-            self._expected_tensor_shards_cache[op_name] = expected
+            self._expected_transfer_shards_cache[op_name] = expected
             self._periodic_trigger_cache[op_name] = is_periodic
 
             if expected:
@@ -862,18 +612,30 @@ class OperatorManager:
 
         Extracts all parameter types (excluding self) from each operator function
         and caches them for use in _assemble_input.
-        """
-        for op_name, operator in self._operators.items():
-            if operator is None:
-                continue
 
+        For operators that accept **kwargs, the individual tensor parameter names
+        are not present in the function signature; they are declared via the
+        operator's ``input_sharding`` and recorded in
+        ``meta.input_param_map`` by ``_resolve_input_sharding``. We expand those
+        synthetic params here so ``_assemble_input`` can collect tuuids for
+        each one and forward them as kwargs at runtime.
+        """
+        from typing import Any as _Any
+
+        for op_name, operator in self._operators.items():
             try:
                 sig = _inspect.signature(operator)
                 is_source = self.is_source_operator(op_name)
 
                 params_dict = {}
+                has_var_keyword = False
                 for p_name, param in sig.parameters.items():
                     if p_name in ("self", "cls"):
+                        continue
+                    if param.kind == _inspect.Parameter.VAR_KEYWORD:
+                        has_var_keyword = True
+                        continue
+                    if param.kind == _inspect.Parameter.VAR_POSITIONAL:
                         continue
                     param_type = param.annotation
                     if param_type == _inspect.Parameter.empty:
@@ -882,6 +644,18 @@ class OperatorManager:
                         )
                         continue
                     params_dict[p_name] = param_type
+
+                # Surface **kwargs-injected tensor params declared via
+                # input_sharding so _assemble_input doesn't see an empty
+                # input_types and silently drop everything.
+                if has_var_keyword:
+                    meta = self._get_operator_spec(op_name)
+                    for k in meta.input_param_map:
+                        if k in params_dict:
+                            continue
+                        if k in self._static_args:
+                            continue
+                        params_dict[k] = _Any
 
                 if not params_dict:
                     if is_source:
@@ -906,39 +680,198 @@ class OperatorManager:
     # =========================================================================
 
     def get_predecessor_ids(self, op_name: str) -> list[str]:
-        """Get all predecessor SPMD IDs for an operator."""
-        return list(self._predecessor_topology.get(op_name, {}).keys())
+        return sorted({route.spmd_id for route in self.get_predecessor_routes(op_name)})
 
     def get_successor_ids(self, op_name: str) -> list[str]:
-        """Get all successor SPMD IDs for an operator."""
-        return list(self._successor_topology.get(op_name, {}).keys())
+        return sorted({route.spmd_id for route in self.get_successor_routes(op_name)})
 
-    def get_predecessor_info(
-        self, op_name: str, spmd_id: str
-    ) -> ResolvedTopologyInfo | None:
-        """Get predecessor topology info."""
-        return self._predecessor_topology.get(op_name, {}).get(spmd_id)
+    def get_predecessor_routes(
+        self, op_name: str
+    ) -> tuple[ResolvedDependencyRoute, ...]:
+        self._get_compiled_operator(op_name)
+        return tuple(self._predecessor_topology[op_name].values())
 
-    def get_successor_info(
-        self, op_name: str, spmd_id: str
-    ) -> ResolvedTopologyInfo | None:
-        """Get successor topology info."""
-        return self._successor_topology.get(op_name, {}).get(spmd_id)
+    def get_successor_routes(self, op_name: str) -> tuple[ResolvedDependencyRoute, ...]:
+        self._get_compiled_operator(op_name)
+        return tuple(self._successor_topology[op_name].values())
 
-    def get_successor_condition_fn(
-        self, op_name: str, spmd_id: str
-    ) -> Callable[..., bool] | None:
-        """Get condition function for a successor edge."""
-        info = self._successor_topology.get(op_name, {}).get(spmd_id)
-        return info.condition_fn if info else None
+    def get_predecessor_route(
+        self,
+        op_name: str,
+        transfer_code: int,
+    ) -> ResolvedDependencyRoute:
+        self._get_compiled_operator(op_name)
+        try:
+            return self._predecessor_topology[op_name][transfer_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"Operator {op_name!r} has no incoming transfer code {transfer_code}."
+            ) from exc
+
+    def get_successor_route(
+        self,
+        op_name: str,
+        transfer_code: int,
+    ) -> ResolvedDependencyRoute:
+        self._get_compiled_operator(op_name)
+        try:
+            return self._successor_topology[op_name][transfer_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"Operator {op_name!r} has no outgoing transfer code {transfer_code}."
+            ) from exc
+
+    def get_outgoing_tensor_dependencies(
+        self,
+        op_name: str,
+    ) -> tuple[CompiledDependency, ...]:
+        self._get_compiled_operator(op_name)
+        return self._outgoing_tensor_dependencies_by_source_op.get(op_name, ())
+
+    def get_outgoing_ordering_dependencies(
+        self,
+        op_name: str,
+    ) -> tuple[CompiledDependency, ...]:
+        self._get_compiled_operator(op_name)
+        return self._ordering_dependencies_by_source_op.get(op_name, ())
+
+    def get_ordering_target_op(self, dependency_code: int) -> str:
+        try:
+            return self._ordering_target_by_code[dependency_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no incoming ordering dependency "
+                f"code {dependency_code}."
+            ) from exc
+
+    def get_expected_ordering_counts(self, op_name: str) -> dict[int, int]:
+        return self._expected_ordering_counts.get(op_name, {})
+
+    def get_dependency_decision_target_op(self, dependency_code: int) -> str:
+        try:
+            return self._dependency_decision_target_by_code[dependency_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no incoming dependency "
+                f"code {dependency_code}."
+            ) from exc
+
+    def get_dependency_decision_expected_count(self, dependency_code: int) -> int:
+        try:
+            return self._dependency_decision_expected_count_by_code[dependency_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no incoming dependency "
+                f"code {dependency_code}."
+            ) from exc
+
+    def get_expected_dependency_decisions(self, op_name: str) -> dict[int, int]:
+        self._get_compiled_operator(op_name)
+        return self._expected_dependency_decisions.get(op_name, {})
+
+    def get_transfer_dependency_codes(self, op_name: str) -> dict[int, int]:
+        self._get_compiled_operator(op_name)
+        return self._transfer_dependency_codes.get(op_name, {})
+
+    def get_dependency_transfer_codes(self, dependency_code: int) -> tuple[int, ...]:
+        try:
+            return self._dependency_transfer_codes[dependency_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no incoming tensor dependency "
+                f"code {dependency_code}."
+            ) from exc
+
+    def _compile_dependency_decisions(self) -> None:
+        for dependency in self._plan.incoming:
+            op_name = dependency.spec.target.op_id
+            if op_name not in self._operators:
+                raise ValueError(
+                    f"Dependency {dependency.spec.key!r} targets inactive operator."
+                )
+            expected_count = dependency.source_participating_count
+            dependency_code = dependency.code
+            if dependency_code in self._dependency_decision_target_by_code:
+                raise ValueError(
+                    f"Duplicate incoming dependency code {dependency_code}."
+                )
+            transfer_codes = tuple(
+                transfer.transfer_code for transfer in dependency.transfers
+            )
+            self._dependency_decision_target_by_code[dependency_code] = op_name
+            self._dependency_decision_expected_count_by_code[dependency_code] = (
+                expected_count
+            )
+            self._dependency_transfer_codes[dependency_code] = transfer_codes
+            for transfer_code in transfer_codes:
+                if transfer_code in self._transfer_dependency_codes[op_name]:
+                    raise ValueError(
+                        f"Duplicate incoming transfer code {transfer_code}."
+                    )
+                self._transfer_dependency_codes[op_name][transfer_code] = (
+                    dependency_code
+                )
+            if dependency.spec.condition is not None:
+                self._expected_dependency_decisions.setdefault(op_name, {})[
+                    dependency_code
+                ] = expected_count
+
+    def _compile_ordering_dependencies(self) -> None:
+        outgoing: dict[str, list[CompiledDependency]] = {}
+        for dependency in self._plan.outgoing:
+            if dependency.transfers:
+                continue
+            op_name = dependency.spec.source.op_id
+            if op_name not in self._operators:
+                raise ValueError(
+                    f"Ordering dependency {dependency.spec.key!r} sources inactive "
+                    "operator."
+                )
+            outgoing.setdefault(op_name, []).append(dependency)
+        for dependency in self._plan.incoming:
+            if dependency.transfers:
+                continue
+            if dependency.spec.condition is not None:
+                continue
+            op_name = dependency.spec.target.op_id
+            if op_name not in self._operators:
+                raise ValueError(
+                    f"Ordering dependency {dependency.spec.key!r} targets inactive "
+                    "operator."
+                )
+            expected_count = dependency.source_participating_count
+            self._ordering_target_by_code[dependency.code] = op_name
+            self._expected_ordering_counts.setdefault(
+                op_name,
+                {},
+            )[dependency.code] = expected_count
+        self._ordering_dependencies_by_source_op.update(
+            {op_name: tuple(items) for op_name, items in outgoing.items()}
+        )
 
     # =========================================================================
     # Operator Metadata Query
     # =========================================================================
 
-    def get_operator_metadata(self, op_name: str) -> "OperatorMeta":
-        """Get the OperatorMeta document for a given op name."""
-        return self._get_operator_metadata(op_name)
+    def get_operator_spec(self, op_name: str) -> OperatorSpec:
+        return self._get_operator_spec(op_name)
+
+    def require_operator_instance(self, op_name: str) -> Any:
+        owner = self._get_operator_spec(op_name).owner
+        if owner is None:
+            raise RuntimeError(f"operator {op_name!r} has no owner class")
+        try:
+            return self._instance_container.require(owner)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"operator {op_name!r} has not been instantiated"
+            ) from error
+
+    def operator_is_coroutine_function(self, op_name: str) -> bool:
+        try:
+            return self._operator_is_coroutine_function[op_name]
+        except KeyError as exc:
+            raise ValueError(f"No operator registered for {op_name}") from exc
 
     # =========================================================================
 
@@ -956,11 +889,9 @@ class OperatorManager:
         Returns:
             True if periodic_trigger is enabled for this operator
         """
-        from fluxway.common.types.configs import BarrierType
+        from fluxway.common.operator_policy import BarrierType
 
-        meta = self._get_operator_metadata(op_name)
-        if not meta or not getattr(meta, "barrier_config", None):
-            return False
+        meta = self._get_operator_spec(op_name)
         return meta.barrier_config.type == BarrierType.PERIODIC
 
     def get_expected_control_arg_names(self, op_name: str) -> list[str]:
@@ -971,9 +902,13 @@ class OperatorManager:
         """Get expected tensor variable names."""
         return list(self._expected_tensor_names.get(op_name, []))
 
-    def get_expected_tuuids(self, op_name: str) -> list[int]:
-        """Get expected TUUIDs for an operator."""
-        return list(self._expected_tensor_shards_cache.get(op_name, {}).keys())
+    def get_expected_transfer_codes(self, op_name: str) -> list[int]:
+        self._get_compiled_operator(op_name)
+        input_codes = self._input_transfer_codes[op_name]
+        return [
+            input_codes[f"{op_name}.{name}"]
+            for name in self._expected_tensor_names[op_name]
+        ]
 
     def is_source_operator(self, op_name: str) -> bool:
         """
@@ -985,8 +920,8 @@ class OperatorManager:
         Note: Source operators can still have static/state arguments (e.g., from Driver),
         but they do not depend on other operators for execution triggers.
         """
-        meta = self._get_operator_metadata(op_name)
-        if meta and meta.is_source is True:
+        meta = self._get_operator_spec(op_name)
+        if meta.is_source is True:
             # Strong validation: A source should not have tensor inputs from other nodes
             pred_ids = self.get_predecessor_ids(op_name)
             if pred_ids:
@@ -1003,12 +938,9 @@ class OperatorManager:
         """Get names of all source operators."""
         return [op for op in self._operators if self.is_source_operator(op)]
 
-    def get_expected_tensor_shards(self, op_name: str) -> dict[int, int]:
-        """
-        Get pre-computed expected tensor shard counts based on topology.
-        Returns a dictionary mapping TUUIDs (int) to counts.
-        """
-        return self._expected_tensor_shards_cache.get(op_name, {})
+    def get_expected_transfer_shards(self, op_name: str) -> dict[int, int]:
+        self._get_compiled_operator(op_name)
+        return dict(self._expected_transfer_shards_cache[op_name])
 
     def get_operator_input_types(self, op_name: str) -> dict[str, type]:
         """
@@ -1021,153 +953,101 @@ class OperatorManager:
 
     def get_output_tuuids(self, op_name: str) -> list[int]:
         """Returns ordered list of UUIDs matching tree_flatten(output) order."""
-        meta = self._get_operator_metadata(op_name)
-        if meta and meta.output_uuids:
-            return meta.output_uuids
-        return []
-
-    def get_output_tuuid_to_name(self, op_name: str) -> dict[int, str] | None:
-        """Get cached TUUID-to-name mapping for operator outputs."""
-        if op_name not in self._output_tuuid_to_name_cache:
-            meta = self._get_operator_metadata(op_name)
-            output_uuids = self.get_output_tuuids(op_name)
-            if meta and output_uuids:
-                out_args = meta.get_arguments(
-                    is_output=True, arg_type=ArgumentType.DATA
-                )
-                if out_args and len(out_args) == len(output_uuids):
-                    self._output_tuuid_to_name_cache[op_name] = dict(
-                        zip(output_uuids, out_args, strict=True)  # type: ignore
-                    )
-                else:
-                    self._output_tuuid_to_name_cache[op_name] = None
-            else:
-                self._output_tuuid_to_name_cache[op_name] = None
-        return self._output_tuuid_to_name_cache[op_name]
+        return list(self._get_compiled_operator(op_name).output_uuids)
 
     def get_input_sharding(self, op_name: str) -> dict[int, ShardingSpec]:
-        """
-        Get sharding specifications for an operator's inputs by TUUID.
-        Returns {tuuid: ShardingSpec}.
-        """
-        return self._input_sharding.get(op_name, {})
+        self._get_compiled_operator(op_name)
+        return dict(self._input_sharding[op_name])
 
-    def get_operators_for_tuuid(self, tuuid: int) -> list[str]:
-        """Returns all local operator names that consume the given TUUID."""
-        return self._tuuid_to_op_inputs.get(tuuid, [])
+    def get_input_transfer_codes(self, op_name: str) -> dict[str, int]:
+        self._get_compiled_operator(op_name)
+        return dict(self._input_transfer_codes[op_name])
 
-    def get_predecessor_topology(self, op_name: str) -> dict[str, ResolvedTopologyInfo]:
-        """Get predecessor topology info for an operator."""
-        return dict(self._predecessor_topology.get(op_name, {}))
+    def get_incoming_dependencies(self, op_name: str) -> tuple[CompiledDependency, ...]:
+        self._get_compiled_operator(op_name)
+        return tuple(
+            dependency
+            for dependency in self._plan.incoming
+            if dependency.spec.target.op_id == op_name and dependency.transfers
+        )
 
-    def get_successor_topology(self, op_name: str) -> dict[str, ResolvedTopologyInfo]:
-        """Get successor topology info for an operator."""
-        return dict(self._successor_topology.get(op_name, {}))
+    def get_transfer_target_op(self, transfer_code: int) -> str:
+        try:
+            return self._transfer_target_by_code[transfer_code]
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no target operator for transfer code "
+                f"{transfer_code}."
+            ) from exc
 
-    def get_all_input_pre_sharding(
+    def get_predecessor_topology(
         self, op_name: str
-    ) -> dict[str, list[EdgeShardingInfo]]:
-        """
-        Get all input pre-sharding strategies for an operator.
-        Returns a map from predecessor spmd_id to a list of EdgeShardingInfo.
-        """
-        meta = self._get_operator_metadata(op_name)
-        if not meta:
-            return {}
-        return dict(meta.input_pre_sharding)
+    ) -> dict[int, ResolvedDependencyRoute]:
+        self._get_compiled_operator(op_name)
+        return dict(self._predecessor_topology[op_name])
 
-    def get_edge_input_sharding_strategies(
-        self, op_name: str, spmd_id: str
-    ) -> list[EdgeShardingInfo]:
-        """
-        Get input sharding strategies for a specific incoming edge.
-        """
-        meta = self._get_operator_metadata(op_name)
-        if not meta:
-            return []
-        return meta.input_pre_sharding.get(spmd_id, [])
+    def get_successor_topology(
+        self, op_name: str
+    ) -> dict[int, ResolvedDependencyRoute]:
+        self._get_compiled_operator(op_name)
+        return dict(self._successor_topology[op_name])
 
     def get_tensor_input_sharding_spec(
-        self, op_name: str, spmd_id: str, tuuid: int
-    ) -> ShardingSpec | None:
-        """
-        Resolve the ShardingSpec for a specific tensor TUUID coming from a specific predecessor.
-        """
-        pre_info = self.get_predecessor_info(op_name, spmd_id)
-        if not pre_info:
-            return None
+        self,
+        transfer_code: int,
+    ) -> ShardingSpec:
+        try:
+            return self._incoming_routes_by_code[transfer_code].target_sharding
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no incoming transfer code {transfer_code}."
+            ) from exc
 
-        return pre_info.tuuid_sharding.get(tuuid)
+    def get_transfer_source_layout(
+        self,
+        op_name: str,
+        transfer_code: int,
+    ) -> PhysicalLayout:
+        route = self.get_predecessor_route(op_name, transfer_code)
+        cached = self._source_layout_cache.get(transfer_code)
+        if cached is not None:
+            return cached
+        source_name = route.dependency.source_operator.key
+        if source_name not in self._source_dispatchers:
+            self._source_dispatchers[source_name] = ExecutionDispatcher(
+                route.dependency.source_operator.execution_layout
+            )
+        dispatcher = self._source_dispatchers[source_name]
+        layout = dispatcher.get_effective_source_layout(
+            route.mesh, route.effective_source_sharding
+        )
+        self._source_layout_cache[transfer_code] = layout
+        return layout
+
+    def get_transfer_target_layout(
+        self,
+        op_name: str,
+        transfer_code: int,
+    ) -> PhysicalLayout:
+        return self._get_target_layout(op_name, transfer_code)
 
     def get_sender_world_size(
-        self, op_name: str, sender_id: str, tuuid: int
-    ) -> int | None:
-        """
-        Retrieve the world size of the sender for a given TUUID.
-
-        Args:
-            op_name: Local operator name consuming the tensor.
-            sender_id: ID of the sender SPMD.
-            tuuid: Unique identifier of the tensor.
-
-        Returns:
-            The world size of the sender, or None if not found.
-        """
-        # Try resolving from pre-defined topology info
-        pre_info = self.get_predecessor_info(op_name, sender_id)
-        if pre_info:
-            return pre_info.world_size
-
-        # Fallback for Eager mode or dynamic inputs: check input_sharding mesh
-        spec = self._input_sharding.get(op_name, {}).get(tuuid)
-        if spec and spec.mesh:
-            return spec.mesh.size
-
-        raise ValueError(
-            f"[OperatorManager] Cannot resolve sender world size: "
-            f"op={op_name}, sender={sender_id}, tuuid={tuuid}. "
-            f"Ensure topology is correctly configured or sharding is registered."
-        )
+        self,
+        transfer_code: int,
+    ) -> int:
+        try:
+            return self._incoming_routes_by_code[transfer_code].world_size
+        except KeyError as exc:
+            raise ValueError(
+                f"SPMD {self._spmd_id!r} has no incoming transfer code {transfer_code}."
+            ) from exc
 
     # =========================================================================
     # Sharding Query
     # =========================================================================
 
     def get_output_sharding(self, op_name: str) -> dict[int, "ShardingSpec"]:
-        """
-        Get output sharding for an operator, keyed by TUUID.
-        """
-        meta = self._get_operator_metadata(op_name)
-        if not meta:
-            return {}
-
-        from fluxway.common.types.sharding import ShardingConfig
-
-        # Build a name-to-TUUID map from local metadata.
-        out_args = meta.get_arguments(is_output=True, arg_type=ArgumentType.DATA)
-        name_to_tuuid = dict(zip(out_args, meta.output_uuids, strict=True))  # type: ignore
-
-        res = {}
-        if meta.output_sharding:
-            for key, spec_dict in meta.output_sharding.items():
-                if isinstance(spec_dict, dict):
-                    spec = ShardingConfig.model_validate(spec_dict).to_spec()
-                else:
-                    spec = spec_dict
-
-                # Prioritize TUUID keys
-                if isinstance(key, int):
-                    res[key] = spec
-                elif key in name_to_tuuid:
-                    res[name_to_tuuid[key]] = spec
-                else:
-                    raise ValueError(
-                        f"Operator '{op_name}' has an output sharding strategy for '{key}', "
-                        f"but it is not a valid output tensor recognized by local metadata. "
-                        f"Available outputs: {out_args}"
-                    )
-
-        return res
+        return self._compiled_output_sharding(self._get_compiled_operator(op_name))
 
     def get_dispatcher(self, op_name: str) -> ExecutionDispatcher:
         """Get the execution dispatcher strategy for an operator."""
@@ -1183,10 +1063,7 @@ class OperatorManager:
         Returns:
             List of state argument names from output_arguments
         """
-        meta = self._get_operator_metadata(op_name)
-        if meta is None:
-            return []
-        return meta.state_names(is_output=True)
+        return self._get_compiled_operator(op_name).state_names(is_output=True)
 
     # =========================================================================
     # Static Arguments
@@ -1209,33 +1086,111 @@ class OperatorManager:
     # Execution
     # =========================================================================
 
-    async def execute_async(self, op_name: str, step: int, *args, **kwargs) -> Any:
-        from fluxway.common.decorators import operator_context
+    def execute(
+        self,
+        op_name: str,
+        step: int,
+        *args: Any,
+        source_work_items: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        operator = self._operator_for_execution(op_name, coroutine_function=False)
+        call_args, call_kwargs = self._operator_arguments(op_name, args, kwargs)
+        with self._operator_execution_context(op_name, step, source_work_items):
+            with function_scope():
+                result = operator(*call_args, **call_kwargs)
+        if _inspect.isawaitable(result):
+            raise TypeError(
+                f"regular operator {op_name!r} returned an awaitable; "
+                "declare it with async def."
+            )
+        return result
 
+    async def execute_async(
+        self,
+        op_name: str,
+        step: int,
+        *args: Any,
+        source_work_items: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        operator = self._operator_for_execution(op_name, coroutine_function=True)
+        call_args, call_kwargs = self._operator_arguments(op_name, args, kwargs)
+        with self._operator_execution_context(op_name, step, source_work_items):
+            with function_scope():
+                return await operator(*call_args, **call_kwargs)
+
+    def _operator_for_execution(
+        self, op_name: str, *, coroutine_function: bool
+    ) -> Callable[..., Any]:
         operator = self._operators.get(op_name)
         if operator is None:
             raise ValueError(f"No operator registered for {op_name}")
+        actual = self.operator_is_coroutine_function(op_name)
+        if actual != coroutine_function:
+            expected = "coroutine" if coroutine_function else "regular"
+            actual_name = "coroutine" if actual else "regular"
+            raise TypeError(f"operator {op_name!r} is {actual_name}, not {expected}.")
+        return cast(Callable[..., Any], operator)
 
+    @contextmanager
+    def _operator_execution_context(
+        self,
+        op_name: str,
+        step: int,
+        source_work_items: Any | None = None,
+    ) -> Iterator[None]:
+        from fluxway.common.decorators import operator_context
+
+        meta = self.get_operator_spec(op_name)
+        controlled_source = getattr(meta, "is_source", False) and getattr(
+            meta, "requires_source_control_runtime", False
+        )
+        if controlled_source:
+            source_work_items = _validated_source_work_items(
+                op_name, step, source_work_items
+            )
         dispatcher = self.get_dispatcher(op_name)
-        logical_ctx = dispatcher.get_logical_context(self._rank, self._world_size, step)
+        batch_size = 1
+        if isinstance(self._static_args, dict) and "batch_size" in self._static_args:
+            raw_batch_size = self._static_args["batch_size"]
+            if not isinstance(raw_batch_size, int) or raw_batch_size <= 0:
+                raise ValueError(
+                    f"batch_size in static_args must be a positive int, got {raw_batch_size!r}"
+                )
+            batch_size = raw_batch_size
+
+        logical_ctx = dispatcher.get_logical_context(
+            self._rank,
+            self._world_size,
+            step,
+            batch_size=batch_size,
+            source_work_items=source_work_items,
+        )
 
         with operator_context(
             static_args=self._static_args,
             rank=self._rank,
             world_size=self._world_size,
+            spmd_id=self._spmd_id,
+            operator_name=op_name,
             operator_ctx=logical_ctx,
             local_rank=self._local_rank,
             local_world_size=self._local_world_size,
             node_rank=self._node_rank,
             num_nodes=self._num_nodes,
+            control_plane=self._control_plane_handle,
+            ray_component_limits=self._ray_component_limits,
+            instance_container=self._instance_container,
         ):
-            is_async = _inspect.iscoroutinefunction(operator)
+            yield
 
-            if is_async:
-                if self.is_source_operator(op_name):
-                    return await operator()
-                return await operator(*args, **kwargs)
-
-            if self.is_source_operator(op_name):
-                return await asyncio.to_thread(operator)
-            return await asyncio.to_thread(operator, *args, **kwargs)
+    def _operator_arguments(
+        self,
+        op_name: str,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        if self.is_source_operator(op_name):
+            return (), {}
+        return args, kwargs

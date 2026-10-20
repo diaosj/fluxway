@@ -1,0 +1,138 @@
+"""Controller-owned logical source work runtime."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from fluxway.common.ingestion import (
+    CompiledSegment,
+    SourceScanBudget,
+    SourceWorkAcknowledgement,
+    SourceWorkLease,
+    WorkerLayoutDescriptor,
+)
+from fluxway.common.types import ControllerState
+from fluxway.common.types.checkpoint import CheckpointCommitPermit, CheckpointCut
+from fluxway.common.types.configs import SourceControlConfig
+from fluxway.control_plane.checkpoint_transaction import PreparedCheckpointTransaction
+from fluxway.control_plane.components import ComponentState
+from fluxway.control_plane.logical_work_ledger import (
+    LogicalWorkEpoch,
+    LogicalWorkLedger,
+)
+
+
+class SourceControlRuntime:
+    """Controller component and typed facade for ordered source work."""
+
+    def __init__(self, config: SourceControlConfig) -> None:
+        if not isinstance(config, SourceControlConfig):
+            raise TypeError("SourceControlRuntime requires a SourceControlConfig")
+        self._config = config
+        self.component_id = "source-control"
+        self._work_ledger = LogicalWorkLedger(
+            max_in_flight_steps=config.max_in_flight_steps
+        )
+
+    @property
+    def config(self) -> SourceControlConfig:
+        return self._config
+
+    @property
+    def planning_limits(self) -> tuple[int, int]:
+        return (
+            self._config.max_planning_units,
+            self._config.max_planning_descriptor_bytes,
+        )
+
+    @property
+    def planning_records(self) -> int:
+        return self._config.max_planning_records
+
+    @property
+    def planning_window_steps(self) -> int:
+        return self._config.planning_window_steps
+
+    @property
+    def window_lead_steps(self) -> int:
+        """Derive a bounded planning lead from existing source-control limits."""
+        return min(
+            self._config.planning_window_steps,
+            self._config.max_in_flight_steps,
+        )
+
+    @property
+    def scan_budget(self) -> SourceScanBudget:
+        return SourceScanBudget(
+            max_records=self._config.max_planning_records,
+            max_units=self._config.max_planning_units,
+        )
+
+    @property
+    def work_ledger(self) -> LogicalWorkLedger:
+        return self._work_ledger
+
+    async def publish_work_epoch(
+        self, epoch: LogicalWorkEpoch, bindings: Sequence[WorkerLayoutDescriptor]
+    ) -> None:
+        await self._work_ledger.publish(epoch, bindings)
+
+    async def acquire_work(
+        self, epoch: int, segments: Sequence[CompiledSegment]
+    ) -> tuple[SourceWorkLease, ...]:
+        return await self._work_ledger.acquire_available(epoch, segments)
+
+    async def acknowledge_work(
+        self, acknowledgements: Sequence[SourceWorkAcknowledgement]
+    ) -> None:
+        await self._work_ledger.acknowledge(acknowledgements)
+
+    async def candidate_work_cut(self) -> int:
+        return await self._work_ledger.candidate_cut()
+
+    async def wait_for_work_cut(self, target: int) -> int:
+        return await self._work_ledger.wait_for_candidate_cut(target)
+
+    async def on_state(self, state: ComponentState) -> None:
+        if not isinstance(state, ControllerState):
+            raise TypeError("source control component requires ControllerState")
+
+    def checkpoint_state(self, cut: CheckpointCut) -> Mapping[str, Any]:
+        if not isinstance(cut, CheckpointCut) or cut.position is None:
+            raise ValueError("source control checkpoint requires a positioned cut")
+        return self._work_ledger.checkpoint_state(committed_cut=cut.position)
+
+    def restore_state(self, state: Mapping[str, Any], cut: CheckpointCut) -> None:
+        if not isinstance(cut, CheckpointCut) or cut.position is None:
+            raise ValueError("source control restore requires a positioned cut")
+        if not isinstance(state, Mapping):
+            raise TypeError("source control restore state must be a mapping")
+        if state.get("committed_cut") != cut.position:
+            raise ValueError("source checkpoint cut does not match shared cut")
+        self._work_ledger.restore_state(state)
+
+    def prepare_checkpoint(
+        self,
+        checkpoint_id: str,
+        permit: CheckpointCommitPermit,
+        cut: CheckpointCut,
+        state_digest: str,
+    ) -> PreparedCheckpointTransaction[dict[str, Any]]:
+        state = self.checkpoint_state(cut)
+        return self._work_ledger.prepare_checkpoint(
+            checkpoint_id, permit, cut, state_digest, state
+        )
+
+    def apply_prepared(
+        self, prepared_state: PreparedCheckpointTransaction[dict[str, Any]]
+    ) -> None:
+        self._work_ledger.apply_prepared(prepared_state)
+
+    def abort_prepared(
+        self, checkpoint_id: str, permit: CheckpointCommitPermit
+    ) -> None:
+        self._work_ledger.abort_prepared(checkpoint_id, permit)
+
+
+__all__ = ["SourceControlRuntime"]

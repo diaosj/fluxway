@@ -1,124 +1,126 @@
 import asyncio
-import numpy as np
-import pytest
-from unittest.mock import MagicMock
+import typing
+from types import SimpleNamespace
 
-from fluxway.spmd.worker.worker import SPMDWorker
-from fluxway.common.types.configs import SPMDConfig
+import pytest
+
+from fluxway import OperatorSpec
 from fluxway.common.mesh import DeviceMesh
+from fluxway.common.operator_policy import ArgumentType
+from fluxway.profiler.record import TraceArena
+from fluxway.profiler.recorder import TraceRecorder
+from fluxway.spmd.worker.worker import SPMDWorker
+from tests.compiled_graph_fixtures import single_spmd_config
 
 
 def _make_config(mesh, *op_names):
-    from fluxway.common.types.configs import OperatorMeta, ArgumentType
-
-    metas = {}
+    operators = {}
     for name in op_names:
-        meta = OperatorMeta(
+        operator = OperatorSpec(
             name=name,
             input_arguments={ArgumentType.DATA.value: ["in"]},
             output_arguments={ArgumentType.DATA.value: ["out"]},
             input_sharding={"in": {"type": "replicated"}},
             output_sharding={"out": {"type": "replicated"}},
         )
-        metas[name] = meta
+        operators[name] = operator
 
-    return SPMDConfig(
+    return single_spmd_config(
+        name="worker-backpressure",
         spmd_id="test",
-        num_workers=mesh.size if mesh else 1,
         mesh=mesh,
-        operator_metas=metas,
+        operators=operators,
     )
 
 
 @pytest.mark.asyncio
-async def test_spmd_worker_backpressure_throttles_sender():
-    """Verify that a sender delays sending if the downstream receiver returns a high watermark."""
+async def test_spmd_worker_delivery_token_registration_is_not_throttled():
     mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
     config = _make_config(mesh, "compute")
+    config.data_plane_max_in_flight = 1
 
-    # Instantiate class depending on whether it's wrapped by Ray or not
     cls = getattr(SPMDWorker, "__ray_metadata__", None)
     cls = cls.modified_class if cls else SPMDWorker
 
     worker = cls(config, rank=0)
-    worker._max_in_flight = 2
-    worker._mailbox_capacity = 10
-    worker._high_watermark = 8
+    release_first = asyncio.Event()
+    started: list[str] = []
 
-    # Create dummy handler to simulate the remote receive call
-    mock_handler = MagicMock()
+    async def delivery(name: str) -> str:
+        started.append(name)
+        if name == "first":
+            await release_first.wait()
+        return name
 
-    # First response: normal watermark (under high_watermark)
-    # Second response: high watermark (above high_watermark=8) -> triggers delay
-    # Third response: normal watermark
-
-    async def recv_side_effect(*args, **kwargs):
-        recv_side_effect.call_count += 1
-        if recv_side_effect.call_count == 1:
-            return 5
-        elif recv_side_effect.call_count == 2:
-            return 9  # Trigger delay
-        else:
-            return 2
-
-    recv_side_effect.call_count = 0
-    mock_handler.receive_shards.remote = MagicMock(side_effect=recv_side_effect)
-
-    # Patch asyncio.sleep
-    sleep_calls = []
-    original_sleep = asyncio.sleep
-
-    async def mock_sleep(delay):
-        sleep_calls.append(delay)
-        await original_sleep(0.001)
-
-    # Create a simplified version of the backpressure logic in _send_fn
-    async def simulated_send_fn(target_rank, tensors, counts, _handlers):
-        handler = _handlers.get(target_rank)
-
-        await worker._send_semaphore.acquire()
-
-        ref = handler.receive_shards.remote(
-            "target", "tensor", 0, worker.rank, tensors, counts, False, False
+    first = await worker._delivery_runtime.submit(
+        delivery("first"), schedule_key=(0, 0, 0, "op")
+    )
+    second_submit = asyncio.create_task(
+        worker._delivery_runtime.submit(
+            delivery("second"), schedule_key=(0, 0, 1, "op")
         )
+    )
+    await asyncio.sleep(0.01)
 
-        async def _wait_and_release(r=ref):
-            try:
-                watermark = await r
-                if isinstance(watermark, int) and watermark > worker._high_watermark:
-                    backoff = 0.05
-                    await worker_module.asyncio.sleep(backoff)
-            finally:
-                worker._send_semaphore.release()
+    assert started == ["first"]
+    assert second_submit.done()
+    second = await second_submit
+    assert not second.done()
 
-        asyncio.create_task(_wait_and_release())
-        return True
+    release_first.set()
+    assert await first == "first"
+    assert await second == "second"
+    assert started == ["first", "second"]
 
-    try:
-        import fluxway.spmd.worker.worker as worker_module
 
-        old_sleep = worker_module.asyncio.sleep
-        worker_module.asyncio.sleep = mock_sleep
+@pytest.mark.asyncio
+async def test_spmd_worker_delivery_runtime_profiler_spans_lifecycle():
+    mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
+    config = _make_config(mesh, "compute")
+    config.data_plane_max_in_flight = 1
 
-        # Test the simulated _send_fn callback
-        data_to_send = [np.array([1])]
-        counts = [1]
-        handlers = {0: mock_handler, 1: mock_handler, 2: mock_handler}
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    cls = cls.modified_class if cls else SPMDWorker
 
-        # Send 1
-        await simulated_send_fn(0, data_to_send, counts, handlers)
-        # Yield to let the wait_and_release task run
-        await asyncio.sleep(0)
+    worker = cls(config, rank=0)
+    recorder = TraceRecorder(
+        TraceArena(1024 * 1024),
+        run_id="delivery-test",
+        process_name="worker",
+    )
+    worker._profiler_runtime = typing.cast(
+        typing.Any, SimpleNamespace(enabled=True, recorder=recorder)
+    )
+    worker._delivery_runtime._profiler_runtime = worker._profiler_runtime
 
-        # Send 2 (receives high watermark from call 2) -> will trigger delay
-        await simulated_send_fn(1, data_to_send, counts, handlers)
-        await asyncio.sleep(0)
+    release_first = asyncio.Event()
+    started: list[str] = []
 
-        # Send 3
-        await simulated_send_fn(2, data_to_send, counts, handlers)
-        await asyncio.sleep(0)
+    async def delivery(name: str) -> str:
+        started.append(name)
+        if name == "first":
+            await release_first.wait()
+        return name
 
-        # Verify sleep was called indicating throttling occurred
-        assert len(sleep_calls) >= 1
-    finally:
-        worker_module.asyncio.sleep = old_sleep
+    first = await worker._delivery_runtime.submit(
+        delivery("first"), schedule_key=(0, 0, 0, "op")
+    )
+    second = await worker._delivery_runtime.submit(
+        delivery("second"), schedule_key=(0, 0, 1, "op")
+    )
+    await asyncio.sleep(0.01)
+    assert started == ["first"]
+
+    release_first.set()
+    await worker._delivery_runtime.drain("unit_test")
+    assert await first == "first"
+    assert await second == "second"
+
+    snapshot = recorder.arena.snapshot()
+    names = [recorder.metadata.name_for(int(row[4])) for row in snapshot]
+
+    assert names.count("delivery.register_token") == 2
+    assert names.count("delivery.semaphore_wait") == 2
+    assert names.count("delivery.run") == 2
+    assert names.count("delivery.fence") == 1
+    assert "data_plane.delivery_fence" not in names

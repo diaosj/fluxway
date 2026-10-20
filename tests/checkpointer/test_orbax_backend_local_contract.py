@@ -1,382 +1,220 @@
-import importlib.util
-import sys
-import types
-from pathlib import Path
+import asyncio
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
-
-class _FakeTreeDef:
-    """Minimal pytree treedef mock supporting pickle + unflatten."""
-
-    def __init__(self, keys):
-        self._keys = keys
-
-    @property
-    def num_leaves(self):
-        return len(self._keys)
-
-    def unflatten(self, leaves):
-        return dict(zip(self._keys, leaves, strict=True))
-
-
-class _ShapeDtypeStruct:
-    def __init__(self, shape=None, dtype=None, sharding=None):
-        self.shape = shape
-        self.dtype = dtype
-        self.sharding = sharding
+from fluxway.common.types.checkpoint import (
+    CheckpointRuntime,
+    CheckpointRuntimeRole,
+    CheckpointCommitPermit,
+    SaveSession,
+    CommitSaveSession,
+    RestoreSession,
+    CheckpointCut,
+    CheckpointObjectRecord,
+    CheckpointObjectRef,
+    TopologyMismatchError,
+    TopologySnapshot,
+)
+from fluxway.control_plane.checkpointer import (
+    OrbaxCheckpointComponent,
+    WorkerLocalCheckpointComponent,
+)
+from fluxway.control_plane.checkpointer import orbax_component as orbax_module
 
 
-def _install_fake_orbax_runtime(monkeypatch):
-    jax_module = types.ModuleType("jax")
+@pytest.mark.parametrize("error_type", [RuntimeError, AttributeError])
+def test_orbax_jax_topology_errors_propagate(monkeypatch, error_type):
+    import jax
 
-    class _Array:
-        def __init__(self, sharding=None):
-            self.sharding = sharding
-            self.shape = (1,)
-            self.dtype = np.float32
+    def fail():
+        raise error_type("distributed initialization failed")
 
-    class _SingleDeviceSharding:
-        pass
+    monkeypatch.setattr(jax.distributed, "is_initialized", fail)
 
-    class _NamedSharding:
-        pass
+    with pytest.raises(error_type, match="distributed initialization failed"):
+        orbax_module._jax_process_count()
 
-    tree_util_module = types.ModuleType("jax.tree_util")
 
-    import jax.tree_util as real_jtu
+@pytest.mark.asyncio
+async def test_worker_local_records_require_exact_topology(tmp_path):
+    async def save(module, context):
+        return {"local": np.array([context.rank])}
 
-    tree_util_module.tree_flatten = real_jtu.tree_flatten
-    tree_util_module.tree_map = real_jtu.tree_map
-    tree_util_module.PyTreeDef = real_jtu.PyTreeDef
-    tree_util_module.tree_leaves = real_jtu.tree_leaves
-    tree_util_module.tree_flatten_with_path = real_jtu.tree_flatten_with_path
-    tree_util_module.tree_unflatten = real_jtu.tree_unflatten
-    tree_util_module.map = getattr(real_jtu, "map", real_jtu.tree_map)
-    tree_util_module.DictKey = real_jtu.DictKey
-    tree_util_module.SequenceKey = real_jtu.SequenceKey
+    async def restore(module, state, context):
+        return None
 
-    jax_module.Array = _Array
-    jax_module.ShapeDtypeStruct = _ShapeDtypeStruct
-    jax_module.tree_util = tree_util_module
-    jax_module.tree = tree_util_module
-    jax_module.sharding = types.SimpleNamespace(
-        SingleDeviceSharding=_SingleDeviceSharding, NamedSharding=_NamedSharding
+    source = TopologySnapshot(1, (), ())
+    changed = TopologySnapshot(2, ("data",), (2,))
+    save_session = SaveSession(
+        instance=None,
+        attempt_id="tx",
+        checkpoint_id="snapshot",
+        commit_permit=CheckpointCommitPermit("tx", 1, b"permit"),
+        cut=CheckpointCut.for_step("cut", 1),
+        spmd_id="train",
+        rank=0,
+        source_topology=source,
+        component_id="local",
     )
-    jax_module.process_index = lambda: 0
-
-    sync_global_devices_calls = []
-
-    def _unexpected_sync_global_devices(*args, **kwargs):
-        sync_global_devices_calls.append((args, kwargs))
-        raise AssertionError(
-            "global Orbax save should use Checkpointer synchronization, not an extra "
-            "manual multihost_utils.sync_global_devices call"
+    restore_context = RestoreSession(
+        instance=None,
+        checkpoint_id="snapshot",
+        cut=save_session.cut,
+        spmd_id="train",
+        rank=0,
+        saved_topology=source,
+        restore_topology=changed,
+        component_id="local",
+        component_checkpoint=None,
+    )
+    component = WorkerLocalCheckpointComponent("local", save, restore)
+    await component.open(
+        CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
+    )
+    await component.prepare_save(save_session)
+    prepared = await component.save(save_session)
+    await component.finish_save(save_session)
+    publication = await component.commit_save(
+        CommitSaveSession(
+            instance=save_session.instance,
+            attempt_id=save_session.attempt_id,
+            checkpoint_id=save_session.checkpoint_id,
+            commit_permit=save_session.commit_permit,
+            cut=save_session.cut,
+            spmd_id=save_session.spmd_id,
+            rank=save_session.rank,
+            source_topology=save_session.source_topology,
+            component_id=save_session.component_id,
+            worker_results={0: prepared},
         )
-
-    multihost_utils_module = types.ModuleType("jax.experimental.multihost_utils")
-    multihost_utils_module.sync_global_devices = _unexpected_sync_global_devices
-    experimental_module = types.ModuleType("jax.experimental")
-    experimental_module.multihost_utils = multihost_utils_module
-    jax_module.experimental = experimental_module
-
-    etils_module = types.ModuleType("etils")
-    epath_module = types.ModuleType("etils.epath")
-    epath_module.Path = Path
-    etils_module.epath = epath_module
-
-    save_calls = []
-
-    class _FakeStandardCheckpointHandler:
-        async def async_save(self, *args, **kwargs):
-            raise AssertionError(
-                "global Orbax save should not call StandardCheckpointHandler.async_save directly"
-            )
-
-    class _FakePyTreeCheckpointHandler:
-        pass
-
-    checkpointer_save_calls = []
-
-    class _FakeCheckpointer:
-        def __init__(self, handler, *, multiprocessing_options=None):
-            self.handler = handler
-            self.multiprocessing_options = multiprocessing_options
-
-        def save(self, directory, args=None, force=False):
-            checkpointer_save_calls.append(
-                {
-                    "directory": Path(directory),
-                    "args": args,
-                    "force": force,
-                    "mp_options": self.multiprocessing_options,
-                }
-            )
-            save_calls.append(Path(directory))
-            Path(directory).mkdir(parents=True, exist_ok=force)
-
-        def restore(self, directory):
-            return {"restored_from": str(directory)}
-
-    ocp_module = types.ModuleType("orbax.checkpoint")
-    ocp_module.StandardCheckpointHandler = _FakeStandardCheckpointHandler
-    ocp_module.PyTreeCheckpointHandler = _FakePyTreeCheckpointHandler
-    ocp_module.Checkpointer = _FakeCheckpointer
-    ocp_module.args = types.SimpleNamespace(
-        PyTreeSave=lambda item: item, StandardSave=lambda item: item
     )
-    ocp_module.options = types.SimpleNamespace(
-        MultiprocessingOptions=lambda **kw: types.SimpleNamespace(**kw)
-    )
-
-    monkeypatch.setitem(sys.modules, "jax", jax_module)
-    monkeypatch.setitem(sys.modules, "jax.tree_util", tree_util_module)
-    monkeypatch.setitem(sys.modules, "jax.experimental", experimental_module)
-    monkeypatch.setitem(
-        sys.modules, "jax.experimental.multihost_utils", multihost_utils_module
-    )
-    monkeypatch.setitem(sys.modules, "etils", etils_module)
-    monkeypatch.setitem(sys.modules, "etils.epath", epath_module)
-    monkeypatch.setitem(sys.modules, "orbax", types.ModuleType("orbax"))
-    monkeypatch.setitem(sys.modules, "orbax.checkpoint", ocp_module)
-    monkeypatch.setitem(sys.modules, "fluxway", types.ModuleType("fluxway"))
-    monkeypatch.setitem(
-        sys.modules, "fluxway.control_plane", types.ModuleType("fluxway.control_plane")
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "fluxway.control_plane.checkpointer",
-        types.ModuleType("fluxway.control_plane.checkpointer"),
-    )
-
-    backend_path = (
-        Path(__file__).resolve().parents[2]
-        / "fluxway"
-        / "control_plane"
-        / "checkpointer"
-        / "backend.py"
-    )
-    backend_spec = importlib.util.spec_from_file_location(
-        "fluxway.control_plane.checkpointer.backend", backend_path
-    )
-    backend_module = importlib.util.module_from_spec(backend_spec)
-    assert backend_spec.loader is not None
-    backend_spec.loader.exec_module(backend_module)
-    monkeypatch.setitem(
-        sys.modules, "fluxway.control_plane.checkpointer.backend", backend_module
-    )
-
-    orbax_path = (
-        Path(__file__).resolve().parents[2]
-        / "fluxway"
-        / "control_plane"
-        / "checkpointer"
-        / "orbax.py"
-    )
-    orbax_spec = importlib.util.spec_from_file_location(
-        "fluxway.control_plane.checkpointer.orbax", orbax_path
-    )
-    orbax_module = importlib.util.module_from_spec(orbax_spec)
-    assert orbax_spec.loader is not None
-    orbax_spec.loader.exec_module(orbax_module)
-
-    return (
-        orbax_module,
-        save_calls,
-        checkpointer_save_calls,
-        sync_global_devices_calls,
-    )
+    restore_context = replace(restore_context, component_checkpoint=publication)
+    with pytest.raises(TopologyMismatchError):
+        await component.restore(restore_context)
+    await component.close()
 
 
 @pytest.mark.asyncio
-async def test_local_save_bypasses_orbax_checkpointer(monkeypatch, tmp_path):
-    """Local state must be saved via direct numpy serialization, NOT via
-    Orbax Checkpointer, because Orbax coordinates all JAX distributed
-    processes and only one process writes non-sharded numpy data."""
-    orbax_module, save_calls, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
-        monkeypatch
-    )
+async def test_orbax_rollback_is_safe_when_cleanup_races(tmp_path, monkeypatch):
+    async def save(module, context):
+        return {"weights": np.array([1.0])}
 
-    backend = orbax_module.OrbaxBackend()
-    metadata = await backend.save(
-        {"operator_states": {"DenseLayers": {"step": np.array(2)}}},
-        str(tmp_path),
-        "DenseLayers",
-        rank=4,
-        step=2,
-    )
+    async def restore(module, state, context):
+        return None
 
-    expected_dir = tmp_path / "2" / "DenseLayers" / "worker_4_local_state"
-    # Must NOT use Orbax Checkpointer for local state.
-    assert checkpointer_save_calls == [], (
-        "Local state should bypass Orbax Checkpointer entirely"
+    async def layout(module, context):
+        return {"weights": np.array([1.0])}
+
+    topology = TopologySnapshot(1, (), ())
+    session = SaveSession(
+        instance=None,
+        attempt_id="tx",
+        checkpoint_id="snapshot",
+        commit_permit=CheckpointCommitPermit("tx", 1, b"permit"),
+        cut=CheckpointCut.for_step("cut", 1),
+        spmd_id="train",
+        rank=0,
+        source_topology=topology,
+        component_id="orbax",
     )
-    # But the metadata and final directory must be correct.
-    assert metadata["local_state_dir"] == str(expected_dir)
-    assert expected_dir.exists()
-    # Verify numpy files were written.
-    assert (expected_dir / "_local_treedef.pkl").exists()
-    assert any(expected_dir.glob("leaf_*.npy")) or any(expected_dir.glob("leaf_*.pkl"))
+    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    await component.open(
+        CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
+    )
+    staging = component._staging_root(session.attempt_id) / "shared"
+    staging.mkdir(parents=True)
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    waiting = 0
+
+    async def synchronized_to_thread(function, path):
+        nonlocal waiting
+        waiting += 1
+        if waiting == 2:
+            cleanup_started.set()
+        await release_cleanup.wait()
+        return function(path)
+
+    monkeypatch.setattr(orbax_module.asyncio, "to_thread", synchronized_to_thread)
+    first = asyncio.create_task(component.rollback_save(session))
+    second = asyncio.create_task(component.rollback_save(session))
+    await cleanup_started.wait()
+    release_cleanup.set()
+    await asyncio.gather(first, second)
+    await component.close()
 
 
 @pytest.mark.asyncio
-async def test_local_save_multiple_ranks_independent(monkeypatch, tmp_path):
-    """Each rank must write its own local state independently.
-    No Orbax barriers, no cross-rank coordination."""
-    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
-        monkeypatch
+async def test_orbax_rollback_removes_regular_completion_marker(tmp_path):
+    async def save(module, context):
+        return {"weights": np.array([1.0])}
+
+    async def restore(module, state, context):
+        return None
+
+    async def layout(module, context):
+        return {"weights": np.array([1.0])}
+
+    session = SaveSession(
+        instance=None,
+        attempt_id="tx",
+        checkpoint_id="snapshot",
+        commit_permit=CheckpointCommitPermit("tx", 1, b"permit"),
+        cut=CheckpointCut.for_step("cut", 1),
+        spmd_id="train",
+        rank=0,
+        source_topology=TopologySnapshot(1, (), ()),
+        component_id="orbax",
     )
+    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    await component.open(
+        CheckpointRuntime(CheckpointRuntimeRole.WORKER, str(tmp_path), "train", 0)
+    )
+    marker = component._staging_root(session.attempt_id) / ".shared-save-complete"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("snapshot", encoding="utf-8")
 
-    backend = orbax_module.OrbaxBackend(force_write=True)
-    state = {"optimizer": np.array([1.0, 2.0, 3.0], dtype=np.float32)}
+    await component.rollback_save(session)
 
-    await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=9)
-    await backend.save(state, str(tmp_path), "DenseLayers", rank=5, step=9)
-
-    # Local saves must NOT touch Orbax Checkpointer.
-    assert checkpointer_save_calls == [], "Local saves must bypass Orbax Checkpointer"
-    # Both ranks must have their own directories with actual data.
-    dir_rank0 = tmp_path / "9" / "DenseLayers" / "worker_0_local_state"
-    dir_rank5 = tmp_path / "9" / "DenseLayers" / "worker_5_local_state"
-    assert dir_rank0.exists()
-    assert dir_rank5.exists()
-    assert (dir_rank0 / "_local_treedef.pkl").exists()
-    assert (dir_rank5 / "_local_treedef.pkl").exists()
+    assert not marker.exists()
+    await component.close()
 
 
 @pytest.mark.asyncio
-async def test_global_save_uses_checkpointer_atomic_save(monkeypatch, tmp_path):
-    orbax_module, _, checkpointer_save_calls, sync_global_devices_calls = (
-        _install_fake_orbax_runtime(monkeypatch)
+async def test_orbax_restore_rejects_noncollective_topology(tmp_path, monkeypatch):
+    async def save(module, context):
+        return {"weights": np.array([1.0])}
+
+    async def restore(module, state, context):
+        return None
+
+    async def layout(module, context):
+        return {"weights": np.array([1.0])}
+
+    monkeypatch.setattr(orbax_module, "_jax_process_count", lambda: 1)
+    component = OrbaxCheckpointComponent("orbax", save, restore, layout)
+    context = RestoreSession(
+        instance=None,
+        checkpoint_id="snapshot",
+        cut=CheckpointCut.for_step("cut", 1),
+        spmd_id="train",
+        rank=0,
+        saved_topology=TopologySnapshot(2, ("data",), (2,)),
+        restore_topology=TopologySnapshot(2, ("data",), (2,)),
+        component_id="orbax",
+        component_checkpoint=None,
     )
-    jax_module = sys.modules["jax"]
-
-    backend = orbax_module.OrbaxBackend(force_write=True)
-    metadata = await backend.save(
-        {
-            "operator_states": {
-                "DenseLayers": {
-                    "weights": jax_module.Array(jax_module.sharding.NamedSharding())
-                }
-            }
-        },
-        str(tmp_path),
-        "DenseLayers",
-        rank=2,
-        step=7,
+    record = CheckpointObjectRecord(
+        checkpoint_objects=(
+            CheckpointObjectRef(
+                component_id="orbax",
+                checkpoint_object_id="state",
+                version_id="snapshot",
+                storage_locator=b"file:///tmp/missing",
+            ),
+        )
     )
-
-    expected_dir = tmp_path / "7" / "DenseLayers" / "orbax_state"
-    assert len(checkpointer_save_calls) == 1
-    assert checkpointer_save_calls[0]["directory"] == expected_dir
-    assert checkpointer_save_calls[0]["force"] is True
-    assert "operator_states/DenseLayers/weights" in checkpointer_save_calls[0]["args"]
-    assert metadata["orbax_final_path"] == str(expected_dir)
-    assert "orbax_tmp_path" not in metadata
-    assert expected_dir.exists()
-    assert sync_global_devices_calls == []
-    # The Checkpointer must receive a step-scoped barrier_sync_key_prefix so
-    # that repeated saves do not reuse the same JAX distributed barrier key.
-    mp_opts = checkpointer_save_calls[0]["mp_options"]
-    assert mp_opts is not None, "multiprocessing_options must be passed to Checkpointer"
-    assert "DenseLayers_7" in mp_opts.barrier_sync_key_prefix, (
-        f"barrier prefix should embed spmd_id and step; got {mp_opts.barrier_sync_key_prefix!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_global_save_uses_distinct_barrier_prefix_per_step(monkeypatch, tmp_path):
-    """Regression test for the distributed barrier-key reuse bug.
-
-    Orbax's Checkpointer.save() calls sync_global_processes() with fixed keys
-    like 'Checkpointer:save_start'. JAX's distributed barrier requires that each
-    key is used exactly once — reusing the same key on a second checkpoint call
-    causes a 300-second deadlock in multi-host environments.
-
-    The fix is to pass a step-scoped ``barrier_sync_key_prefix`` to
-    MultiprocessingOptions so that each checkpoint's barrier keys are unique,
-    e.g. 'DenseLayers_50_Checkpointer:save_start' vs
-         'DenseLayers_100_Checkpointer:save_start'.
-    """
-    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
-        monkeypatch
-    )
-    jax_module = sys.modules["jax"]
-
-    state = {
-        "operator_states": {
-            "DenseLayers": {
-                "weights": jax_module.Array(jax_module.sharding.NamedSharding())
-            }
-        }
-    }
-    backend = orbax_module.OrbaxBackend(force_write=True)
-
-    # First checkpoint
-    await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=50)
-    # Second checkpoint (different step)
-    await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=100)
-
-    assert len(checkpointer_save_calls) == 2
-    prefix_50 = checkpointer_save_calls[0]["mp_options"].barrier_sync_key_prefix
-    prefix_100 = checkpointer_save_calls[1]["mp_options"].barrier_sync_key_prefix
-
-    assert prefix_50 != prefix_100, (
-        "Each checkpoint step must use a distinct barrier_sync_key_prefix. "
-        f"Both steps produced the same prefix: {prefix_50!r}"
-    )
-    assert "50" in prefix_50
-    assert "100" in prefix_100
-
-
-@pytest.mark.asyncio
-async def test_ckpt_dir_always_points_to_spmd_level_dir(monkeypatch, tmp_path):
-    """ckpt_dir must be ckpt_dir/step/spmd_id, not the orbax_state subdirectory.
-
-    Operators receive the SPMD-level directory during the save phase; the load
-    path must expose the same directory so operators can locate their own
-    artifacts consistently.
-    """
-    orbax_module, _, _, _ = _install_fake_orbax_runtime(monkeypatch)
-    jax_module = sys.modules["jax"]
-
-    state = {"weights": jax_module.Array(jax_module.sharding.NamedSharding())}
-    backend = orbax_module.OrbaxBackend(force_write=True)
-    metadata = await backend.save(state, str(tmp_path), "DenseLayers", rank=0, step=5)
-
-    expected_spmd_dir = tmp_path / "5" / "DenseLayers"
-    assert metadata["ckpt_dir"] == str(expected_spmd_dir), (
-        f"ckpt_dir should be the SPMD-level directory {expected_spmd_dir}, "
-        f"not the orbax_state subdirectory; got {metadata['ckpt_dir']!r}"
-    )
-    # orbax_state lives one level below
-    assert metadata["orbax_final_path"] == str(expected_spmd_dir / "orbax_state")
-
-
-@pytest.mark.asyncio
-async def test_ckpt_dir_set_for_local_only_checkpoint(monkeypatch, tmp_path):
-    """ckpt_dir must be present even when the checkpoint contains only local_state.
-
-    If ckpt_dir is absent, load_state_from_disk silently skips restoration,
-    leading to a silent state reset that is extremely hard to diagnose.
-    """
-    orbax_module, _, checkpointer_save_calls, _ = _install_fake_orbax_runtime(
-        monkeypatch
-    )
-
-    # SingleDeviceSharding → classified as local_state by _split_hybrid_state
-    state = {"optimizer": np.array([1.0], dtype=np.float32)}
-    backend = orbax_module.OrbaxBackend(force_write=True)
-    metadata = await backend.save(state, str(tmp_path), "DenseLayers", rank=1, step=3)
-
-    expected_spmd_dir = tmp_path / "3" / "DenseLayers"
-    assert "ckpt_dir" in metadata, (
-        "ckpt_dir must be set for local-only checkpoints so that "
-        "load_state_from_disk does not silently skip restoration"
-    )
-    assert metadata["ckpt_dir"] == str(expected_spmd_dir)
-    assert "orbax_final_path" not in metadata, (
-        "A local-only checkpoint should not produce orbax_final_path"
-    )
-    assert "local_state_dir" in metadata
+    with pytest.raises(RuntimeError, match="one initialized JAX process"):
+        await component._read_global(record, {}, context)

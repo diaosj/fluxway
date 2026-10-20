@@ -1,24 +1,47 @@
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.configs import SPMDConfig
+from fluxway import OperatorSpec
+from fluxway.common.compiled_graph import compile_graph
 from fluxway.spmd.driver.driver import SPMDDriver
+from tests.compiled_graph_fixtures import compiled_spmd_spec
 import pytest
 
 
 def _driver_cls():
-    return SPMDDriver.__ray_metadata__.modified_class
+    cls = getattr(SPMDDriver, "__ray_metadata__", None)
+    return cls.modified_class if cls else SPMDDriver
 
 
 def _make_driver():
     mesh = DeviceMesh(axis_names=("dp",), device_shape=(4,))
-    config = SPMDConfig(mesh=mesh, operators={}, operator_metas={})
+    operator = OperatorSpec(name="compute")
+    compiled_graph = compile_graph(
+        name="driver-local-rank-test",
+        spmds=(
+            compiled_spmd_spec(
+                spmd_id="spmd-a",
+                mesh=mesh,
+                operators={"compute": operator},
+            ),
+        ),
+        dependencies=(),
+    ).spmd("spmd-a")
+    config = SPMDConfig(
+        spmd_id="spmd-a",
+        graph_view=compiled_graph,
+        mesh=mesh,
+        operator_specs={"compute": operator},
+    )
     driver_cls = _driver_cls()
     return driver_cls(
         spmd_id="spmd-a",
         config=config,
-        placement_group=None,
+        placement_group=object(),
         worker_bundle_indices=[],
         controller_handle=None,
         graph_topology={"predecessors": [], "successors": []},
+        worker_resource={"CPU": 0},
+        expected_node_ids=[],
     )
 
 
@@ -26,7 +49,7 @@ def test_compute_rank_info_single_node():
     driver = _make_driver()
     node_ids = {0: "node-a", 1: "node-a", 2: "node-a"}
 
-    assert driver._compute_rank_info(node_ids) == {
+    assert driver.executor._compute_rank_info(node_ids) == {
         0: {"local_rank": 0, "local_world_size": 3, "node_rank": 0, "num_nodes": 1},
         1: {"local_rank": 1, "local_world_size": 3, "node_rank": 0, "num_nodes": 1},
         2: {"local_rank": 2, "local_world_size": 3, "node_rank": 0, "num_nodes": 1},
@@ -37,7 +60,7 @@ def test_compute_rank_info_partial_fill_orders_node_rank_by_smallest_rank():
     driver = _make_driver()
     node_ids = {0: "node-b", 1: "node-b", 2: "node-a", 3: "node-a", 4: "node-a"}
 
-    assert driver._compute_rank_info(node_ids) == {
+    assert driver.executor._compute_rank_info(node_ids) == {
         0: {"local_rank": 0, "local_world_size": 2, "node_rank": 0, "num_nodes": 2},
         1: {"local_rank": 1, "local_world_size": 2, "node_rank": 0, "num_nodes": 2},
         2: {"local_rank": 0, "local_world_size": 3, "node_rank": 1, "num_nodes": 2},
@@ -84,7 +107,8 @@ class FakeWorker:
 @pytest.mark.asyncio
 async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
     driver = _make_driver()
-    driver.worker_bundle_indices = [0, 1, 2]
+    driver.executor.worker_bundle_indices = [0, 1, 2]
+    driver.executor.expected_node_ids = ["node-a", "node-a", "node-b"]
     fake_workers = [FakeWorker("node-a"), FakeWorker("node-a"), FakeWorker("node-b")]
     worker_iter = iter(fake_workers)
 
@@ -96,16 +120,10 @@ async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
             return next(worker_iter)
 
     monkeypatch.setattr(
-        "fluxway.spmd.driver.driver.SPMDWorker",
+        "fluxway.spmd.driver.executor.ray_executor.SPMDWorker",
         _FakeActorClass(),
     )
-    monkeypatch.setattr(
-        "fluxway.spmd.driver.driver.ray.get_runtime_context",
-        lambda: type("Ctx", (), {"current_actor": object()})(),
-    )
-    monkeypatch.setattr("fluxway.spmd.driver.driver.ray.get", lambda refs: refs)
-
-    await driver._start_workers()
+    await driver.executor.start_workers(driver.spmd_id, None, driver.controller_handle)
 
     assert fake_workers[0].setup_calls == [
         {

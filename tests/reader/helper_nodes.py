@@ -59,7 +59,7 @@ class TypedGrainReader(GrainReader):
     @operator(
         "read", is_source=True, output_sharding={"type": "static", "axis": ["data"]}
     )
-    def read(self) -> SimpleData:
+    def read(self) -> SimpleData | None:
         raw = super().read()
         if raw is None:
             return None

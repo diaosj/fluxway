@@ -1,191 +1,226 @@
-import json
-import pathlib
-import jax.numpy as jnp
+import numpy as np
 from typing import Any
 
-from fluxway.common.decorators import spmd_source, operator
-from fluxway.common.index_descriptor import ContinuousIndex
-from fluxway.common.types.tensor import TransportTensor
-from fluxway.reader import GrainReader
+from fluxway.common.decorators import spmd_source, operator, requires_worker_process
+from fluxway.common.operator_policy import AsyncPolicy
+from fluxway.example.recommendation.source_adapter import RecommendationSourceDescriptor
+from fluxway.reader import BaseReader
+from fluxway import ResourceProfile
 from .data_types import UserBatch, ActiveFeatures, PassiveFeatures, LabelFeatures
 
 
+@requires_worker_process
 @spmd_source(
-    resource={"num_cpus": 1, "memory_gb": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("worker",),
     interleaved=True,
     interleave_unit_size=1,
+    source=RecommendationSourceDescriptor(),
 )
-class RecommendationReader(GrainReader):
+class RecommendationReader(BaseReader):
+    rank: int
+    world_size: int
     """
     Produces batches of UserBatch in col-store layout (Active / Passive / Label).
     When no data_source is provided, generates a 1000-sample synthetic dataset.
     """
 
-    def _create_data_loader(
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self._data_source = self._create_data_source(self.static_args)
+
+    def _create_data_source(
         self,
         static_args: dict[str, Any],
-        rank: int,
-        world_size: int,
-        shard_index: int | None = None,
-        shard_count: int | None = None,
     ):
         if "data_source" not in static_args:
-            data = [
-                {
-                    "user_id": [1000 + i],
-                    "user_age_level": [i % 5],
-                    "request_hour": [18],
-                    "hist_click_item_seq": ([200, 201, 202] if i % 2 == 0 else [210]),
-                    "hist_seq_length": 3 if i % 2 == 0 else 1,
-                    "target_item_id": [500 + i],
-                    "target_item_category": [i % 10],
-                    "target_item_stats": [0.05, 19.9],
-                    "is_click": [1 if i % 3 == 0 else 0],
-                }
-                for i in range(1000)
-            ]
-            static_args["data_source"] = data
-            static_args.setdefault("batch_size", 24)
-            static_args.setdefault("num_epochs", 1)
-            static_args.setdefault("shuffle", False)
+            # Synthesize a recommendation corpus whose item / user popularity
+            # follows a power-law (Zipf-like) distribution, mirroring real
+            # traffic where a small set of "hot" entities dominates impressions.
+            # This guarantees that different DP ranks observe overlapping sparse
+            # IDs and thereby exercise the cross-DP embedding routing path
+            # (e.g. the same item shows up on multiple input workers, gets routed to a single
+            # sparse worker, and its embedding fans out to multiple dense
+            # workers).
+            seed = static_args.get("seed", 42)
+            rng = np.random.default_rng(seed)
 
-        super()._create_data_loader(
-            static_args, rank, world_size, shard_index, shard_count
-        )
-        self._completed_steps = 0
+            vocab_size_user = static_args.get("vocab_size_user", 100)
+            vocab_size_item = static_args.get("vocab_size_item", 2000)
+            num_samples = static_args.get("num_samples", 1000)
+            item_alpha = static_args.get("item_zipf_alpha", 1.2)
+            user_alpha = static_args.get("user_zipf_alpha", 1.0)
+            max_seq_len = static_args.get("max_seq_len", 5)
+
+            item_probs = self._zipf_probs(vocab_size_item, item_alpha, rng)
+            user_probs = self._zipf_probs(vocab_size_user, user_alpha, rng)
+
+            # Heavier-tailed sequence length: most users have short history,
+            # a few have longer ones.
+            seq_len_choices = np.arange(1, max_seq_len + 1)
+            seq_len_probs = 1.0 / seq_len_choices.astype(np.float64)
+            seq_len_probs /= seq_len_probs.sum()
+
+            user_ids = rng.choice(vocab_size_user, size=num_samples, p=user_probs)
+            target_target_ids = rng.choice(
+                vocab_size_item, size=num_samples, p=item_probs
+            )
+            seq_lens = rng.choice(seq_len_choices, size=num_samples, p=seq_len_probs)
+
+            data = []
+            for i in range(num_samples):
+                sl = int(seq_lens[i])
+                hist_seq = rng.choice(vocab_size_item, size=sl, p=item_probs).tolist()
+
+                data.append(
+                    {
+                        "user_id": [int(user_ids[i])],
+                        "user_age_level": [int(rng.integers(0, 5))],
+                        "request_hour": [int(rng.integers(0, 24))],
+                        "hist_click_item_seq": [int(x) for x in hist_seq],
+                        "hist_seq_length": [sl],
+                        "target_target_id": [int(target_target_ids[i])],
+                        "target_item_category": [int(rng.integers(0, 10))],
+                        "target_item_stats": [
+                            rng.random(),
+                            (rng.random() * 20),
+                        ],
+                        "is_click": [int(rng.integers(0, 2))],
+                    }
+                )
+
+            return data
+        return static_args["data_source"]
+
+    @staticmethod
+    def _zipf_probs(
+        vocab_size: int, alpha: float, rng: np.random.Generator
+    ) -> np.ndarray:
+        """Return a permuted Zipf-like probability vector over [0, vocab_size).
+
+        The raw 1 / (rank + 1) ** alpha mass is then permuted so that "hot"
+        IDs are scattered across the vocabulary instead of being clustered at
+        small numeric values.  This decouples ID popularity from ID encoding,
+        which is closer to real-world scenarios and prevents the downstream
+        ``ModuloPartitioner`` from skewing all hot IDs onto a single shard.
+        """
+        ranks = np.arange(1, vocab_size + 1, dtype=np.float64)
+        p = 1.0 / (ranks**alpha)
+        p /= p.sum()
+        perm = rng.permutation(vocab_size)
+        out = np.empty_like(p)
+        out[perm] = p
+        return out
 
     @operator(
         "read",
+        async_policy=AsyncPolicy.pipelined(depth=4),
         output_sharding={
             "active": {"type": "static", "axis": ["worker"]},
             "passive": {"type": "static", "axis": ["worker"]},
             "labels": {"type": "static", "axis": ["worker"]},
         },
     )
-    def read(self) -> UserBatch | None:
-        static_args = getattr(self, "static_args", {})
-        batch_size = static_args.get("batch_size", 24)
+    async def read(self) -> UserBatch | None:
+        if self.ctx is None:
+            raise RuntimeError(
+                "RecommendationReader.read requires an active OperatorContext"
+            )
+        work = self.ctx.source_work_items
+        if not work:
+            raise RuntimeError("RecommendationReader requires acquired source work")
+        samples = [
+            self._data_source[index % len(self._data_source)]
+            for item in work
+            for index in range(item.logical_start, item.logical_end)
+        ]
 
-        samples = []
-        for _ in range(batch_size):
-            item = self.next_item()
-            if item is None:
-                break
-            samples.append(item)
+        # -- Invariants on per-sample structure --
+        required_keys = (
+            "user_id",
+            "user_age_level",
+            "request_hour",
+            "hist_click_item_seq",
+            "hist_seq_length",
+            "target_target_id",
+            "target_item_category",
+            "target_item_stats",
+            "is_click",
+        )
+        for k in required_keys:
+            assert k in samples[0], f"[Reader] sample missing required key '{k}'"
 
-        if not samples:
-            return None
-
-        self._completed_steps += 1
-
-        logical_world = self.world_size if hasattr(self, "world_size") else 1
-        global_batch_size = batch_size * logical_world
-        g_shape = (global_batch_size,)
-        origins = ContinuousIndex.chunk(0, global_batch_size)
+        # Determine feature dimensions from first sample
+        stats_dim = len(samples[0]["target_item_stats"])
+        assert stats_dim > 0, (
+            f"[Reader] target_item_stats must be non-empty, got dim={stats_dim}"
+        )
+        # All samples must agree on stats dimensionality.
+        for i, s in enumerate(samples):
+            assert len(s["target_item_stats"]) == stats_dim, (
+                f"[Reader] sample {i} target_item_stats dim "
+                f"{len(s['target_item_stats'])} != expected {stats_dim}"
+            )
+            assert s["is_click"][0] in (0, 1), (
+                f"[Reader] sample {i} is_click must be 0 or 1, got {s['is_click'][0]}"
+            )
 
         active = ActiveFeatures(
-            user_id=TransportTensor.from_lists(
-                [s["user_id"] for s in samples],
-                dtype=jnp.int64,
-                global_shape=g_shape,
-                origin_indices=origins,
+            user_id=self.create_row_sparse_tensor(
+                [[s["user_id"][0]] for s in samples], width=1, dtype=np.int32
             ),
-            user_age_level=TransportTensor.from_lists(
-                [s["user_age_level"] for s in samples],
-                dtype=jnp.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+            user_age_level=self.create_tensor(
+                [s["user_age_level"][0] for s in samples],
+                dtype=np.int32,
+                uniform_dense_partition=True,
             ),
-            request_hour=TransportTensor.from_lists(
-                [s["request_hour"] for s in samples],
-                dtype=jnp.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+            request_hour=self.create_tensor(
+                [s["request_hour"][0] for s in samples],
+                dtype=np.int32,
+                uniform_dense_partition=True,
             ),
-            hist_click_item_seq=TransportTensor.from_lists(
+            hist_click_item_seq=self.create_row_sparse_tensor(
                 [s["hist_click_item_seq"] for s in samples],
-                dtype=jnp.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                width=self.static_args.get("max_seq_len", 5),
+                dtype=np.int32,
             ),
-            hist_seq_length=TransportTensor.from_lists(
-                [[s["hist_seq_length"]] for s in samples],
-                dtype=jnp.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+            hist_seq_length=self.create_tensor(
+                [s["hist_seq_length"][0] for s in samples],
+                dtype=np.int32,
+                uniform_dense_partition=True,
             ),
         )
 
         passive = PassiveFeatures(
-            target_item_id=TransportTensor.from_lists(
-                [s["target_item_id"] for s in samples],
-                dtype=jnp.int64,
-                global_shape=g_shape,
-                origin_indices=origins,
+            target_target_id=self.create_row_sparse_tensor(
+                [
+                    [
+                        s["target_target_id"][0],
+                        *s["hist_click_item_seq"],
+                    ]
+                    for s in samples
+                ],
+                width=self.static_args.get("max_seq_len", 5) + 1,
+                dtype=np.int32,
             ),
-            target_item_category=TransportTensor.from_lists(
-                [s["target_item_category"] for s in samples],
-                dtype=jnp.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+            target_item_category=self.create_tensor(
+                [s["target_item_category"][0] for s in samples],
+                dtype=np.int32,
+                uniform_dense_partition=True,
             ),
-            target_item_stats=TransportTensor.from_lists(
+            target_item_stats=self.create_tensor(
                 [s["target_item_stats"] for s in samples],
-                dtype=jnp.float32,
-                global_shape=g_shape,
-                origin_indices=origins,
+                dtype=np.float32,
+                uniform_dense_partition=True,
             ),
         )
 
         labels = LabelFeatures(
-            is_click=TransportTensor.from_lists(
-                [s["is_click"] for s in samples],
-                dtype=jnp.int32,
-                global_shape=g_shape,
-                origin_indices=origins,
+            is_click=self.create_tensor(
+                [s["is_click"][0] for s in samples],
+                dtype=np.int32,
+                uniform_dense_partition=True,
             )
         )
 
         return UserBatch(active=active, passive=passive, labels=labels)
-
-    def save_state(self, ckpt_dir: str) -> dict[str, Any]:
-        shard_count = getattr(self, "world_size", 1)
-        static_args = getattr(self, "static_args", {})
-        path = pathlib.Path(ckpt_dir) / f"reader_rank_{self.rank}_of_{shard_count}.json"
-        with open(path, "w") as f:
-            json.dump(
-                {
-                    "completed_steps": getattr(self, "_completed_steps", 0),
-                    "batch_size": static_args.get("batch_size", 24),
-                },
-                f,
-            )
-        return {}
-
-    def restore_state(self, state: dict[str, Any], ckpt_dir: str) -> None:
-        # completed_steps is identical across all ranks, so take the max.
-        # Pair it with the saved batch_size to get the exact items-per-rank to skip,
-        # regardless of the new world_size or batch_size.
-        completed_steps = 0
-        saved_batch_size = None
-        for p in sorted(pathlib.Path(ckpt_dir).glob("reader_rank_*_of_*.json")):
-            with open(p) as f:
-                data = json.load(f)
-            steps = data.get("completed_steps", 0)
-            if steps > completed_steps:
-                completed_steps = steps
-                saved_batch_size = data.get("batch_size")
-
-        new_shard_count = getattr(self, "world_size", 1)
-        static_args = getattr(self, "static_args", {})
-        if saved_batch_size is None:
-            saved_batch_size = static_args.get("batch_size", 24)
-
-        per_rank_skip = completed_steps * saved_batch_size
-
-        self._create_data_loader(static_args, getattr(self, "rank", 0), new_shard_count)
-        for _ in range(per_rank_skip):
-            self.next_item()
-
-        self._completed_steps = completed_steps

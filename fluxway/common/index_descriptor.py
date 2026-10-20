@@ -2,10 +2,9 @@ from builtins import slice as python_slice
 from dataclasses import dataclass
 import enum
 from typing import Any, Optional
-from collections.abc import Callable
 
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 
 
 class IndexMorphology(enum.Enum):
@@ -50,7 +49,7 @@ class IndexDescriptor:
             all_merged = True
 
             for next_d in descriptors[1:]:
-                merged_candidate = merged._try_merge(next_d)
+                merged_candidate = merged._try_merge(next_d)  # type: ignore
                 if merged_candidate is None:
                     all_merged = False
                     break
@@ -104,8 +103,8 @@ class IndexDescriptor:
 
     def __eq__(self, other):
         if isinstance(other, IndexDescriptor):
-            return bool(get_backend().equal(self.materialize(), other.materialize()))
-        return bool(get_backend().equal(self.materialize(), other))
+            return get_backend().equal(self.materialize(), other.materialize())
+        return get_backend().equal(self.materialize(), other)
 
 
 class IndexPattern(enum.Enum):
@@ -130,20 +129,20 @@ class ContinuousIndex(IndexDescriptor):
     def to_compact_params(self) -> list[int]:
         """Calculate sharded parameters for compact transport."""
         return [
-            int(self.start),
-            int(self.step),
-            int(self.count),
-            int(self.pattern.value),
+            self.start,
+            self.step,
+            self.count,
+            self.pattern.value,
         ]
 
     @staticmethod
     def from_compact_params(p: list[int]) -> "ContinuousIndex":
         """Reconstruct from parameters."""
         return ContinuousIndex(
-            pattern=IndexPattern(int(p[3])),
-            start=int(p[0]),
-            step=int(p[1]),
-            count=int(p[2]),
+            pattern=IndexPattern(p[3]),
+            start=p[0],
+            step=p[1],
+            count=p[2],
         )
 
     @property
@@ -181,7 +180,7 @@ class ContinuousIndex(IndexDescriptor):
         backend = get_backend()
         if self.pattern == IndexPattern.CONTIGUOUS:
             return backend.arange(
-                self.start, self.start + self.count, dtype=backend.int32()
+                self.start, self.start + self.count, dtype=backend.int32(), device="cpu"
             )
         elif self.pattern == IndexPattern.STRIDED:
             return backend.arange(
@@ -189,6 +188,7 @@ class ContinuousIndex(IndexDescriptor):
                 self.start + self.step * self.count,
                 self.step,
                 dtype=backend.int32(),
+                device="cpu",
             )
         raise ValueError(f"Cannot materialize pattern={self.pattern}")
 
@@ -227,8 +227,8 @@ class ContinuousIndex(IndexDescriptor):
                 and self.count == other.count
             )
         if isinstance(other, IndexDescriptor):
-            return bool(get_backend().equal(self.materialize(), other.materialize()))
-        return bool(get_backend().equal(self.materialize(), other))
+            return get_backend().equal(self.materialize(), other.materialize())
+        return get_backend().equal(self.materialize(), other)
 
     def __hash__(self):
         return hash((self.pattern, self.start, self.step, self.count))
@@ -297,39 +297,20 @@ class ExplicitIndex(IndexDescriptor):
             return ExplicitIndex(self.indices[s:e])
 
         # Tensor path: Avoid JAX tracer concretization errors
-        idx_range = backend.arange(start, end, dtype=backend.int32())
+        idx_range = backend.arange(start, end, dtype=backend.int32(), device="cpu")
         sliced_indices = backend.take(self.indices, idx_range)
         return ExplicitIndex(sliced_indices)
 
     def __eq__(self, other):
         bk = get_backend()
         if isinstance(other, ExplicitIndex):
-            return bool(bk.equal(self.indices, other.indices))
+            return bk.equal(self.indices, other.indices)
         if isinstance(other, IndexDescriptor):
-            return bool(bk.equal(self.indices, other.materialize()))
-        return bool(bk.equal(self.indices, other))
+            return bk.equal(self.indices, other.materialize())
+        return bk.equal(self.indices, other)
 
     def __hash__(self):
         return id(self)
-
-
-@dataclass(frozen=True)
-class FunctionalIndex(IndexDescriptor):
-    """IndexDescriptor describing a dynamic functional mapping for hashing (formerly hash_fn dict)."""
-
-    hash_fn: Callable
-
-    @property
-    def morphology(self) -> IndexMorphology:
-        return IndexMorphology.INDEXED
-
-    def materialize(self) -> Any:
-        raise NotImplementedError(
-            "FunctionalIndex cannot be materialized without input."
-        )
-
-    def slice(self, start: Any, end: Any) -> "FunctionalIndex":
-        raise NotImplementedError("FunctionalIndex cannot be sliced directly.")
 
 
 try:
@@ -340,11 +321,13 @@ except ImportError:
     _JAX_AVAILABLE = False
 
 if _JAX_AVAILABLE:
+    import jax
+
     jax.tree_util.register_pytree_node(
         ContinuousIndex,
-        lambda x: ((x.start, x.step, x.count), {"pattern": x.pattern}),
+        lambda x: ((x.start, x.step, x.count), x.pattern),
         lambda aux, children: ContinuousIndex(
-            pattern=aux["pattern"],
+            pattern=aux,
             start=children[0],
             step=children[1],
             count=children[2],

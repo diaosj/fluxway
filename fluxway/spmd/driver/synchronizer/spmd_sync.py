@@ -11,10 +11,21 @@ Responsibilities:
 import logging
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
+from fluxway.common.types import (
+    DrainBoundary,
+    DrainEvent,
+    DrainEventKind,
+    reduce_drain_boundary,
+)
+
 logger = logging.getLogger(__name__)
+
+
+OpRunnableEpoch = int
+OpRunnableControlCallback = Callable[[int, str, OpRunnableEpoch], None]
 
 
 class SyncPolicy(ABC):
@@ -58,6 +69,27 @@ class MaxSkewSyncPolicy(SyncPolicy):
         return skew_diff > self.max_skew and worker_step >= max_step
 
 
+class OpRunnableEpochIssuer:
+    __slots__ = ("_epochs_by_rank",)
+
+    def __init__(self, num_workers: int):
+        self._epochs_by_rank: dict[int, dict[str, OpRunnableEpoch]] = {
+            rank: {} for rank in range(num_workers)
+        }
+
+    def issue(self, rank: int, op_name: str) -> OpRunnableEpoch:
+        epochs = self._epochs_by_rank[rank]
+        if op_name in epochs:
+            epoch = epochs[op_name] + 1
+        else:
+            epoch = 0
+        epochs[op_name] = epoch
+        return epoch
+
+    def clear_worker(self, rank: int) -> None:
+        self._epochs_by_rank[rank].clear()
+
+
 class SPMDSynchronizer:
     """
     Manages worker step synchronization within a single SPMD.
@@ -81,6 +113,12 @@ class SPMDSynchronizer:
         # SPMD-level completed count (minimum count reached by all workers)
         self._spmd_completed_count: dict[str, int] = {}
 
+        # Durable/terminal-facing logical view.  The execution counters above
+        # are raw cursors and must never be rewritten when a terminal boundary
+        # arrives; this derived view is the only value exposed to checkpoint
+        # and controller callbacks after a terminal cut is observed.
+        self._committed_spmd_count: dict[str, int] = {}
+
         # Op lock states (controller-requested)
         self._op_locked: dict[str, bool] = {}
 
@@ -88,6 +126,7 @@ class SPMDSynchronizer:
         self._worker_op_locked: dict[int, dict[str, bool]] = {
             rank: {} for rank in range(num_workers)
         }
+        self._op_runnable_epoch_issuer = OpRunnableEpochIssuer(num_workers)
 
         # Global flow control: op_name -> max allowed step (watermark from Controller)
         self._allowed_steps: dict[str, int] = {}
@@ -95,15 +134,16 @@ class SPMDSynchronizer:
         self._lock = threading.Lock()
 
         self._on_spmd_op_completed: Callable[[str, str, int], None] | None = None
-        self._block_worker_op: Callable[[int, str], None] | None = None
-        self._unblock_worker_op: Callable[[int, str], None] | None = None
+        self._block_worker_op: OpRunnableControlCallback | None = None
+        self._unblock_worker_op: OpRunnableControlCallback | None = None
 
         self._expected_ops: set = set()
 
         # Drain parameters
-        self._drain_target_count: int | None = None
+        self._drain_step_count: int | None = None
         self._drain_on_drained: Callable[[], None] | None = None
         self._drain_acked_ops: set = set()  # ops where all workers reached ceiling
+        self._drain_boundary = DrainBoundary()
 
     def load_spmd_state(self, spmd_state: dict[str, Any]) -> None:
         """Load step counts for all workers uniformly from SPMD-level logical state.
@@ -113,24 +153,42 @@ class SPMDSynchronizer:
         counts to every rank slot, ensuring no rank starts at step 0 after restore.
         """
         with self._lock:
-            for op_name, count in spmd_state.get("completed_step_count", {}).items():
+            boundary_state = spmd_state.get("drain_boundary")
+            if not isinstance(boundary_state, dict):
+                raise TypeError("SPMD checkpoint state requires drain_boundary")
+            restored_boundary = DrainBoundary.from_mapping(boundary_state)
+            committed_cut = restored_boundary.committed_cut
+            if committed_cut is None or committed_cut < 0:
+                raise ValueError(
+                    "SPMD checkpoint drain_boundary requires committed_cut"
+                )
+            self._drain_boundary = DrainBoundary.from_committed_cut(committed_cut)
+            for worker_counts in self._worker_completed_count.values():
+                worker_counts.clear()
+            self._spmd_completed_count.clear()
+            self._committed_spmd_count.clear()
+            for op_name in self._expected_ops:
+                count = committed_cut
                 for rank in range(self.num_workers):
                     self._worker_completed_count[rank][op_name] = count
                 self._spmd_completed_count[op_name] = count
+                self._committed_spmd_count[op_name] = self._effective_count_internal(
+                    count
+                )
                 if (
-                    op_name not in self._allowed_steps
-                    or self._allowed_steps[op_name] < count
+                    op_name in self._allowed_steps
+                    and self._allowed_steps[op_name] < count
                 ):
                     self._allowed_steps[op_name] = count
 
             logger.debug(
                 "SPMD %s loaded spmd_state steps=%s for %d workers",
                 self.spmd_id,
-                spmd_state.get("completed_step_count", {}),
+                committed_cut,
                 self.num_workers,
             )
 
-    def register_expected_ops(self, ops: list[str]) -> None:
+    def register_expected_ops(self, ops: Iterable[str]) -> None:
         """Register statically known operators to properly anchor drain ceilings.
         Can be called additively to prepare for Eager Mode dynamic scheduling.
         """
@@ -143,29 +201,34 @@ class SPMDSynchronizer:
             self._expected_ops.add(op)
 
     def _active_ops_for_drain(self) -> set:
-        """Drain denominator: expected ops that have actually been executed.
+        """Drain denominator for checkpoint-safe SPMD progress.
 
-        An op present in ``_expected_ops`` but never reported (e.g. skipped by
-        Dispatcher for every rank, or a conditional Eager op that never ran on
-        this SPMD) must not block drain completion.  Only ops that have reached
-        ``_spmd_completed_count`` -- meaning at least one worker completed at
-        least one step -- are included.
+        Every operator registered in ``_expected_ops`` is part of the SPMD
+        state machine and must reach the drain boundary before checkpointing.
+        Otherwise a fast upstream op can trigger a snapshot while a downstream
+        op is one step behind, producing manifests such as
+        ``lookup=2, update=1`` that cannot resume in a step-ordered worker.
 
+        Optional or conditional work must be modeled explicitly by graph
+        construction instead of being inferred from missing completion reports.
         Must be called while holding ``_lock``.
         """
         if self._expected_ops:
-            return self._expected_ops & set(self._spmd_completed_count.keys())
+            return set(self._expected_ops)
         return set(self._spmd_completed_count.keys())
 
     def set_callbacks(
         self,
         on_spmd_op_completed: Callable[[str, str, int], None] | None = None,
-        block_worker_op: Callable[[int, str], None] | None = None,
-        unblock_worker_op: Callable[[int, str], None] | None = None,
+        block_worker_op: OpRunnableControlCallback | None = None,
+        unblock_worker_op: OpRunnableControlCallback | None = None,
     ) -> None:
         self._on_spmd_op_completed = on_spmd_op_completed
         self._block_worker_op = block_worker_op
         self._unblock_worker_op = unblock_worker_op
+
+    def _issue_op_runnable_epoch(self, rank: int, op_name: str) -> OpRunnableEpoch:
+        return self._op_runnable_epoch_issuer.issue(rank, op_name)
 
     def report_worker_op_completed(
         self, rank: int, op_name: str, completed_count: int
@@ -191,19 +254,33 @@ class SPMDSynchronizer:
 
             if self._all_workers_reached_count_internal(op_name, completed_count):
                 old_spmd_count = self._spmd_completed_count.get(op_name, 0)
-                self._spmd_completed_count[op_name] = completed_count
+                self._spmd_completed_count[op_name] = max(
+                    old_spmd_count, completed_count
+                )
+                effective_count = reduce_drain_boundary(
+                    self._drain_boundary,
+                    DrainEvent(
+                        DrainEventKind.LATE_COMPLETION,
+                        self._spmd_completed_count[op_name],
+                    ),
+                ).clamped_completion
+                if effective_count is None:
+                    raise RuntimeError("late completion reducer returned no count")
+                old_committed_count = self._committed_spmd_count.get(op_name, 0)
+                self._committed_spmd_count[op_name] = effective_count
                 logger.debug(
                     f"SPMD {self.spmd_id} reached {op_name} total_count {completed_count}"
                 )
-                should_report = completed_count > old_spmd_count
+                should_report = effective_count > old_committed_count
+                completed_count = effective_count
 
             # Drain ACK: All workers have fully completed the requested number of steps.
-            # They are now idle at the START of step index == _drain_target_count.
+            # They are now idle at the START of step index == _drain_step_count.
             if (
-                self._drain_target_count is not None
+                self._drain_step_count is not None
                 and op_name not in self._drain_acked_ops
                 and self._all_workers_reached_count_internal(
-                    op_name, self._drain_target_count
+                    op_name, self._drain_step_count
                 )
             ):
                 self._drain_acked_ops.add(op_name)
@@ -221,6 +298,47 @@ class SPMDSynchronizer:
                 logger.error(f"Error reporting op completion: {e}")
 
         if drain_complete and callback:
+            callback()
+
+    @property
+    def drain_step_count(self) -> int | None:
+        with self._lock:
+            return self._drain_step_count
+
+    @property
+    def drain_boundary(self) -> DrainBoundary:
+        with self._lock:
+            return self._drain_boundary
+
+    def apply_boundary_event(self, event: DrainEvent) -> None:
+        """Apply one shared boundary event without changing execution cursors."""
+        callback = None
+        with self._lock:
+            transition = reduce_drain_boundary(self._drain_boundary, event)
+            self._drain_boundary = transition.boundary
+            if event.kind is not DrainEventKind.TERMINAL_OBSERVATION:
+                return
+            cut = self._drain_boundary.observed_cut
+            if cut is None:
+                raise RuntimeError("terminal reducer did not produce a cut")
+            for op_name, count in tuple(self._spmd_completed_count.items()):
+                self._committed_spmd_count[op_name] = min(count, cut)
+            for op_name in self._active_ops_for_drain():
+                if self._all_workers_reached_count_internal(op_name, cut):
+                    self._committed_spmd_count[op_name] = cut
+            if self._drain_step_count is not None:
+                known_ops = self._active_ops_for_drain()
+                self._drain_acked_ops = {
+                    op_name
+                    for op_name in known_ops
+                    if self._all_workers_reached_count_internal(
+                        op_name, self._drain_step_count
+                    )
+                }
+                if self._drain_acked_ops >= known_ops and known_ops:
+                    callback = self._drain_on_drained
+                    self._drain_on_drained = None
+        if callback:
             callback()
 
     def _check_worker_skew_internal(self, op_name: str) -> None:
@@ -260,16 +378,29 @@ class SPMDSynchronizer:
                         else ("global" if should_block_global else "controller")
                     )
                     logger.debug(
-                        f"Blocking rank {rank} {op_name} (count {worker_count}, reason={reason})"
+                        "Blocking rank %s %s (count=%s max=%s min=%s "
+                        "allowed_limit=%s reason=%s spmd_id=%s)",
+                        rank,
+                        op_name,
+                        worker_count,
+                        max_count,
+                        min_count,
+                        allowed_limit,
+                        reason,
+                        self.spmd_id,
                     )
                     if self._block_worker_op:
-                        self._block_worker_op(rank, op_name)
+                        self._block_worker_op(
+                            rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                        )
             else:
                 if self._worker_op_locked[rank].get(op_name, False):
                     self._worker_op_locked[rank][op_name] = False
                     logger.debug(f"Unblocking rank {rank} {op_name}")
                     if self._unblock_worker_op:
-                        self._unblock_worker_op(rank, op_name)
+                        self._unblock_worker_op(
+                            rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                        )
 
     def _all_workers_reached_count_internal(self, op_name: str, count: int) -> bool:
         """Check if all workers have reached the given count. Must hold lock."""
@@ -277,6 +408,10 @@ class SPMDSynchronizer:
             self._worker_completed_count[r].get(op_name, 0) >= count
             for r in range(self.num_workers)
         )
+
+    def _effective_count_internal(self, count: int) -> int:
+        terminal_cut = self._drain_boundary.observed_cut
+        return count if terminal_cut is None else min(count, terminal_cut)
 
     # =========================================================================
     # Drain-to-Step Control
@@ -286,30 +421,30 @@ class SPMDSynchronizer:
     def is_draining(self) -> bool:
         """True if a drain ceiling is active."""
         with self._lock:
-            return self._drain_target_count is not None
+            return self._drain_step_count is not None
 
     def drain_to_step_count(
-        self, target_count: int, on_drained: Callable[[], None]
+        self, step_count: int, on_drained: Callable[[], None]
     ) -> None:
         """
-        Request the SPMD to drain until every worker has COMPLETED exactly 'target_count' steps.
+        Request the SPMD to drain until every worker has COMPLETED exactly 'step_count' steps.
         """
         drain_complete = False
         with self._lock:
-            if self._drain_target_count is not None:
+            if self._drain_step_count is not None:
                 raise RuntimeError(
                     f"SPMD {self.spmd_id} is already draining to count "
-                    f"{self._drain_target_count}; call clear_drain() first"
+                    f"{self._drain_step_count}; call clear_drain() first"
                 )
-            self._drain_target_count = target_count
+            self._drain_step_count = step_count
             self._drain_on_drained = on_drained
             self._drain_acked_ops = set()
-            logger.debug(f"Drain target set to {target_count} spmd_id={self.spmd_id}")
+            logger.debug(f"Drain target set to {step_count} spmd_id={self.spmd_id}")
 
             # Instantly check if we are ALREADY drained
             known_ops = self._active_ops_for_drain()
             for op_name in known_ops:
-                if self._all_workers_reached_count_internal(op_name, target_count):
+                if self._all_workers_reached_count_internal(op_name, step_count):
                     self._drain_acked_ops.add(op_name)
 
             # Require at least one op to have been registered before declaring
@@ -324,14 +459,48 @@ class SPMDSynchronizer:
         if drain_complete:
             on_drained()
 
+    def shorten_drain_to_step_count(
+        self,
+        step_count: int,
+        on_drained: Callable[[], None] | None = None,
+    ) -> None:
+        callback = None
+        with self._lock:
+            current = self._drain_step_count
+            if current is None:
+                raise RuntimeError("cannot shorten an inactive SPMD drain")
+            if step_count > current:
+                raise ValueError(
+                    f"drain target can only shrink: current={current} "
+                    f"requested={step_count}"
+                )
+            self._drain_step_count = step_count
+            if on_drained is not None:
+                self._drain_on_drained = on_drained
+            known_ops = self._active_ops_for_drain()
+            self._drain_acked_ops = {
+                op_name
+                for op_name in known_ops
+                if self._all_workers_reached_count_internal(op_name, step_count)
+            }
+            if self._drain_acked_ops >= known_ops and known_ops:
+                callback = self._drain_on_drained
+                self._drain_on_drained = None
+        if callback is not None:
+            callback()
+
     def clear_drain(self) -> None:
         """Remove the drain target and unblock workers so training resumes."""
         with self._lock:
-            if self._drain_target_count is None:
-                return
-            self._drain_target_count = None
+            self._drain_step_count = None
             self._drain_on_drained = None
             self._drain_acked_ops = set()
+            ops = set(self._expected_ops)
+            ops.update(self._spmd_completed_count)
+            for worker_steps in self._worker_completed_count.values():
+                ops.update(worker_steps)
+            for op_name in sorted(ops):
+                self._check_worker_skew_internal(op_name)
             logger.debug(f"Drain cleared spmd_id={self.spmd_id}")
 
     # =========================================================================
@@ -345,7 +514,9 @@ class SPMDSynchronizer:
         if self._block_worker_op:
             for rank in range(self.num_workers):
                 try:
-                    self._block_worker_op(rank, op_name)
+                    self._block_worker_op(
+                        rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                    )
                 except Exception as e:
                     logger.error(f"Error blocking worker {rank} op: {e}")
 
@@ -361,7 +532,9 @@ class SPMDSynchronizer:
         if self._unblock_worker_op:
             for rank in workers_to_unblock:
                 try:
-                    self._unblock_worker_op(rank, op_name)
+                    self._unblock_worker_op(
+                        rank, op_name, self._issue_op_runnable_epoch(rank, op_name)
+                    )
                 except Exception as e:
                     logger.error(f"Error unblocking worker {rank} op: {e}")
 
@@ -397,11 +570,11 @@ class SPMDSynchronizer:
 
     def get_spmd_steps(self) -> dict[str, int]:
         with self._lock:
-            return dict(self._spmd_completed_count)
+            return dict(self._committed_spmd_count)
 
     def get_spmd_step(self, op_name: str) -> int:
         with self._lock:
-            return self._spmd_completed_count.get(op_name, 0)
+            return self._committed_spmd_count.get(op_name, 0)
 
     def get_worker_step(self, rank: int, op_name: str) -> int:
         with self._lock:
@@ -426,5 +599,7 @@ class SPMDSynchronizer:
             for rank in range(self.num_workers):
                 self._worker_completed_count[rank].clear()
                 self._worker_op_locked[rank].clear()
+                self._op_runnable_epoch_issuer.clear_worker(rank)
             self._spmd_completed_count.clear()
+            self._committed_spmd_count.clear()
             self._op_locked.clear()

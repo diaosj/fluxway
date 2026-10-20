@@ -11,11 +11,21 @@ from fluxway.common.types.sharding import (
     PartitionStrategy,
     ChunkPartition,
     CyclicPartition,
-    IndexedPartition,
+    FunctionPartition,
     GreedyPartition,
+    # RoutingDomain abstraction (L2 contract)
+    RoutingDomain,
+    RoutingAxis,
+    ReplicaSpec,
+    # Strict-typed indices specification (L1 ↔ L2 contract)
+    IndicesSpec,
+    LiteralIndices,
+    RangeIndices,
+    IdentityIndices,
 )
 from .planner import TransportPlanner, TransportPlan
-from .communication import DataDistributor, TransportReceiver
+from .communication import AsyncDataDistributor
+from .routing import TransportRoutingMode
 
 __all__ = [
     "TransportTensor",
@@ -24,12 +34,21 @@ __all__ = [
     "PartitionStrategy",
     "ChunkPartition",
     "CyclicPartition",
-    "IndexedPartition",
+    "FunctionPartition",
     "GreedyPartition",
+    # RoutingDomain abstraction
+    "RoutingDomain",
+    "RoutingAxis",
+    "ReplicaSpec",
+    # IndicesSpec hierarchy
+    "IndicesSpec",
+    "LiteralIndices",
+    "RangeIndices",
+    "IdentityIndices",
     "TransportPlanner",
     "TransportPlan",
-    "DataDistributor",
-    "TransportReceiver",
+    "AsyncDataDistributor",
+    "TransportRoutingMode",
 ]
 
 ensure_logging_configured()

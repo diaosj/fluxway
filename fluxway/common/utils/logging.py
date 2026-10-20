@@ -29,7 +29,7 @@ class FluxwayLogger(logging.Logger):
 
     def heartbeat(self, msg: object, *args: object, **kwargs: object) -> None:
         if self.isEnabledFor(HEARTBEAT):
-            self._log(HEARTBEAT, msg, args, **kwargs)
+            self._log(HEARTBEAT, msg, args, **kwargs)  # type: ignore
 
 
 logging.setLoggerClass(FluxwayLogger)

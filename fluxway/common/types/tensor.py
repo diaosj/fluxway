@@ -1,13 +1,115 @@
-from typing import Any, Optional
+import logging
+from enum import Enum, auto
+from typing import Any, Optional, Protocol
 
 import numpy as np
 
-from fluxway.common.backend import get_backend
+from fluxway.common.allocation import (
+    AllocationDescriptor,
+    AllocationRelation,
+)
+from fluxway.common.coherence import (
+    CoherenceStateTransitionError,
+    TensorAccessIntent,
+    CoherenceInstance,
+    PhysicalMutability,
+)
+
+from fluxway.common.tensor_backend import force_writable, get_backend
 from fluxway.common.index_descriptor import (
     ContinuousIndex,
     IndexDescriptor,
     ExplicitIndex,
 )
+from fluxway.common.tensor_components import (
+    TensorLayout,
+    TensorLineage,
+    TensorPayload,
+    TensorRouting,
+    normalize_index_descriptor,
+    routing_entity_count,
+    validate_dense_global_shape,
+    validate_metadata_lengths,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class TensorRuntimeState(Enum):
+    VALID = auto()
+    INVALIDATED = auto()
+    RELEASED = auto()
+
+
+class _ConsumerLeaseOwner(Protocol):
+    def acquire_consumer_lease(
+        self, instances: tuple[CoherenceInstance, ...]
+    ) -> Any: ...
+
+    def reserve_consumer_lease(
+        self, instances: tuple[CoherenceInstance, ...]
+    ) -> Any: ...
+
+
+class _ConsumerLeaseReservationRef(Protocol):
+    def claim(self) -> Any: ...
+
+    def release_for_cleanup(self) -> None: ...
+
+
+class TensorConsumerLease:
+    __slots__ = ("_lease", "_tensor", "_released")
+
+    def __init__(self, tensor: "TransportTensor", lease: Any) -> None:
+        self._tensor = tensor
+        self._lease = lease
+        self._released = False
+
+    def release(self) -> None:
+        if self._released:
+            raise CoherenceStateTransitionError(
+                "tensor consumer lease was already released."
+            )
+        self._released = True
+        self._lease.release()
+        self._tensor._release_consumer_lease()
+
+    def cancel(self) -> None:
+        self.release()
+
+
+class _ReleasedPayload:
+    __slots__ = ()
+
+
+_RELEASED_PAYLOAD = _ReleasedPayload()
+
+
+class _LocalConsumerLease:
+    __slots__ = ()
+
+    def release(self) -> None:
+        return None
+
+    def cancel(self) -> None:
+        self.release()
+
+
+def runtime_allocation_descriptor(value: Any) -> AllocationDescriptor:
+    if isinstance(value, TransportTensor):
+        return value._runtime_allocation_descriptor()
+    return get_backend().allocation_descriptor(value)
+
+
+def runtime_allocation_relation(left: Any, right: Any) -> AllocationRelation:
+    left_value = left._payload.values if isinstance(left, TransportTensor) else left
+    right_value = right._payload.values if isinstance(right, TransportTensor) else right
+    if left_value is right_value:
+        return AllocationRelation.EXACT
+    return runtime_allocation_descriptor(left).identity.relation(
+        runtime_allocation_descriptor(right).identity
+    )
+
 
 # ============================================================
 # TransportTensor — Unified tensor wrapper
@@ -27,6 +129,17 @@ class SymmetryReceipt:
             world_size: Total number of ranks in the source mesh.
             sender_rank_tags: Tensor or int containing target worker ranks.
         """
+        if type(world_size) is not int or world_size <= 0:
+            raise ValueError(
+                f"SymmetryReceipt.world_size must be a positive int, got {world_size!r}."
+            )
+        if isinstance(sender_rank_tags, int | np.integer) and not (
+            0 <= int(sender_rank_tags) < world_size
+        ):
+            raise ValueError(
+                "SymmetryReceipt scalar rank is outside its rank domain: "
+                f"rank={int(sender_rank_tags)} world_size={world_size}."
+            )
         self._world_size = world_size
         self._sender_rank_tags = sender_rank_tags
 
@@ -39,7 +152,23 @@ class SymmetryReceipt:
         return self._sender_rank_tags
 
     def is_scalar(self) -> bool:
-        return isinstance(self._sender_rank_tags, int | np.integer)
+        if isinstance(self._sender_rank_tags, int | np.integer):
+            return True
+        return getattr(self._sender_rank_tags, "shape", None) == ()
+
+    def validate_entity_count(self, count: int) -> None:
+        if self.is_scalar():
+            return
+        shape = get_backend().shape(self._sender_rank_tags)
+        if len(shape) != 1:
+            raise ValueError(
+                f"SymmetryReceipt rank tags must be 1D, got shape={shape}."
+            )
+        if shape[0] != count:
+            raise ValueError(
+                f"SymmetryReceipt receipt length {shape[0]} does not match "
+                f"tensor routing entity count {count}."
+            )
 
     def __getitem__(self, key: Any) -> "SymmetryReceipt":
         """Slice or gather symmetry metadata."""
@@ -54,6 +183,7 @@ class SymmetryReceipt:
             return backend.full(
                 (length,), int(self._sender_rank_tags), dtype=backend.int32()
             )
+        self.validate_entity_count(length)
         return self._sender_rank_tags
 
     @classmethod
@@ -63,6 +193,10 @@ class SymmetryReceipt:
         """Concatenate multiple receipts into one."""
         if not receipts:
             return None
+        if len(receipts) != len(lengths):
+            raise ValueError(
+                f"Receipt count {len(receipts)} does not match length count {len(lengths)}."
+            )
 
         # Filter out None values and check for consistency
         valid_receipts = [r for r in receipts if r is not None]
@@ -74,6 +208,15 @@ class SymmetryReceipt:
                 f"Inconsistent provenance: Expected {len(receipts)} receipts, "
                 f"but found {len(valid_receipts)}. All shards must carry receipts."
             )
+        rank_domains = {receipt.world_size for receipt in valid_receipts}
+        if len(rank_domains) != 1:
+            raise ValueError(
+                f"Cannot concatenate receipts from different rank domains: "
+                f"{sorted(rank_domains)}."
+            )
+        if len(valid_receipts) == 1:
+            valid_receipts[0].validate_entity_count(lengths[0])
+            return valid_receipts[0]
 
         world_size = valid_receipts[0].world_size
 
@@ -116,71 +259,67 @@ class TransportTensor:
     def __init__(
         self,
         flat_values: Any,
-        nested_splits: list[np.ndarray] | None = None,  # type: ignore
-        origin_indices: IndexDescriptor | None = None,
-        routing_indices: IndexDescriptor | None = None,
+        nested_splits: list[Any] | None = None,
+        origin_indices: Any | None = None,
+        routing_indices: Any | None = None,
         global_shape: tuple[int, ...] | None = None,
         receipt: SymmetryReceipt | None = None,
+        routing_axes: tuple[int, ...] = (0,),
+        source_step: int | None = None,
     ):
-        self._flat_values = flat_values
-        self._nested_splits = nested_splits if nested_splits is not None else []
-        self._global_shape = global_shape
+        self._routing_axes: tuple[int, ...] = tuple(a for a in routing_axes)
+        if len(self._routing_axes) != len(set(self._routing_axes)):
+            raise ValueError(f"routing_axes must be unique, got {self._routing_axes}")
+        if self._routing_axes != (0,):
+            logger.warning(
+                "TransportTensor.routing_axes=%s (non-default). "
+                "Apply path requires non-leading binding support.",
+                self._routing_axes,
+            )
 
-        self._origin_indices: IndexDescriptor | None
-        if origin_indices is not None:
-            if isinstance(origin_indices, IndexDescriptor):
-                self._origin_indices = origin_indices
-            else:
-                self._origin_indices = ExplicitIndex(origin_indices)
-        else:
-            self._origin_indices = None
+        self._payload = TensorPayload.create(flat_values)
+        self._layout = TensorLayout.create(
+            nested_splits, global_shape, self._routing_axes
+        )
+        self._flat_values = self._payload.values
+        self._nested_splits = list(self._layout.nested_splits)
+        self._global_shape = self._layout.global_shape
+        backend = get_backend()
+        validate_dense_global_shape(self._payload, self._layout, backend)
 
-        self._receipt = receipt
+        data_len = routing_entity_count(self._payload, self._layout, backend)
+        origin_routing = TensorRouting.create(
+            normalize_index_descriptor(origin_indices, data_len)
+        )
+        self._lineage = TensorLineage(origin=origin_routing, receipt=receipt)
+
+        self._routing = TensorRouting.create(
+            normalize_index_descriptor(routing_indices, data_len)
+        )
         self._routing_indices_materialize_cache = None
         self._origin_indices_materialize_cache = None
-
-        self._routing_indices: IndexDescriptor | None
-        if isinstance(routing_indices, ContinuousIndex):
-            self._routing_indices = routing_indices
-        elif isinstance(routing_indices, slice):
-            backend = get_backend()
-            if not self._nested_splits:
-                if isinstance(self._flat_values, list):
-                    count = len(self._flat_values)
-                else:
-                    count = int(backend.shape(self._flat_values)[0])
-            else:
-                if isinstance(self._nested_splits[0], list):
-                    count = len(self._nested_splits[0]) - 1
-                else:
-                    count = int(backend.shape(self._nested_splits[0])[0]) - 1
-
-            start = routing_indices.start if routing_indices.start is not None else 0
-            stride = routing_indices.step if routing_indices.step is not None else 1
-            if routing_indices.stop is not None:
-                expected_count = (
-                    max(0, (routing_indices.stop - start + stride - 1) // stride)
-                    if stride > 0
-                    else max(
-                        0, (start - routing_indices.stop - stride - 1) // (-stride)
-                    )
-                )
-                if expected_count != count:
-                    raise ValueError(
-                        f"Slice implies count={expected_count}, but tensor has local count={count}"
-                    )
-
-            if stride == 1:
-                self._routing_indices = ContinuousIndex.chunk(start, count)
-            else:
-                self._routing_indices = ContinuousIndex.cyclic(start, stride, count)
-        elif routing_indices is not None:
-            if isinstance(routing_indices, IndexDescriptor):
-                self._routing_indices = routing_indices
-            else:
-                self._routing_indices = ExplicitIndex(routing_indices)
-        else:
-            self._routing_indices = None
+        self._routing_indices = self._routing.indices
+        self._origin_indices = self._lineage.origin.indices
+        self._receipt = self._lineage.receipt
+        self._source_step = None
+        self._runtime_access_intent = TensorAccessIntent.WRITABLE
+        self._runtime_state = TensorRuntimeState.VALID
+        self._consumer_lease_owner: _ConsumerLeaseOwner | None = None
+        self._consumer_lease_reservation_ref: _ConsumerLeaseReservationRef | None = None
+        self._active_consumer_leases = 0
+        self._release_requested = False
+        self._coherence_instances: tuple[CoherenceInstance, ...] = ()
+        self._allocation_descriptor: AllocationDescriptor | None = None
+        self.source_step = source_step
+        validate_metadata_lengths(
+            self._payload,
+            self._layout,
+            self._routing,
+            self._lineage,
+            backend,
+        )
+        if receipt is not None:
+            receipt.validate_entity_count(data_len)
 
     @classmethod
     def from_tensor(
@@ -190,6 +329,9 @@ class TransportTensor:
         origin_indices: Any | None = None,
         routing_indices: Any | None = None,
         receipt: SymmetryReceipt | None = None,
+        routing_axes: tuple[int, ...] = (0,),
+        logical_world_size: int | None = None,
+        is_uniform_dense_partition: bool = False,
     ) -> "TransportTensor":
         """Creates a dense TransportTensor directly from a multi-dimensional tensor.
 
@@ -201,13 +343,29 @@ class TransportTensor:
                      ContinuousIndex, or a python `slice` object for O(1) regular patterns.
             global_shape: Optional global shape of the full tensor.
             receipt: Optional symmetry receipt for provenance tracking.
+            routing_axes: Which axes of `tensor` are bound to the routing
+                domain. Default (0,) is correct for nearly all DP/MP/EP/SP/CP/TP
+                layouts. The planner stays 1-D regardless; routing_axes only
+                affects the apply (gather) step in the L1 distributor.
+            is_uniform_dense_partition: If True, auto-infers `global_shape` by multiplying
+                the leading dimension with `logical_world_size`. Must be False for ragged
+                or filtered data.
         """
-        if global_shape and origin_indices is None:
-            from functools import reduce
-
-            origin_indices = ContinuousIndex.chunk(
-                0, reduce(lambda x, y: x * y, global_shape)
-            )
+        # NOTE: We intentionally do NOT auto-fill origin_indices here.
+        # `origin_indices` is per-origin-rank state ("which global rows do I hold"),
+        # and the framework has no rank/partition context at construction time, so
+        # any auto-synthesized value would be a wrong guess (e.g. all ranks claiming
+        # start=0). The caller MUST set origin_indices explicitly when it is needed,
+        # otherwise leave it as None and let the receipt/transport layer take over.
+        backend = get_backend()
+        if (
+            global_shape is None
+            and logical_world_size is not None
+            and is_uniform_dense_partition
+        ):
+            p_shape = backend.shape(tensor)
+            if len(p_shape) > 0:
+                global_shape = (p_shape[0] * logical_world_size,) + tuple(p_shape[1:])
 
         return cls(
             flat_values=tensor,
@@ -216,6 +374,7 @@ class TransportTensor:
             routing_indices=routing_indices,
             global_shape=global_shape,
             receipt=receipt,
+            routing_axes=routing_axes,
         )
 
     @classmethod
@@ -227,6 +386,9 @@ class TransportTensor:
         origin_indices: Any | None = None,
         routing_indices: Any | None = None,
         receipt: SymmetryReceipt | None = None,
+        routing_axes: tuple[int, ...] = (0,),
+        logical_world_size: int | None = None,
+        is_uniform_dense_partition: bool = False,
     ) -> "TransportTensor":
         """Creates a TransportTensor from a nested list.
 
@@ -264,6 +426,15 @@ class TransportTensor:
             if dtype is None:
                 dtype = backend.float32()
             dense_tensor = backend.tensor(data, dtype=dtype)
+
+            if (
+                global_shape is None
+                and logical_world_size is not None
+                and is_uniform_dense_partition
+            ):
+                p_shape = backend.shape(dense_tensor)
+                global_shape = (p_shape[0] * logical_world_size,) + tuple(p_shape[1:])
+
             return cls(
                 dense_tensor,
                 [],
@@ -271,6 +442,7 @@ class TransportTensor:
                 origin_indices=origin_indices,
                 routing_indices=routing_indices,
                 receipt=receipt,
+                routing_axes=routing_axes,
             )
 
         # Ragged tensor: use iterative flattening
@@ -315,6 +487,7 @@ class TransportTensor:
             dtype = backend.float32()
 
         flat_tensor = backend.tensor(current_level_lists, dtype=dtype)
+
         return cls(
             flat_tensor,
             all_splits,
@@ -322,6 +495,43 @@ class TransportTensor:
             origin_indices=origin_indices,
             routing_indices=routing_indices,
             receipt=receipt,
+            routing_axes=routing_axes,
+        )
+
+    @classmethod
+    def from_row_partitioned(
+        cls,
+        rows: list[list[Any]],
+        *,
+        width: int,
+        dtype: Any | None = None,
+        global_shape: tuple[int, int] | None = None,
+        origin_indices: Any | None = None,
+        routing_axes: tuple[int, ...] = (0,),
+    ) -> "TransportTensor":
+        if width <= 0:
+            raise ValueError("row-partitioned width must be positive")
+        if not all(isinstance(row, list) for row in rows):
+            raise TypeError("row-partitioned rows must be lists")
+        if global_shape is None:
+            raise ValueError("row-partitioned tensors require explicit global_shape")
+        if tuple(global_shape)[1] != width:
+            raise ValueError("global_shape width does not match row-partitioned width")
+        backend = get_backend()
+        flat = [value for row in rows for value in row]
+        offsets = [0]
+        for row in rows:
+            offsets.append(offsets[-1] + len(row))
+        if dtype is None:
+            dtype = backend.float32()
+        flat_tensor = backend.tensor(flat, dtype=dtype)
+        splits = backend.tensor(offsets, dtype=backend.int32())
+        return cls(
+            flat_tensor,
+            [splits],
+            global_shape=global_shape,
+            origin_indices=origin_indices,
+            routing_axes=routing_axes,
         )
 
     def to_lists(self) -> list[Any]:
@@ -357,26 +567,239 @@ class TransportTensor:
 
     @property
     def flat_values(self) -> Any:
-        return self._flat_values
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"tensor access is {self._runtime_state.name.lower()}."
+            )
+        values = self._payload.values
+        if self._runtime_access_intent is TensorAccessIntent.READONLY:
+            return get_backend().readonly_view(values)
+        return values
+
+    @property
+    def is_readonly(self) -> bool:
+        return self._runtime_access_intent is TensorAccessIntent.READONLY
+
+    @property
+    def physical_mutability(self) -> PhysicalMutability:
+        return self._payload.physical_mutability
+
+    def dlpack_values_for_consumer(self) -> Any:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"tensor access is {self._runtime_state.name.lower()}."
+            )
+        if not self.is_readonly:
+            raise CoherenceStateTransitionError(
+                "DLPack consumer export requires a readonly coherence grant."
+            )
+        if self.physical_mutability is not PhysicalMutability.PROVEN_WRITABLE:
+            raise CoherenceStateTransitionError(
+                "DLPack consumer export requires a physically writable payload."
+            )
+        return force_writable(self._payload.values)
+
+    def acquire_consumer_lease(self) -> TensorConsumerLease:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"cannot acquire a consumer lease while tensor access is "
+                f"{self._runtime_state.name.lower()}."
+            )
+        owner = self._consumer_lease_owner
+        if self._coherence_instances and owner is None:
+            raise CoherenceStateTransitionError(
+                "coherence-bound tensor has no consumer lease owner."
+            )
+        reservation_ref = self._consumer_lease_reservation_ref
+        if reservation_ref is not None:
+            lease = reservation_ref.claim()
+            self._consumer_lease_reservation_ref = None
+        else:
+            lease = (
+                owner.acquire_consumer_lease(self._coherence_instances)
+                if owner is not None
+                else _LocalConsumerLease()
+            )
+        self._active_consumer_leases += 1
+        return TensorConsumerLease(self, lease)
+
+    def _reserve_consumer_lease(self) -> None:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                "cannot reserve a consumer lease for invalid data."
+            )
+        owner = self._consumer_lease_owner
+        if owner is None or not self._coherence_instances:
+            raise CoherenceStateTransitionError(
+                "coherence-bound tensor has no consumer lease owner."
+            )
+        if self._consumer_lease_reservation_ref is not None:
+            raise CoherenceStateTransitionError(
+                "tensor already has a consumer lease reservation."
+            )
+        self._consumer_lease_reservation_ref = owner.reserve_consumer_lease(
+            self._coherence_instances
+        )
+
+    def _cleanup_consumer_lease_reservation_ref(self) -> None:
+        reservation_ref = self._consumer_lease_reservation_ref
+        if reservation_ref is None:
+            return
+        self._consumer_lease_reservation_ref = None
+        reservation_ref.release_for_cleanup()
+
+    def _release_consumer_lease(self) -> None:
+        if self._active_consumer_leases <= 0:
+            raise CoherenceStateTransitionError(
+                "tensor consumer lease count underflow."
+            )
+        self._active_consumer_leases -= 1
+        if self._active_consumer_leases == 0 and self._release_requested:
+            self._release_runtime_payload()
+
+    def _bind_consumer_lease_owner(self, owner: _ConsumerLeaseOwner) -> None:
+        if (
+            self._consumer_lease_owner is not None
+            and self._consumer_lease_owner is not owner
+        ):
+            raise CoherenceStateTransitionError(
+                "tensor consumer lease owner is already bound."
+            )
+        self._consumer_lease_owner = owner
+
+    def _set_runtime_access_intent(self, intent: TensorAccessIntent) -> None:
+        if not isinstance(intent, TensorAccessIntent):
+            raise TypeError(
+                f"intent must be TensorAccessIntent, got {type(intent).__name__}."
+            )
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError("cannot grant access to invalid data.")
+        self._runtime_access_intent = intent
+
+    def _invalidate_runtime_access(self) -> None:
+        if self._runtime_state is TensorRuntimeState.RELEASED:
+            raise CoherenceStateTransitionError("tensor payload was already released.")
+        self._runtime_state = TensorRuntimeState.INVALIDATED
+        self._cleanup_consumer_lease_reservation_ref()
+        if self._active_consumer_leases:
+            self._release_requested = True
+
+    def _release_runtime_payload(self) -> None:
+        if self._runtime_state is TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                "tensor payload cannot be released while runtime access is valid."
+            )
+        if self._runtime_state is TensorRuntimeState.RELEASED:
+            raise CoherenceStateTransitionError("tensor payload was already released.")
+        if self._active_consumer_leases:
+            self._release_requested = True
+            return
+        self._payload = TensorPayload(_RELEASED_PAYLOAD, PhysicalMutability.UNKNOWN)
+        self._layout = TensorLayout((), None, self._routing_axes)
+        self._flat_values = _RELEASED_PAYLOAD
+        self._nested_splits.clear()
+        self._routing = TensorRouting(None)
+        self._lineage = TensorLineage(origin=TensorRouting(None), receipt=None)
+        self._routing_indices = None
+        self._origin_indices = None
+        self._receipt = None
+        self._coherence_instances = ()
+        self._consumer_lease_reservation_ref = None
+        self._routing_indices_materialize_cache = None
+        self._origin_indices_materialize_cache = None
+        self._allocation_descriptor = None
+        self._runtime_state = TensorRuntimeState.RELEASED
+
+    def _bind_coherence_instances(
+        self, instances: tuple[CoherenceInstance, ...]
+    ) -> None:
+        if self._coherence_instances:
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances are already bound."
+            )
+        if not instances or len(instances) != len(set(instances)):
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances must be non-empty and unique."
+            )
+        self._coherence_instances = instances
+
+    def _extend_coherence_instances(
+        self,
+        instances: tuple[CoherenceInstance, ...],
+    ) -> None:
+        if not instances:
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances to extend must be non-empty."
+            )
+        if len(set(instances)) != len(instances):
+            raise CoherenceStateTransitionError(
+                "tensor coherence instances to extend must be unique."
+            )
+        merged_values = list(self._coherence_instances)
+        seen = set(self._coherence_instances)
+        for instance in instances:
+            if instance not in seen:
+                seen.add(instance)
+                merged_values.append(instance)
+        merged = tuple(merged_values)
+        self._coherence_instances = merged
+
+    def _handoff_coherence_instance(
+        self,
+        old: CoherenceInstance,
+        new: CoherenceInstance,
+    ) -> None:
+        if self._coherence_instances != (old,):
+            raise CoherenceStateTransitionError(
+                "allocation handoff requires one exact coherence instance."
+            )
+        self._coherence_instances = (new,)
+
+    def _runtime_allocation_descriptor(self) -> AllocationDescriptor:
+        descriptor = self._allocation_descriptor
+        if descriptor is None:
+            descriptor = get_backend().allocation_descriptor(self._payload.values)
+            self._allocation_descriptor = descriptor
+        return descriptor
+
+    @property
+    def payload(self) -> TensorPayload:
+        if self._runtime_state is not TensorRuntimeState.VALID:
+            raise CoherenceStateTransitionError(
+                f"tensor payload is {self._runtime_state.name.lower()}."
+            )
+        return self._payload
+
+    @property
+    def layout(self) -> TensorLayout:
+        return self._layout
+
+    @property
+    def routing(self) -> TensorRouting:
+        return self._routing
+
+    @property
+    def lineage(self) -> TensorLineage:
+        return self._lineage
 
     @property
     def nested_splits(self) -> list[Any]:
-        return self._nested_splits
+        return list(self._layout.nested_splits)
 
     @property
     def is_dense(self) -> bool:
         """Returns True if this tensor is dense (no ragged dimensions)."""
-        return len(self._nested_splits) == 0
+        return self._layout.is_dense
 
     @property
     def is_ragged(self) -> bool:
         """Returns True if this tensor has ragged dimensions."""
-        return len(self._nested_splits) > 0
+        return self._layout.is_ragged
 
     @property
     def origin_indices(self) -> IndexDescriptor | None:
         """The underlying IndexDescriptor (metadata) for origin tracking."""
-        return self._origin_indices
+        return self._lineage.origin.indices
 
     @property
     def origin_indices_materialized(self) -> Any | None:
@@ -386,21 +809,12 @@ class TransportTensor:
         """
         if self._origin_indices is None:
             return None
-        if self._origin_indices_materialize_cache is not None:
-            return self._origin_indices_materialize_cache
-
-        if isinstance(self._origin_indices, ExplicitIndex):
-            self._origin_indices_materialize_cache = self._origin_indices.indices
-        elif isinstance(self._origin_indices, ContinuousIndex):
-            self._origin_indices_materialize_cache = self._origin_indices.materialize()
-        else:
-            self._origin_indices_materialize_cache = self._origin_indices
-        return self._origin_indices_materialize_cache
+        return self._lineage.origin.materialize()
 
     @property
     def routing_indices(self) -> IndexDescriptor | None:
         """The underlying IndexDescriptor (metadata) for spatial positioning."""
-        return self._routing_indices
+        return self._routing.indices
 
     @property
     def routing_indices_materialized(self) -> Any | None:
@@ -411,23 +825,12 @@ class TransportTensor:
         """
         if self._routing_indices is None:
             return None
-        if self._routing_indices_materialize_cache is not None:
-            return self._routing_indices_materialize_cache
-
-        if isinstance(self._routing_indices, ExplicitIndex):
-            self._routing_indices_materialize_cache = self._routing_indices.indices
-        elif isinstance(self._routing_indices, ContinuousIndex):
-            self._routing_indices_materialize_cache = (
-                self._routing_indices.materialize()
-            )
-        else:
-            self._routing_indices_materialize_cache = self._routing_indices
-        return self._routing_indices_materialize_cache
+        return self._routing.materialize()
 
     @property
     def global_shape(self) -> tuple[int, ...] | None:
         """Global shape of the full tensor across all ranks."""
-        return self._global_shape
+        return self._layout.global_shape
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -436,22 +839,19 @@ class TransportTensor:
         return backend.shape(self._flat_values)
 
     @property
-    def logical_count(self) -> int:
-        """Returns the number of logical elements in the primary dimension."""
-        backend = get_backend()
-        if self._nested_splits and len(self._nested_splits) > 0:
-            top_split = self._nested_splits[0]
-            if backend.shape(top_split)[0] > 0:
-                return int(backend.item(top_split[-1]))
-        return int(backend.shape(self._flat_values)[0])
-
-    @property
-    def logical_shape(self) -> tuple[int, ...]:
-        """Returns the logical shape, honoring ragged boundaries."""
+    def logical_shape(self) -> tuple[int | None, ...]:
+        """Returns the logical shape, honoring ragged boundaries.
+        Variable-length (ragged) dimensions are represented as `None`.
+        """
         backend = get_backend()
         p_shape = backend.shape(self._flat_values)
         if self._nested_splits and len(self._nested_splits) > 0:
-            return (self.logical_count,) + p_shape[1:]
+            top_split = self._nested_splits[0]
+            if backend.shape(top_split)[0] > 0:
+                bs = int(backend.shape(top_split)[0]) - 1
+            else:
+                bs = 0
+            return (bs, None) + p_shape[1:]
         return p_shape
 
     @property
@@ -467,11 +867,90 @@ class TransportTensor:
 
     @property
     def receipt(self) -> SymmetryReceipt | None:
-        return self._receipt
+        return self._lineage.receipt
 
     @receipt.setter
     def receipt(self, value: SymmetryReceipt | None):
+        if value is not None:
+            value.validate_entity_count(self.routing_entity_count)
+        self._lineage.receipt = value
         self._receipt = value
+
+    def with_lineage(
+        self,
+        *,
+        origin_indices: Any | None,
+        receipt: SymmetryReceipt,
+        global_shape: tuple[int, ...] | None,
+    ) -> "TransportTensor":
+        return TransportTensor(
+            self.flat_values,
+            nested_splits=self.nested_splits,
+            routing_indices=self.routing_indices,
+            global_shape=global_shape,
+            origin_indices=origin_indices,
+            receipt=receipt,
+            routing_axes=self.routing_axes,
+            source_step=self.source_step,
+        )
+
+    def zero_copy_alias(self) -> "TransportTensor":
+        return self._zero_copy_alias(TensorAccessIntent.WRITABLE)
+
+    def zero_copy_readonly_alias(self) -> "TransportTensor":
+        return self._zero_copy_alias(TensorAccessIntent.READONLY)
+
+    def _zero_copy_alias(self, intent: TensorAccessIntent) -> "TransportTensor":
+        alias = TransportTensor(
+            self._payload.values,
+            nested_splits=self.nested_splits,
+            origin_indices=self.origin_indices,
+            routing_indices=self.routing_indices,
+            global_shape=self.global_shape,
+            receipt=self.receipt,
+            routing_axes=self.routing_axes,
+            source_step=self.source_step,
+        )
+        if alias._payload.values is not self._payload.values and (
+            runtime_allocation_relation(alias, self) is not AllocationRelation.EXACT
+        ):
+            raise CoherenceStateTransitionError(
+                "zero-copy alias construction changed the backing allocation."
+            )
+        alias._set_runtime_access_intent(intent)
+        return alias
+
+    @property
+    def source_step(self) -> int | None:
+        return self._source_step
+
+    @source_step.setter
+    def source_step(self, value: int | None):
+        if value is not None and (type(value) is not int):
+            raise TypeError(
+                f"TransportTensor.source_step must be an int or None, got {type(value).__name__}."
+            )
+        if self._source_step is not None and value != self._source_step:
+            raise ValueError(
+                "TransportTensor.source_step is immutable once assigned; "
+                f"current={self._source_step}, attempted={value}."
+            )
+        self._source_step = value
+
+    @property
+    def routing_axes(self) -> tuple[int, ...]:
+        """Axes of `flat_values` bound to the routing domain.
+
+        The planner (L2) is structurally 1-D and ignores this; it is read
+        only by the L1 distributor at apply time to decide between the
+        fast `take(axis=0)` path and the moveaxis+reshape fallback.
+        """
+        return self._routing_axes
+
+    @property
+    def routing_entity_count(self) -> int:
+        backend = get_backend()
+        return routing_entity_count(self._payload, self._layout, backend)
 
     @property
     def meta_state(self) -> int:
@@ -514,6 +993,7 @@ class TransportTensor:
                 self._flat_values[key],
                 global_shape=self._global_shape,
                 receipt=self._receipt[key] if self._receipt else None,
+                routing_axes=self._routing_axes,
             )
 
         raise NotImplementedError(
@@ -555,6 +1035,7 @@ class TransportTensor:
             global_shape=self._global_shape,
             origin_indices=self.origin_indices,
             receipt=self.receipt,
+            routing_axes=self._routing_axes,
         )
 
     def sum(self, dim: Any = None) -> Any:
@@ -587,6 +1068,7 @@ class TransportTensor:
             origin_indices=self.origin_indices,
             routing_indices=self.routing_indices,
             global_shape=self.global_shape,
+            routing_axes=self._routing_axes,
         )
 
         compacted = TransportTensor(
@@ -594,6 +1076,7 @@ class TransportTensor:
             routing_indices=uniques,
             origin_indices=origin_indices,
             global_shape=self.global_shape,
+            routing_axes=self._routing_axes,
         )
 
         return compacted, inverse_tt
@@ -679,11 +1162,13 @@ class TransportTensor:
                 [],
                 routing_indices=new_indices,
                 origin_indices=new_origin_indices,
+                global_shape=self._global_shape,
                 receipt=(
                     self._receipt[start : start + size_tensor]
                     if self._receipt
                     else None
                 ),
+                routing_axes=self._routing_axes,
             )
 
         else:
@@ -729,7 +1214,7 @@ class TransportTensor:
                 dim0_static = static_shape
 
         # Input normalization for Tensor operations
-        # If unsafe is True and inputs are ints, we keep them as ints for native slicing
+        # If unsafe is True and inputs are ints, we retention them as ints for native slicing
         if not unsafe:
             if not backend.is_tensor(start):
                 start = backend.tensor(start, dtype=backend.int32())
@@ -774,7 +1259,7 @@ class TransportTensor:
             for i in range(1, len(self._nested_splits)):
                 curr_splits = self._nested_splits[i]
 
-                # For next levels, use dynamic slice logic but try to keep it cheap
+                # For next levels, use dynamic slice logic but try to retention it cheap
                 count = curr_end - curr_start + 1
                 new_spl = backend.dynamic_slice(curr_splits, curr_start, count)
 
@@ -807,7 +1292,9 @@ class TransportTensor:
                 new_nested_splits,
                 routing_indices=new_indices,
                 origin_indices=new_origin_indices,
+                global_shape=self._global_shape,
                 receipt=self._receipt[s:e] if self._receipt else None,
+                routing_axes=self._routing_axes,
             )
 
         # -------------------------------------------------------------------------
@@ -921,7 +1408,9 @@ class TransportTensor:
             new_nested_splits,
             routing_indices=new_indices,
             origin_indices=new_origin_indices,
+            global_shape=self._global_shape,
             receipt=self._receipt[start:end] if self._receipt else None,
+            routing_axes=self._routing_axes,
         )
 
     def as_dlpack_slice(self, cursor: Any | None = None) -> Any:
@@ -966,7 +1455,12 @@ class TransportTensor:
 
             new_values = backend.dynamic_slice(self._flat_values, starts, sizes)
             return TransportTensor(
-                new_values, self._nested_splits, routing_indices=self._routing_indices
+                new_values,
+                self._nested_splits,
+                routing_indices=self._routing_indices,
+                origin_indices=self._origin_indices,
+                global_shape=self._global_shape,
+                routing_axes=self._routing_axes,
             )
         return self
 
@@ -1006,7 +1500,9 @@ class TransportTensor:
                 new_splits,
                 routing_indices=new_routing_indices,
                 origin_indices=new_origin_indices,
+                global_shape=self._global_shape,
                 receipt=self._receipt[idx_flat] if self._receipt else None,
+                routing_axes=self._routing_axes,
             )
 
         current_indices = idx_flat
@@ -1067,6 +1563,8 @@ class TransportTensor:
             new_splits,
             routing_indices=new_routing_indices,
             origin_indices=new_origin_indices,
+            global_shape=self._global_shape,
+            routing_axes=self._routing_axes,
         )
 
     def __reduce__(self):
@@ -1079,6 +1577,9 @@ class TransportTensor:
                 self._routing_indices,
                 self._global_shape,
                 self._origin_indices,
+                self._receipt,
+                self._routing_axes,
+                self._source_step,
             ),
         )
 
@@ -1092,26 +1593,36 @@ class TransportTensor:
 
 
 def _reconstruct_transport_tensor(
-    flat_values, nested_splits, routing_indices, global_shape=None, origin_indices=None
+    flat_values,
+    nested_splits,
+    routing_indices,
+    global_shape=None,
+    origin_indices=None,
+    receipt=None,
+    routing_axes=(0,),
+    source_step=None,
 ):
-    """Pickle reconstruction helper (top-level function for pickling)."""
     return TransportTensor(
         flat_values,
         nested_splits,
         routing_indices=routing_indices,
         global_shape=global_shape,
         origin_indices=origin_indices,
+        receipt=receipt,
+        routing_axes=routing_axes,
+        source_step=source_step,
     )
 
 
 try:
-    import jax
+    import jax  # pyrefly: ignore [missing-import]
 
     _JAX_AVAILABLE = True
 except ImportError:
     _JAX_AVAILABLE = False
 
 if _JAX_AVAILABLE:
+    import jax  # pyrefly: ignore [missing-import]
 
     def _tt_flatten(v):
         children = (
@@ -1121,18 +1632,22 @@ if _JAX_AVAILABLE:
             v._global_shape,
             v._origin_indices,
         )
-        return children, None
+        aux_data = (v._routing_axes, v._source_step)
+        return children, aux_data
 
     def _tt_unflatten(aux_data, children):
         flat_values, nested_splits, routing_indices, global_shape, origin_indices = (
             children
         )
+        routing_axes, source_step = aux_data
         return TransportTensor(
             flat_values,
             nested_splits,
             routing_indices=routing_indices,
             global_shape=global_shape,
             origin_indices=origin_indices,
+            routing_axes=routing_axes,
+            source_step=source_step,
         )
 
     jax.tree_util.register_pytree_node(TransportTensor, _tt_flatten, _tt_unflatten)

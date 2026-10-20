@@ -4,8 +4,27 @@ Device Mesh Abstraction.
 
 from __future__ import annotations
 
-import numpy as np
+from types import MappingProxyType
 from typing import Any
+
+import numpy as np
+
+_INT32_MAX = int(np.iinfo(np.int32).max)
+
+
+def _coerce_device_ids(device_ids: Any) -> np.ndarray:
+    """Validate topology IDs before converting them to Fluxway's int32 ABI."""
+
+    raw = np.asarray(device_ids)
+    for value in raw.reshape(-1).tolist():
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value, (int, np.integer)
+        ):
+            raise TypeError("device_ids must contain integer ranks")
+        rank = int(value)
+        if rank < 0 or rank > _INT32_MAX:
+            raise ValueError("device_ids must contain non-negative int32 ranks")
+    return np.asarray(raw, dtype=np.int32)
 
 
 class DeviceMesh:
@@ -17,8 +36,13 @@ class DeviceMesh:
     Attributes:
         shape (Tuple[int, ...]): The shape of the mesh (number of devices per axis).
         axis_names (Tuple[str, ...]): Names for each axis of the mesh.
-        device_ids (np.ndarray): Array of physical device IDs (ranks) with shape `shape`.
+        device_ids (np.ndarray): Physical device IDs (ranks), shaped like ``shape``.
     """
+
+    _frozen: bool
+    axis_map: dict[str, int] | MappingProxyType[str, int]
+    size_map: dict[str, int] | MappingProxyType[str, int]
+    _inverse_map: dict[int, tuple[int, ...]] | MappingProxyType[int, tuple[int, ...]]
 
     def __init__(
         self,
@@ -33,14 +57,15 @@ class DeviceMesh:
             axis_names: Tuple of names for each axis.
             device_shape: Optional tuple defining the dimensions of the mesh.
             device_ids: Optional physical device IDs.
-                        If provided as a multi-dimensional array, device_shape will be inferred.
-                        If provided as a 1D array and device_shape is given, it will be reshaped.
+                        A multi-dimensional array infers ``device_shape``.
+                        A 1D array uses the supplied shape for reshaping.
         """
+        self._frozen = False
         self._axis_names = tuple(axis_names)
 
         # Determine device_ids and shape
         if device_ids is not None:
-            self.device_ids = np.array(device_ids)
+            self.device_ids = _coerce_device_ids(device_ids)
             if device_shape is None:
                 # Infer shape from device_ids
                 if self.device_ids.ndim == 1:
@@ -49,7 +74,8 @@ class DeviceMesh:
                         self._shape = self.device_ids.shape
                     else:
                         raise ValueError(
-                            f"Cannot infer multi-dimensional shape from 1D device_ids without device_shape. axis_names: {self._axis_names}"
+                            "Cannot infer multi-dimensional shape from 1D device_ids "
+                            f"without device_shape. axis_names: {self._axis_names}"
                         )
                 else:
                     self._shape = tuple(int(s) for s in self.device_ids.shape)
@@ -61,7 +87,8 @@ class DeviceMesh:
                     expected_size *= s
                 if self.device_ids.size != expected_size:
                     raise ValueError(
-                        f"device_ids size {self.device_ids.size} does not match device_shape {self._shape}"
+                        f"device_ids size {self.device_ids.size} does not match "
+                        f"device_shape {self._shape}"
                     )
                 self.device_ids = self.device_ids.reshape(self._shape)
         elif device_shape is not None:
@@ -70,7 +97,9 @@ class DeviceMesh:
             expected_size = 1
             for s in self._shape:
                 expected_size *= s
-            self.device_ids = np.arange(expected_size).reshape(self._shape)
+            self.device_ids = np.arange(expected_size, dtype=np.int32).reshape(
+                self._shape
+            )
         else:
             raise ValueError("Either device_shape or device_ids must be provided.")
 
@@ -81,16 +110,65 @@ class DeviceMesh:
 
         self._axis_names = tuple(axis_names)
         self.axis_map = dict(
-            zip(self.axis_names, range(len(self.axis_names)), strict=False)
+            zip(self.axis_names, range(len(self.axis_names)), strict=True)
         )
-        self.size_map = dict(zip(self.axis_names, self.shape, strict=False))
+        self.size_map = dict(zip(self.axis_names, self.shape, strict=True))
 
         # Inverse map: rank -> coordinates (cached)
         self._inverse_map = {}
         it = np.nditer(self.device_ids, flags=["multi_index", "refs_ok"])
         for x in it:
-            rank = int(x)
+            rank = int(x)  # type: ignore
             self._inverse_map[rank] = it.multi_index
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if getattr(self, "_frozen", False):
+            raise AttributeError("frozen DeviceMesh cannot be modified")
+        super().__setattr__(name, value)
+
+    @property
+    def is_frozen(self) -> bool:
+        return self._frozen
+
+    def copy(self) -> DeviceMesh:
+        return DeviceMesh(
+            axis_names=self.axis_names,
+            device_shape=self.shape,
+            device_ids=np.array(self.device_ids, dtype=np.int32, copy=True),
+        )
+
+    def frozen_copy(self) -> DeviceMesh:
+        return self if self._frozen else self.copy().freeze()
+
+    def freeze(self) -> DeviceMesh:
+        if self._frozen:
+            return self
+        if not isinstance(self.device_ids, np.ndarray):
+            raise TypeError("only host DeviceMesh instances can be frozen")
+        self.device_ids.setflags(write=False)
+        self.axis_map = MappingProxyType(dict(self.axis_map))
+        self.size_map = MappingProxyType(dict(self.size_map))
+        self._inverse_map = MappingProxyType(dict(self._inverse_map))
+        self._frozen = True
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> DeviceMesh:
+        if self._frozen:
+            return self
+        copied = self.copy()
+        memo[id(self)] = copied
+        return copied
+
+    def __reduce__(self):
+        return (
+            _restore_device_mesh,
+            (
+                self.axis_names,
+                self.shape,
+                np.array(self.device_ids, dtype=np.int32, copy=True),
+                self._frozen,
+            ),
+        )
 
     @property
     def ndim(self) -> int:
@@ -115,7 +193,7 @@ class DeviceMesh:
         return self.size_map[axis_name]
 
     def get_coordinate(self, rank_id: int) -> tuple[int, ...]:
-        """Get the multi-dimensional logical coordinates of a physical rank in the mesh."""
+        """Get logical coordinates for a physical rank in the mesh."""
         if rank_id not in self._inverse_map:
             raise ValueError(f"Rank {rank_id} not found in mesh")
         return self._inverse_map[rank_id]
@@ -130,55 +208,61 @@ class DeviceMesh:
 
     def coordinate_to_device(self, coords: tuple[Any, ...]) -> Any:
         """Vectorized get_rank. coords elements can be tensors or numpy arrays."""
-        from fluxway.common.backend import get_backend
+        from fluxway.common.tensor_backend import get_backend
 
         backend = get_backend()
 
-        # If we are in JAX, we must ensure device_ids is a JAX array to support tracer indexing.
-        # jnp.asarray(numpy_array)[tracer] works correctly.
-        if backend.name() == "jax":
+        # JAX tracers require device_ids as a JAX array for indexed access.
+        if backend.is_jax:
             return backend.as_tensor(self.device_ids)[coords]
 
-        return self.device_ids[coords]
+        # device_ids is a small NumPy lookup table — always index on CPU,
+        # then transfer result to device if the backend is on GPU.
+        np_coords = tuple(
+            backend.to_numpy(c) if hasattr(c, "shape") else c for c in coords
+        )
+        return backend.tensor(self.device_ids[np_coords], device="cpu")
 
     def unravel_index(self, ranks: Any) -> tuple[Any, ...]:
         """Convert physical ranks to multi-dimensional logical coordinates."""
-        from fluxway.common.backend import get_backend
+        from fluxway.common.tensor_backend import get_backend
 
-        try:
-            backend = get_backend()
-            return backend.unravel_index(ranks, self.shape)
-        except Exception:
-            # Fallback for simple numpy usage if backend fails or not set
-            return np.unravel_index(ranks, self.shape)
+        return get_backend().unravel_index(ranks, self.shape)
 
     def flatten(self) -> list[int]:
         """Return a flattened list of physical device IDs."""
-        from fluxway.common.backend import get_backend
-
-        try:
-            backend = get_backend()
-            # If device_ids is tracer, to_numpy will fail, but flatten() usage implies host-side often.
-            # If used in JIT, we return list? No, JIT can't return list of ints derived from tracers.
-            # Assume flatten is for eager use.
-            return backend.to_numpy(self.device_ids).flatten().tolist()
-        except Exception:
-            return self.device_ids.flatten().tolist()
+        if not isinstance(self.device_ids, np.ndarray):
+            raise TypeError("DeviceMesh.flatten requires host device IDs")
+        return self.device_ids.flatten().tolist()
 
     def __repr__(self) -> str:
         return f"DeviceMesh(shape={self.shape}, axis_names={self.axis_names})"
 
     def __hash__(self):
-        return hash((self.shape, self.axis_names))
+        return hash((self.shape, self.axis_names, self.device_ids.tobytes()))
 
     def __eq__(self, other):
         if not isinstance(other, DeviceMesh):
             return False
-        return self.shape == other.shape and self.axis_names == other.axis_names
+        return (
+            self.shape == other.shape
+            and self.axis_names == other.axis_names
+            and np.array_equal(self.device_ids, other.device_ids)
+        )
 
     def to_backend_mesh(self, backend_engine: Any = None):
-        """Convert to the mesh representation of the corresponding backend framework (e.g. JAX Mesh or PyTorch DeviceMesh)."""
+        """Convert to a corresponding backend mesh representation."""
         raise NotImplementedError("Backend conversion not implemented yet.")
+
+
+def _restore_device_mesh(
+    axis_names: tuple[str, ...],
+    shape: tuple[int, ...],
+    device_ids: np.ndarray,
+    frozen: bool,
+) -> DeviceMesh:
+    mesh = DeviceMesh(axis_names, shape, device_ids)
+    return mesh.freeze() if frozen else mesh
 
 
 # JAX Pytree Registration
@@ -193,21 +277,21 @@ try:
     def _dm_unflatten(aux_data, children):
         # Reconstruct without invoking __init__ (avoids numpy conversion of Tracers)
         obj = object.__new__(DeviceMesh)
+        obj._frozen = False
         obj._shape, obj._axis_names = aux_data
         obj.device_ids = children[0]
 
         # Restore derived maps (static)
         obj.axis_map = dict(
-            zip(obj.axis_names, range(len(obj.axis_names)), strict=False)
+            zip(obj.axis_names, range(len(obj.axis_names)), strict=True)
         )
-        obj.size_map = dict(zip(obj.axis_names, obj.shape, strict=False))
+        obj.size_map = dict(zip(obj.axis_names, obj.shape, strict=True))
 
         # _inverse_map relies on iterating device_ids.
         # If device_ids is a Tracer, we CANNOT iterate it.
         # So _inverse_map will be empty or invalid inside JIT.
-        # BUT _inverse_map is only used by `get_coordinate` (scalar) and `get_rank` (via logic).
-        # Vectorized methods (unravel_index, coordinate_to_device) use tensor ops (backend)
-        # and do NOT use _inverse_map.
+        # _inverse_map is only used by scalar coordinate/rank methods.
+        # Vectorized methods use backend tensor operations instead.
         # So it is safe to skip _inverse_map construction inside JIT.
         obj._inverse_map = {}
 

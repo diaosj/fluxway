@@ -4,7 +4,7 @@
 from fluxway.common.utils.logging import ensure_logging_configured
 
 
-from .graph import GraphParser, Builder
+from .graph import Builder
 from .scheduler import Scheduler
 from .spmd_manager import SPMDManager, SPMDHandle
 from .state_manager import StateManager
@@ -12,22 +12,57 @@ from .monitor import Monitor
 from .heartbeat import HeartbeatManager
 from .state_machine import ControllerStateMachine
 from .async_manager import AsyncStepManager
-from .controller import Controller, create_controller
+from .errors import ExecutionFailedError
+from .components import (
+    ControlPlaneComponent,
+    ControlPlaneComponentRegistry,
+    TransactionalControlPlaneComponent,
+    DriverComponentContext,
+    DriverComponentRegistry,
+)
+from .ledger_client import SourceWorkClient
+from .source_control import SourceControlRuntime
+from .logical_work_ledger import LogicalWorkEpoch, LogicalWorkLedger, StepBatchLayout
+from .ingestion import (
+    AlgebraicLayoutCompiler,
+    CanonicalWorkInterval,
+    CompiledIngestionLayout,
+    CompiledSegment,
+    DirectIngestionSourceDescriptor,
+    EncodedWorkerLayoutDescriptor,
+    SourceLayoutCompletion,
+    IngestionLayoutActivation,
+    IngestionLayoutActivationComponent,
+    SourceLayoutActivation,
+    IngestionLayoutEpoch,
+    IngestionLayoutPlanningComponent,
+    IngestionLayoutReceiver,
+    IngestionSourceAdapter,
+    LayoutCompileRequest,
+    AssignmentPolicy,
+    LayoutUnitDescriptor,
+    RankDemand,
+    ReaderGroupDemand,
+    ReaderTopologyDescriptor,
+    WorkerCompiledLayout,
+    WorkerLayoutDescriptor,
+    ingestion_worker_id,
+    validate_canonical_work_intervals,
+)
+from .execution import start, GraphExecution
 from .checkpointer import (
+    CheckpointComponentRegistration,
+    CheckpointComponentRegistry,
+    SaveSession,
+    CheckpointCut,
     FluxwayCheckpointer,
-    WorkerCheckpointBackend,
-    SafeTensorsBackend,
-    OrbaxBackend,
+    StateCheckpointComponent,
+    SafeTensorsCheckpointComponent,
+    WorkerLocalCheckpointComponent,
+    OrbaxCheckpointComponent,
 )
 
-try:
-    from .controller import ControllerActor
-except ImportError:
-    # Ray not available
-    ControllerActor = None  # type: ignore
-
 __all__ = [
-    "GraphParser",
     "Builder",
     "Scheduler",
     "SPMDManager",
@@ -37,13 +72,52 @@ __all__ = [
     "HeartbeatManager",
     "ControllerStateMachine",
     "AsyncStepManager",
-    "Controller",
-    "ControllerActor",
-    "create_controller",
+    "ExecutionFailedError",
+    "ControlPlaneComponent",
+    "ControlPlaneComponentRegistry",
+    "TransactionalControlPlaneComponent",
+    "DriverComponentContext",
+    "DriverComponentRegistry",
+    "SourceWorkClient",
+    "SourceControlRuntime",
+    "LogicalWorkEpoch",
+    "LogicalWorkLedger",
+    "StepBatchLayout",
+    "EncodedWorkerLayoutDescriptor",
+    "DirectIngestionSourceDescriptor",
+    "IngestionLayoutActivation",
+    "IngestionLayoutActivationComponent",
+    "SourceLayoutActivation",
+    "SourceLayoutCompletion",
+    "IngestionLayoutEpoch",
+    "WorkerLayoutDescriptor",
+    "AlgebraicLayoutCompiler",
+    "CanonicalWorkInterval",
+    "CompiledIngestionLayout",
+    "CompiledSegment",
+    "IngestionLayoutPlanningComponent",
+    "IngestionLayoutReceiver",
+    "LayoutCompileRequest",
+    "AssignmentPolicy",
+    "LayoutUnitDescriptor",
+    "RankDemand",
+    "ReaderGroupDemand",
+    "ReaderTopologyDescriptor",
+    "WorkerCompiledLayout",
+    "validate_canonical_work_intervals",
+    "IngestionSourceAdapter",
+    "ingestion_worker_id",
+    "start",
+    "GraphExecution",
     "FluxwayCheckpointer",
-    "WorkerCheckpointBackend",
-    "SafeTensorsBackend",
-    "OrbaxBackend",
+    "SaveSession",
+    "CheckpointComponentRegistration",
+    "CheckpointComponentRegistry",
+    "CheckpointCut",
+    "StateCheckpointComponent",
+    "SafeTensorsCheckpointComponent",
+    "WorkerLocalCheckpointComponent",
+    "OrbaxCheckpointComponent",
 ]
 
 ensure_logging_configured()

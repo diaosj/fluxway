@@ -1,360 +1,167 @@
-"""
-Placement Group Manager for resource mapping and lifecycle.
-
-Based on ARCHITECTURE.md Section 2.1.2
-
-Responsibilities:
-- Maintain SPMD ID → Placement Group mapping
-- Resource pool management
-- Execute preemption and eviction operations
-- Track resource availability
-- Support multi-bundle PG for driver + workers
-"""
-
-from typing import Any
+import asyncio
 import logging
+from typing import cast
 
-try:
-    from ray.util.placement_group import (
-        PlacementGroup,
-        placement_group,
-        remove_placement_group,
-    )
-
-    RAY_AVAILABLE = True
-except ImportError:
-    RAY_AVAILABLE = False
-    PlacementGroup = Any  # type: ignore
-
-from fluxway.common.types import (
-    ResourceSpec,
-    PlacementStrategy,
-    ResourcePriority,
-    DriverResourceSpec,
+from ray.util.placement_group import (
+    PlacementGroup,
+    placement_group,
+    remove_placement_group,
 )
+
+from fluxway.placement.models import (
+    ClusterSnapshot,
+    PlacementGroupTimeoutError,
+    PlacementMaterializationError,
+    ResolvedPlacementPlan,
+)
+from fluxway.placement.worker_group import SPMDWorkerGroup
 
 logger = logging.getLogger(__name__)
 
 
 class PGManager:
-    """
-    Placement Group Manager.
+    def __init__(self) -> None:
+        self._job_pg: PlacementGroup | None = None
+        self._worker_groups: dict[str, SPMDWorkerGroup] = {}
 
-    Manages the pool of Ray Placement Groups and their mappings to SPMDs.
-    Handles resource allocation, preemption, and eviction at the PG level.
+    @property
+    def has_job_pg(self) -> bool:
+        return self._job_pg is not None
 
-    Each SPMD's PG contains:
-    - 1 driver bundle (index 0)
-    - N worker bundles (indices 1 to num_workers)
-    """
-
-    def __init__(self):
-        # SPMD ID → PlacementGroup mapping
-        self._spmd_to_pg: dict[str, PlacementGroup] = {}
-        # SPMD ID → ResourceSpec mapping (single worker resource)
-        self._spmd_to_resource: dict[str, ResourceSpec] = {}
-        # SPMD ID → ResourcePriority mapping
-        self._spmd_to_priority: dict[str, ResourcePriority] = {}
-        # SPMD ID → worker count mapping
-        self._spmd_to_num_workers: dict[str, int] = {}
-        # SPMD ID → driver resource mapping
-        self._spmd_to_driver_resource: dict[str, DriverResourceSpec] = {}
-
-    async def create_pg(
+    async def create_job_pg(
         self,
-        spmd_id: str,
-        resource: ResourceSpec,
-        priority: ResourcePriority = ResourcePriority.MID,
-        strategy: PlacementStrategy = PlacementStrategy.PACK,
-        num_workers: int = 1,
-        driver_resource: DriverResourceSpec | None = None,
-    ) -> PlacementGroup | None:
-        """
-        Create a Placement Group for an SPMD with driver and worker bundles.
-
-        The PG contains:
-        - Bundle 0: Driver bundle
-        - Bundle 1 to num_workers: Worker bundles
-
-        Args:
-            spmd_id: Unique SPMD identifier
-            resource: Resource requirements for each worker
-            priority: Resource priority for preemption decisions
-            strategy: Placement strategy
-            num_workers: Number of workers
-            driver_resource: Optional driver resource spec (uses default if None)
-
-        Returns:
-            Created PlacementGroup or None if failed
-        """
-        driver_res = driver_resource or DriverResourceSpec()
-
-        if not RAY_AVAILABLE:
-            logger.warning("Ray not available, returning mock placement group")
-            self._spmd_to_resource[spmd_id] = resource
-            self._spmd_to_priority[spmd_id] = priority
-            self._spmd_to_num_workers[spmd_id] = num_workers
-            self._spmd_to_driver_resource[spmd_id] = driver_res
-            return None
-
+        *,
+        plan: ResolvedPlacementPlan,
+        snapshot: ClusterSnapshot,
+        timeout_s: float,
+    ) -> PlacementGroup:
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        if self._job_pg is not None:
+            raise PlacementMaterializationError("job placement group already exists")
+        snapshot_by_id = {node.node_id: node for node in snapshot.nodes}
+        bundle_resources = plan.bundle_resources()
+        node_ids = tuple(sorted(bundle_resources))
+        node_to_bundle = {node_id: index for index, node_id in enumerate(node_ids)}
+        bundles = []
+        for node_id in node_ids:
+            if node_id not in snapshot_by_id:
+                raise PlacementMaterializationError(
+                    f"resolved node {node_id!r} is absent from the Ray snapshot"
+                )
+            bundle = {
+                resource: float(quantity)
+                for resource, quantity in bundle_resources[node_id].items()
+                if quantity > 0
+            }
+            bundles.append(bundle)
         try:
-            # Build bundles: driver bundle + worker bundles
-            bundles = []
-
-            # Bundle 0: Driver bundle
-            driver_bundle = self._driver_resource_to_bundle(driver_res)
-            bundles.append(driver_bundle)
-
-            # Bundles 1 to num_workers: Worker bundles
-            worker_bundle = self._resource_to_bundle(resource)
-            for _ in range(num_workers):
-                bundles.append(worker_bundle.copy())
-
-            pg = placement_group(bundles=bundles, strategy=strategy.value)
-
-            # Wait for placement group to be ready (avoid blocking ray.get)
-            await pg.ready()
-
-            # Store mappings
-            self._spmd_to_pg[spmd_id] = pg
-            self._spmd_to_resource[spmd_id] = resource
-            self._spmd_to_priority[spmd_id] = priority
-            self._spmd_to_num_workers[spmd_id] = num_workers
-            self._spmd_to_driver_resource[spmd_id] = driver_res
-
-            logger.debug(
-                f"Created placement group for SPMD {spmd_id}: "
-                f"driver={driver_res}, worker={resource}, count={num_workers}"
-            )
-            return pg
-
-        except Exception as e:
-            logger.error(f"Failed to create placement group for SPMD {spmd_id}: {e}")
-            return None
-
-    def get_driver_bundle_index(self, spmd_id: str) -> int:
-        """Get the bundle index for the driver (always 0)."""
-        return 0
-
-    def get_worker_bundle_indices(self, spmd_id: str) -> list[int]:
-        """
-        Get the bundle indices for workers.
-
-        Returns:
-            List of bundle indices [1, 2, ..., num_workers]
-        """
-        num_workers = self._spmd_to_num_workers.get(spmd_id, 1)
-        return list(range(1, num_workers + 1))
-
-    def get_num_workers(self, spmd_id: str) -> int:
-        """Get the worker count for an SPMD."""
-        return self._spmd_to_num_workers.get(spmd_id, 1)
-
-    def get_pg(self, spmd_id: str) -> PlacementGroup | None:
-        """Get the PlacementGroup for an SPMD."""
-        return self._spmd_to_pg.get(spmd_id)
-
-    def get_resource(self, spmd_id: str) -> ResourceSpec | None:
-        """Get the resource allocation for an SPMD."""
-        return self._spmd_to_resource.get(spmd_id)
-
-    def get_priority(self, spmd_id: str) -> ResourcePriority:
-        """Get the priority for an SPMD."""
-        return self._spmd_to_priority.get(spmd_id, ResourcePriority.MID)
-
-    def release_pg(self, spmd_id: str) -> bool:
-        """
-        Release the Placement Group for an SPMD.
-
-        Args:
-            spmd_id: SPMD identifier
-
-        Returns:
-            True if released successfully
-        """
-        if spmd_id not in self._spmd_to_pg and spmd_id not in self._spmd_to_resource:
-            return False
-
-        pg = self._spmd_to_pg.get(spmd_id)
-        if pg is not None and RAY_AVAILABLE:
-            try:
-                remove_placement_group(pg)
-                logger.debug(f"Released placement group for SPMD {spmd_id}")
-            except Exception as e:
-                logger.error(f"Error releasing placement group for {spmd_id}: {e}")
-
-        # Clean up mappings
-        self._spmd_to_pg.pop(spmd_id, None)
-        self._spmd_to_resource.pop(spmd_id, None)
-        self._spmd_to_priority.pop(spmd_id, None)
-
-        return True
-
-    def preempt(self, spmd_id: str, reason: str) -> bool:
-        """
-        Execute preemption on an SPMD's resources.
-
-        Args:
-            spmd_id: SPMD to preempt
-            reason: Reason for preemption
-
-        Returns:
-            True if preemption executed
-
-        TODO: Coordinate with spmd_manager for state saving
-        TODO: Actually implement preemption logic
-        """
-        logger.warning(
-            f"preempt called for {spmd_id} (reason: {reason}) - not implemented"
-        )
-        return False
-
-    def evict(self, spmd_id: str) -> bool:
-        """
-        Execute eviction on an SPMD's resources.
-
-        Args:
-            spmd_id: SPMD to evict
-
-        Returns:
-            True if eviction executed
-
-        TODO: Coordinate with spmd_manager for checkpoint
-        TODO: Actually implement eviction logic
-        """
-        logger.warning(f"evict called for {spmd_id} - not implemented")
-        return False
-
-    def get_all_spmd_ids(self) -> list[str]:
-        """Get all SPMD IDs with allocated resources."""
-        return list(self._spmd_to_resource.keys())
-
-    def get_preemptable_spmds(self, required_resource: ResourceSpec) -> list[str]:
-        """
-        Get SPMDs that could be preempted to free resources.
-
-        Returns SPMDs sorted by priority (LOW first).
-
-        Args:
-            required_resource: Resource needed
-
-        Returns:
-            List of SPMD IDs that could be preempted
-        """
-        # Sort by priority: LOW < MID < HIGH
-        priority_order = {
-            ResourcePriority.LOW: 0,
-            ResourcePriority.MID: 1,
-            ResourcePriority.HIGH: 2,
-        }
-
-        candidates = [
-            (
-                spmd_id,
-                priority_order[
-                    self._spmd_to_priority.get(spmd_id, ResourcePriority.MID)
+            pg = placement_group(
+                bundles=bundles,
+                strategy="STRICT_SPREAD",
+                bundle_label_selector=[
+                    {"ray.io/node-id": node_id} for node_id in node_ids
                 ],
             )
-            for spmd_id in self._spmd_to_resource.keys()
-        ]
-
-        # Sort by priority (ascending) - lower priority first
-        candidates.sort(key=lambda x: x[1])
-
-        return [spmd_id for spmd_id, _ in candidates]
-
-    def _resource_to_bundle(self, resource: ResourceSpec) -> dict[str, float]:
-        """Convert ResourceSpec to Ray bundle specification."""
-        bundle: dict[str, float] = {}
-
-        if resource.num_cpus > 0:
-            bundle["CPU"] = float(resource.num_cpus)
-
-        if resource.num_gpus > 0:
-            bundle["GPU"] = float(resource.num_gpus)
-
-        if resource.memory_gb > 0:
-            bundle["memory"] = resource.memory_gb * 1024 * 1024 * 1024
-
-        return bundle
-
-    def _driver_resource_to_bundle(
-        self, resource: DriverResourceSpec
-    ) -> dict[str, float]:
-        """Convert DriverResourceSpec to Ray bundle specification."""
-        bundle: dict[str, float] = {}
-
-        if resource.num_cpus > 0:
-            bundle["CPU"] = float(resource.num_cpus)
-
-        if resource.memory_gb > 0:
-            bundle["memory"] = resource.memory_gb * 1024 * 1024 * 1024
-
-        return bundle
-
-    def get_pg_info(self, spmd_id: str) -> dict[str, Any] | None:
-        """
-        Get detailed placement group info for an SPMD.
-
-        Returns:
-            Dict with pg, driver_bundle_index, worker_bundle_indices, num_workers
-        """
-        if spmd_id not in self._spmd_to_resource:
-            return None
-
-        return {
-            "pg": self._spmd_to_pg.get(spmd_id),
-            "driver_bundle_index": self.get_driver_bundle_index(spmd_id),
-            "worker_bundle_indices": self.get_worker_bundle_indices(spmd_id),
-            "num_workers": self.get_num_workers(spmd_id),
-            "worker_resource": self._spmd_to_resource.get(spmd_id),
-            "driver_resource": self._spmd_to_driver_resource.get(spmd_id),
-        }
-
-    def get_resource_allocation_summary(self, spmd_id: str) -> dict[str, Any] | None:
-        """Return a stable, human-readable resource summary for one SPMD."""
-        worker_resource = self._spmd_to_resource.get(spmd_id)
-        if worker_resource is None:
-            return None
-
-        worker_count = self._spmd_to_num_workers.get(spmd_id, 1)
-        driver_resource = self._spmd_to_driver_resource.get(
-            spmd_id, DriverResourceSpec()
+        except Exception as error:
+            raise PlacementMaterializationError(
+                f"Ray rejected placement group for recipe {plan.recipe_id}"
+            ) from error
+        logger.info(
+            "placement.pg.waiting bundles=%s timeout_s=%s",
+            len(bundles),
+            timeout_s,
         )
-
-        driver_bundle = self._driver_resource_to_bundle(driver_resource)
-        worker_bundle = self._resource_to_bundle(worker_resource)
-
-        return {
-            "spmd_id": spmd_id,
-            "worker_count": worker_count,
-            "bundle_count": worker_count + 1,
-            "driver_bundle": self._bundle_summary(driver_bundle),
-            "worker_bundle": self._bundle_summary(worker_bundle),
-            "total_cpu": driver_bundle.get("CPU", 0.0)
-            + worker_bundle.get("CPU", 0.0) * worker_count,
-            "total_gpu": driver_bundle.get("GPU", 0.0)
-            + worker_bundle.get("GPU", 0.0) * worker_count,
-            "total_memory_gb": (
-                driver_bundle.get("memory", 0.0)
-                + worker_bundle.get("memory", 0.0) * worker_count
+        started = asyncio.get_running_loop().time()
+        try:
+            await asyncio.wait_for(pg.ready(), timeout=timeout_s)
+            worker_groups = self._worker_groups_from_plan(
+                plan,
+                pg,
+                node_to_bundle,
             )
-            / (1024 * 1024 * 1024),
-            "placement_group_ready": spmd_id in self._spmd_to_pg,
-        }
+        except TimeoutError as error:
+            remove_placement_group(pg)
+            raise PlacementGroupTimeoutError(
+                f"placement group timed out after {timeout_s}s for recipe {plan.recipe_id}"
+            ) from error
+        except BaseException as error:
+            remove_placement_group(pg)
+            if not isinstance(error, Exception) or isinstance(
+                error, PlacementMaterializationError
+            ):
+                raise
+            raise PlacementMaterializationError(
+                f"Ray failed to materialize placement group for recipe {plan.recipe_id}"
+            ) from error
+        self._job_pg = pg
+        self._worker_groups = worker_groups
+        logger.info(
+            "placement.pg.ready pg_id=%s bundles=%s wait_duration=%s",
+            getattr(pg, "id", None),
+            len(bundles),
+            asyncio.get_running_loop().time() - started,
+        )
+        return cast(PlacementGroup, pg)
 
-    def get_all_resource_allocation_summaries(self) -> dict[str, dict[str, Any]]:
-        """Return resource summaries for every allocated SPMD."""
-        return {
-            spmd_id: summary
-            for spmd_id in self._spmd_to_resource
-            if (summary := self.get_resource_allocation_summary(spmd_id)) is not None
-        }
+    def _worker_groups_from_plan(
+        self,
+        plan: ResolvedPlacementPlan,
+        pg: PlacementGroup,
+        node_to_bundle: dict[str, int],
+    ) -> dict[str, SPMDWorkerGroup]:
+        worker_groups = {}
+        spmd_ids = sorted({assignment.spmd_id for assignment in plan.assignments})
+        for spmd_id in spmd_ids:
+            assignments = tuple(
+                sorted(
+                    (
+                        assignment
+                        for assignment in plan.assignments
+                        if assignment.spmd_id == spmd_id
+                    ),
+                    key=lambda assignment: assignment.rank,
+                )
+            )
+            resource_vectors = {
+                tuple(sorted(assignment.resources.items()))
+                for assignment in assignments
+            }
+            if len(resource_vectors) != 1:
+                raise PlacementMaterializationError(
+                    f"SPMD {spmd_id!r} has non-uniform per-worker resources"
+                )
+            rank_zero = assignments[0]
+            if rank_zero.rank != 0:
+                raise PlacementMaterializationError(
+                    f"SPMD {spmd_id!r} has no rank-zero assignment"
+                )
+            worker_groups[spmd_id] = SPMDWorkerGroup(
+                spmd_id=spmd_id,
+                placement_group=pg,
+                rank_to_bundle=tuple(
+                    node_to_bundle[assignment.node_id] for assignment in assignments
+                ),
+                expected_node_ids=tuple(
+                    assignment.node_id for assignment in assignments
+                ),
+                worker_resources=dict(next(iter(resource_vectors))),
+                driver_bundle_index=node_to_bundle[rank_zero.node_id],
+                driver_resources=dict(rank_zero.driver_resources),
+            )
+        return worker_groups
 
-    def _bundle_summary(self, bundle: dict[str, float]) -> dict[str, float]:
-        """Normalize raw Ray bundle fields into a stable summary shape."""
-        return {
-            "cpu": bundle.get("CPU", 0.0),
-            "gpu": bundle.get("GPU", 0.0),
-            "memory_gb": bundle.get("memory", 0.0) / (1024 * 1024 * 1024),
-        }
+    def get_worker_group(self, spmd_id: str) -> SPMDWorkerGroup:
+        try:
+            return self._worker_groups[spmd_id]
+        except KeyError as error:
+            raise KeyError(
+                f"SPMD {spmd_id!r} has no worker-group allocation"
+            ) from error
+
+    def release_job_pg(self) -> None:
+        if self._job_pg is None:
+            raise RuntimeError("job placement group does not exist")
+        remove_placement_group(self._job_pg)
+        self._job_pg = None
+        self._worker_groups.clear()

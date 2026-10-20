@@ -45,7 +45,7 @@ class Monitor:
         """
         pass
 
-    def get_spmd_telemetry(self, spmd_id: str) -> dict[str, WorkerTelemetry]:
+    def get_spmd_telemetry(self, spmd_id: str) -> dict[str, WorkerTelemetry]:  # type: ignore
         """
         Query SPMD telemetry.
 
@@ -69,7 +69,7 @@ class Monitor:
         """
         pass
 
-    def get_cluster_health(self) -> dict[str, str]:
+    def get_cluster_health(self) -> dict[str, str]:  # type: ignore
         """
         Get overall cluster health status.
 
@@ -81,7 +81,7 @@ class Monitor:
         """
         pass
 
-    def probe_sub_controller(self, spmd_id: str) -> bool:
+    def probe_sub_controller(self, spmd_id: str) -> bool:  # type: ignore
         """
         Probe SPMD sub-controller for health.
 
@@ -101,7 +101,7 @@ class Monitor:
         """
         pass
 
-    def get_eviction_history(self, spmd_id: str) -> list:
+    def get_eviction_history(self, spmd_id: str) -> list:  # type: ignore
         """
         Get eviction and recovery history for an SPMD.
 
@@ -109,7 +109,7 @@ class Monitor:
         """
         pass
 
-    def get_resource_usage(self, spmd_id: str) -> dict:
+    def get_resource_usage(self, spmd_id: str) -> dict:  # type: ignore
         """
         Get resource usage for an SPMD.
 

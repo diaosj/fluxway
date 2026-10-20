@@ -1,241 +1,572 @@
+import asyncio
+import inspect
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
 import numpy as np
 import pytest
-import asyncio
-from unittest.mock import AsyncMock, patch
 
-from fluxway.spmd.worker.worker import SPMDWorker
-from fluxway.common.types.configs import (
-    SPMDConfig,
-    OperatorMeta,
-    EdgeShardingInfo,
-    ArgumentType,
-    SPMDTopology,
-    SPMDTopologyInfo,
+from fluxway.common.compiled_graph import (
+    DependencySpec,
+    OperatorKey,
+    OperatorPort,
+    TensorTransfer,
+    compile_graph,
 )
-from fluxway.common.types.sharding import ShardingSpec, PartitionSpec
+from fluxway.common.driver_control import IngestionLayoutActivationRequest
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.decorators import spmd, operator as fw_operator
+from fluxway.common.execution_layout import compile_execution_layout
+from fluxway.common.operator_spec import OperatorSpec
+from fluxway.common.types import DrainBoundary, SPMDConfig
+from fluxway.common.ingestion import (
+    CompiledSegment,
+    IngestionLayoutActivation,
+    WorkerLayoutDescriptor,
+    ingestion_worker_id,
+)
+from fluxway.common.types.sharding import PartitionSpec, ShardingSpec
+from fluxway.spmd.worker.data_plane import (
+    SuccessorRouteContext,
+    build_step_frame_groups,
+    compile_send_plan,
+)
+from fluxway.spmd.worker.mailbox.mailbox import WorkerMailbox
+from fluxway.spmd.worker.operator_manager.dispatcher import (
+    ExecutionResult,
+    ExecutionStatus,
+    ExecutionDispatcher,
+)
+from fluxway.spmd.worker.worker import SPMDWorker
+from fluxway.spmd.worker.source_scope import SourceExecutionScope
+from fluxway.spmd.worker.admission import StepAdmissionState
+from tests.compiled_graph_fixtures import compiled_spmd_spec
 
 
-@spmd(mesh_axis_names=("data", "mp"), mesh_axis_shapes=(2, 2))
-class _LoaderOp:
-    @fw_operator(name="loader", is_source=True)
-    def loader(self):
-        return {"t1": np.ones((10, 10))}
+class _SourceDescriptor:
+    requires_source_control_runtime = True
 
+    def build_component(self, context):
+        raise AssertionError("descriptor is not built in this worker unit test")
 
-@spmd(mesh_axis_names=("data",), mesh_axis_shapes=(2,))
-class _ProcessorOp:
-    @fw_operator(name="processor")
-    def processor(self, t1: np.ndarray = None):
-        pass
+    def _build_reader_topology(self, *, spmd_id, operator_name, config):
+        raise AssertionError(
+            "build_reader_topology is not called in this worker unit test"
+        )
 
+    def _build_source_scan_adapter(self, **kwargs):
+        raise AssertionError(
+            "scan result adapter is not called in this worker unit test"
+        )
 
-def _meta_to_topology(meta: OperatorMeta) -> dict[str, SPMDTopology]:
-    """Helper for unit tests to derive topology from OperatorMeta."""
-    top_dict = {}
-    top = SPMDTopology()
-    for pred_id, edges in meta.input_pre_sharding.items():
-        if edges:
-            e = edges[0]
-            top.predecessors[pred_id] = SPMDTopologyInfo(
-                spmd_id=pred_id,
-                tuuid_sharding=e.tuuid_sharding,
-                tuuid_map=e.tuuid_map,
-                is_interleaved=e.is_interleaved,
-                interleave_unit_size=e.interleave_unit_size,
-                mesh=e.mesh,
-                world_size=e.mesh.size if getattr(e, "mesh", None) else 0,
-            )
-    for succ_id, edges in meta.output_post_sharding.items():
-        if edges:
-            e = edges[0]
-            top.successors[succ_id] = SPMDTopologyInfo(
-                spmd_id=succ_id,
-                tuuid_sharding=e.tuuid_sharding,
-                tuuid_map=e.tuuid_map,
-                is_interleaved=e.is_interleaved,
-                interleave_unit_size=e.interleave_unit_size,
-                mesh=e.mesh,
-                world_size=e.mesh.size if getattr(e, "mesh", None) else 0,
-            )
-    top_dict[meta.name] = top
-    return top_dict
+    def _build_source_scan_tail_layout(self, **kwargs):
+        raise AssertionError("tail policy is not called in this worker unit test")
+
+    def build_source_scan_binding(self, **kwargs):
+        raise AssertionError("source binding is not called in this worker unit test")
 
 
 @pytest.mark.asyncio
-async def test_multi_worker_interleaved_unit_mesh_inheritance():
-    """
-    Verify that interleaved units correctly inherit the sub-mesh structure.
-    Loader (4 ranks, mesh (2,2)) -> Processor (2 ranks)
-    """
-    loader_mesh = DeviceMesh(
-        axis_names=("data", "mp"), device_shape=(2, 2), device_ids=[0, 1, 2, 3]
+async def test_worker_activates_layout_on_matching_source_operator_only():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "reader"
+    worker.rank = 1
+    worker._profiler_runtime = SimpleNamespace(enabled=False)
+    worker._background_tasks = set()
+    worker._source_scope = SourceExecutionScope(
+        acquire=worker._acquire_source_work,
+        spawn=worker._spawn_background_task,
+        completed=lambda op: 0,
+        depth=lambda op: 1,
     )
-    processor_mesh = DeviceMesh(
-        axis_names=("data",), device_shape=(2,), device_ids=[0, 1]
+    received = []
+
+    class Reader:
+        async def activate_ingestion_layout(self, activation):
+            received.append(activation)
+
+    reader = Reader()
+    worker._op_manager = SimpleNamespace(
+        get_operator_spec=lambda op_name: OperatorSpec(
+            name=op_name,
+            is_source=True,
+        ),
+        require_operator_instance=lambda op_name: reader,
+        is_source_operator=lambda op_name: True,
+    )
+    worker_id = ingestion_worker_id("reader", "read", 1)
+    activation = IngestionLayoutActivation(
+        epoch=0,
+        start_position=0,
+        end_position=1,
+        layout_digest="layout",
+        terminal=True,
+        descriptor=WorkerLayoutDescriptor(
+            source_identity="source",
+            view_identity="view",
+            schema_digest="schema",
+            lineage_digest="lineage",
+            layout_digest="layout",
+            worker_id=worker_id,
+            segments=(
+                CompiledSegment(
+                    0,
+                    "assignment",
+                    worker_id,
+                    "unit",
+                    "revision",
+                    "node",
+                    "file",
+                    "rows",
+                    0,
+                    1,
+                    "token",
+                ),
+            ),
+        ).encode(),
     )
 
-    sharding = ShardingSpec.chunk(PartitionSpec("data", "mp"))
-    edge_info = EdgeShardingInfo(
-        is_interleaved=True,
-        interleave_unit_size=2,
-        tuuid_sharding={1001: sharding},
-        tuuid_map={"t1": 1001},
-        mesh=loader_mesh,
+    await worker.dispatch_control(
+        IngestionLayoutActivationRequest(
+            rank=1,
+            operator_name="read",
+            activation=activation,
+        )
     )
 
-    loader_meta = OperatorMeta(
+    assert received == [activation]
+
+
+def _compile_interleaved_compiled_graph(
+    *,
+    source_mesh: DeviceMesh,
+    target_mesh: DeviceMesh,
+    source_sharding: ShardingSpec,
+    target_sharding: ShardingSpec,
+    interleave_unit_size: int,
+):
+    loader = OperatorSpec(
         name="loader",
         is_source=True,
         is_interleaved=True,
-        interleave_unit_size=2,
-        output_arguments={ArgumentType.DATA.value: ["t1"]},
-        output_uuids=[1001],
-        output_sharding={1001: sharding},
-        output_post_sharding={"processor": [edge_info]},
-        owner_class_module=_LoaderOp.__module__,
-        owner_class_qualname=_LoaderOp.__qualname__,
+        interleave_unit_size=interleave_unit_size,
+        output_arguments={"data": ("t1",)},
+        output_sharding={"t1": source_sharding},
     )
 
-    processor_meta = OperatorMeta(
+    processor = OperatorSpec(
         name="processor",
-        input_arguments={ArgumentType.DATA.value: ["t1"]},
-        input_sharding={"t1": ShardingSpec.chunk(PartitionSpec())},
-        input_pre_sharding={"loader": [edge_info]},
-        owner_class_module=_ProcessorOp.__module__,
-        owner_class_qualname=_ProcessorOp.__qualname__,
+        input_arguments={"data": ("t1",)},
+        input_sharding={"t1": target_sharding},
+    )
+    return compile_graph(
+        name="interleaved-source",
+        spmds=(
+            compiled_spmd_spec("loader", source_mesh, {"loader": loader}),
+            compiled_spmd_spec("processor", target_mesh, {"processor": processor}),
+        ),
+        dependencies=(
+            DependencySpec(
+                source=OperatorKey("loader", "loader"),
+                target=OperatorKey("processor", "processor"),
+                transfers=(TensorTransfer(OperatorPort("t1"), OperatorPort("t1")),),
+            ),
+        ),
     )
 
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
 
-    # Instantiate Loader Workers
-    loader_workers = []
-    for rank in range(4):
-        config = SPMDConfig(
-            mesh=loader_mesh,
-            spmd_id="loader",
-            operators={"loader": "loader"},
-            operator_metas={"loader": loader_meta, "processor": processor_meta},
-            topology=_meta_to_topology(loader_meta),
-        )
-        w = cls(config, rank=rank)
-        w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
-        w._successor_handlers = {"processor": {0: AsyncMock(), 1: AsyncMock()}}
-        loader_workers.append(w)
-
-    # Instantiate Processor Workers (for shard count check)
-    processor_workers = []
-    for rank in range(2):
-        config = SPMDConfig(
-            mesh=processor_mesh,
-            spmd_id="processor",
-            operators={"processor": "processor"},
-            operator_metas={"loader": loader_meta, "processor": processor_meta},
-            topology=_meta_to_topology(processor_meta),
-        )
-        w = cls(config, rank=rank)
-        w.setup_and_start(local_rank=rank, local_world_size=2, node_rank=0, num_nodes=1)
-        processor_workers.append(w)
-
-    shards_dict = processor_workers[0]._op_manager.get_expected_tensor_shards(
-        "processor"
+def test_controlled_interleaved_source_eof_is_explicit_execution_status():
+    loader = OperatorSpec(
+        name="loader",
+        is_source=True,
+        source=_SourceDescriptor(),
+        is_interleaved=True,
     )
-    assert shards_dict[1001] == 2, (
-        f"Target processor should expect 2 shards, got {shards_dict}"
+    graph = compile_graph(
+        name="controlled-eof",
+        spmds=(
+            compiled_spmd_spec(
+                "loader",
+                DeviceMesh(device_shape=(1,), axis_names=("dp",)),
+                {"loader": loader},
+            ),
+        ),
+        dependencies=(),
+    )
+    worker_class = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_class = worker_class.modified_class if worker_class else SPMDWorker
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "loader"
+    worker.config = SPMDConfig(
+        spmd_id="loader",
+        graph_view=graph.spmd("loader"),
+    )
+    worker._drain_boundary = DrainBoundary()
+    worker._driver_handle = SimpleNamespace(
+        report_boundary_event=SimpleNamespace(remote=Mock())
+    )
+    worker._pending_terminal_observation = None
+
+    result = worker._normalize_interleaved_source_result("loader", 3, None)
+
+    assert result.status is ExecutionStatus.SOURCE_EXHAUSTED
+    assert worker._drain_boundary.observed_cut == 3
+
+
+def test_uncontrolled_interleaved_source_eof_is_reported():
+    loader = OperatorSpec(name="loader", is_source=True, is_interleaved=True)
+    graph = compile_graph(
+        name="uncontrolled-eof",
+        spmds=(
+            compiled_spmd_spec(
+                "loader",
+                DeviceMesh(device_shape=(1,), axis_names=("dp",)),
+                {"loader": loader},
+            ),
+        ),
+        dependencies=(),
+    )
+    worker_class = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_class = worker_class.modified_class if worker_class else SPMDWorker
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "loader"
+    worker.config = SPMDConfig(
+        spmd_id="loader",
+        graph_view=graph.spmd("loader"),
+    )
+    worker._drain_boundary = DrainBoundary()
+    worker._pending_terminal_observation = None
+
+    result = worker._normalize_interleaved_source_result("loader", 3, None)
+
+    assert result.status is ExecutionStatus.SOURCE_EXHAUSTED
+    assert worker._drain_boundary.observed_cut == 3
+
+
+def test_source_exhaustion_is_not_sent_as_a_data_completion():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+
+    result = ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)
+
+    assert not worker_class._result_requires_send(worker, result)
+
+
+def test_source_exhaustion_is_stable_for_already_prefetched_steps():
+    loader = OperatorSpec(
+        name="loader",
+        is_source=True,
+        source=_SourceDescriptor(),
+        is_interleaved=True,
+    )
+    graph = compile_graph(
+        name="stable-controlled-eof",
+        spmds=(
+            compiled_spmd_spec(
+                "loader",
+                DeviceMesh(device_shape=(1,), axis_names=("dp",)),
+                {"loader": loader},
+            ),
+        ),
+        dependencies=(),
+    )
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker.spmd_id = "loader"
+    worker.config = SPMDConfig(
+        spmd_id="loader",
+        graph_view=graph.spmd("loader"),
+    )
+    worker._drain_boundary = DrainBoundary()
+    worker._pending_terminal_observation = None
+
+    first = worker_class._normalize_interleaved_source_result(worker, "loader", 3, None)
+    already_prefetched = worker_class._normalize_interleaved_source_result(
+        worker, "loader", 4, {"late": "batch"}
     )
 
-    # 2. RUN STEP 0: Unit 0 (Ranks 0, 1) active
-    with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:
-        mock_dist = mock_dist_cls.return_value
-        mock_dist.distribute = AsyncMock()
-
-        await asyncio.gather(
-            *[w._execute_operator("loader", 0) for w in loader_workers]
-        )
-
-        assert mock_dist.plan_and_shard.call_count == 2
-        assert mock_dist.distribute.call_count == 2
-        found_u0 = False
-        for call in mock_dist.plan_and_shard.call_args_list:
-            source_spec = call.args[1]
-            if list(source_spec.mesh.device_ids.flatten()) == [0, 1]:
-                assert source_spec.mesh.shape == (1, 2)
-                assert source_spec.mesh.axis_names == ("data", "mp")
-                found_u0 = True
-        assert found_u0, "Unit 0 sub-mesh distribution not found"
-
-    # 3. RUN STEP 1: Unit 1 (Ranks 2, 3) active
-    with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:
-        mock_dist = mock_dist_cls.return_value
-        mock_dist.distribute = AsyncMock()
-
-        await asyncio.gather(
-            *[w._execute_operator("loader", 1) for w in loader_workers]
-        )
-
-        assert mock_dist.plan_and_shard.call_count == 2
-        assert mock_dist.distribute.call_count == 2
-        found_u1 = False
-        for call in mock_dist.plan_and_shard.call_args_list:
-            source_spec = call.args[1]
-            if list(source_spec.mesh.device_ids.flatten()) == [2, 3]:
-                found_u1 = True
-        assert found_u1, "Unit 1 sub-mesh distribution not found"
+    assert first.status is ExecutionStatus.SOURCE_EXHAUSTED
+    assert already_prefetched.status is ExecutionStatus.SOURCE_EXHAUSTED
 
 
 @pytest.mark.asyncio
-async def test_single_worker_interleaved_unit():
-    loader_mesh = DeviceMesh(axis_names=("data",), device_shape=(4,))
-    sharding = ShardingSpec.chunk(PartitionSpec("data"))
-    edge = EdgeShardingInfo(
-        is_interleaved=True,
-        interleave_unit_size=4,
-        tuuid_sharding={2001: sharding},
-        tuuid_map={"t1": 2001},
-        mesh=loader_mesh,
+async def test_source_exhaustion_does_not_advance_the_data_watermark():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker._completed_step_count = {"loader": 3}
+    worker._finished_plan_steps = {
+        "loader": {3: ExecutionResult(status=ExecutionStatus.SOURCE_EXHAUSTED)}
+    }
+    worker._coherence_input_grants = {}
+    worker._coherence_alias_dependencies = {}
+    worker._coherence_input_tensors = {}
+    worker._coherence_input_bindings = {}
+    worker._coherence_output_intents = {}
+    worker._local_input_origins = {}
+    worker._barriers_declared = {("loader", 3): True}
+    worker._drain_boundary = DrainBoundary()
+    worker._driver_handle = SimpleNamespace(
+        report_boundary_event=SimpleNamespace(remote=Mock())
     )
-    loader_meta = OperatorMeta(
-        name="loader",
-        is_source=True,
-        is_interleaved=True,
+    worker._pending_terminal_observation = None
+    worker._pending_blocked = {"loader": []}
+    worker._pending_future_steps = {"loader": []}
+    worker._ready_pending_pipeline_steps = {"loader": []}
+    worker._pending_async_lag_steps = {"loader": []}
+    worker._pending_phase_order_steps = {"loader": []}
+    worker._in_op_step_queue = set()
+    worker._running_plan_steps = {"loader": set()}
+    worker._mailbox_ready_steps = {"loader": set()}
+    worker._direct_local_ready_steps = {"loader": set()}
+    worker._plan_task_steps = {}
+    worker._send_tasks = {}
+    worker._delivery_runtime = SimpleNamespace(cancel_matching=lambda _predicate: None)
+    worker._spawn_background_task = Mock(
+        side_effect=lambda coro: coro.close() if inspect.iscoroutine(coro) else None
+    )
+    worker._mailbox = SimpleNamespace(clear_step=AsyncMock())
+    worker._return_input_coherence = AsyncMock()
+    worker._clear_direct_local_step = Mock()
+    worker._advance_step = AsyncMock(
+        side_effect=AssertionError("source exhaustion is not a data step")
+    )
+    worker._scheduled_step_count = {"loader": 3}
+    worker._admission_state = StepAdmissionState(
+        completed=worker._completed_step_count,
+        scheduled=worker._scheduled_step_count,
+        queue_membership=worker._in_op_step_queue,
+        pending_blocked=worker._pending_blocked,
+        pending_future=worker._pending_future_steps,
+        pending_async_lag=worker._pending_async_lag_steps,
+        pending_phase_order=worker._pending_phase_order_steps,
+        ready_pipeline=worker._ready_pending_pipeline_steps,
+        mailbox_ready=worker._mailbox_ready_steps,
+        running=worker._running_plan_steps,
+        finished=worker._finished_plan_steps,
+        is_periodic=lambda _op: False,
+        is_runnable=lambda _op: True,
+        hold_prepare_token=lambda _op, _step: False,
+        async_lag_blocked=lambda _op, _step: False,
+        phase_order_blocked=lambda _op, _step: False,
+        can_start=lambda _op: True,
+    )
+
+    await worker_class._commit_finished_steps(worker, "loader")
+
+    assert worker._completed_step_count["loader"] == 3
+    assert worker._drain_boundary.observed_cut == 3
+    worker._advance_step.assert_not_awaited()
+
+
+def _build_interleaved_frames(
+    *,
+    compiled_graph,
+    rank: int,
+    interleave_unit_size: int,
+    exec_step: int,
+) -> None:
+    source_plan = compiled_graph.spmd("loader")
+    compiled_plan = compile_send_plan(
+        graph_view=source_plan,
+        source_op_id="loader",
+        rank=rank,
+        successor_contexts=(
+            SuccessorRouteContext(
+                context_index=0,
+                dependencies=source_plan.outgoing,
+                effective_rank=rank % interleave_unit_size,
+            ),
+        ),
+        sender_spmd_code=1,
+        interleave_unit_size=interleave_unit_size,
+    )
+    build_step_frame_groups(
+        compiled_plan=compiled_plan,
+        flat_results=[np.ones((10, 10))],
+        step_transfer_cache={},
+        exec_step=exec_step,
+    )
+
+
+def test_multi_worker_interleaved_unit_mesh_inheritance():
+    source_mesh = DeviceMesh(
+        axis_names=("data", "mp"),
+        device_shape=(2, 2),
+        device_ids=[0, 1, 2, 3],
+    )
+    target_mesh = DeviceMesh(axis_names=("data",), device_shape=(2,))
+    compiled_graph = _compile_interleaved_compiled_graph(
+        source_mesh=source_mesh,
+        target_mesh=target_mesh,
+        source_sharding=ShardingSpec.chunk(PartitionSpec("data", "mp")),
+        target_sharding=ShardingSpec.chunk(PartitionSpec()),
+        interleave_unit_size=2,
+    )
+
+    for exec_step, ranks, expected_device_ids in (
+        (0, (0, 1), [0, 1]),
+        (1, (2, 3), [0, 1]),
+    ):
+        with patch(
+            "fluxway.spmd.worker.data_plane.AsyncDataDistributor"
+        ) as distributor_cls:
+            distributor = distributor_cls.return_value
+            distributor.build_transport_frame_args.return_value = []
+            for rank in ranks:
+                _build_interleaved_frames(
+                    compiled_graph=compiled_graph,
+                    rank=rank,
+                    interleave_unit_size=2,
+                    exec_step=exec_step,
+                )
+
+        assert distributor.plan_and_shard.call_count == 2
+        assert distributor.build_transport_frame_args.call_count == 2
+        assert [
+            call.kwargs["sender_rank"]
+            for call in distributor.build_transport_frame_args.call_args_list
+        ] == list(ranks)
+        for call in distributor.plan_and_shard.call_args_list:
+            source_spec = call.args[1]
+            assert source_spec.mesh.shape == (1, 2)
+            assert source_spec.mesh.axis_names == ("data", "mp")
+            assert list(source_spec.mesh.device_ids.flatten()) == expected_device_ids
+
+
+def test_single_worker_interleaved_unit():
+    source_mesh = DeviceMesh(axis_names=("data",), device_shape=(4,))
+    target_mesh = DeviceMesh(axis_names=("data",), device_shape=(1,))
+    compiled_graph = _compile_interleaved_compiled_graph(
+        source_mesh=source_mesh,
+        target_mesh=target_mesh,
+        source_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
         interleave_unit_size=1,
-        output_arguments={ArgumentType.DATA.value: ["t1"]},
-        output_uuids=[2001],
-        output_sharding={2001: sharding},
-        output_post_sharding={"processor": [edge]},
-        owner_class_module=_LoaderOp.__module__,
-        owner_class_qualname=_LoaderOp.__qualname__,
     )
 
-    cls = getattr(SPMDWorker, "__ray_metadata__", None)
-    cls = cls.modified_class if cls else SPMDWorker
-
-    loader_workers = []
-    for rank in range(4):
-        config = SPMDConfig(
-            mesh=loader_mesh,
-            spmd_id="loader",
-            operators={"loader": "loader"},
-            operator_metas={"loader": loader_meta},
-            topology=_meta_to_topology(loader_meta),
+    with patch(
+        "fluxway.spmd.worker.data_plane.AsyncDataDistributor"
+    ) as distributor_cls:
+        distributor = distributor_cls.return_value
+        distributor.build_transport_frame_args.return_value = []
+        _build_interleaved_frames(
+            compiled_graph=compiled_graph,
+            rank=0,
+            interleave_unit_size=1,
+            exec_step=0,
         )
-        w = cls(config, rank=rank)
-        w.setup_and_start(local_rank=rank, local_world_size=4, node_rank=0, num_nodes=1)
-        w._successor_handlers = {"processor": {0: AsyncMock()}}
-        loader_workers.append(w)
 
-    with patch("fluxway.spmd.worker.worker.AsyncDataDistributor") as mock_dist_cls:
-        mock_dist = mock_dist_cls.return_value
-        mock_dist.distribute = AsyncMock()
+    distributor.plan_and_shard.assert_called_once()
+    distributor.build_transport_frame_args.assert_called_once()
+    assert distributor.build_transport_frame_args.call_args.kwargs["sender_rank"] == 0
+    source_spec = distributor.plan_and_shard.call_args.args[1]
+    assert source_spec.mesh.shape == (1,)
+    assert list(source_spec.mesh.device_ids.flatten()) == [0]
 
-        await asyncio.gather(
-            *[w._execute_operator("loader", 0) for w in loader_workers]
+
+def test_interleaved_dependency_uses_active_unit_size():
+    compiled_graph = _compile_interleaved_compiled_graph(
+        source_mesh=DeviceMesh(("data",), (4,)),
+        target_mesh=DeviceMesh(("data",), (1,)),
+        source_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+        interleave_unit_size=2,
+    )
+    dependency = compiled_graph.dependencies[0]
+
+    assert dependency.source_world_size == 4
+    assert dependency.source_participating_count == 2
+
+
+def test_interleaved_source_requires_complete_units():
+    with pytest.raises(
+        ValueError,
+        match=("mesh size 3 must be divisible by interleave_unit_size 2"),
+    ):
+        _compile_interleaved_compiled_graph(
+            source_mesh=DeviceMesh(("data",), (3,)),
+            target_mesh=DeviceMesh(("data",), (1,)),
+            source_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+            target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+            interleave_unit_size=2,
         )
-        assert mock_dist.plan_and_shard.call_count == 1
-        assert mock_dist.distribute.call_count == 1
 
-        source_spec = mock_dist.plan_and_shard.call_args.args[1]
-        assert source_spec.mesh.shape == (1,)
-        assert list(source_spec.mesh.device_ids.flatten()) == [0]
+
+def test_interleaved_source_unit_contains_complete_trailing_mesh():
+    with pytest.raises(
+        ValueError,
+        match=("interleave_unit_size 1 must be divisible by trailing mesh size 2"),
+    ):
+        _compile_interleaved_compiled_graph(
+            source_mesh=DeviceMesh(("data", "model"), (2, 2)),
+            target_mesh=DeviceMesh(("data",), (1,)),
+            source_sharding=ShardingSpec.chunk(PartitionSpec("data", "model")),
+            target_sharding=ShardingSpec.chunk(PartitionSpec("data")),
+            interleave_unit_size=1,
+        )
+
+
+def test_interleaved_source_balances_complete_units_across_steps():
+    dispatcher = ExecutionDispatcher(
+        compile_execution_layout(DeviceMesh(("worker",), (6,)), unit_size=2)
+    )
+
+    owners = [
+        [rank for rank in range(6) if dispatcher.should_execute(rank, 6, step)]
+        for step in range(9)
+    ]
+
+    assert owners == [
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [0, 1],
+        [2, 3],
+        [4, 5],
+        [0, 1],
+        [2, 3],
+        [4, 5],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inactive_interleaved_rank_does_not_send():
+    worker_class = SPMDWorker.__ray_metadata__.modified_class  # type: ignore[attr-defined]
+    worker = object.__new__(worker_class)
+    worker.rank = 2
+    worker._world_size = 4
+    worker._completed_step_count = {"loader": 0}
+    worker._mailbox = WorkerMailbox()
+    worker._op_manager = SimpleNamespace(
+        get_dispatcher=lambda _name: ExecutionDispatcher(
+            compile_execution_layout(DeviceMesh(("worker",), (4,)), unit_size=2)
+        )
+    )
+    worker._drain_cond = asyncio.Condition()
+    worker._drain_step_count = None
+    worker._drain_boundary = DrainBoundary()
+    worker._pending_terminal_observation = None
+    worker._barriers_declared = {("loader", 0): True}
+    worker._operator_send_context = lambda _name: (_ for _ in ()).throw(
+        AssertionError("inactive rank must not access a send plan")
+    )
+    worker._op_manager.get_operator_spec = lambda _name: SimpleNamespace(
+        is_source=False,
+        is_interleaved=False,
+        has_source_descriptor=False,
+    )
+
+    result = await worker_class._execute_operator_prepare_input(worker, "loader", 0)
+
+    assert result.status is ExecutionStatus.INACTIVE
+    assert not worker_class._result_requires_send(worker, result)
+    assert (
+        await worker_class._send_output(
+            worker,
+            "loader",
+            result,
+            exec_step=0,
+            step_transfer_cache={},
+        )
+        == ()
+    )

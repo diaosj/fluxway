@@ -9,12 +9,14 @@ on fluxway.example.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import jax.numpy as jnp
 import pytest
 
-from fluxway.common.backend import set_backend
+from fluxway.common.tensor_backend import set_backend
 from fluxway.common.decorators import data_type, operator, operator_context, spmd
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.types.tensor import TransportTensor
 
 # ---------------------------------------------------------------------------
@@ -26,7 +28,7 @@ from fluxway.common.types.tensor import TransportTensor
 @data_type()
 @dataclass
 class Item:
-    item_id: TransportTensor
+    target_id: TransportTensor
     item_stats: TransportTensor
 
 
@@ -66,8 +68,16 @@ class InputOp:
         name="process",
         input_sharding={"data": {"type": "static", "axis": ["dp"]}},
         output_sharding={
-            "unique_users": {"type": "dynamic", "axis": ["dp"], "fn": "hash_routing"},
-            "unique_items": {"type": "dynamic", "axis": ["dp"], "fn": "hash_routing"},
+            "unique_users": {
+                "type": "dynamic",
+                "axis": ["dp"],
+                "strategy": "modulo",
+            },
+            "unique_items": {
+                "type": "dynamic",
+                "axis": ["dp"],
+                "strategy": "modulo",
+            },
             "user_inv": {"type": "static", "axis": ["dp"]},
             "item_inv": {"type": "static", "axis": ["dp"]},
             "stats": {"type": "static", "axis": ["dp"]},
@@ -76,7 +86,7 @@ class InputOp:
     )
     def process(self, data: Batch) -> Deduped:
         u_users, inv_users = data.user_id.unique_with_routing()
-        u_items, inv_items = data.item.item_id.unique_with_routing()
+        u_items, inv_items = data.item.target_id.unique_with_routing()
         return Deduped(
             unique_users=u_users,
             user_inv=inv_users,
@@ -87,17 +97,10 @@ class InputOp:
         )
 
 
-def hash_routing(tensor, mesh):
-    val = (
-        tensor.routing_indices
-        if tensor.routing_indices is not None
-        else tensor.flat_values
-    )
-    return jnp.mod(val, mesh.size)
-
-
 @spmd(mesh_axis_names=("shard",), mesh_axis_shapes=(4,))
 class EmbeddingOp:
+    ctx: Any
+
     def __init__(self, vocab_size: int = 1000, embed_dim: int = 4):
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -108,7 +111,11 @@ class EmbeddingOp:
         name="lookup",
         data_argument=["unique_ids"],
         input_sharding={
-            "unique_ids": {"type": "dynamic", "axis": ["shard"], "fn": "hash_routing"}
+            "unique_ids": {
+                "type": "dynamic",
+                "axis": ["shard"],
+                "strategy": "modulo",
+            }
         },
         output_sharding={"embeddings": {"type": "dynamic", "axis": ["shard"]}},
     )
@@ -224,12 +231,12 @@ def test_input_op_dedup_and_inv():
             jnp.array([100, 101], dtype=jnp.int32), global_shape=(2,)
         ),
         item=Item(
-            item_id=TransportTensor(
+            target_id=TransportTensor(
                 jnp.array([500, 501], dtype=jnp.int32), global_shape=(2,)
             ),
             item_stats=TransportTensor(
                 jnp.array([[0.1, 0.2], [0.3, 0.4]], dtype=jnp.float32),
-                global_shape=(2,),
+                global_shape=(2, 2),
             ),
         ),
         label=TransportTensor(jnp.array([1, 0], dtype=jnp.int32), global_shape=(2,)),
@@ -251,11 +258,11 @@ def test_input_op_dedup_repeated_ids():
             jnp.array([7, 7, 9], dtype=jnp.int32), global_shape=(3,)
         ),
         item=Item(
-            item_id=TransportTensor(
+            target_id=TransportTensor(
                 jnp.array([3, 5, 3], dtype=jnp.int32), global_shape=(3,)
             ),
             item_stats=TransportTensor(
-                jnp.array([[0.0, 0.0]] * 3, dtype=jnp.float32), global_shape=(3,)
+                jnp.array([[0.0, 0.0]] * 3, dtype=jnp.float32), global_shape=(3, 2)
             ),
         ),
         label=TransportTensor(jnp.array([0, 0, 1], dtype=jnp.int32), global_shape=(3,)),
@@ -301,10 +308,15 @@ def test_embedding_update_modifies_params():
     """EmbeddingOp.update applies gradient descent; verified by observing changed lookup output."""
     ids = jnp.array([200, 201], dtype=jnp.int32)
     tt = TransportTensor(ids, global_shape=(2,))
+    instance_container = OperatorInstanceContainer()
 
     # Step 0 forward: record baseline embeddings
     with operator_context(
-        static_args={}, rank=0, world_size=1, operator_ctx=_ctx(step=0)
+        static_args={},
+        rank=0,
+        world_size=1,
+        operator_ctx=_ctx(step=0),
+        instance_container=instance_container,
     ):
         out_before = _ItemTable.lookup(tt)
 
@@ -313,14 +325,22 @@ def test_embedding_update_modifies_params():
     # Step 0 backward: apply uniform gradient of 0.5
     grads = TransportTensor(jnp.ones((2, 4), dtype=jnp.float32) * 0.5)
     with operator_context(
-        static_args={}, rank=0, world_size=1, operator_ctx=_ctx(step=0)
+        static_args={},
+        rank=0,
+        world_size=1,
+        operator_ctx=_ctx(step=0),
+        instance_container=instance_container,
     ):
         _ItemTable.update(grads)
 
     # Step 1 forward: lookup the same IDs again — embeddings must differ by -lr*grad effect
     tt2 = TransportTensor(ids, global_shape=(2,))
     with operator_context(
-        static_args={}, rank=0, world_size=1, operator_ctx=_ctx(step=1)
+        static_args={},
+        rank=0,
+        world_size=1,
+        operator_ctx=_ctx(step=1),
+        instance_container=instance_container,
     ):
         out_after = _ItemTable.lookup(tt2)
         # Clear step-1 cache to avoid polluting update tests
@@ -346,10 +366,10 @@ def test_dense_op_step_grad_shape():
     batch = 4
 
     emb1 = TransportTensor(
-        jnp.ones((n_unique_users, embed_dim)), global_shape=(n_unique_users,)
+        jnp.ones((n_unique_users, embed_dim)), global_shape=(n_unique_users, embed_dim)
     )
     emb2 = TransportTensor(
-        jnp.ones((n_unique_items, embed_dim)), global_shape=(n_unique_items,)
+        jnp.ones((n_unique_items, embed_dim)), global_shape=(n_unique_items, embed_dim)
     )
     inv1 = TransportTensor(
         jnp.array([0, 1, 0, 1], dtype=jnp.int32), global_shape=(batch,)
@@ -357,7 +377,9 @@ def test_dense_op_step_grad_shape():
     inv2 = TransportTensor(
         jnp.array([0, 1, 2, 0], dtype=jnp.int32), global_shape=(batch,)
     )
-    stats = TransportTensor(jnp.zeros((batch, stats_dim)), global_shape=(batch,))
+    stats = TransportTensor(
+        jnp.zeros((batch, stats_dim)), global_shape=(batch, stats_dim)
+    )
 
     with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=_ctx(0)):
         result = DenseOp.step(emb1=emb1, inv1=inv1, emb2=emb2, inv2=inv2, stats=stats)
@@ -373,11 +395,11 @@ def test_dense_op_step_scatter_add_correctness():
 
     # user 0 appears in sample 0 and 2 → grad accumulates twice
     # user 1 appears in sample 1 and 3 → grad accumulates twice
-    emb1 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2,))
-    emb2 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2,))
+    emb1 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2, embed_dim))
+    emb2 = TransportTensor(jnp.ones((2, embed_dim)), global_shape=(2, embed_dim))
     inv1 = TransportTensor(jnp.array([0, 1, 0, 1], dtype=jnp.int32), global_shape=(4,))
     inv2 = TransportTensor(jnp.array([0, 0, 1, 1], dtype=jnp.int32), global_shape=(4,))
-    stats = TransportTensor(jnp.zeros((4, stats_dim)), global_shape=(4,))
+    stats = TransportTensor(jnp.zeros((4, stats_dim)), global_shape=(4, stats_dim))
 
     with operator_context(static_args={}, rank=0, world_size=1, operator_ctx=_ctx(0)):
         result = DenseOp.step(emb1=emb1, inv1=inv1, emb2=emb2, inv2=inv2, stats=stats)

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
-import jax.numpy as jnp
+from typing import Any
+
 from fluxway.common.decorators import data_type
 from fluxway.common.types.tensor import TransportTensor
 
@@ -21,7 +22,7 @@ class ActiveFeatures:
 class PassiveFeatures:
     """Candidate item features."""
 
-    target_item_id: TransportTensor
+    target_target_id: TransportTensor
     target_item_category: TransportTensor
     target_item_stats: TransportTensor
 
@@ -60,7 +61,7 @@ class InputNodeOutput:
 
     unique_user_ids: TransportTensor
     user_inv: TransportTensor
-    unique_item_ids: TransportTensor
+    unique_target_ids: TransportTensor
     item_inv: TransportTensor
     # DP-aligned features
     dp_data: DPFeatures
@@ -79,7 +80,7 @@ class LookupOutput:
 class DenseOutput:
     """The result of the dense forward pass, serving as context for backward."""
 
-    prediction: jnp.ndarray
+    prediction: Any
     # Metadata for backward
     user_inv: TransportTensor
     item_inv: TransportTensor

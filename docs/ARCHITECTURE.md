@@ -1,124 +1,183 @@
-# 1. 概述
-Fluxway 是一个面向大规模分布式训练的深度学习框架，采用直接 SPMD-to-SPMD 数据传输机制，避免了传统的 "SPMD-to-One + One-to-SPMD" 中间聚合步骤，从而提升训练效率。框架在重构后，进一步加强了面向有向无环图（DAG）的数据驱动编排模型、完全异步化的状态机控制以及极高并行度的数据传输分离。
+# Fluxway Architecture
 
-## 1.1 核心特性
-**双平面传播协议**：将数据流分为基于高性能网络协议的 Data Plane（处理张量数据本身）与依赖 Ray RPC/Control Agent 广播的 Control Plane（处理标量、状态量和控制流），根据数据切片进行自动路由分发。
+This document is the English companion to [ARCHITECTURE_zh.md](ARCHITECTURE_zh.md).
+Both files describe the same stable implementation and protocol boundaries.
 
-**基于 Mailbox 的纯异步汇聚**：Worker 抛弃了传统事件阻塞，采用 `WorkerMailbox` 管理接收到的数据片。配合 `StepBarrier` 检测条件，一旦所期望的张量和状态量就绪，操作将自动进入 `asyncio.PriorityQueue` 执行。
+## Runtime ownership
 
-**细粒度 Async 异步控制和反压机制**：新增了 `AsyncStepManager` 来约束不同 SPMD 中执行异步步数差异；并结合了基于信用的 `_busy_worker_ratio` 进行反向压力追踪，自动使得 Reader 节点级联挂起。
+The compiled graph is the single source of truth for SPMD declarations,
+operator identity, dependencies, tensor transfers, placement inventory, and
+worker routes. Workers receive immutable graph projections and do not rebuild
+sharding or tensor identity metadata.
 
-**层级架构与灵活资源管理**：使用全局级别的 `Controller` 调度图信息和 Placement Group；使用局部的 `SPMDDriver` 追踪 Worker 心跳；各个 `SPMDWorker` 则专注于高性能异步 Kernel 计算，真正做到职责隔离。
+The Controller owns graph lifecycle, placement, drivers, heartbeats, drain,
+checkpoint orchestration, and failure propagation. Drivers supervise workers
+and forward control commands. Workers own local execution, admission, pending
+step lifecycle, transport delivery, and local plan execution.
 
-## 1.2 架构概览
+`ExecutionLifecycle` centralizes startup, restore, drain/checkpoint continuation,
+admission delivery and failure ordering. Driver heartbeats report readiness only.
+See [distributed execution lifecycle](execution_lifecycle.md) for the state flow
+and ownership table.
+
+Controller and Driver state machines use pure transition relations. A transition commits only
+state and failure records; its effect is executed after the lock by the owning lifecycle object.
+Source progress has one generation-aware supervisor, and terminal cleanup has one shared future.
+Worker close has one release future. These boundaries prevent duplicate tasks and keep Ray,
+checkpoint, transport and resource-release work off state-reducer critical sections.
+
+Lifecycle effects use `BoundedLifecycleEffectScheduler`, whose bounded queue and fixed workers
+provide explicit capacity. `ASYNC` is reserved for genuinely awaitable I/O; short blocking or
+GIL-releasing calls use the fixed thread lane, and pickleable pure-Python CPU work uses the spawn-
+based process lane. Same-key effects are ordered, different keys are bounded-concurrent, and a
+full queue raises a backpressure error. Outcomes carry `state_revision`; an owner discards stale
+outcomes before producing a fact event. CPython's event loop remains single-threaded and
+cooperative, so an `async def` declaration alone is not a non-blocking guarantee.
+
+## Coherence and data plane
+
+The endpoint-local MESI directory is the sole coherence state owner. A
+`CoherenceInstance(subject, epoch)` is the identity; `CoherenceDirectory.admit`
+is the synchronous admission seam, while `CoherenceSequencer` orders per-subject
+intents. Directory operations are event-loop local and do not own worker tasks
+or transport queues.
+
+`TransportTensor` is the canonical tensor ABI. Tensor slicing, frame assembly,
+batching, routing, and lineage belong to the transport/data-plane layer rather
+than the worker scheduler. Exact-step inputs are required; another step cannot
+be substituted as a fallback.
+
+## Compiled transfer plans
+
+`TensorTransfer.unit_routing` declares whole-unit incidence independently of source
+operators. `CompiledDependency` validates and binds the relation; `CompiledSendPlan`
+lowers it alongside ordinary sharding and receipt routing. Execution groups separate
+physical identities from logical layout coordinates. All payloads use the existing
+DataPlane. See [transfer planning](transfer_planning.md).
+
+## Coherence fanout publication
+
+One worker local step submits its complete immutable target-batch tuple to
+`CoherenceBatchRetireRuntime.retire_publication()`. The runtime admits the
+publication's instance set once, registers each unique child receipt, and starts
+all target enqueues concurrently. `CoherenceSequencer` retains only subject
+epoch admission and terminal retirement ordering; it does not serialize sibling
+readonly deliveries for one instance.
+
+For the CPU/Ray carrier, receiver completion means the frame was admitted and
+deposited into the receiver mailbox. The receiver then owns its materialized
+carrier, while the publication keeps the producer outbound references only until
+all child results terminate. Same-worker aliases remain protected by their
+consumer leases. This avoids a general variable-size buffer ring and does not
+claim cross-process zero-copy. A target failure cancels unfinished siblings and
+fails the complete publication through its single receipt owner.
+
+## Drain and restore
+
+One `DrainBoundary` reducer owns observed, admitted, drained and committed cuts.
+Controller derives `DrainAdmission(revision, target, terminal_cut)` from that reducer
+and carries it only on control messages and completion reports. Driver and Worker
+reject stale or conflicting admissions before opening a new finite gate. Completion
+requires the registered participant set and the active admission identity.
+
+Controller mutation locks contain state reduction, not Driver RPC, source ACK waits
+or checkpoint cancellation waits. Source ACK coverage is checked after drain and
+before checkpoint preparation. Restore rebuilds canonical plans and physical bindings,
+applies the committed cut, and restores model/runtime state with the Worker gate
+closed at that cut. Driver `resume` resets checkpoint bookkeeping without clearing
+the Worker gate; the next admission supplies its finite target.
+
+## Checkpoint transaction ownership
+
+Controller/Repository checkpoint coordination uses `CheckpointTransactionState`,
+distinct from the Worker-local `CheckpointSaveState`:
+
+```mermaid
+flowchart LR
+    S[STAGED] --> D[COMMIT_DECIDED]
+    D --> C[COMMITTED]
+    S --> A[ABANDONED]
+    D --> A
 ```
-+----------------------------------------------------------------------------------+
-|                           Control Plane (Ray Actor)                              |
-|                                                                                  |
-|   +------------------+     +------------------+    +-------------------------+   |
-|   |  DAG Parser /    |     |    Scheduler     |    |   AsyncStepManager &    |   |
-|   |   Graph Builder  |     |   (PG Manager)   |    |    HeartbeatManager     |   |
-|   +------------------+     +------------------+    +-------------------------+   |
-|                                                                                  |
-|                +------------------------------------------------+                |
-|                |              ControllerStateMachine            |                |
-|                +------------------------------------------------+                |
-+----------------------------------------------------------------------------------+
-                                        |
-+----------------------------------------------------------------------------------+
-|                            SPMD Level (Driver Layer)                             |
-|                                                                                  |
-|   +----------------------+      +--------------------+      +----------------+   |
-|   |   Driver FSM         |      | WorkerSynchronizer |      |  SPMD Monitor  |   |
-|   +----------------------+      +--------------------+      +----------------+   |
-|                                                                                  |
-|                +------------------------------------------------+                |
-|                |              Stateful Executor                 |                |
-|                +------------------------------------------------+                |
-+----------------------------------------------------------------------------------+
-                                        |
-+----------------------------------------------------------------------------------+
-|                           Worker Level (Async Actors)                            |
-|                                                                                  |
-|   +------------------+     +--------------------------+    +-----------------+   |
-|   |  Worker Mailbox  | --> | asyncio.PriorityQueue    | -> | OperatorManager |   |
-|   |  (StepBarrier)   |     |                          |    | (Dispatcher)    |   |
-|   +------------------+     +--------------------------+    +-----------------+   |
-|                                                                                  |
-|                +------------------------------------------------+                |
-|                |       AsyncDataDistributor & Transport         |                |
-|                |               (ULP Protocol)                   |                |
-|                +------------------------------------------------+                |
-+----------------------------------------------------------------------------------+
-```
 
----
+`COMMIT_DECIDED` records that physical publication has started. If a crash occurs
+before the global commit marker is written, startup fences the transaction via `abort_save(permit)`
+to `ABANDONED`. If the commit marker was already written, startup fencing replays component
+`acknowledge_save(permit)` and advances the transaction to `COMMITTED`. Only `COMMITTED` manifests
+are restorable and visible. Manifests, transactions, and cleanup intents are persisted
+using compact binary MessagePack via `msgpack_codec` rather than uncompacted JSON,
+ensuring low coordinator latency and bounded storage size.
 
-# 2. 控制平面 (Control Plane)
-控制平面是整个训练框架的核心协调层，对应代码目录为 `fluxway/control_plane`。
+## Placement and execution
 
-## 2.1 主控制器 (Controller)
-`Controller` 是由 Ray Actor 实现的主控入口，负责管理任务的整体生命周期和资源调度。
+Placement declarations come from compiled SPMD declarations and
+`ResourceProfile`. `PlacementRecipe` expresses constraints and lexicographic
+objectives without duplicating resource ownership. Each solved NodeID maps to one
+composite bundle in a shared heterogeneous placement group. Ray's `ray.io/node-id`
+bundle label selector pins the exact identity under `STRICT_SPREAD`; IP resource
+markers are not node identities. CPU, GPU and custom accelerator resources retain
+the quantities selected by the planner. Workers attest their actual NodeID against
+the plan. Multi-node execution requires compatible node environments and a shared
+checkpoint repository when recovery is enabled.
 
-### 2.1.1 拓扑构建与解析 (Graph Builder & Parser)
-`GraphParser` 负责处理和生成有向无环图，将用户编写的层级连线提取成了内部任务视图。并在运行时提供节点的前置、后置关联映射。`FunctionalGraph` 和 `NodeProxy` 为前端 API 提供透明抽象。
+Runtime-bound dynamic resources (such as dynamic routing tables, device meshes, or rank
+providers) are managed through `ResourceRegistry` (`fluxway.common.resource_registry`)
+and referenced via `ResourceHandle(namespace, resource_id)`. The active registry context is established
+by `bind_resource_registry`. `LogicalPartitionBinding` associates logical coordinate
+partitions with physical ranks, decoupling placement and routing from physical worker renumbering.
 
-### 2.1.2 调度层 (Scheduler & PGManager)
-**职责**：基于有向无环图的配置结构进行调度。依赖 `PGManager` 包装了基于 Ray Placement Group 的底层创建，实现了 CPU、GPU 内存的静态计算和按需资源划分分配。
-支持创建阶段构建整个网络的节点拓扑连接方式。
+The worker admission owner contains gating and pending-state promotion.
+`SourcePipelineMaintenance.request()` coalesces requests to fill the Worker source
+step queue; `fill()` checks running state, pipeline depth, drain boundaries and
+the total step target before enqueueing work. This queue maintenance does not
+discover source revisions or publish new ingestion windows. The execution lane
+consumes owned queue items, evaluates admission, dispatches plans, and completes
+`task_done()`.
 
-### 2.1.3 心跳和限流 (HeartbeatManager & AsyncStepManager)
-**双重监控与限流**：
-1. **HeartbeatManager**：接收各个 SPMD 的 Driver 带来的心跳汇报信息。并在全部 Driver 准备好后发送拓扑注册请求，在探测到出错时切换系统异常状态抛出错误。
-2. **AsyncStepManager**：计算操作的最大步数容忍漂移差，执行针对特定 Op（操作）层级的阻止和释放阻塞通知。
-3. **反向压力与 Backpressure**：通过探测下游 Driver 发生大量 mailbox full 或 busy 的概率 (`busy_worker_ratio`)，对入图无前驱节点的 Reader 节点触发 pause 停止拉取新批次。
+## Ingestion layout and source coordination
 
-### 2.1.4 状态管理器与 SPMD 配置 (StateManager & SPMDManager)
-负责记录图上每个 SPMD 的句柄，以及对节点启动、驱逐做句柄跟踪。保存并规划整个拓扑的状态持久化策略和集群统计。
+`IngestionSourceAdapter` returns immutable `SourceScanResult` values for bounded
+scan requests. The controller's `SourceProgressSupervisor` owns event-driven
+scan and activation publication. The compiler first creates canonical assignments,
+identified by `SourceWorkKey(epoch, step, assignment_id)`, then binds them to current
+reader quotas in transient `WorkerLayoutDescriptor` values. `LogicalWorkLedger`
+alone owns leases, ACK frontiers and committed cuts. Driver activation checkpoint
+state is empty. Restore reconstructs plans
+and bindings before applying the logical committed cut.
 
----
+`IngestionLayoutPlanningComponent` owns descriptor construction and adapter scans
+on a dedicated `IOLane`, and pure compilation on a persistent spawn process pool.
+Accepted operations survive cancellation of their callers. Close rejects new work,
+joins accepted operations, and joins the compiler on a separate lifecycle lane
+before closing the adapter lane. Planner and ledger publication is installed in
+one owner-loop section without suspension; validation and installation costs still
+scale with window size. I/O threads isolate blocking calls but do not remove the
+GIL for Python CPU work.
 
-# 3. SPMD 层面
-SPMD 在运行时切分为两层，一层是对内做监督的 `SPMDDriver`，另一层是专注于流式运算的极简 `SPMDWorker`。
+`SourceExecutionScope` owns Worker window installation, the active-step index and
+transient grants. Acquisition batches active steps up to operator pipeline depth;
+the authority returns the complete-step prefix permitted by current credit.
+Normal checkpoint continuation retains the scope. Restore uses fresh actors before
+source activation. ACK submission uses a bounded asynchronous queue; full capacity
+applies backpressure. Controller startup activates one layout. The planner component
+supports idle observations and pending tails. The startup API starts this lifecycle;
+the controller supervisor performs event-driven adapter scans and replenishment,
+while the adapter itself does not own refill. Committed planning windows and
+physical bindings remain retained, so metadata grows with installed window count.
+See [source coordination](source_coordination.md) and
+[formal protocol](source_spmd_formal_protocol.md) for the supported contracts.
 
-## 3.1 SPMD 主控端 (SPMDDriver)
-位于 `fluxway/spmd/driver` 目录下，作为该 SPMD 系列资源的总管（Master）。每个 SPMD 有一个特定的 Driver，被 SPMDManager 控制启动。
-- **DriverStateMachine (FSM)**：控制当前 SPMD 子循环的局部状态（如初始化等待节点汇聚、暂停、完成等）。
-- **WorkerSynchronizer**：执行特定细粒度的 Operation Block。能针对该 SPMD 中每个 Operator（操作符）设定统一的 Step Watermark 水位线限制。
-- **StatefulExecutor**：有状态执行器，用来响应并维护模型状态向主存储介质或远程主节点的收发。
-- **SPMDMonitor**：周期性收集所有所辖内部的 `SPMDWorker` 上报的心跳。
+## Process diagnostics and signal capture
 
-## 3.2 强异步底层执行流 (SPMDWorker)
-重构后的 `SPMDWorker` 使用 Python 原生 `asyncio` 并发替代了原先复杂的异步执行树（Event Loop 模式更加单纯可靠）。
+To reliably attribute worker process exits caused by external preemption, evictions, or operating system signals, Fluxway provides non-blocking process-level diagnostic interception in `fluxway.diagnostics`:
 
-### 3.2.1 双流汇聚与邮箱架构 (Dual-Stream Convergence via WorkerMailbox)
-为了支持极端的 "Control + Data" 并行发送到达随机性：
-Worker 并不会使用阻塞拉取来推进。相反，采用 `WorkerMailbox` 建立异步回调墙（`StepBarrier`）。
-- 控制流数据（如 LR 等由 Controller 发出的标量）在经过 Driver 使用 `receive_control` 发进来。
-- 数据流张量（如前向输出特征，ULP 通信包）经过 Data Plane 由 `receive_shards` 发进来。
-- 一旦某一对 (`op_name`, `step`) 符合了 `StepBarrier` 的预期收到所有的 tensors / states 数目，它将通过回调函数唤起，把该任务放入 `asyncio.PriorityQueue` 执行队列。
+- **Bootstrap hook injection**: `prepare_worker_runtime_env` injects `worker_process_setup_hook` via Ray's `WORKER_PROCESS_SETUP_HOOK_ENV_VAR`, initializing signal interceptors before worker execution while chaining user hooks.
+- **Ray SIGTERM interception**: Intercepts Ray's internal `set_sigterm_handler` to record previous handlers and Ray's own SIGTERM callback without altering Ray's teardown protocol.
+- **Non-blocking signal delivery**: Signal handlers enqueue events and wake a background emitter daemon thread via a non-blocking pipe (`os.pipe2(O_NONBLOCK | O_CLOEXEC)`), preventing deadlocks or blocking I/O inside OS interrupt context.
+- **Faithful delegation**: Handlers always forward signals to prior handlers (`callable`, `SIG_DFL` via `raise_signal`, or `SIG_IGN`), preserving native process termination semantics.
+- **Thread safety**: Signal handlers are only installed on the process main thread; asynchronous actor worker threads publish diagnostic metadata without attempting invalid signal registrations.
 
-### 3.2.2 优先队列调度 (Execution PriorityQueue)
-调度执行循环 `_run()` 仅盯着 PriorityQueue 收取内容，通过对图上的操作权重排序，执行更急迫先获得资源的运算，确保关键链路阻塞最少。
-
-### 3.2.3 操作派发与操作管理 (Operator Manager & Dispatcher)
-用户函数已被进一步简化剥离为 `OperatorManager` 管理的具体可派发结构。
-`ExecutionDispatcher` 分离了 **逻辑节点** 和 **物理节点**。提供了两类主要派发策略：
-- **StandardDispatcher**：正常的 DataParallel 和 SequenceParallel。物理 rank == 逻辑 rank，步步执行。
-- **InterleavedDispatcher**：处理特殊的虚拟流水线模式，依据 `stride` 数值对计算流程执行空间复用隔绝。
-
----
-
-# 4. 数据传输层
-底层数据传输位于 `fluxway/transport/communication.py` 等文件中。重构后的传输协议极大解耦了网络拓扑，将原本的 "SPMD To One, One to SPMD" 变为了 JIT 编译加速的 ULP (Universal Layout Protocol) 零拷贝网。
-
-## 4.1 数据切片形式 (Transport Layouts)
-通信策略依托于 `PhysicalLayout` 中的定义，包括 `is_content_addressable` （依值路由的 Hash 或 Lookup 等散列）与 `routing_dim`（依行列路由的切片 Dense 等）。并根据目标是否开启 `is_referential`（对称流转回写，如 Mirror 反向梯度流），灵活产生网卡路由寻址图。
-
-## 4.2 AsyncDataDistributor
-新的双流架构引入了真正的异步发送管理器 `AsyncDataDistributor`。
-**分发工作流**：
-1. **打包填充 (Plan and Shard)**：使用 JAX `_jit_plan_and_pack` 的向量化静态指令来对即将发送的批次实现切分和数据重组提取，彻底摆脱 Python 动态层缓慢调度。
-2. **异步发送 (Distribute)**：获取 `dest_agg` 内所有下游节点切分后的张量、长度计算块和 Global Shape 等，组成多个长程 RPC（使用 Ray Remote 调用）统一挂在 `asyncio.gather` 同时投递，达成全满带宽高传导。
-
-这种完全避免集合通信堵塞，又兼顾了极高的 Python 层扩展性（支持 Sparse 和 Dense 动态组装）。
+See [coherence_protocol.md](coherence_protocol.md),
+[placement_recipe.md](placement_recipe.md),
+[placement_mathematics.md](placement_mathematics.md), and the detailed Chinese
+companion for the complete section-by-section specification.

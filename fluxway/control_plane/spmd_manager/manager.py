@@ -14,17 +14,15 @@ Note: Controller layer only starts drivers. Workers are started by drivers.
 """
 
 import asyncio
+from collections.abc import Callable
 from typing import Any
 
-try:
-    import ray  # noqa: F401
-
-    RAY_AVAILABLE = True
-except ImportError:
-    RAY_AVAILABLE = False
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from fluxway.common.types import SPMDConfig
 from fluxway.common.utils.logging import get_logger
+from fluxway.placement import SPMDWorkerGroup
+from fluxway.placement.worker_group import ray_actor_options
 
 logger = get_logger(__name__)
 
@@ -41,49 +39,34 @@ class SPMDHandle:
         self.spmd_id = spmd_id
         self._driver_handle: Any | None = None  # ray.ActorHandle
         self._config: SPMDConfig | None = None
-        self._is_initialized: bool = False
+        self._attested_node_ids: tuple[str, ...] | None = None
+
+    @property
+    def attested_node_ids(self) -> tuple[str, ...] | None:
+        return self._attested_node_ids
 
     @property
     def driver_handle(self) -> Any | None:
         """Get the driver actor handle."""
         return self._driver_handle
 
-    @property
-    def is_initialized(self) -> bool:
-        """Check if the SPMD is initialized."""
-        return self._is_initialized
-
     def set_driver_handle(self, handle: Any | None) -> None:
         """Set the driver actor handle."""
         self._driver_handle = handle
 
-    def set_initialized(self, initialized: bool = True) -> None:
-        """Mark the SPMD as initialized."""
-        self._is_initialized = initialized
-
-    def call_driver(self, method: str, *args, **kwargs) -> Any:
-        """
-        Call a method on the driver.
-
-        Args:
-            method: Method name to call
-            *args: Positional arguments
-            **kwargs: Keyword arguments
-
-        Returns:
-            Ray ObjectRef for the method call result
-        """
+    def resolve_driver_method(self, method: str) -> Callable[..., Any]:
         if self._driver_handle is None:
             raise RuntimeError(f"Driver handle not set for SPMD {self.spmd_id}")
+        remote = getattr(self._driver_handle, method).remote
+        if not callable(remote):
+            raise TypeError(f"Driver method {method!r} has no callable remote endpoint")
+        return remote
 
-        method_fn: Any = getattr(self._driver_handle, method, None)
-        if method_fn is None:
-            raise AttributeError(f"Driver does not have method: {method}")
-
-        return method_fn.remote(*args, **kwargs)
+    def call_driver(self, method: str, *args, **kwargs) -> Any:
+        return self.resolve_driver_method(method)(*args, **kwargs)
 
 
-class SPMDManager:
+class SPMDManager:  # pyright: ignore[reportRedeclaration]
     """
     Global SPMD Manager (Orchestrator).
 
@@ -91,7 +74,10 @@ class SPMDManager:
     Workers are managed by their respective drivers.
     """
 
-    def __init__(self, controller_handle: Any | None = None):
+    def __init__(
+        self,
+        controller_handle: Any | None = None,
+    ):
         """
         Initialize SPMDManager.
 
@@ -100,19 +86,15 @@ class SPMDManager:
         """
         self._controller_handle = controller_handle
         self._spmd_handles: dict[str, SPMDHandle] = {}
+        self._pending_driver_calls: set[asyncio.Future] = set()
         self._topology: dict[str, list[str]] = {}  # spmd_id -> downstream spmd_ids
         self._reverse_topology: dict[
             str, list[str]
         ] = {}  # spmd_id -> upstream spmd_ids
-        self._checkpoint_backend: Any | None = None
 
     def set_controller_handle(self, controller_handle: Any) -> None:
         """Set the controller handle for driver callbacks."""
         self._controller_handle = controller_handle
-
-    def set_checkpoint_backend(self, backend: Any) -> None:
-        """Set the per-worker checkpoint backend to forward to all Drivers."""
-        self._checkpoint_backend = backend
 
     def register_spmd(self, spmd_id: str, handle: SPMDHandle) -> None:
         """
@@ -132,12 +114,9 @@ class SPMDManager:
         self,
         spmd_id: str,
         config: SPMDConfig,
-        placement_group: Any | None = None,
-        worker_bundle_indices: list[int] | None = None,
-        driver_bundle_index: int = 0,
+        worker_group: SPMDWorkerGroup,
         checkpoint_id: str | None = None,
-        worker_resource: Any | None = None,
-    ) -> SPMDHandle | None:
+    ) -> SPMDHandle:
         """
         Start an SPMD instance by creating its driver.
 
@@ -161,13 +140,6 @@ class SPMDManager:
         handle = SPMDHandle(spmd_id)
         handle._config = config
 
-        if not RAY_AVAILABLE:
-            logger.warning(
-                f"Ray not available, creating mock SPMD handle for {spmd_id}"
-            )
-            self._spmd_handles[spmd_id] = handle
-            return handle
-
         try:
             # Import driver here to avoid circular imports
             from fluxway.spmd.driver import SPMDDriver
@@ -184,27 +156,45 @@ class SPMDManager:
             # Create driver actor with placement group
             driver_name = f"spmd_driver_{spmd_id}"
             driver_opts: dict[str, Any] = {"name": driver_name}
-            if placement_group is not None:
-                driver_opts["placement_group"] = placement_group
-                driver_opts["placement_group_bundle_index"] = driver_bundle_index
-            if config.runtime_env:
-                driver_opts["runtime_env"] = config.runtime_env
+            driver_opts.update(ray_actor_options(worker_group.driver_resources))
+            driver_opts["scheduling_strategy"] = PlacementGroupSchedulingStrategy(
+                placement_group=worker_group.placement_group,
+                placement_group_bundle_index=worker_group.driver_bundle_index,
+                placement_group_capture_child_tasks=False,
+            )
+            # Driver is a control-plane actor: it must NOT inherit GPU-related
+            # JAX env_vars (JAX_PLATFORMS=cuda,...) from the worker side,
+            # otherwise pickle.loads of jax.Array on the driver eagerly
+            # initializes a CUDA backend in a process that holds no GPU
+            # bundle and crashes the SPMD pipeline.  Resolution order:
+            #   1) explicit user override via config.driver_runtime_env
+            #   2) safe default that pins jax to CPU on the driver actor.
+            # Note: we deliberately do NOT clear CUDA_VISIBLE_DEVICES here
+            # because Ray uses the driver's visible accelerator list to
+            # propagate accelerator ids to child worker actors -- masking
+            # it triggers `IndexError: list index out of range` inside
+            # `ray._private.worker.get_accelerator_ids_for_accelerator_resource`.
+            if config.driver_runtime_env is not None:
+                driver_opts["runtime_env"] = config.driver_runtime_env
 
-            driver = spmd_driver_cls.options(**driver_opts).remote(
+            driver = spmd_driver_cls.options(**driver_opts).remote(  # type: ignore
                 spmd_id=spmd_id,
                 config=config,
-                placement_group=placement_group,
-                worker_bundle_indices=worker_bundle_indices
-                or list(range(1, config.num_workers + 1)),
+                placement_group=worker_group.placement_group,
+                worker_bundle_indices=list(worker_group.rank_to_bundle),
                 controller_handle=self._controller_handle,
                 graph_topology=graph_topology,
-                checkpoint_backend=self._checkpoint_backend,
-                worker_resource=worker_resource,
+                worker_resource=worker_group.worker_resources,
+                expected_node_ids=list(worker_group.expected_node_ids),
             )
 
             handle.set_driver_handle(driver)
 
-            driver.initialize.remote(checkpoint_id)
+            initialization = driver.initialize.remote(checkpoint_id)
+            await initialization
+            handle._attested_node_ids = tuple(
+                await driver.get_attested_node_ids.remote()
+            )
 
             # Register handle
             self._spmd_handles[spmd_id] = handle
@@ -212,7 +202,7 @@ class SPMDManager:
 
         except Exception as e:
             logger.error(f"Failed to start SPMD {spmd_id}: {e}")
-            return None
+            raise
 
     async def stop_spmd(
         self,
@@ -227,9 +217,9 @@ class SPMDManager:
             spmd_id: ID of SPMD to stop
             save_checkpoint: Whether to save checkpoint before stopping
             release_driver_handle: Whether to clear the controller-side driver
-                reference immediately after stop returns. Terminal cleanup keeps
+                reference immediately after stop returns. Terminal reclaim retentions
                 handles until the controller reaches its terminal state so Ray
-                bookkeeping can settle before actor references are dropped.
+                bookretentioning can settle before actor references are dropped.
         """
         handle = self._spmd_handles.get(spmd_id)
         if handle is None:
@@ -241,15 +231,11 @@ class SPMDManager:
             return
 
         try:
-            if RAY_AVAILABLE:
-                # Stop the driver and wait for its worker shutdown path.
-                await handle.call_driver("stop", save_checkpoint)
-        except Exception as e:
-            logger.error(f"Error stopping SPMD {spmd_id}: {e}")
+            # Stop the driver and wait for its worker shutdown path.
+            await handle.call_driver("stop", save_checkpoint)
         finally:
             if release_driver_handle:
                 handle.set_driver_handle(None)
-            handle.set_initialized(False)
             logger.info(f"Stopped SPMD {spmd_id}")
 
     def release_driver_handle(self, spmd_id: str) -> None:
@@ -295,58 +281,6 @@ class SPMDManager:
         """Get all registered SPMD IDs."""
         return list(self._spmd_handles.keys())
 
-    async def evict_spmd(self, spmd_id: str) -> str | None:
-        """
-        Evict an SPMD and return checkpoint ID.
-
-        Args:
-            spmd_id: ID of SPMD to evict
-
-        Returns:
-            Checkpoint ID for later restoration, or None on failure
-
-        TODO: Implement checkpoint saving
-        """
-        logger.warning(f"evict_spmd called for {spmd_id} - checkpoint not implemented")
-        await self.stop_spmd(spmd_id, save_checkpoint=True)
-        return None
-
-    async def restore_spmd(
-        self,
-        spmd_id: str,
-        config: SPMDConfig,
-        placement_group: Any | None = None,
-        worker_bundle_indices: list[int] | None = None,
-        checkpoint_id: str | None = None,
-    ) -> SPMDHandle | None:
-        """
-        Restore an SPMD from checkpoint.
-
-        Args:
-            spmd_id: ID of SPMD to restore
-            config: SPMD configuration
-            placement_group: Placement group for resources
-            worker_bundle_indices: Worker bundle indices
-            checkpoint_id: Checkpoint to restore from
-            node_type: Type of node (SPMD or READER)
-            reader_config: Reader configuration (for READER nodes)
-
-        Returns:
-            Handle to restored SPMD
-
-        TODO: Implement checkpoint loading
-        """
-        logger.warning(
-            f"restore_spmd called for {spmd_id} - checkpoint not implemented"
-        )
-        return await self.start_spmd(
-            spmd_id=spmd_id,
-            config=config,
-            placement_group=placement_group,
-            worker_bundle_indices=worker_bundle_indices,
-            checkpoint_id=checkpoint_id,
-        )
-
     def establish_topology(self, topology: dict[str, list[str]]) -> None:
         """
         Establish SPMD topology connections.
@@ -354,7 +288,11 @@ class SPMDManager:
         Args:
             topology: Mapping of SPMD ID to downstream SPMD IDs
         """
-        # Establish topology connections
+        if self._spmd_handles:
+            raise RuntimeError(
+                "Topology must be established before Driver registration"
+            )
+
         self._topology = {source: list(targets) for source, targets in topology.items()}
 
         # Build reverse topology
@@ -368,18 +306,6 @@ class SPMDManager:
 
         logger.debug(f"Established topology with {len(topology)} SPMDs")
 
-        # Notify existing drivers of topology update
-        if RAY_AVAILABLE:
-            for spmd_id, handle in self._spmd_handles.items():
-                ## TODO(Chiave): Must ensure all drivers are is_initialized before registering predecessor/successor nodes
-                if handle.driver_handle is not None and handle.is_initialized:
-                    try:
-                        predecessors = self._reverse_topology.get(spmd_id, [])
-                        successors = self._topology.get(spmd_id, [])
-                        handle.call_driver("update_topology", predecessors, successors)
-                    except Exception as e:
-                        logger.error(f"Failed to update topology for {spmd_id}: {e}")
-
     def get_predecessors(self, spmd_id: str) -> list[str]:
         """
         Get predecessor SPMD IDs.
@@ -392,36 +318,36 @@ class SPMDManager:
         """
         return self._topology.get(spmd_id, [])
 
-    async def broadcast_to_all_drivers(
+    def enqueue_driver_calls(
         self, method: str, *args, **kwargs
-    ) -> dict[str, Any]:
-        """
-        Broadcast a method call to all drivers.
+    ) -> asyncio.Future[list[Any]]:
+        if not self._spmd_handles:
+            raise RuntimeError("Driver fan-out requires registered participants")
+        remotes = []
+        for handle in self._spmd_handles.values():
+            remotes.append(handle.resolve_driver_method(method))
+        refs = []
+        for remote in remotes:
+            try:
+                ref = asyncio.ensure_future(remote(*args, **kwargs))
+                self._pending_driver_calls.add(ref)
+                ref.add_done_callback(self._driver_call_finished)
+                refs.append(ref)
+            except Exception as error:
+                logger.exception("Driver fan-out submission failed")
+                failure = asyncio.get_running_loop().create_future()
+                failure.set_exception(error)
+                refs.append(failure)
+                break
+        return asyncio.gather(*refs)
 
-        Args:
-            method: Method name to call
-            *args: Positional arguments
-            **kwargs: Keyword arguments
+    def _driver_call_finished(self, operation: asyncio.Future) -> None:
+        self._pending_driver_calls.remove(operation)
+        if not operation.cancelled():
+            operation.exception()
 
-        Returns:
-            Dict mapping spmd_id to result (or exception)
-        """
-        results = {}
-        refs = {}
-
-        for spmd_id, handle in self._spmd_handles.items():
-            if handle.driver_handle is not None and handle.is_initialized:
-                try:
-                    ref = handle.call_driver(method, *args, **kwargs)
-                    refs[spmd_id] = ref
-                except Exception as e:
-                    results[spmd_id] = e
-
-        if RAY_AVAILABLE and refs:
-            spmd_ids = list(refs.keys())
-            obj_refs = [refs[s] for s in spmd_ids]
-            gathered = await asyncio.gather(*obj_refs, return_exceptions=True)
-            for spmd_id, result in zip(spmd_ids, gathered, strict=True):  # type: ignore
-                results[spmd_id] = result
-
-        return results
+    async def close_driver_calls(self) -> None:
+        pending = tuple(self._pending_driver_calls)
+        for operation in pending:
+            operation.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)

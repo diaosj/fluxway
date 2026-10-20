@@ -1,18 +1,23 @@
+import pytest
+
 from fluxway.common.decorators import (
+    _STATIC_CONTEXT_ATTR_NAMES,
     get_current_context,
-    get_instance_storage,
     operator,
     operator_context,
 )
+from fluxway.common.operator_instances import OperatorInstanceContainer
 from fluxway.common.mesh import DeviceMesh
-from fluxway.common.types.configs import SPMDConfig
 from fluxway.spmd.worker.operator_manager import OperatorManager
 from fluxway.spmd.worker.worker import SPMDWorker
-import pytest
+from fluxway.resources import ResourceProfile
+from tests.compiled_graph_fixtures import single_spmd_config
 
 
 class TopologyAwareOperator:
     seen_in_init = None
+    rank: int
+    world_size: int
 
     def __init__(self):
         type(self).seen_in_init = (
@@ -36,10 +41,32 @@ class TopologyAwareOperator:
         )
 
 
+class RayComponentLimitsAwareOperator:
+    seen_in_init = None
+    ray_component_limits: object
+
+    def __init__(self):
+        type(self).seen_in_init = self.ray_component_limits
+
+    @operator(name="inspect_ray_component_limits")
+    def inspect_ray_component_limits(self):
+        return self.ray_component_limits
+
+
 def _clear_operator_instance():
-    storage, _ = get_instance_storage()
-    storage.pop(id(TopologyAwareOperator), None)
     TopologyAwareOperator.seen_in_init = None
+
+
+def _topology_config():
+    operator_spec = TopologyAwareOperator.inspect._fluxway_operator_spec.updated(
+        owner=TopologyAwareOperator
+    )
+    return single_spmd_config(
+        name="operator-topology-context",
+        spmd_id="spmd-a",
+        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
+        operators={"inspect": operator_spec},
+    )
 
 
 def test_operator_context_exposes_topology_fields():
@@ -57,6 +84,46 @@ def test_operator_context_exposes_topology_fields():
         assert ctx.local_world_size == 4
         assert ctx.node_rank == 0
         assert ctx.num_nodes == 2
+
+
+def test_operator_context_exposes_ray_component_limits_in_eager_execution():
+    ray_component_limits = ResourceProfile(
+        base={"CPU": 1}, ray_component_limits={"CPU": "0.5"}
+    ).ray_component_limits
+
+    with operator_context(
+        static_args={},
+        rank=0,
+        world_size=1,
+        ray_component_limits=ray_component_limits,
+    ):
+        assert get_current_context().ray_component_limits is ray_component_limits
+
+
+def test_preinstantiate_operator_exposes_compiled_ray_component_limits():
+    RayComponentLimitsAwareOperator.seen_in_init = None
+    operator_spec = RayComponentLimitsAwareOperator.inspect_ray_component_limits._fluxway_operator_spec.updated(
+        owner=RayComponentLimitsAwareOperator
+    )
+    profile = ResourceProfile(
+        base={"CPU": 1}, ray_component_limits={"CPU": "0.5", "memory": 1024}
+    )
+    config = single_spmd_config(
+        name="ray-component-limits-context",
+        spmd_id="metrics",
+        mesh=DeviceMesh(axis_names=("dp",), device_shape=(1,)),
+        operators={"inspect_ray_component_limits": operator_spec},
+        resource_profile=profile,
+    )
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+
+    container = OperatorInstanceContainer()
+    worker_cls._pre_instantiate_operators(
+        config, 0, static_args={}, instance_container=container
+    )
+
+    assert RayComponentLimitsAwareOperator.seen_in_init is profile.ray_component_limits
 
 
 def test_operator_wrapper_sets_topology_fields_on_instance():
@@ -78,19 +145,23 @@ def test_operator_wrapper_sets_topology_fields_on_instance():
 
 def test_preinstantiate_operator_sets_topology_fields_in_init():
     _clear_operator_instance()
-    meta = TopologyAwareOperator.inspect._fluxway_operator_meta
-    config = SPMDConfig(
-        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
-        operators={"inspect": "inspect"},
-        operator_metas={"inspect": meta},
+    config = _topology_config()
+    container = OperatorInstanceContainer()
+
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+    worker_cls._pre_instantiate_operators(  # type: ignore
+        config,
+        3,
+        static_args={},
+        instance_container=container,
+        local_rank=1,
+        local_world_size=4,
+        node_rank=0,
+        num_nodes=2,
     )
 
-    SPMDWorker.__ray_metadata__.modified_class._pre_instantiate_operators(
-        config, 3, local_rank=1, local_world_size=4, node_rank=0, num_nodes=2
-    )
-
-    storage, _ = get_instance_storage()
-    instance = storage[id(TopologyAwareOperator)]
+    instance = container.require(TopologyAwareOperator)
 
     assert TopologyAwareOperator.seen_in_init == (3, 8, 1, 4, 0, 2)
 
@@ -119,26 +190,22 @@ def test_preinstantiate_operator_sets_topology_fields_in_init():
         assert instance.local_rank == 1  # plain attr, ignores context
 
 
-@pytest.mark.asyncio
-async def test_operator_manager_execute_preserves_topology_fields():
+def test_operator_manager_execute_preserves_topology_fields():
     _clear_operator_instance()
-    meta = TopologyAwareOperator.inspect._fluxway_operator_meta
-    config = SPMDConfig(
-        mesh=DeviceMesh(axis_names=("dp",), device_shape=(8,)),
-        operators={"inspect": "inspect"},
-        operator_metas={"inspect": meta},
-    )
+    config = _topology_config()
     manager = OperatorManager(
         config,
         rank=3,
         spmd_id="spmd-a",
+        static_args={},
+        instance_container=OperatorInstanceContainer(),
         local_rank=1,
         local_world_size=4,
         node_rank=0,
         num_nodes=2,
     )
 
-    result = await manager.execute_async("inspect", step=0)
+    result = manager.execute("inspect", step=0)
 
     assert result == (3, 8, 1, 4, 0, 2)
 
@@ -171,3 +238,47 @@ def test_operator_wrapper_resolves_local_classes():
         result = LocalClass.inspect_local()
 
     assert result == 5
+
+
+def test_operator_wrapper_surfaces_descriptor_conflict_as_error():
+    class ConflictingDescriptorOperator:
+        @property
+        def rank(self) -> int:
+            return 999
+
+        @operator(name="conflicting_op")
+        def conflicting_op(self):
+            return self.rank
+
+    with pytest.raises(AttributeError):
+        with operator_context(
+            static_args={},
+            rank=3,
+            world_size=4,
+        ):
+            ConflictingDescriptorOperator.conflicting_op()
+
+
+def test_operator_wrapper_supports_slotted_owner():
+    seen = {}
+
+    class SlottedOperator:
+        __slots__ = tuple(_STATIC_CONTEXT_ATTR_NAMES) + ("extra",)
+
+        def __init__(self):
+            seen["rank"] = self.rank
+            seen["world_size"] = self.world_size
+
+        @operator(name="slotted_op")
+        def slotted_op(self):
+            return self.rank
+
+    with operator_context(
+        static_args={},
+        rank=7,
+        world_size=8,
+    ):
+        result = SlottedOperator.slotted_op()
+
+    assert result == 7
+    assert seen == {"rank": 7, "world_size": 8}

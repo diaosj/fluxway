@@ -3,10 +3,10 @@
 import pytest
 import jax.numpy as jnp
 
-from fluxway.common.backend import set_backend
+from fluxway.common.tensor_backend import set_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.types.sharding import ShardingSpec, P
-from fluxway.common.index_descriptor import RaggedIndex, ExplicitIndex, FunctionalIndex
+from fluxway.common.index_descriptor import RaggedIndex, ExplicitIndex
 
 
 @pytest.fixture(autouse=True)
@@ -163,26 +163,6 @@ def test_hash_layout_with_routing_indices():
     assert_indices_equal(indices2, jnp.array([0, 3], dtype=jnp.int32))
 
 
-def test_hash_layout_with_custom_function():
-    """hash using custom hash function via index_desc."""
-
-    def custom_hash(indices):
-        return indices * 2
-
-    mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
-    spec = ShardingSpec.hash(P("x")).bind(mesh)
-    data_shape = (4,)
-    index_desc = FunctionalIndex(hash_fn=custom_hash)
-
-    indices0 = spec.get_shard_indices(0, 0, data_shape[0], index_desc)
-    indices1 = spec.get_shard_indices(1, 0, data_shape[0], index_desc)
-    indices2 = spec.get_shard_indices(2, 0, data_shape[0], index_desc)
-
-    assert_indices_equal(indices0, jnp.array([0, 3], dtype=jnp.int32))
-    assert_indices_equal(indices1, jnp.array([2], dtype=jnp.int32))
-    assert_indices_equal(indices2, jnp.array([1], dtype=jnp.int32))
-
-
 def test_hash_layout_default():
     """hash with no index_desc or routing_indices - hash indices directly."""
     mesh = DeviceMesh(device_shape=(3,), axis_names=("x",))
@@ -227,13 +207,16 @@ def test_follow_layout():
     follow_spec = ShardingSpec.follow("train_step.embedding.weight")
     follow_layout = follow_spec.bind(mesh)
 
+    from fluxway.common.types.sharding import ReferentialRouting
+
     assert follow_layout.is_referential is True
+    assert isinstance(follow_layout.spec.routing, ReferentialRouting)
     assert follow_layout.spec.routing.path == "train_step.embedding.weight"
 
     # Passing a non-string should raise immediately
     src_layout = ShardingSpec.hash(P("x")).bind(mesh)
     try:
-        ShardingSpec.follow(src_layout)
+        ShardingSpec.follow(src_layout)  # type: ignore[arg-type]
         raise AssertionError("Expected TypeError was not raised")
     except TypeError as e:
         assert "string path" in str(e)

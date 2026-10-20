@@ -2,6 +2,7 @@ import unittest
 from dataclasses import dataclass
 from fluxway.common.decorators import data_type, operator, _get_fluxway_streams
 from fluxway.common.types.tensor import TransportTensor
+from fluxway.common.types.sharding import ShardingConfig
 
 # --- Test Data Types ---
 
@@ -31,27 +32,29 @@ class RootLevel:
 spec = {"type": "static", "axis": ["dp"]}
 
 
-@operator(
-    name="test_op",
-    input_sharding={
-        "inp": {
-            "mid": {"leaf": spec, "direct": {"type": "dynamic", "axis": ["shard"]}},
-            "top_val": spec,
-        }
-    },
-)
-def my_op(inp: RootLevel):
-    pass
+class _RecursiveOperators:
+    @operator(
+        name="test_op",
+        input_sharding={
+            "inp": {
+                "mid": {
+                    "leaf": spec,
+                    "direct": {"type": "dynamic", "axis": ["shard"]},
+                },
+                "top_val": spec,
+            }
+        },
+    )
+    def my_op(self, inp: RootLevel):
+        return inp
 
+    @operator(name="uniform_op", input_sharding={"inp": spec})
+    def uniform_op(self, inp: RootLevel):
+        return inp
 
-@operator(name="uniform_op", input_sharding={"inp": spec})
-def uniform_op(inp: RootLevel):
-    pass
-
-
-@operator(name="output_op", output_sharding=spec)
-def output_op() -> RootLevel:
-    return None  # type: ignore
+    @operator(name="output_op", output_sharding=spec)
+    def output_op(self) -> RootLevel:
+        raise NotImplementedError
 
 
 # --- Test Class ---
@@ -67,26 +70,33 @@ class TestRecursiveDataType(unittest.TestCase):
 
     def test_recursive_sharding_resolution(self):
         """Test how @operator resolves nested input_sharding specs using parameter prefixes."""
-        # my_op is now a regular function in our test (since it's top-level)
-        meta = my_op._fluxway_operator_meta
+        meta = _RecursiveOperators.my_op._fluxway_operator_spec
         sharding = meta.input_sharding
 
         # Keys should be: param_name.field_path
-        self.assertEqual(sharding["mid.leaf.val"], spec)
-        self.assertEqual(sharding["mid.direct"]["type"], "dynamic")
-        self.assertEqual(sharding["top_val"], spec)
+        self.assertEqual(
+            sharding["mid.leaf.val"], ShardingConfig.model_validate(spec).to_spec()
+        )
+        self.assertTrue(sharding["mid.direct"].is_dynamic)
+        self.assertEqual(
+            sharding["top_val"], ShardingConfig.model_validate(spec).to_spec()
+        )
 
     def test_uniform_sharding_resolution(self):
         """Test applying one spec to an entire nested @data_type parameter branch."""
-        sharding = uniform_op._fluxway_operator_meta.input_sharding
+        sharding = _RecursiveOperators.uniform_op._fluxway_operator_spec.input_sharding
         for field in ["mid.leaf.val", "mid.direct", "top_val"]:
-            self.assertEqual(sharding[field], spec)
+            self.assertEqual(
+                sharding[field], ShardingConfig.model_validate(spec).to_spec()
+            )
 
     def test_output_sharding_resolution(self):
         """Test applying uniform spec to @data_type return (no parameter prefix for returns)."""
-        sharding = output_op._fluxway_operator_meta.output_sharding
+        sharding = _RecursiveOperators.output_op._fluxway_operator_spec.output_sharding
         for field in ["mid.leaf.val", "mid.direct", "top_val"]:
-            self.assertEqual(sharding[field], spec)
+            self.assertEqual(
+                sharding[field], ShardingConfig.model_validate(spec).to_spec()
+            )
 
 
 if __name__ == "__main__":

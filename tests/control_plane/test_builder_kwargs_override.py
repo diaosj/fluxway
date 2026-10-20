@@ -1,9 +1,10 @@
 from fluxway.common.decorators import spmd, operator
 from fluxway.control_plane.graph.builder import Builder
+from fluxway import ResourceProfile
 
 
 @spmd(
-    resource={"num_cpus": 1, "memory_gb": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1, "memory": 1024**3}),
     mesh_axis_names=("dp",),
     mesh_axis_shapes=(2,),
 )
@@ -14,7 +15,7 @@ class _TestSPMD:
 
 
 @spmd(
-    resource={"num_cpus": 1},
+    resource_profile=ResourceProfile(base={"CPU": 1}),
     mesh_axis_names=("dp",),
     mesh_axis_shapes=(2,),
 )
@@ -35,21 +36,23 @@ def test_builder_resource_override():
     builder.add_node(
         "n1",
         _TestSPMD,
-        resource={"num_gpus": 2, "num_cpus": 4, "memory_gb": 8.0},
+        resource_profile=ResourceProfile(
+            base={"GPU": 2, "CPU": 4, "memory": 8 * 1024**3}
+        ),
     )
     node = builder._nodes["n1"]
-    assert node.resource.num_gpus == 2
-    assert node.resource.num_cpus == 4
-    assert node.resource.memory_gb == 8.0
+    assert node.resource_profile is not None
+    assert node.resource_profile.base["GPU"] == 2
+    assert node.resource_profile.base["CPU"] == 4
+    assert node.resource_profile.base["memory"] == 8 * 1024**3
 
 
 def test_builder_resource_partial_override():
     builder = Builder()
-    builder.add_node("n1", _TestSPMD, resource={"num_gpus": 1})
+    builder.add_node("n1", _TestSPMD, resource_profile=ResourceProfile(base={"GPU": 1}))
     node = builder._nodes["n1"]
-    assert node.resource.num_gpus == 1
-    assert node.resource.num_cpus == 1
-    assert node.resource.memory_gb == 1
+    assert node.resource_profile is not None
+    assert node.resource_profile.base == {"GPU": 1}
 
 
 def test_builder_runtime_env_override():
@@ -65,12 +68,12 @@ def test_builder_reserved_kwargs_not_in_static_args():
     builder.add_node(
         "n1",
         _TestSPMD,
-        resource={"num_gpus": 1},
+        resource_profile=ResourceProfile(base={"GPU": 1}),
         runtime_env={"env_vars": {}},
         my_custom_arg="value",
     )
     node = builder._nodes["n1"]
-    assert "resource" not in node.spmd_config.static_args
+    assert "resource_profile" not in node.spmd_config.static_args
     assert "runtime_env" not in node.spmd_config.static_args
     assert "operator_configs" not in node.spmd_config.static_args
     assert node.spmd_config.static_args["my_custom_arg"] == "value"
@@ -91,7 +94,7 @@ def test_builder_operator_configs_override_sharding():
         },
     )
     node = builder._nodes["n1"]
-    meta = node.spmd_config.operator_metas["step"]
+    meta = node.spmd_config.operator_specs["step"]
     assert "a" in meta.input_sharding
     assert "b" in meta.input_sharding
 
@@ -108,14 +111,13 @@ def test_builder_operator_configs_register_new():
         },
     )
     node = builder._nodes["n1"]
-    assert "undecorated_method" in node.spmd_config.operator_metas
-    assert "x" in node.spmd_config.operator_metas["undecorated_method"].input_sharding
+    assert "undecorated_method" in node.spmd_config.operator_specs
+    assert "x" in node.spmd_config.operator_specs["undecorated_method"].input_sharding
 
 
 def test_builder_no_resource_override_uses_default():
     builder = Builder()
     builder.add_node("n1", _TestSPMD)
     node = builder._nodes["n1"]
-    assert node.resource.num_cpus == 1
-    assert node.resource.memory_gb == 1
-    assert node.resource.num_gpus == 0
+    assert node.resource_profile is not None
+    assert node.resource_profile.base == {"CPU": 1, "memory": 1024**3}

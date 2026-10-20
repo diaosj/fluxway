@@ -1,10 +1,13 @@
 """Execution utilities for controlling JIT behavior."""
 
-from typing import Any
+from typing import Any, ParamSpec, TypeVar
 from collections.abc import Callable
 import functools
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def shield(func: Callable | None = None, *, result_shape: Any = None):
@@ -28,9 +31,8 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         backend = get_backend()
-        backend_name = backend.name()
 
-        if backend_name == "jax":
+        if backend.is_jax:
             import jax
 
             # Safe Strategy: Always use callback mechanism.
@@ -57,8 +59,8 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
                 # Use pure_callback for return values
                 return jax.pure_callback(_host_runner, result_shape, (args, kwargs))
 
-        elif backend_name == "torch":
-            import torch
+        elif backend.is_torch:
+            import torch  # type: ignore
 
             # Optimization: Only use disable if we are actually compiling.
             # Avoids overhead in eager mode.
@@ -73,7 +75,9 @@ def shield(func: Callable | None = None, *, result_shape: Any = None):
     return wrapper
 
 
-def compile(func: Callable | None = None, **kwargs):
+def compile[**P, R](
+    func: Callable[P, R] | None = None, **kwargs
+) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
     """
     Unified compilation decorator (JAX JIT / PyTorch Compile).
 
@@ -85,36 +89,44 @@ def compile(func: Callable | None = None, **kwargs):
               (Defaults to mode="reduce-overhead" if not specified)
     """
     if func is None:
-        return functools.partial(compile, **kwargs)
+        return functools.partial(compile, **kwargs)  # type: ignore[return-value]
 
-    backend = get_backend()
-    backend_name = backend.name()
+    cache = {}
 
-    if backend_name == "jax":
-        import jax
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs_call: P.kwargs) -> R:
+        backend = get_backend()
+        backend_name = backend.name()
+        if backend_name not in cache:
+            if backend.is_jax:
+                import jax
 
-        # Identify JIT-specific args.
-        # jax.jit(fun, static_argnums=None, device=None, backend=None, donate_argnums=None, inline=False, keep_unused=False, abstracted_axes=None)
-        # We pass everything in kwargs to jax.jit
-        return jax.jit(func, **kwargs)
+                # Identify JIT-specific args.
+                # jax.jit(fun, static_argnums=None, device=None, backend=None, donate_argnums=None, inline=False, retention_unused=False, abstracted_axes=None)
+                # We pass everything in kwargs to jax.jit
+                cache[backend_name] = jax.jit(func, **kwargs)
 
-    elif backend_name == "torch":
-        import torch
+            elif backend.is_torch:
+                import torch  # type: ignore
 
-        # JAX call sites may pass options like static_argnums; torch.compile does
-        # not accept those, so keep only parameters from torch.compile's API.
-        torch_kwargs = {
-            key: value
-            for key, value in kwargs.items()
-            if key in {"backend", "disable", "dynamic", "fullgraph", "mode", "options"}
-        }
+                # JAX call sites may pass options like static_argnums; torch.compile does
+                # not accept those, so retention only parameters from torch.compile's API.
+                torch_kwargs = {
+                    key: value
+                    for key, value in kwargs.items()
+                    if key
+                    in {"backend", "disable", "dynamic", "fullgraph", "mode", "options"}
+                }
 
-        # Set default mode to reduce-overhead if not provided, per user request
-        if "mode" not in torch_kwargs:
-            torch_kwargs["mode"] = "reduce-overhead"
+                # Set default mode to reduce-overhead if not provided, per user request
+                if "mode" not in torch_kwargs:
+                    torch_kwargs["mode"] = "reduce-overhead"
 
-        return torch.compile(func, **torch_kwargs)
+                cache[backend_name] = torch.compile(func, **torch_kwargs)
 
-    else:
-        # No-op for other backends (e.g. numpy?)
-        return func
+            else:
+                # No-op for other backends (e.g. numpy?)
+                cache[backend_name] = func
+        return cache[backend_name](*args, **kwargs_call)
+
+    return wrapper

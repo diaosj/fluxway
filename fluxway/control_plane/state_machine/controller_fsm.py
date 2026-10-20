@@ -1,25 +1,14 @@
-"""
-ControllerStateMachine for managing Controller lifecycle.
-
-State transitions (event-driven initialization):
-- INITIALIZING -> PENDING (on INIT_COMPLETE: resources allocated, SPMDs started)
-- PENDING -> TOPOLOGY_REGISTERING (on ALL_DRIVERS_READY: all drivers report workers_ready)
-    -> triggers topology registration
-- TOPOLOGY_REGISTERING -> RUNNING (on ALL_SPMDS_TOPOLOGY_READY: all workers running)
-    -> starts heartbeat timeout monitoring
-- RUNNING -> BLOCKED (on DRIVER_ERROR, blocks all SPMDs, triggers restart)
-- BLOCKED -> RUNNING (on DRIVER_RECOVERED)
-- BLOCKED -> FAILING -> FAILED
-- RUNNING -> COMPLETING -> COMPLETED
-
-Supports async callbacks for Ray Actor Controller.
-"""
+"""Local lifecycle transitions coordinated by ExecutionLifecycle."""
 
 import asyncio
 from typing import TYPE_CHECKING
 
-from fluxway.common.types import ControllerState, ControllerEvent
+from fluxway.common.types import ControllerEvent, ControllerState, ExecutionFailure
 from fluxway.common.utils.logging import get_logger
+from fluxway.control_plane.state_machine.controller_transitions import (
+    ControllerEffect,
+    plan_controller_transition,
+)
 
 if TYPE_CHECKING:
     from fluxway.control_plane.controller import ControllerActor
@@ -35,76 +24,7 @@ class ControllerStateMachine:
     and driver reports. Supports async callbacks for Ray Actor.
     """
 
-    # State transition table: (current_state, event) -> next_state
-    _TRANSITIONS = {
-        # --- Event-driven initialization flow ---
-        (
-            ControllerState.INITIALIZING,
-            ControllerEvent.INIT_COMPLETE,
-        ): ControllerState.PENDING,
-        (
-            ControllerState.PENDING,
-            ControllerEvent.ALL_DRIVERS_READY,
-        ): ControllerState.TOPOLOGY_REGISTERING,
-        (
-            ControllerState.TOPOLOGY_REGISTERING,
-            ControllerEvent.ALL_SPMDS_TOPOLOGY_READY,
-        ): ControllerState.RUNNING,
-        # --- Normal operation ---
-        (
-            ControllerState.RUNNING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.BLOCKED,
-        (
-            ControllerState.BLOCKED,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.BLOCKED,
-        (
-            ControllerState.BLOCKED,
-            ControllerEvent.DRIVER_RECOVERED,
-        ): ControllerState.RUNNING,
-        (
-            ControllerState.BLOCKED,
-            ControllerEvent.RECOVERY_FAILED,
-        ): ControllerState.FAILING,
-        (
-            ControllerState.RUNNING,
-            ControllerEvent.ALL_DRIVERS_COMPLETED,
-        ): ControllerState.COMPLETING,
-        # # If task run super fast, RUNNING may not be reached, and ALL_DRIVERS_COMPLETED may be received.
-        # (
-        #     ControllerState.PENDING,
-        #     ControllerEvent.ALL_DRIVERS_COMPLETED,
-        # ): ControllerState.COMPLETED,
-        (
-            ControllerState.TOPOLOGY_REGISTERING,
-            ControllerEvent.ALL_DRIVERS_COMPLETED,
-        ): ControllerState.COMPLETING,
-        (
-            ControllerState.COMPLETING,
-            ControllerEvent.CLEANUP_FINISHED,
-        ): ControllerState.COMPLETED,
-        (
-            ControllerState.FAILING,
-            ControllerEvent.CLEANUP_FINISHED,
-        ): ControllerState.FAILED,
-        # Recovery from BLOCKED
-        (
-            ControllerState.BLOCKED,
-            ControllerEvent.ALL_DRIVERS_READY,
-        ): ControllerState.RUNNING,
-        # Errors during init phases
-        (
-            ControllerState.PENDING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.BLOCKED,
-        (
-            ControllerState.TOPOLOGY_REGISTERING,
-            ControllerEvent.DRIVER_ERROR,
-        ): ControllerState.BLOCKED,
-    }
-
-    def __init__(self, controller: "ControllerActor"):
+    def __init__(self, controller: "ControllerActor"):  # type: ignore
         """
         Initialize ControllerStateMachine.
 
@@ -113,16 +33,21 @@ class ControllerStateMachine:
         """
         self._controller = controller
         self._state = ControllerState.INITIALIZING
+        self._state_revision = 0
         self._lock = asyncio.Lock()
+        self._terminal_event = asyncio.Event()
 
-        # Track error information
-        self._error_spmds: dict[str, str] = {}  # spmd_id -> error_message
-        self._restarting_spmds: set = set()
+        self._failures: dict[str, ExecutionFailure] = {}
 
     @property
     def state(self) -> ControllerState:
         """Get current state (sync access for simple reads)."""
         return self._state
+
+    @property
+    def state_revision(self) -> int:
+        """Monotonic version of the committed Controller state."""
+        return self._state_revision
 
     async def trigger_event(self, event: ControllerEvent, **kwargs) -> bool:
         """
@@ -131,73 +56,77 @@ class ControllerStateMachine:
         Args:
             event: The event to trigger
             **kwargs: Additional event data
-                - spmd_id: SPMD ID (for DRIVER_ERROR, DRIVER_RECOVERED)
-                - error: Error message (for DRIVER_ERROR)
+                - spmd_id: SPMD ID (for DRIVER_ERROR)
+                - failure: Structured execution failure
 
         Returns:
             True if transition occurred, False otherwise
         """
+        transition = None
+        failure_to_log: ExecutionFailure | None = None
         async with self._lock:
             current = self._state
-            key = (current, event)
-
-            if key not in self._TRANSITIONS:
+            repeated_failure = (
+                current is ControllerState.FAILING
+                and event is ControllerEvent.DRIVER_ERROR
+            )
+            if repeated_failure:
+                self._record_driver_failure(kwargs)
+                failure_to_log = kwargs["failure"]
+            else:
+                transition = plan_controller_transition(current, event)
+            if not repeated_failure and transition is None:
                 logger.warning(
-                    f"Invalid state transition: {current} + {event}. Ignoring event."
+                    "Invalid state transition: %s + %s. Ignoring event.",
+                    current,
+                    event,
                 )
                 return False
-            next_state = self._TRANSITIONS[key]
+            if repeated_failure:
+                next_state = current
+            else:
+                next_state = transition.target_state
 
-            # Handle event-specific data
-            if event == ControllerEvent.DRIVER_ERROR:
-                spmd_id = kwargs.get("spmd_id", "unknown")
-                error = kwargs.get("error", "Unknown error")
-                self._error_spmds[spmd_id] = error
-                logger.error(f"Driver error: {spmd_id} - {error}")
-
-            elif event == ControllerEvent.DRIVER_RECOVERED:
-                spmd_id = kwargs.get("spmd_id")
-                if spmd_id and spmd_id in self._error_spmds:
-                    del self._error_spmds[spmd_id]
-                if spmd_id and spmd_id in self._restarting_spmds:
-                    self._restarting_spmds.remove(spmd_id)
-                logger.debug(f"Driver recovered: {spmd_id}")
-
-                if current == ControllerState.BLOCKED and self._error_spmds:
-                    # Do not transition if there are still errors
-                    return True
+            if not repeated_failure and event == ControllerEvent.DRIVER_ERROR:
+                self._record_driver_failure(kwargs)
+                failure_to_log = kwargs["failure"]
+            elif not repeated_failure and event == ControllerEvent.CLEANUP_FAILED:
+                self._record_reclaim_failure(kwargs)
+                failure_to_log = kwargs["failure"]
 
             # Perform state transition
             old_state = self._state
             self._state = next_state
-            logger.debug(
-                f"State transition: {old_state} -> {next_state} (event: {event})"
+            self._state_revision += 1
+            if next_state in (
+                ControllerState.COMPLETED,
+                ControllerState.FAILED,
+                ControllerState.CANCELLED,
+            ):
+                self._terminal_event.set()
+        if transition is None:
+            if failure_to_log is not None:
+                logger.error("Controller error: %s", failure_to_log)
+            return True
+
+        profiler_runtime = getattr(self._controller, "_profiler_runtime", None)
+        if profiler_runtime is not None and profiler_runtime.enabled:
+            profiler_runtime.recorder.controller_fsm_transition(
+                from_state=old_state.name,
+                event=event.name,
+                to_state=next_state.name,
             )
+        logger.debug(
+            "State transition: %s -> %s (event: %s)", old_state, next_state, event
+        )
+        if failure_to_log is not None:
+            logger.error("Controller error: %s", failure_to_log)
 
-        # Execute entry callback (outside lock to prevent deadlock)
-        await self._execute_entry_callback(next_state)
-
+        if transition.effect is ControllerEffect.BEGIN_TERMINAL_CLEANUP:
+            self._controller._execution_lifecycle.begin_terminal_cleanup(next_state)
+        else:
+            await self._controller._execution_lifecycle.enter_state(next_state)
         return True
-
-    async def _execute_entry_callback(self, state: ControllerState) -> None:
-        """Execute the entry callback for a state."""
-        callbacks = {
-            ControllerState.PENDING: self._on_enter_pending,
-            ControllerState.TOPOLOGY_REGISTERING: self._on_enter_topology_registering,
-            ControllerState.RUNNING: self._on_enter_running,
-            ControllerState.BLOCKED: self._on_enter_blocked,
-            ControllerState.COMPLETING: self._on_enter_completing,
-            ControllerState.FAILING: self._on_enter_failing,
-            ControllerState.COMPLETED: self._on_enter_completed,
-            ControllerState.FAILED: self._on_enter_failed,
-        }
-
-        callback = callbacks.get(state)
-        if callback:
-            try:
-                await callback()
-            except Exception as e:
-                logger.error(f"Error in entry callback for {state}: {e}")
 
     def get_state(self) -> ControllerState:
         """Get current state (alias for property)."""
@@ -209,168 +138,61 @@ class ControllerStateMachine:
 
     def is_completed(self) -> bool:
         """Check if controller has completed."""
-        return self.state in (ControllerState.COMPLETED, ControllerState.FAILED)
-
-    def get_error_spmds(self) -> dict[str, str]:
-        """Get SPMDs currently in error state."""
-        return dict(self._error_spmds)
-
-    # =========================================================================
-    # State entry callbacks (async)
-    # =========================================================================
-
-    async def _on_enter_pending(self) -> None:
-        """Called when entering PENDING state.
-
-        Resources are allocated and SPMDs are started (fire-and-forget).
-        Waiting for all drivers to report workers_ready via heartbeat.
-        """
-        logger.debug(
-            "Controller entering PENDING state, waiting for all drivers to report workers_ready"
+        return self.state in (
+            ControllerState.COMPLETED,
+            ControllerState.FAILED,
+            ControllerState.CANCELLED,
         )
 
-    async def _on_enter_topology_registering(self) -> None:
-        """Called when entering TOPOLOGY_REGISTERING state.
-
-        All drivers have reported workers_ready.
-        Initiates topology registration on all SPMDs (fire-and-forget).
-        Workers will auto-start after handler registration.
-        """
-        logger.debug(
-            "Controller entering TOPOLOGY_REGISTERING state, initiating topology registration"
-        )
-
-        # Initiate topology registration (fire-and-forget, no await needed)
-        try:
-            await self._controller._initiate_topology_registration()
-        except Exception as e:
-            logger.error(f"Failed to initiate topology registration: {e}")
-
-    async def _on_enter_running(self) -> None:
-        """Called when entering RUNNING state.
-
-        All workers are running after topology registration.
-        Starts heartbeat timeout monitoring.
-        """
-        logger.debug("Controller entering RUNNING state")
-
-        # Start heartbeat timeout monitoring now that system is fully initialized
-        try:
-            await self._controller._heartbeat_manager.start_monitoring_async()
-            logger.debug("Heartbeat timeout monitoring started")
-            # If Drain strategy is configured, issue the first drain target to trigger execution
-            has_trigger = getattr(self._controller, "_issue_initial_drain", None)
-            if has_trigger:
-                await self._controller._issue_initial_drain()
-        except Exception as e:
-            logger.error(
-                f"Failed to start heartbeat monitoring or issue initial drain: {e}"
-            )
-
-        # Prevent discarded events: Check if operations were already completed
-        # during restoration (PENDING state).  However, when a drain strategy is
-        # active, the drain→checkpoint→resume pipeline will detect max_steps and
-        # trigger ALL_DRIVERS_COMPLETED itself after the final checkpoint is
-        # persisted.  Firing the event here would race with that pipeline —
-        # cleanup would release placement groups while saves are in-flight.
-        if self._controller._async_step_manager.is_all_completed():
-            has_drain = self._controller._drain_strategy is not None
-            if has_drain:
-                logger.debug(
-                    "All operators completed upon entering RUNNING, but drain "
-                    "strategy is active — deferring completion to the "
-                    "drain→checkpoint→resume pipeline"
-                )
+    async def wait_until_terminal(
+        self, timeout: float | None = None
+    ) -> ControllerState:
+        if not self.is_completed():
+            if timeout is None:
+                await self._terminal_event.wait()
             else:
-                logger.debug(
-                    "wait_for_completion detected all operators completed "
-                    "upon entering RUNNING, transitioning"
-                )
-                await self.trigger_event(ControllerEvent.ALL_DRIVERS_COMPLETED)
+                await asyncio.wait_for(self._terminal_event.wait(), timeout=timeout)
+        state = self.state
+        if state not in (
+            ControllerState.COMPLETED,
+            ControllerState.FAILED,
+            ControllerState.CANCELLED,
+        ):
+            raise RuntimeError(f"Terminal event set in non-terminal state: {state}")
+        return state
 
-    async def _on_enter_blocked(self) -> None:
-        """
-        Called when entering BLOCKED state.
+    def get_failures(self) -> dict[str, ExecutionFailure]:
+        return dict(self._failures)
 
-        Blocks all SPMDs and initiates recovery for error SPMDs.
-        """
-        logger.warning("Controller entering BLOCKED state")
-
-        # Block all SPMDs
-        try:
-            await self._controller.block_all_spmds()
-        except Exception as e:
-            logger.error(f"Failed to block all SPMDs: {e}")
-
-        # Initiate recovery for error SPMDs
-        error_spmds = list(self._error_spmds.keys())
-
-        for spmd_id in error_spmds:
-            if spmd_id in self._restarting_spmds:
-                continue
-            self._restarting_spmds.add(spmd_id)
-            try:
-                await self._controller.restart_spmd(spmd_id)
-            except Exception as e:
-                logger.error(f"Failed to restart SPMD {spmd_id}: {e}")
-                self._restarting_spmds.discard(spmd_id)
-
-    async def _on_enter_completing(self) -> None:
-        """
-        Called when entering COMPLETING state.
-
-        Reclaims all SPMD resources and performs cleanup.
-        """
-        logger.debug("Controller entering COMPLETING state")
-
-        try:
-            if hasattr(self._controller, "stop_checkpointer"):
-                await self._controller.stop_checkpointer()
-            await self._controller._cleanup_all_spmds()
-            release_fn = getattr(
-                self._controller, "_release_stopped_spmd_handles", None
+    def _record_driver_failure(self, event_data: dict) -> None:
+        spmd_id = event_data.get("spmd_id")
+        failure = event_data.get("failure")
+        if not isinstance(spmd_id, str) or not spmd_id:
+            raise TypeError("DRIVER_ERROR requires a non-empty spmd_id.")
+        if not isinstance(failure, ExecutionFailure):
+            raise TypeError("DRIVER_ERROR requires an ExecutionFailure.")
+        if spmd_id != failure.spmd_id:
+            raise ValueError(
+                "DRIVER_ERROR spmd_id must match failure.spmd_id: "
+                f"{spmd_id!r} != {failure.spmd_id!r}"
             )
-            if release_fn is not None:
-                release_fn()
-        except Exception as e:
-            logger.error(f"Failed to cleanup SPMDs: {e}")
-        await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
+        self._failures[spmd_id] = failure
 
-    async def _on_enter_failing(self) -> None:
-        """
-        Called when entering FAILING state.
-
-        Handles unrecoverable failures.
-        """
-        logger.error("Controller entering FAILING state")
-
-        errors = dict(self._error_spmds)
-        logger.error(f"Failed SPMDs: {errors}")
-
-        # Attempt to cleanup resources even on failure
-        try:
-            await self._controller._cleanup_all_spmds()
-            release_fn = getattr(
-                self._controller, "_release_stopped_spmd_handles", None
+    def _record_reclaim_failure(self, event_data: dict) -> None:
+        failure = event_data.get("failure")
+        if not isinstance(failure, ExecutionFailure):
+            raise TypeError("CLEANUP_FAILED requires an ExecutionFailure.")
+        if failure.spmd_id != "controller" or failure.phase != "CONTROLLER_CLEANUP":
+            raise ValueError(
+                "CLEANUP_FAILED requires controller/CONTROLLER_CLEANUP identity."
             )
-            if release_fn is not None:
-                release_fn()
-        except Exception as e:
-            logger.error(f"Failed to cleanup SPMDs during failure handling: {e}")
-        await self.trigger_event(ControllerEvent.CLEANUP_FINISHED)
-
-    async def _on_enter_completed(self) -> None:
-        """Called when entering COMPLETED state."""
-        logger.debug("Controller entering COMPLETED state")
-
-    async def _on_enter_failed(self) -> None:
-        """Called when entering FAILED state."""
-        logger.error("Controller entering FAILED state")
+        self._failures[failure.spmd_id] = failure
 
     async def reset(self) -> None:
         """Reset state machine to initial state."""
         async with self._lock:
             self._state = ControllerState.INITIALIZING
-            self._error_spmds.clear()
-            self._restarting_spmds.clear()
+            self._state_revision = 0
+            self._failures.clear()
+            self._terminal_event.clear()
         logger.debug("Controller state machine reset")

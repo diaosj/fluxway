@@ -1,8 +1,19 @@
 import pytest
 import pickle
 import jax.numpy as jnp
-from fluxway.common.types.tensor import TransportTensor
-from fluxway.common.backend import set_backend, get_backend
+import numpy as np
+from fluxway.common.allocation import AllocationRelation
+from fluxway.common.coherence import (
+    CoherenceStateTransitionError,
+    TensorAccessIntent,
+    UnsupportedAllocationHandoffError,
+)
+from fluxway.common.types.tensor import (
+    SymmetryReceipt,
+    TransportTensor,
+    runtime_allocation_relation,
+)
+from fluxway.common.tensor_backend import set_backend, get_backend
 from fluxway.common.index_descriptor import ContinuousIndex
 
 
@@ -32,6 +43,40 @@ def test_jax_zero_copy_construction():
     # Verify Identity
     assert tensor.flat_values is original_flat
     assert jnp.array_equal(tensor.flat_values, original_flat)
+
+
+def test_single_symmetry_receipt_concatenate_returns_same_object():
+    receipt = SymmetryReceipt(4, jnp.array([0, 1, 3], dtype=jnp.int32))
+
+    result = SymmetryReceipt.concatenate([receipt], [3])
+
+    assert result is receipt
+
+
+def test_multiple_symmetry_receipts_concatenate_values():
+    left = SymmetryReceipt(4, jnp.array([0, 1], dtype=jnp.int32))
+    right = SymmetryReceipt(4, jnp.array([2, 3], dtype=jnp.int32))
+
+    result = SymmetryReceipt.concatenate([left, right], [2, 2])
+
+    assert result is not None
+    assert jnp.array_equal(result.sender_rank_tags, jnp.array([0, 1, 2, 3]))
+
+
+def test_symmetry_receipt_rejects_mixed_rank_domains_on_concatenate():
+    left = SymmetryReceipt(2, jnp.array([0, 1], dtype=jnp.int32))
+    right = SymmetryReceipt(3, jnp.array([2], dtype=jnp.int32))
+
+    with pytest.raises(ValueError, match="rank domains"):
+        SymmetryReceipt.concatenate([left, right], [2, 1])
+
+
+def test_transport_tensor_rejects_receipt_length_mismatch():
+    with pytest.raises(ValueError, match="receipt length"):
+        TransportTensor(
+            jnp.array([[1.0], [2.0]], dtype=jnp.float32),
+            receipt=SymmetryReceipt(2, jnp.array([0], dtype=jnp.int32)),
+        )
 
 
 def test_flat_ragged_conversion():
@@ -296,13 +341,13 @@ def test_ragged_slice_multilevel():
 
     tensor = TransportTensor(values, [l0_splits, l1_splits])
 
-    # Slice [0:1] -> Should keep Row 0 only.
+    # Slice [0:1] -> Should retention Row 0 only.
     sliced = tensor.slice(0, 1)
 
     lists = sliced.to_lists()
     assert lists == [[[1, 2], [3]]]
 
-    # Slice [1:2] -> Keep Row 1
+    # Slice [1:2] -> Retention Row 1
     sliced_2 = tensor.slice(1, 2)
     assert sliced_2.to_lists() == [[[4]]]
 
@@ -473,7 +518,7 @@ def test_gather_propagates_explicit_indices():
 
 
 def test_no_indices_stays_none():
-    """Operations on tensor without indices keep routing_indices as None."""
+    """Operations on tensor without indices retention routing_indices as None."""
     backend = get_backend()
     data = backend.tensor([1.0, 2.0, 3.0])
     tensor = TransportTensor(data)
@@ -548,3 +593,76 @@ def test_from_tensor_and_slice():
     assert isinstance(tensor_strided.routing_indices, ContinuousIndex)
     assert tensor_strided.routing_indices.start == 10
     assert tensor_strided.routing_indices.count == 4
+
+
+def test_runtime_readonly_and_invalidation_fail_fast():
+    set_backend("numba_cpu")
+    tensor = TransportTensor(np.arange(4, dtype=np.int64))
+
+    tensor._set_runtime_access_intent(TensorAccessIntent.READONLY)
+    values = tensor.flat_values
+
+    assert not values.flags.writeable
+    with pytest.raises(ValueError):
+        values[0] = 9
+
+    tensor._invalidate_runtime_access()
+    with pytest.raises(CoherenceStateTransitionError, match="invalidated"):
+        _ = tensor.flat_values
+
+
+def test_runtime_allocation_relation_is_exact_overlap_or_disjoint():
+    set_backend("numba_cpu")
+    values = np.arange(8, dtype=np.int64)
+
+    assert (
+        runtime_allocation_relation(values, values.reshape(2, 4))
+        is AllocationRelation.EXACT
+    )
+    assert runtime_allocation_relation(values, values[2:]) is AllocationRelation.OVERLAP
+    assert (
+        runtime_allocation_relation(values, values.copy())
+        is AllocationRelation.DISJOINT
+    )
+    with pytest.raises(UnsupportedAllocationHandoffError):
+        runtime_allocation_relation(object(), object())
+
+
+def test_zero_copy_alias_has_independent_runtime_lifetime():
+    import numpy as np
+    from fluxway.common.types.tensor import TransportTensor
+
+    values = np.arange(6, dtype=np.float32)
+    tensor = TransportTensor(values)
+    alias = tensor.zero_copy_alias()
+
+    assert alias is not tensor
+    assert (
+        alias.flat_values.__array_interface__["data"][0]
+        == values.__array_interface__["data"][0]
+    )
+    tensor._invalidate_runtime_access()
+    assert alias.flat_values.tolist() == values.tolist()
+
+
+def test_zero_copy_readonly_alias_is_readonly_until_operator_grant():
+    import numpy as np
+    from fluxway.common.coherence import TensorAccessIntent
+    from fluxway.common.types.tensor import TransportTensor
+
+    values = np.arange(6, dtype=np.float32)
+    tensor = TransportTensor(values)
+    alias = tensor.zero_copy_readonly_alias()
+
+    assert alias is not tensor
+    assert (
+        alias.flat_values.__array_interface__["data"][0]
+        == values.__array_interface__["data"][0]
+    )
+    assert alias._runtime_access_intent is TensorAccessIntent.READONLY
+    with pytest.raises(ValueError):
+        alias.flat_values[0] = 99
+
+    alias._set_runtime_access_intent(TensorAccessIntent.WRITABLE)
+    alias.flat_values[0] = 99
+    assert values[0] == 99

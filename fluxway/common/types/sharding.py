@@ -3,21 +3,34 @@
 from __future__ import annotations
 
 import enum
+import functools
+import operator
+import inspect
 import logging
-from typing import Any
-from collections.abc import Callable
-from pydantic import Field, model_validator
+from dataclasses import dataclass, field
+from typing import Any, Literal, SupportsIndex
+from collections.abc import Callable, Mapping
+from pydantic import (
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-from fluxway.common.backend import get_backend
+from fluxway.common.tensor_backend import get_backend
 from fluxway.common.mesh import DeviceMesh
 from fluxway.common.index_descriptor import (
     IndexDescriptor,
     ContinuousIndex,
     ExplicitIndex,
     RaggedIndex,
-    FunctionalIndex,
 )
-from fluxway.common.types.configs import FluxwayBaseSchema, ConfigDict
+from fluxway.common.schema import FluxwayBaseSchema
+from fluxway.common.frozen_mapping import FrozenMap
+from fluxway.common.resource_registry import (
+    ResourceHandle,
+    get_active_resource_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +91,11 @@ class AlgebraicRouting(Routing):
     routing_dim: int | tuple[int, ...] = 0
     index_descriptor: IndexDescriptor | None = None
 
+    @field_validator("strategy", mode="before")
+    @classmethod
+    def validate_strategy(cls, value: Any) -> PartitionStrategy:
+        return _parse_partition_strategy(value)
+
     @property
     def is_static(self) -> bool:
         return self.strategy.routing_paradigm == RoutingParadigm.STATIC
@@ -96,8 +114,6 @@ class ReferentialRouting(Routing):
     tuuid: int | None = None
     # Map: Target Dimension -> Source Dimension
     dim_map: dict[int, int] = Field(default_factory=lambda: {0: 0})
-    # To be populated during topology resolution phase to avoid late-binding logic in the Hot Path.
-    _resolved_routing: AlgebraicRouting | None = None
 
     @property
     def is_referential(self) -> bool:
@@ -105,8 +121,6 @@ class ReferentialRouting(Routing):
 
     @property
     def routing_dim(self) -> int | tuple[int, ...]:
-        if self._resolved_routing:
-            return self._resolved_routing.routing_dim
         raise RuntimeError(
             f"[Fluxway Referential Error] Unresolved 'mirror/follow' routing at path '{self.path}'.\n"
             f"  Status: Unresolved (TUUID: {self.tuuid})\n"
@@ -115,8 +129,6 @@ class ReferentialRouting(Routing):
 
     @property
     def strategy(self) -> PartitionStrategy:
-        if self._resolved_routing:
-            return self._resolved_routing.strategy
         raise RuntimeError(
             f"[Fluxway Referential Error] Strategy accessed on unresolved path '{self.path}'.\n"
             f"  Fix: This typically means a 'mirror' tensor was used in a Forward path where its source was not yet materialized."
@@ -124,20 +136,26 @@ class ReferentialRouting(Routing):
 
     @property
     def partition(self) -> PartitionSpec:
-        if self._resolved_routing:
-            return self._resolved_routing.partition
         raise RuntimeError(
             f"[Fluxway Referential Error] Partition accessed on unresolved path '{self.path}'."
         )
 
-    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
-        """Resolve the logical path to a physical TUUID."""
-        if self.tuuid is None:
-            object.__setattr__(self, "tuuid", resolver_fn(self.path))
-
-    def resolve_sharding(self, routing: AlgebraicRouting) -> None:
-        """Inject the physical routing strategy once resolved."""
-        object.__setattr__(self, "_resolved_routing", routing)
+    def resolved(
+        self,
+        resolver_fn: Callable[[str], int | None],
+        *,
+        required: bool,
+    ) -> ReferentialRouting:
+        if self.tuuid is not None:
+            return self
+        tuuid = resolver_fn(self.path)
+        if tuuid is None:
+            if required:
+                raise ValueError(
+                    f"referential routing path {self.path!r} does not resolve to a TUUID"
+                )
+            return self
+        return self.model_copy(update={"tuuid": tuuid})
 
     def __hash__(self):
         items = tuple(sorted(self.dim_map.items())) if self.dim_map else ()
@@ -156,11 +174,20 @@ class PartitionSpec(FluxwayBaseSchema):
 
     specs: tuple[str | tuple[str, ...] | None, ...] = Field(default_factory=tuple)
 
-    def __init__(self, *specs: str | tuple[str, ...] | None):
+    def __init__(
+        self,
+        *specs: str | tuple[str, ...] | None,
+        **data: Any,
+    ):
+        if data:
+            if specs:
+                raise TypeError("PartitionSpec accepts positional specs or model data")
+            super().__init__(**data)
+            return
         if len(specs) == 1 and isinstance(specs[0], list | tuple) and not specs[0]:
-            super().__init__(specs=())
+            super().__init__(specs=())  # type: ignore
         else:
-            super().__init__(specs=specs)
+            super().__init__(specs=specs)  # type: ignore
 
     @property
     def partitions(self) -> dict[int, tuple[str, ...]]:
@@ -170,7 +197,7 @@ class PartitionSpec(FluxwayBaseSchema):
                 if isinstance(s, str):
                     result[i] = (s,)
                 else:
-                    result[i] = tuple(str(x) for x in s)
+                    result[i] = tuple(x for x in s)
         return result
 
     def __repr__(self) -> str:
@@ -181,84 +208,6 @@ class PartitionSpec(FluxwayBaseSchema):
 
 
 P = PartitionSpec
-
-
-# ============================================================
-# ShardingConfig — Declarative Config (Bridge from Dict)
-# ============================================================
-
-
-class ShardingConfig(FluxwayBaseSchema):
-    """Bridge model to parse user-provided sharding dictionaries."""
-
-    model_config = ConfigDict(populate_by_name=True)
-
-    sharding_type: str = Field(default="static", alias="type")
-    axis: list[str] = Field(default_factory=list)
-    fn: str | None = None
-    routing_dim: int | tuple[int, ...] = 0
-    reference: str | None = None
-
-    def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
-        """Binds the sharding config to a physical mesh, producing a PhysicalLayout."""
-        return self.to_spec().bind(mesh)
-
-    def to_spec(self) -> ShardingSpec:
-        """Alias for to_routing for backward compatibility."""
-        return self.to_routing()
-
-    def to_routing(self) -> ShardingSpec:
-        """Converts declarative config to a ShardingSpec (pure logic)."""
-        ps = PartitionSpec(*self.axis)
-
-        # 1. Handle Explicitly Replicated or Default Static
-        if self.sharding_type == "replicated" or (
-            self.sharding_type == "static" and not self.axis
-        ):
-            return ShardingSpec(
-                routing=AlgebraicRouting(strategy=_CHUNK, partition=PartitionSpec())
-            )
-
-        # 2. Handle Referential Routing (Follow/Mirror)
-        if self.sharding_type == "mirror":
-            if not self.reference:
-                raise ValueError(
-                    "[Fluxway Sharding Config Error] 'mirror' (referential) sharding type REQUIRES a 'reference' path "
-                    "specifying which TUUID to follow (e.g., reference='train_step.state')."
-                )
-            return ShardingSpec.follow(reference_path=self.reference)
-
-        # 3. Handle Algebraic Routing with Strategy Detection
-        if self.sharding_type not in ("static", "dynamic"):
-            raise ValueError(
-                f"[Fluxway Sharding Config Error] Unsupported sharding type: '{self.sharding_type}'. "
-                "Valid types: replicated, static, dynamic, mirror."
-            )
-
-        if self.fn in ("hash_routing", "hash"):
-            # Explicit hash-based routing ALWAYS uses modulo
-            strategy = _INDEXED_MODULO
-        elif self.sharding_type == "dynamic":
-            # Default dynamic (no fn specified) now uses chunking as requested
-            strategy = _INDEXED_CHUNK
-        elif self.fn == "cyclic":
-            strategy = _CYCLIC
-        elif self.fn == "greedy":
-            strategy = _GREEDY
-        elif self.fn in ("chunk", "block", None) or self.sharding_type == "static":
-            # Default to chunk-sharding for static assignments
-            strategy = _CHUNK
-        else:
-            raise ValueError(
-                f"[Fluxway Sharding Config Error] Unsupported partitioning function: fn='{self.fn}' for type='{self.sharding_type}'. "
-                "Valid fns: hash, cyclic, greedy, chunk."
-            )
-
-        return ShardingSpec(
-            routing=AlgebraicRouting(
-                strategy=strategy, partition=ps, routing_dim=self.routing_dim
-            )
-        )
 
 
 # ============================================================
@@ -275,6 +224,7 @@ class PartitionStrategy(FluxwayBaseSchema):
 
     model_config = ConfigDict(arbitrary_types_allowed=True, frozen=True)
 
+    type: Any
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(
@@ -284,6 +234,30 @@ class PartitionStrategy(FluxwayBaseSchema):
         num_workers: int,
         index_desc: IndexDescriptor | None = None,
     ) -> Any:
+        """Map a 1-D index tensor to a 1-D rank tensor.
+
+        This is the L3 routing primitive. It is a pure function over a
+        single ``RoutingAxis`` — it never sees tensor data shape.
+
+        Contract:
+            - ``indices`` MUST be a 1-D tensor of length ``axis_size``
+              (== ``RoutingAxis.size``). Multi-dimensional inputs are a
+              category error and indicate a leak from the data layer
+              into the routing layer; subclasses are encouraged to assert
+              ``ndim == 1`` in debug builds.
+            - ``dim_size`` is the routing-domain extent along this axis
+              (NOT a tensor data dim). It bounds the legal value range of
+              ``indices`` to ``[0, dim_size)``.
+            - ``num_workers`` is the product of mesh-axis sizes consumed
+              by this routing axis (== ``RoutingAxis.num_workers``).
+            - ``index_desc`` is an optional ``IndexDescriptor`` used by
+              ragged / explicit-index strategies; static strategies
+              ignore it.
+
+        Returns:
+            A 1-D rank tensor of the same length as ``indices``, with
+            entries in ``[0, num_workers)``.
+        """
         raise NotImplementedError
 
     @property
@@ -299,6 +273,18 @@ class PartitionStrategy(FluxwayBaseSchema):
     ) -> Any:
         """Determines rank assignments for given indices."""
         return self(indices, dim_size, num_workers, index_desc)
+
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        raise NotImplementedError(
+            f"{self.name} must implement ranks_for_indices_spec for "
+            f"{type(spec).__name__}; implicit materialization is forbidden."
+        )
 
     def get_index_bounds(
         self,
@@ -334,6 +320,7 @@ class PartitionStrategy(FluxwayBaseSchema):
 class ChunkPartition(PartitionStrategy):
     """Chunk partitioning: idx → idx // chunk_size"""
 
+    type: Literal["chunk"] = "chunk"
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
@@ -345,6 +332,16 @@ class ChunkPartition(PartitionStrategy):
             backend.full(backend.shape(ranks), num_workers - 1, dtype=backend.int32()),
             ranks,
         )
+
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        return _chunk_ranks_for_indices_spec(spec, dim_size, num_workers, backend)
 
     def intersects(
         self, src_rank, src_world_size, dst_rank, dst_world_size, dim_size, dst_strategy
@@ -362,11 +359,22 @@ class ChunkPartition(PartitionStrategy):
 class CyclicPartition(PartitionStrategy):
     """Cyclic partitioning: idx → idx % num_workers"""
 
+    type: Literal["cyclic"] = "cyclic"
     routing_paradigm: RoutingParadigm = RoutingParadigm.STATIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
         return backend.mod(indices, num_workers)
+
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        return _cyclic_ranks_for_indices_spec(spec, num_workers, backend)
 
     def intersects(
         self, src_rank, src_world_size, dst_rank, dst_world_size, dim_size, dst_strategy
@@ -379,23 +387,30 @@ class CyclicPartition(PartitionStrategy):
         return (src_rank % gcd) == (dst_rank % gcd)
 
 
-class IndexedChunkPartition(PartitionStrategy):
+class _IndexValuePartition(PartitionStrategy):
+    def ranks_for_indices_spec(
+        self,
+        spec: IndicesSpec,
+        dim_size: int,
+        num_workers: int,
+        index_desc: IndexDescriptor | None = None,
+    ) -> tuple[Any, Any]:
+        backend = get_backend()
+        indices, valid = _values_for_indices_spec(spec, backend)
+        ranks = self(indices, dim_size, num_workers, index_desc=index_desc)
+        return ranks, valid
+
+
+class IndexedChunkPartition(_IndexValuePartition):
     """Dynamic partitioning using continuous chunks based on index values."""
 
+    type: Literal["indexed_chunk"] = "indexed_chunk"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
 
-        if isinstance(index_desc, ExplicitIndex):
-            values = index_desc.indices
-        elif isinstance(index_desc, FunctionalIndex):
-            values = index_desc.hash_fn(indices)
-        elif isinstance(index_desc, RaggedIndex):
-            starts = index_desc.splits[0][:-1]
-            values = backend.take(starts, indices)
-        else:
-            values = indices
+        values = _dynamic_routing_values(indices, index_desc, backend)
 
         if num_workers <= 1:
             return backend.zeros(backend.shape(values), dtype=backend.int32())
@@ -409,30 +424,23 @@ class IndexedChunkPartition(PartitionStrategy):
         )
 
 
-class IndexedModuloPartition(PartitionStrategy):
+class IndexedModuloPartition(_IndexValuePartition):
     """Dynamic partitioning using modulo hashing based on index values."""
 
+    type: Literal["indexed_modulo"] = "indexed_modulo"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
         backend = get_backend()
-
-        if isinstance(index_desc, ExplicitIndex):
-            values = index_desc.indices
-        elif isinstance(index_desc, FunctionalIndex):
-            values = index_desc.hash_fn(indices)
-        elif isinstance(index_desc, RaggedIndex):
-            starts = index_desc.splits[0][:-1]
-            values = backend.take(starts, indices)
-        else:
-            values = indices
-
-        return backend.mod(values, num_workers)
+        worker_count = _require_positive_worker_count(num_workers)
+        values = _dynamic_routing_values(indices, index_desc, backend)
+        return backend.mod(values, worker_count)
 
 
 class GreedyPartition(PartitionStrategy):
     """Greedy load balancing partitioning."""
 
+    type: Literal["greedy"] = "greedy"
     routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
 
     def __call__(self, indices, dim_size, num_workers, index_desc=None):
@@ -458,6 +466,238 @@ class GreedyPartition(PartitionStrategy):
         return backend.tensor(assigned, dtype=backend.int32())
 
 
+def _validate_routing_arguments(value: Any) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise TypeError("routing arguments must be a mapping")
+    reserved = {"partition_count", "domain_size"}.intersection(value)
+    if reserved:
+        raise ValueError(f"routing arguments use reserved names: {sorted(reserved)}")
+    for name, argument in value.items():
+        if not isinstance(name, str) or not name:
+            raise TypeError("routing argument names must be non-empty strings")
+        try:
+            hash(argument)
+        except TypeError as error:
+            raise TypeError(f"routing argument {name!r} must be hashable") from error
+    return FrozenMap(value)
+
+
+class FunctionPartition(_IndexValuePartition):
+    type: Literal["function"] = "function"
+    routing_paradigm: RoutingParadigm = RoutingParadigm.DYNAMIC
+    target: Callable[..., Any] | ResourceHandle
+    arguments: Mapping[str, Any] = Field(default_factory=lambda: FrozenMap({}))
+
+    @field_validator("target", mode="before")
+    @classmethod
+    def validate_target(cls, value: Any) -> Callable[..., Any] | ResourceHandle:
+        if isinstance(value, ResourceHandle):
+            return value
+        if (
+            isinstance(value, Mapping)
+            and "namespace" in value
+            and "resource_id" in value
+        ):
+            return ResourceHandle.model_validate(value)
+        if callable(value):
+            return value
+        raise TypeError(
+            f"function partition target must be callable or ResourceHandle, got {type(value).__name__}"
+        )
+
+    @field_validator("arguments")
+    @classmethod
+    def validate_arguments(cls, value: Any) -> Mapping[str, Any]:
+        return _validate_routing_arguments(value)
+
+    def validate_contract(self) -> None:
+        if isinstance(self.target, ResourceHandle):
+            return
+        if callable(self.target):
+            _resolve_and_validate_callable(self.target, self.arguments)
+            return
+        raise TypeError(
+            f"unsupported target type for contract validation: {type(self.target).__name__}"
+        )
+
+    def resolve_callable(self) -> Callable[..., Any]:
+        registry = (
+            get_active_resource_registry()
+            if isinstance(self.target, ResourceHandle)
+            else None
+        )
+        return _resolve_and_validate_callable(self.target, self.arguments, registry)
+
+    def __call__(self, indices, dim_size, num_workers, index_desc=None):
+        backend = get_backend()
+        values = _dynamic_routing_values(indices, index_desc, backend)
+        callable_target = self.resolve_callable()
+        result = callable_target(
+            values,
+            partition_count=num_workers,
+            domain_size=dim_size,
+            **self.arguments,
+        )
+        return backend.asarray(result, copy=False, device=backend.default_device)
+
+
+@functools.cache
+def _resolve_and_validate_callable(
+    target: Callable[..., Any] | ResourceHandle,
+    arguments: Mapping[str, Any],
+    registry: Any = None,
+) -> Callable[..., Any]:
+    if callable(target):
+        provider = target
+    elif isinstance(target, ResourceHandle):
+        if registry is None:
+            raise RuntimeError(
+                "No active ResourceRegistry bound to resolve ResourceHandle"
+            )
+        provider = registry.resolve(target.namespace, target.resource_id)
+        if not callable(provider):
+            raise TypeError(
+                f"resolved resource {target.resource_id!r} in namespace "
+                f"{target.namespace!r} is not callable"
+            )
+    else:
+        raise TypeError(f"unsupported target type: {type(target).__name__}")
+
+    try:
+        inspect.signature(provider).bind(
+            object(),
+            partition_count=1,
+            domain_size=1,
+            **arguments,
+        )
+    except (TypeError, ValueError) as error:
+        raise TypeError(
+            "function partition target does not satisfy the routing contract"
+        ) from error
+
+    return provider
+
+
+def _require_positive_worker_count(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, SupportsIndex):
+        raise TypeError("partition worker count must be an integer")
+    try:
+        worker_count = operator.index(value)
+    except TypeError as error:
+        raise TypeError("partition worker count must be an integer") from error
+    if worker_count <= 0:
+        raise ValueError(f"partition worker count must be positive; got {worker_count}")
+    return worker_count
+
+
+def _dynamic_routing_values(indices: Any, index_desc: Any, backend: Any) -> Any:
+    if isinstance(index_desc, ExplicitIndex):
+        return index_desc.indices
+    if isinstance(index_desc, RaggedIndex):
+        starts = index_desc.splits[0][:-1]
+        return backend.take(starts, indices)
+    return indices
+
+
+def _values_for_indices_spec(spec: IndicesSpec, backend: Any) -> tuple[Any, Any]:
+    values, valid = _closed_form_indices_for_static_spec(spec, backend)
+    return values, valid
+
+
+def _valid_mask_for_length(spec: IndicesSpec, length: int, backend: Any) -> Any:
+    valid_length = length if spec.valid_length is None else spec.valid_length
+    iota = backend.arange(0, length, dtype=backend.int32(), device="cpu")
+    return backend.cast(iota < valid_length, backend.int32())
+
+
+def _literal_values_and_valid(spec: LiteralIndices, backend: Any) -> tuple[Any, Any]:
+    values = spec.values
+    valid = _valid_mask_for_length(spec, spec.length, backend)
+    return values, valid
+
+
+def _range_iota(length: int, backend: Any) -> Any:
+    return backend.arange(0, length, dtype=backend.int32(), device="cpu")
+
+
+def _chunk_ranks_for_indices_spec(
+    spec: IndicesSpec,
+    dim_size: int,
+    num_workers: int,
+    backend: Any,
+) -> tuple[Any, Any]:
+    length = spec.length
+    chunk_size = max((dim_size + num_workers - 1) // num_workers, 1)
+    if isinstance(spec, LiteralIndices):
+        values, valid = _literal_values_and_valid(spec, backend)
+        safe_values = backend.where(valid > 0, values, 0)
+        ranks = safe_values // chunk_size
+    elif isinstance(spec, IdentityIndices):
+        values = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = values // chunk_size
+    elif isinstance(spec, RangeIndices):
+        iota = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = (spec.start + iota * spec.stride) // chunk_size
+    else:
+        raise TypeError(f"ChunkPartition cannot route {type(spec).__name__}.")
+    return (
+        backend.where(
+            ranks >= num_workers,
+            backend.full(backend.shape(ranks), num_workers - 1, dtype=backend.int32()),
+            ranks,
+        ),
+        valid,
+    )
+
+
+def _cyclic_ranks_for_indices_spec(
+    spec: IndicesSpec,
+    num_workers: int,
+    backend: Any,
+) -> tuple[Any, Any]:
+    length = spec.length
+    if isinstance(spec, LiteralIndices):
+        values, valid = _literal_values_and_valid(spec, backend)
+        safe_values = backend.where(valid > 0, values, 0)
+        ranks = backend.mod(safe_values, num_workers)
+    elif isinstance(spec, IdentityIndices):
+        values = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = backend.mod(values, num_workers)
+    elif isinstance(spec, RangeIndices):
+        iota = _range_iota(length, backend)
+        valid = _valid_mask_for_length(spec, length, backend)
+        ranks = backend.mod(spec.start + iota * spec.stride, num_workers)
+    else:
+        raise TypeError(f"CyclicPartition cannot route {type(spec).__name__}.")
+    return ranks, valid
+
+
+def _closed_form_indices_for_static_spec(
+    spec: IndicesSpec, backend: Any
+) -> tuple[Any, Any]:
+    length = spec.length
+    if isinstance(spec, LiteralIndices):
+        values = spec.values
+    elif isinstance(spec, IdentityIndices):
+        values = backend.arange(0, length, dtype=backend.int32(), device="cpu")
+    elif isinstance(spec, RangeIndices):
+        iota = backend.arange(0, length, dtype=backend.int32(), device="cpu")
+        values = spec.start + iota * spec.stride
+    elif isinstance(spec, ConstantIndices):
+        if length <= 0:
+            values = backend.zeros((0,), dtype=backend.int32(), device="cpu")
+        else:
+            values = backend.tensor([spec.value], dtype=backend.int32(), device="cpu")
+    else:
+        raise TypeError(f"Unsupported IndicesSpec type {type(spec).__name__}.")
+
+    valid = _valid_mask_for_length(spec, length, backend)
+    return values, valid
+
+
 # Singleton instances for common strategies.
 _CHUNK = ChunkPartition()
 _CYCLIC = CyclicPartition()
@@ -465,9 +705,91 @@ _INDEXED_CHUNK = IndexedChunkPartition()
 _INDEXED_MODULO = IndexedModuloPartition()
 _GREEDY = GreedyPartition()
 
-# TODO(He Jia) I'm not sure if we need this implicity default alias, maybe it's a bug.
-# Compatibility Aliases
-IndexedPartition = IndexedChunkPartition
+
+_PARTITION_STRATEGY_TYPES: dict[str, type[PartitionStrategy]] = {
+    "chunk": ChunkPartition,
+    "cyclic": CyclicPartition,
+    "indexed_chunk": IndexedChunkPartition,
+    "indexed_modulo": IndexedModuloPartition,
+    "greedy": GreedyPartition,
+    "function": FunctionPartition,
+}
+
+
+def _parse_partition_strategy(value: Any) -> PartitionStrategy:
+    if isinstance(value, PartitionStrategy):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("partition strategy must be a typed mapping")
+    strategy_type = value.get("type")
+    if not isinstance(strategy_type, str):
+        raise ValueError(f"unsupported partition strategy type {strategy_type!r}")
+    model = _PARTITION_STRATEGY_TYPES.get(strategy_type)
+    if model is None:
+        raise ValueError(f"unsupported partition strategy type {strategy_type!r}")
+    return model.model_validate(value)
+
+
+_CONFIG_STRATEGIES: dict[tuple[str, str], PartitionStrategy] = {
+    ("static", "chunk"): _CHUNK,
+    ("static", "cyclic"): _CYCLIC,
+    ("dynamic", "chunk"): _INDEXED_CHUNK,
+    ("dynamic", "modulo"): _INDEXED_MODULO,
+    ("dynamic", "greedy"): _GREEDY,
+}
+
+
+class ShardingConfig(FluxwayBaseSchema):
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    sharding_type: str = Field(default="static", alias="type")
+    axis: list[str] = Field(default_factory=list)
+    strategy: str | FunctionPartition = "chunk"
+    routing_dim: int | tuple[int, ...] = 0
+    reference: str | None = None
+
+    def bind(self, mesh: DeviceMesh) -> PhysicalLayout:
+        return self.to_spec().bind(mesh)
+
+    def to_spec(self) -> ShardingSpec:
+        return self.to_routing()
+
+    def to_routing(self) -> ShardingSpec:
+        partition = PartitionSpec(*self.axis)
+        if self.sharding_type == "replicated":
+            return ShardingSpec(
+                routing=AlgebraicRouting(
+                    strategy=_CHUNK,
+                    partition=PartitionSpec(),
+                )
+            )
+        if self.sharding_type == "mirror":
+            if not self.reference:
+                raise ValueError("mirror routing requires a reference path")
+            return ShardingSpec.follow(reference_path=self.reference)
+        if self.sharding_type not in ("static", "dynamic"):
+            raise ValueError(f"unsupported sharding type {self.sharding_type!r}")
+        if isinstance(self.strategy, FunctionPartition):
+            if self.sharding_type != "dynamic":
+                raise ValueError(
+                    "function partition strategies require dynamic routing"
+                )
+            self.strategy.validate_contract()
+            strategy = self.strategy
+        else:
+            strategy = _CONFIG_STRATEGIES.get((self.sharding_type, self.strategy))
+            if strategy is None:
+                raise ValueError(
+                    f"strategy {self.strategy!r} is invalid for "
+                    f"{self.sharding_type!r} routing"
+                )
+        return ShardingSpec(
+            routing=AlgebraicRouting(
+                strategy=strategy,
+                partition=partition,
+                routing_dim=self.routing_dim,
+            )
+        )
 
 
 # ============================================================
@@ -494,14 +816,12 @@ class ShardingSpec(FluxwayBaseSchema):
     routing: AlgebraicRouting | ReferentialRouting
 
     def __init__(self, routing: AlgebraicRouting | ReferentialRouting, **kwargs):
-        super().__init__(routing=routing, **kwargs)
+        super().__init__(routing=routing, **kwargs)  # type: ignore
 
     @property
     def strategy(self) -> PartitionStrategy:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.strategy
-        if self.routing._resolved_routing:
-            return self.routing._resolved_routing.strategy
 
         raise RuntimeError(
             f"Sharding strategy accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid}). "
@@ -512,8 +832,6 @@ class ShardingSpec(FluxwayBaseSchema):
     def partition(self) -> PartitionSpec:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.partition
-        if self.routing._resolved_routing:
-            return self.routing._resolved_routing.partition
 
         raise RuntimeError(
             f"Partition spec accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
@@ -523,8 +841,6 @@ class ShardingSpec(FluxwayBaseSchema):
     def routing_dim(self) -> int | tuple[int, ...]:
         if isinstance(self.routing, AlgebraicRouting):
             return self.routing.routing_dim
-        if self.routing._resolved_routing:
-            return self.routing._resolved_routing.routing_dim
 
         raise RuntimeError(
             f"Routing dim accessed on unresolved referential routing: {self.routing.path} (TUUID {self.routing.tuuid})"
@@ -565,15 +881,18 @@ class ShardingSpec(FluxwayBaseSchema):
         """Returns True if the routing is rank-based (Algebraic STATIC)."""
         return self.routing.is_static
 
-    def resolve(self, resolver_fn: Callable[[str], int | None]) -> None:
-        """Resolve the logical path to a physical TUUID."""
-        if hasattr(self.routing, "resolve"):
-            self.routing.resolve(resolver_fn)
-
-    def resolve_sharding(self, routing: AlgebraicRouting) -> None:
-        """Inject the physical routing strategy once resolved."""
-        if hasattr(self.routing, "resolve_sharding"):
-            self.routing.resolve_sharding(routing)
+    def resolved(
+        self,
+        resolver_fn: Callable[[str], int | None],
+        *,
+        required: bool = True,
+    ) -> ShardingSpec:
+        if not isinstance(self.routing, ReferentialRouting):
+            return self
+        routing = self.routing.resolved(resolver_fn, required=required)
+        if routing is self.routing:
+            return self
+        return self.model_copy(update={"routing": routing})
 
     # ---- Factory Methods ----
 
@@ -664,6 +983,9 @@ class PhysicalLayout(FluxwayBaseSchema):
     replica_axes: tuple[str, ...] | None = Field(default=None)
     replica_size: int = Field(default=1)
 
+    global_shape: tuple[int, ...] | None = Field(default=None)
+    reduce_op: Any | None = Field(default=None)
+
     @property
     def partitions(self) -> dict[int, tuple[str, ...]]:
         return self.spec.partitions
@@ -696,27 +1018,29 @@ class PhysicalLayout(FluxwayBaseSchema):
     def index_descriptor(self) -> IndexDescriptor | None:
         return self.spec.index_descriptor
 
-    def __init__(self, spec: ShardingSpec, mesh: DeviceMesh, **kwargs):
-        super().__init__(spec=spec, mesh=mesh, **kwargs)
-
-    @model_validator(mode="after")
-    def _compute_replica_info(self) -> PhysicalLayout:
-        if self.spec.is_referential:
-            return self
-
+    @model_validator(mode="before")
+    @classmethod
+    def _compute_replica_info(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        spec = value.get("spec")
+        mesh = value.get("mesh")
+        if not isinstance(spec, ShardingSpec) or not isinstance(mesh, DeviceMesh):
+            return value
+        if spec.is_referential:
+            return value
         used = set()
-        for axes in self.spec.partitions.values():
-            used.update(ax for ax in axes if ax in self.mesh.axis_names)
+        for axes in spec.partitions.values():
+            used.update(ax for ax in axes if ax in mesh.axis_names)
 
-        all_axes = set(self.mesh.axis_names)
-        repl = sorted(all_axes - used, key=lambda x: self.mesh.axis_names.index(x))
-        if repl:
-            object.__setattr__(self, "replica_axes", tuple(repl))
-            size = 1
-            for ax in repl:
-                size *= self.mesh.shape[self.mesh.axis_names.index(ax)]
-            object.__setattr__(self, "replica_size", size)
-        return self
+        all_axes = set(mesh.axis_names)
+        repl = sorted(all_axes - used, key=lambda x: mesh.axis_names.index(x))
+        if not repl:
+            return value
+        size = 1
+        for ax in repl:
+            size *= mesh.shape[mesh.axis_names.index(ax)]
+        return {**value, "replica_axes": tuple(repl), "replica_size": size}
 
     def shard_size(self, dim: int) -> int:
         """Returns the effective size of the sub-mesh assigned to a given dimension."""
@@ -730,11 +1054,8 @@ class PhysicalLayout(FluxwayBaseSchema):
 
     def get_shard_rank(self, physical_rank: int, dim: int) -> int:
         """Projects a physical mesh rank down to the logical 1D rank for a given dimension."""
+        coords = self.mesh.get_coordinate(physical_rank)
         if not self.spec.partitions or dim not in self.spec.partitions:
-            return 0
-        try:
-            coords = self.mesh.get_coordinate(physical_rank)
-        except ValueError:
             return 0
         sub_coords = []
         sub_sizes = []
@@ -882,7 +1203,7 @@ class PhysicalLayout(FluxwayBaseSchema):
         mask = target_ranks == effective_rank
 
         # Static shape required for JIT only if provided.
-        is_jax = backend.name() == "jax"
+        is_jax = backend.is_jax
 
         if is_jax:
             nz = backend.nonzero(mask, size=dim_size, fill_value=-1)
@@ -1010,4 +1331,491 @@ class PhysicalLayout(FluxwayBaseSchema):
         """Specialized follow for derived tensors like routing_indices."""
         return ShardingSpec.follow(
             reference_path=reference_path, dim_map={target_dim: source_dim}
+        )
+
+
+# ============================================================
+# IndicesSpec — strict sum type for per-axis index descriptions
+# ============================================================
+#
+# A `RoutingAxis.indices` is ALWAYS an `IndicesSpec` instance. Under no
+# circumstances should it be `None` or a bare runtime tensor.  Three
+# concrete shapes:
+#
+#   - `LiteralIndices(values, length, valid_length=None)`: a materialised
+#     1-D tensor.  `values` is excluded from eq/hash so the spec stays
+#     usable as a jax.jit static argument — the runtime tensor flows
+#     through the dynamic leg of `(domain_static, indices_dyn)`.
+#
+#   - `RangeIndices(start, length, stride, valid_length=None)`: a closed
+#     form arithmetic progression `{start + k*stride : 0 <= k < length}`.
+#     Constructed only via the explicit factories `contiguous()` /
+#     `cyclic()` / `strided()` (no bare constructor at the call sites).
+#
+#   - `IdentityIndices(length, valid_length=None)`: equivalent to
+#     `RangeIndices.contiguous(0, length)`, but cheaper to inspect.
+#
+# `valid_length`, when not `None`, marks the first N entries as the only
+# valid ones (the rest are sentinel padding produced by L1 capacity
+# bucketing).  When `None` the entire `length` is valid.
+#
+# This sum type unifies sentinel handling between the materialised path
+# (sentinels are `-1` rows in the tensor) and the symbolic path (sentinels
+# are the tail rows beyond `valid_length`).
+
+
+@dataclass(frozen=True)
+class IndicesSpec:
+    """Abstract base for per-axis index descriptions.
+
+    Subclasses must expose a `length: int` field — the static logical
+    length of the index sequence (== `len(sort_indices)` contribution
+    along this axis).  Subclasses may carry an optional `valid_length:
+    int | None`; when set, only the first `valid_length` entries are
+    real and the rest are sentinel padding.
+    """
+
+    length: int
+    valid_length: int | None
+
+
+@dataclass(frozen=True)
+class LiteralIndices(IndicesSpec):
+    """Materialised 1-D index tensor.
+
+    `values` is the runtime tensor of shape `(length,)`.  It is excluded
+    from eq/hash so this dataclass remains hashable and usable as a
+    jax.jit static argument; the tensor flows through the dynamic leg of
+    the planner call.
+    """
+
+    length: int
+    values: Any = field(compare=False, hash=False, repr=False)
+    valid_length: int | None = field(default=None, kw_only=True)
+
+    def __post_init__(self):
+        if self.length < 0:
+            raise ValueError(f"LiteralIndices.length must be >= 0; got {self.length}")
+        if self.valid_length is not None and not (
+            0 <= self.valid_length <= self.length
+        ):
+            raise ValueError(
+                f"LiteralIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+
+@dataclass(frozen=True)
+class RangeIndices(IndicesSpec):
+    """Closed-form arithmetic progression `{start + k*stride}`.
+
+    Construct via the explicit factories below — never call the bare
+    constructor at user code sites.  Three modes are recognised:
+
+      - `contiguous(start, length)` -> `stride = 1`
+      - `cyclic(start, length, num_workers)` -> `stride = num_workers`
+      - `strided(start, length, stride)` -> generic
+    """
+
+    start: int
+    length: int
+    stride: int = 1
+    valid_length: int | None = field(default=None, kw_only=True)
+
+    def __post_init__(self):
+        if self.length < 0:
+            raise ValueError(f"RangeIndices.length must be >= 0; got {self.length}")
+        if self.stride == 0:
+            raise ValueError("RangeIndices.stride must be non-zero")
+        if self.valid_length is not None and not (
+            0 <= self.valid_length <= self.length
+        ):
+            raise ValueError(
+                f"RangeIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+    @classmethod
+    def contiguous(
+        cls, start: int, length: int, valid_length: int | None = None
+    ) -> RangeIndices:
+        """Standard chunk source: rank `r` holds `[r*chunk, r*chunk+length)`."""
+        return cls(start=start, length=length, stride=1, valid_length=valid_length)
+
+    @classmethod
+    def cyclic(
+        cls,
+        start: int,
+        length: int,
+        num_workers: int,
+        valid_length: int | None = None,
+    ) -> RangeIndices:
+        """Cyclic source: rank `r` holds `{r, r+W, r+2W, ...}` of `length` items."""
+        if num_workers <= 0:
+            raise ValueError(
+                f"RangeIndices.cyclic.num_workers must be > 0; got {num_workers}"
+            )
+        return cls(
+            start=start,
+            length=length,
+            stride=num_workers,
+            valid_length=valid_length,
+        )
+
+    @classmethod
+    def strided(
+        cls,
+        start: int,
+        length: int,
+        stride: int,
+        valid_length: int | None = None,
+    ) -> RangeIndices:
+        """Generic strided range — used by tests covering degenerate cases."""
+        return cls(
+            start=start,
+            length=length,
+            stride=stride,
+            valid_length=valid_length,
+        )
+
+
+@dataclass(frozen=True)
+class IdentityIndices(IndicesSpec):
+    """Anonymous identity over `[0, length)`.
+
+    Equivalent to `RangeIndices.contiguous(0, length)` but cheaper to
+    construct and pattern-match.
+    """
+
+    length: int
+    valid_length: int | None = field(default=None, kw_only=True)
+
+    def __post_init__(self):
+        if self.length < 0:
+            raise ValueError(f"IdentityIndices.length must be >= 0; got {self.length}")
+        if self.valid_length is not None and not (
+            0 <= self.valid_length <= self.length
+        ):
+            raise ValueError(
+                f"IdentityIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+
+# Patch L: ConstantIndices — degenerate single-valued axis.
+#
+# Used when src is partitioned on an *auxiliary* routed dst dim under
+# isomorphic chunk geometry: every local entity (row) on this rank shares
+# the same dim sub-rank, so the per-axis routing decision collapses to a
+# constant.  The planner pattern-matches this and avoids materialising a
+# `length`-sized array of repeated values; the `(1,)` rank tensor flows
+# through XLA broadcast naturally to align with the primary axis length.
+#
+# Construction contract:
+#   - `value`: the GLOBAL routing key (single int in `[0, dim_size)`).
+#   - `length`: the placeholder length.  When set to ``-1`` (the default
+#     produced by ``derive_src_side_view``), ``_build_routing_domain``
+#     finalises it to the primary axis length so all axes share the same
+#     zip-mode entity count before reaching the planner.
+@dataclass(frozen=True)
+class ConstantIndices(IndicesSpec):
+    """Single-valued axis: every entity holds the same routing key.
+
+    The `value` is the GLOBAL coordinate that the per-axis strategy maps
+    to a `sub_rank`.  `length` is the logical entity count along this
+    axis (== primary axis length under zip semantics).  Use
+    `length=-1` to defer length finalisation until
+    `_build_routing_domain` learns the primary axis length.
+    """
+
+    value: int
+    length: int = field(default=-1, kw_only=True)
+    valid_length: int | None = field(default=None, kw_only=True)
+
+    def __post_init__(self):
+        if self.length < -1:
+            raise ValueError(
+                f"ConstantIndices.length must be >= 0 (or -1 placeholder); "
+                f"got {self.length}"
+            )
+        if self.valid_length is not None and (
+            self.length < 0 or not (0 <= self.valid_length <= self.length)
+        ):
+            raise ValueError(
+                f"ConstantIndices.valid_length out of range: "
+                f"valid_length={self.valid_length}, length={self.length}"
+            )
+
+
+# ============================================================
+# RoutingDomain — Decoupled Routing Abstraction (L2 contract)
+# ============================================================
+#
+# RoutingDomain is the *only* object the planner (L2) sees. It carries the
+# 1-D routing space (a Cartesian product of independent RoutingAxes) and the
+# DeviceMesh, but is structurally incapable of leaking tensor data shape
+# (e.g. embedding dim D) into the routing math. The historical bug where
+# `sort_indices.len = N × D` is eliminated at the API layer.
+#
+# Hashability rules (so RoutingDomain can be passed via jax.jit static_argnums):
+#   - RoutingAxis / ReplicaSpec / RoutingDomain are frozen dataclasses, hashable
+#     by virtue of all *static* fields being hashable.
+#   - `RoutingAxis.indices` is an `IndicesSpec` instance.  For
+#     `RangeIndices` / `IdentityIndices` the spec is fully hashable.  For
+#     `LiteralIndices` the runtime `values` tensor is excluded from eq/hash
+#     so the spec stays hashable; the tensor flows through the dynamic leg
+#     of `(domain_static, indices_dyn)` at the jit boundary.
+#   - PartitionStrategy / IndexDescriptor / DeviceMesh are already frozen and
+#     hashable in this codebase; embedding them is safe.
+
+
+@dataclass(frozen=True)
+class RoutingAxis:
+    """One independent routing dimension.
+
+    Maps a 1-D `IndicesSpec` of effective length `len(indices)` to a 1-D
+    rank tensor of the same length over `num_workers` workers (the product
+    of mesh sub-axis sizes).  The strategy is a pure function
+    `(indices, dim_size, num_workers, idx_desc) -> ranks` and never sees
+    tensor data shape.
+
+    Decoupling rule (axis.size vs len(indices)):
+        - ``size`` is the strategy's ``dim_size`` — the GLOBAL routing
+          extent (e.g. ``vocab_size`` / ``global_N``).  Used by the
+          strategy to compute chunk boundaries, hash buckets, etc.  It
+          is a property of the routing domain, NOT a per-rank shape.
+        - ``len(indices)`` is the LOCAL per-rank entity count
+          (== ``indices.length``).  ``sort_indices`` length along this
+          axis equals ``indices.length``.
+        These two quantities are orthogonal; conflating them is the
+        category error that produced the historical ``N x D`` broadcast
+        leak.
+
+    Fields:
+        size: routing-domain extent along this axis (strategy dim_size).
+        num_workers: product of mesh-axis sizes that this routing axis
+            occupies. Cached here so the planner does not need to walk the
+            mesh for every call.
+        mesh_axes: ordered tuple of mesh axis names this routing axis is
+            sharded across. Length 1 for simple DP/MP, >1 for hybrid.
+        strategy: 1-D partition function (already frozen pydantic, hashable).
+        paradigm: STATIC (rank-based) or DYNAMIC (content-based).
+        index_descriptor: optional descriptor for ragged/explicit indices.
+        indices: an `IndicesSpec` instance — REQUIRED, never `None`.
+            `IdentityIndices(length)` is the only way to express the
+            anonymous identity case; bare tensors must be wrapped in
+            `LiteralIndices(values, length)` by the caller.
+    """
+
+    size: int
+    num_workers: int
+    mesh_axes: tuple[str, ...]
+    strategy: PartitionStrategy
+    indices: IndicesSpec = field(default_factory=lambda: IdentityIndices(length=0))
+    paradigm: RoutingParadigm = RoutingParadigm.STATIC
+    index_descriptor: IndexDescriptor | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.indices, IndicesSpec):
+            raise TypeError(
+                f"RoutingAxis.indices must be an IndicesSpec instance "
+                f"(use IdentityIndices/RangeIndices/LiteralIndices); got "
+                f"{type(self.indices).__name__}"
+            )
+
+
+@dataclass(frozen=True)
+class ReplicaSpec:
+    """Replication group living on the dimensions complementary to routing.
+
+    `axes` are mesh-axis names that are *not* consumed by any RoutingAxis.
+    `size` is their product. The planner fans the primary destination out to
+    every coordinate along these axes (mirror replication).
+    """
+
+    axes: tuple[str, ...]
+    size: int
+
+
+@dataclass(frozen=True)
+class RoutingDomain:
+    """Pure routing space — independent of any tensor's data shape.
+
+    `axes` is a tuple of independent RoutingAxis whose Cartesian product
+    forms the full routing domain. `mesh` is the DeviceMesh those axes are
+    embedded in. `replica` (optional) describes mirror replication on the
+    mesh-axes not covered by any RoutingAxis.
+
+    `combine` controls how multiple axes are combined into the entity
+    domain.  "cartesian" (default) gives ``∏ axis.indices.length``
+    entities — the planner's general routing engine semantics.  "zip"
+    gives ``primary axis length`` entities — required by L1 transport's
+    row-binding (``backend.take(data, sort_indices, axes=(0,))``) so the
+    sort_indices length matches the row count rather than the inflated
+    Cartesian product.
+
+    Invariants enforced by `__post_init__`:
+        - All axes' mesh_axes are valid names in mesh.axis_names
+        - No mesh axis is consumed twice across different RoutingAxes
+        - replica.axes (if present) are disjoint from any axis.mesh_axes
+        - replica.size equals the product of replica.axes' mesh shape
+        - combine ∈ {"cartesian", "zip"}
+    """
+
+    axes: tuple[RoutingAxis, ...]
+    mesh: DeviceMesh
+    replica: ReplicaSpec | None = None
+    combine: str = "cartesian"
+
+    def __post_init__(self):
+        if self.combine not in ("cartesian", "zip"):
+            raise ValueError(
+                f"RoutingDomain.combine must be 'cartesian' or 'zip'; "
+                f"got {self.combine!r}"
+            )
+        seen: set[str] = set()
+        mesh_names = tuple(self.mesh.axis_names)
+        for ax in self.axes:
+            for name in ax.mesh_axes:
+                if name not in mesh_names:
+                    raise ValueError(
+                        f"RoutingAxis references unknown mesh axis {name!r}; "
+                        f"available: {mesh_names}"
+                    )
+                if name in seen:
+                    raise ValueError(
+                        f"Mesh axis {name!r} is consumed by more than one RoutingAxis"
+                    )
+                seen.add(name)
+            expected = 1
+            for name in ax.mesh_axes:
+                expected *= self.mesh.shape[mesh_names.index(name)]
+            if ax.num_workers != expected:
+                raise ValueError(
+                    f"RoutingAxis(num_workers={ax.num_workers}) does not match "
+                    f"product of mesh shape over {ax.mesh_axes} (={expected})"
+                )
+        if self.replica is not None:
+            for name in self.replica.axes:
+                if name not in mesh_names:
+                    raise ValueError(
+                        f"ReplicaSpec references unknown mesh axis {name!r}"
+                    )
+                if name in seen:
+                    raise ValueError(
+                        f"Mesh axis {name!r} cannot be both routed and replicated"
+                    )
+            expected_rep = 1
+            for name in self.replica.axes:
+                expected_rep *= self.mesh.shape[mesh_names.index(name)]
+            if self.replica.size != expected_rep:
+                raise ValueError(
+                    f"ReplicaSpec(size={self.replica.size}) does not match "
+                    f"product of mesh shape over {self.replica.axes} (={expected_rep})"
+                )
+
+    @property
+    def domain_size(self) -> int:
+        """Length of the flat routing domain (product over all axes' size)."""
+        n = 1
+        for ax in self.axes:
+            n *= ax.size
+        return n
+
+    @property
+    def replica_size(self) -> int:
+        return self.replica.size if self.replica is not None else 1
+
+    @staticmethod
+    def from_layout(
+        target: PhysicalLayout,
+        axis_sizes: tuple[int, ...],
+        axis_indices: tuple[IndicesSpec, ...],
+        combine: str = "cartesian",
+    ) -> RoutingDomain:
+        """Derive a RoutingDomain from a target PhysicalLayout.
+
+        This is the *single* place that reads `target.partitions` /
+        `target.replica_axes` / `target.replica_size`, sealing the
+        data-shape boundary so the planner never sees tensor dims.
+
+        Args:
+            target: destination PhysicalLayout produced by the sharding API.
+            axis_sizes: tuple of `size` per RoutingAxis, in the same order as
+                `sorted(target.partitions.keys())`.  This is the strategy's
+                ``dim_size`` (the GLOBAL routing extent), independent of
+                the per-rank `axis_indices` length.
+            axis_indices: tuple of `IndicesSpec` instances, one per
+                RoutingAxis, in the same order.  STRICT TYPING: bare
+                tensors / `None` are rejected.  Use
+                `IdentityIndices(length)` for the anonymous identity case,
+                `LiteralIndices(values=tensor, length=N)` for materialised
+                tensors, or `RangeIndices.contiguous/cyclic/strided(...)`
+                for closed-form ranges.
+
+        Returns:
+            A RoutingDomain whose Cartesian product equals the routed portion
+            of the target layout, with replica axes captured separately.
+
+        Raises:
+            TypeError: any element of `axis_indices` is not an `IndicesSpec`.
+            ValueError: target has no algebraic routing partitions, or
+                len(axis_sizes) / len(axis_indices) is inconsistent with
+                target.partitions.
+        """
+        for i, idx in enumerate(axis_indices):
+            if not isinstance(idx, IndicesSpec):
+                raise TypeError(
+                    f"RoutingDomain.from_layout: axis_indices[{i}] must be an "
+                    f"IndicesSpec instance (use IdentityIndices / RangeIndices / "
+                    f"LiteralIndices); got {type(idx).__name__}.  Bare tensors "
+                    f"and None are not accepted (strict typing contract)."
+                )
+        routing = target.routing
+        if not isinstance(routing, AlgebraicRouting):
+            raise ValueError(
+                f"RoutingDomain.from_layout requires AlgebraicRouting; got "
+                f"{type(routing).__name__}"
+            )
+        partitions = target.partitions
+        if not partitions:
+            raise ValueError(
+                "RoutingDomain.from_layout requires at least one routed dim; "
+                "target has empty partitions (full replication should not enter L2)"
+            )
+        ordered_dims = sorted(partitions.keys())
+        if len(axis_sizes) != len(ordered_dims) or len(axis_indices) != len(
+            ordered_dims
+        ):
+            raise ValueError(
+                f"axis_sizes/axis_indices length ({len(axis_sizes)}/{len(axis_indices)}) "
+                f"does not match number of routed dims ({len(ordered_dims)})"
+            )
+        mesh = target.mesh
+        mesh_names = tuple(mesh.axis_names)
+        axes_list: list[RoutingAxis] = []
+        for size, idx, dim in zip(axis_sizes, axis_indices, ordered_dims, strict=True):
+            mesh_axes = tuple(partitions[dim])
+            num_workers = 1
+            for name in mesh_axes:
+                num_workers *= mesh.shape[mesh_names.index(name)]
+            axes_list.append(
+                RoutingAxis(
+                    size=size,
+                    num_workers=num_workers,
+                    mesh_axes=mesh_axes,
+                    strategy=routing.strategy,
+                    paradigm=routing.strategy.routing_paradigm,
+                    index_descriptor=routing.index_descriptor,
+                    indices=idx,
+                )
+            )
+        replica: ReplicaSpec | None = None
+        if target.replica_axes:
+            replica = ReplicaSpec(
+                axes=tuple(target.replica_axes),
+                size=target.replica_size,
+            )
+        return RoutingDomain(
+            axes=tuple(axes_list), mesh=mesh, replica=replica, combine=combine
         )
