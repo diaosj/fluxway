@@ -138,6 +138,37 @@ assert binding.topology.global_cardinality == 4
 
 ## 限制规划与领取范围
 
+```mermaid
+sequenceDiagram
+    participant S as 来源进度监督器
+    participant P as 窗口规划器
+    participant I as 适配器输入输出线程
+    participant C as 编译进程池
+    participant L as LogicalWorkLedger
+    participant W as 驱动器与读取工作进程
+    S->>P: 启动或事件唤醒后规划下一窗口
+    loop 有界扫描，直到形成完整步骤或观察到暂停/终点
+        P->>I: scan_next(cursor, budget)
+        I-->>P: SourceScanResult
+        P->>P: 校验身份与预算，保留非终态尾部
+    end
+    alt 暂时没有可发布窗口
+        P-->>S: None
+        Note over S,W: 等待下一次显式唤醒；空结果不等于结束
+    else 可以发布
+        P->>C: 提交纯编译请求
+        C-->>P: 逻辑任务与物理绑定
+        P->>L: 同一事件循环内校验并安装窗口与账本
+        Note over P,L: 安装期间不挂起；不在控制器状态锁内扫描
+        P-->>S: SourceLayoutActivation
+        S->>W: 投递已编译描述
+        W->>W: 读取器安装成功后发布窗口并唤醒等待者
+        W-->>S: 安装完成
+    end
+```
+
+扫描预算约束单次调用，窗口和描述字节预算另行约束。来源结束后的不足批次按声明的尾部策略处理。
+
 | 配置字段 | 上限 |
 | --- | --- |
 | `planning_window_steps` | 每个窗口期望准备的完整训练步数。 |
@@ -248,6 +279,37 @@ asyncio.run(demonstrate_wakeup())
 操作。会话拥有者停止并等待进度任务，再等待 `planner.close()` 拒绝新工作、完成已接受
 操作并释放执行资源。失败必须可见。没有新记录的元数据扫描能否有界推进，仍须由
 适配器与控制器的联合验证证明。
+
+```mermaid
+sequenceDiagram
+    participant A as 会话拥有者
+    participant S as 进度监督器
+    participant P as 规划器
+    participant I as 适配器通道
+    participant C as 编译池与生命周期通道
+    A->>P: 提交规划并等待
+    P->>I: 已接受的扫描
+    opt 调用方取消等待
+        A->>A: CancelledError
+        Note over P,C: 已接受操作仍受监督并继续完成
+    end
+    A->>S: await stop()
+    S-->>A: 唯一进度任务已结束
+    A->>P: await close()
+    P->>P: 拒绝新请求，等待已接受操作
+    I-->>P: 扫描完成，后续编译与安装仍需完成
+    par 释放适配器通道
+        P->>I: await close()
+        I-->>P: 线程已退出
+    and 释放编译池
+        P->>C: shutdown(wait=True)
+        C-->>P: 编译进程已退出
+    end
+    P->>C: 关闭生命周期通道
+    P-->>A: 返回或传播未观察的失败
+```
+
+重复关闭等待同一结果；取消关闭等待者不会中断资源释放。
 
 ## 从共同检查点恢复
 

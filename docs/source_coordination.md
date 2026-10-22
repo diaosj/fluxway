@@ -149,6 +149,38 @@ committed bookmarks.
 
 ## Bound planning and acquisition
 
+```mermaid
+sequenceDiagram
+    participant S as Source progress<br/>supervisor
+    participant P as Window planner
+    participant I as Adapter I/O thread
+    participant C as Compiler process pool
+    participant L as LogicalWorkLedger
+    participant W as Drivers and reader<br/>Workers
+    S->>P: Plan next window after startup or event wakeup
+    loop Bounded scans until complete steps, idle, or terminal
+        P->>I: scan_next(cursor, budget)
+        I-->>P: SourceScanResult
+        P->>P: Validate identity/budget, retain nonterminal<br/>tail
+    end
+    alt No publishable window yet
+        P-->>S: None
+        Note over S,W: Await next explicit wakeup, empty does not mean terminal
+    else Window can be published
+        P->>C: Submit pure compilation
+        C-->>P: Logical work and physical bindings
+        P->>L: Validate/install window and ledger on owner loop
+        Note over P,L: No suspension during install, scanning is outside the Controller<br/>state lock
+        P-->>S: SourceLayoutActivation
+        S->>W: Deliver compiled descriptors
+        W->>W: Publish window and wake waiters after Reader<br/>installation
+        W-->>S: Installation complete
+    end
+```
+
+Scan budgets apply per call; window and descriptor-byte budgets apply separately. A
+terminal remainder follows the declared tail policy.
+
 | Configuration field | Limit |
 | --- | --- |
 | `planning_window_steps` | Target complete logical steps per window. |
@@ -160,7 +192,8 @@ committed bookmarks.
 These limits are independent. Adapters own native metadata read limits. Several
 bounded scans may be combined into one logical step, so the scan limits do not
 cap the window's total rows or units. Window size and compiled descriptor bytes
-have separate limits; at least one step's descriptors must fit. Nonterminal tails remain ordered across scans and
+have separate limits; at least one step's descriptors must fit. Nonterminal tails remain
+ordered across scans and
 revisions. They are neither padded nor dropped. Finite termination applies the
 declared tail policy once.
 
@@ -274,6 +307,37 @@ session owner stops and joins progress, then awaits `planner.close()` to reject
 new work, join accepted operations and release executors. Failures stay visible.
 Adapter/controller integration must separately validate bounded progress when
 metadata scans contain no new records.
+
+```mermaid
+sequenceDiagram
+    participant A as Session owner
+    participant S as Progress supervisor
+    participant P as Planner
+    participant I as Adapter lane
+    participant C as Compiler pool and<br/>lifecycle lane
+    A->>P: Submit planning and await
+    P->>I: Accepted scan
+    opt Caller cancels its wait
+        A->>A: CancelledError
+        Note over P,C: Accepted operation stays supervised and continues
+    end
+    A->>S: await stop()
+    S-->>A: Sole progress task joined
+    A->>P: await close()
+    P->>P: Reject new requests and join accepted operations
+    I-->>P: Scan completes, remaining compilation and<br/>installation must finish
+    par Release adapter lane
+        P->>I: await close()
+        I-->>P: Thread joined
+    and Release compiler pool
+        P->>C: shutdown(wait=True)
+        C-->>P: Compiler processes joined
+    end
+    P->>C: Close lifecycle lane
+    P-->>A: Return or propagate unobserved failures
+```
+
+Repeated close waits for the same result; cancelling a close waiter does not interrupt resource release.
 
 ## Restore at the joint checkpoint
 

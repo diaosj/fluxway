@@ -214,6 +214,36 @@ async def consume_layout(
 注入任务条目、调用读取器，再通过有界异步队列确认租约。应用不能替其他工作进程
 确认整个描述区间。
 
+```mermaid
+sequenceDiagram
+    participant A as 异步消费方
+    participant S as IngestionLayoutSession
+    participant T as 读取线程
+    participant R as IngestionReadSession
+    loop 直到完整耗尽
+        A->>S: await read()
+        S->>S: 取得会话异步锁
+        S->>T: to_thread(next)
+        T->>R: 推进阻塞区间迭代器
+        R-->>T: SegmentReadChunk
+        T->>T: 校验实际记录数与区间覆盖
+        T-->>S: 本批数据或流结束
+        alt 仍有数据
+            S-->>A: batch
+            A->>A: await consume(batch)
+        else 全部区间耗尽且计数一致
+            S->>S: 创建 SourceLayoutCompletion
+            S-->>A: None
+        end
+    end
+    A->>S: await close()
+    S->>T: to_thread(stream.close)
+    T->>R: close()
+    S-->>A: 读取资源已关闭
+```
+
+提前退出或读取异常不会生成布局完成信息；计数不符直接报错。调用方需等待消费完成并在 `finally` 中关闭会话，不能把 `close()` 当作租约确认或检查点提交。
+
 ## 来源注册与恢复
 
 来源适配器实现 `IngestionSourceAdapter.scan_next(cursor, budget)` 和纯位置运算

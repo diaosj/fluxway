@@ -226,6 +226,38 @@ controlled execution the worker acquires leases, injects work items, calls the
 reader and submits lease acknowledgements through a bounded asynchronous queue.
 Applications do not manually acknowledge a whole descriptor for other workers.
 
+```mermaid
+sequenceDiagram
+    participant A as Async consumer
+    participant S as IngestionLayoutSession
+    participant T as Reader thread
+    participant R as IngestionReadSession
+    loop Until complete exhaustion
+        A->>S: await read()
+        S->>S: Acquire session async lock
+        S->>T: to_thread(next)
+        T->>R: Advance blocking interval iterator
+        R-->>T: SegmentReadChunk
+        T->>T: Validate actual cardinality and interval<br/>coverage
+        T-->>S: Batch or end of stream
+        alt Batch available
+            S-->>A: batch
+            A->>A: await consume(batch)
+        else All intervals exhausted with matching counts
+            S->>S: Create SourceLayoutCompletion
+            S-->>A: None
+        end
+    end
+    A->>S: await close()
+    S->>T: to_thread(stream.close)
+    T->>R: close()
+    S-->>A: Reader resources closed
+```
+
+Early exit or read failure produces no layout completion; count mismatches raise. Await
+consumption and close the session in `finally`. `close()` does not acknowledge a work
+lease or commit a checkpoint.
+
 ## Source registration and recovery
 
 Implement `IngestionSourceAdapter.scan_next(cursor, budget)` and pure
