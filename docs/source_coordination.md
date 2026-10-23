@@ -13,11 +13,25 @@ source progress.
 ## Scan records and locate a consumed prefix
 
 `IngestionSourceAdapter` implements bounded `scan_next(cursor, budget)` and pure
-`advance_cursor(cursor, records)`. The adapter owns source identity, revision
+`advance_cursor(cursor, records)`, and provides `close()` for resource release.
+The adapter owns source identity, revision
 selection, physical locators and cursor encoding. Fluxway does not decode those
 bytes or discover a different latest revision on the reader's behalf.
 Scans return immutable `SourceScanResult` values with ordered units and opaque
 cursors.
+
+| Callback | Result and execution context |
+| --- | --- |
+| Source descriptor's `build_source_scan_binding(...)` | Returns `SourceScanBinding` or an awaitable producing it; construction runs on the dedicated adapter I/O lane. |
+| `SourceScanBinding.initial_cursor_factory()` | Returns `OpaqueSourceCursor`, `None`, or an awaitable producing either; runs on the same lane. |
+| `scan_next(cursor, budget)` | Returns `SourceScanResult` or an awaitable producing it; runs on the same lane. |
+| `close()` | Returns `None` or an awaitable producing `None`; releases clients and handles on the same lane and propagates failures. |
+| `advance_cursor(cursor, records)` | Returns `OpaqueSourceCursor` synchronously; remains pure and performs no storage I/O. |
+
+The lane executes and awaits callbacks on its own thread and event loop, rather
+than moving them back to the Controller loop. Adapters without external resources
+must still implement `close()`. A caller using an adapter directly owns its final
+closure until the planner takes ownership.
 
 This independent example uses the bundled in-memory recommendation source. It
 captures four records, then derives a bookmark after the first three records
@@ -81,11 +95,42 @@ by compilation and window planning; see the [interval example](source_spmd_forma
 
 ## Bind one source session
 
-`SourceScanBinding` owns the adapter, stable binding identity, reader topology,
-tail policy and `initial_cursor_factory`. The controller creates and caches it
-once. The resolver may return `None` when an empty continuous source has no view;
+`SourceScanBinding` groups the adapter, stable binding identity, reader topology,
+tail policy and `initial_cursor_factory`. The Controller delegates creation and
+caching to `IngestionLayoutPlanningComponent.open_source_binding()`. The planner
+serializes construction requests and takes ownership before the first scan.
+Later concurrent requests return the first successful binding without rebuilding
+it. The resolver may return `None` when an empty continuous source has no view;
 future attempts use the same binding. Once resolved, the session does not replace
 that initial position with a new snapshot.
+
+```mermaid
+sequenceDiagram
+    participant C as Controller callers
+    participant P as Planner
+    participant I as Dedicated adapter lane
+    C->>P: Concurrent open_source_binding(factory) calls
+    P->>P: Supervise accepted work, serialize cache checks
+    P->>I: build_source_scan_binding(...)
+    opt Caller cancels its wait
+        C->>C: CancelledError
+        Note over P,I: Accepted construction continues, close must still join it
+    end
+    alt Factory returns a valid binding
+        I-->>P: SourceScanBinding
+        P->>P: Validate/cache binding and own adapter
+        P-->>C: Return same binding to remaining waiters
+        Note over P,I: Planner close releases the adapter even before any scan
+    else Factory fails or returns an invalid result
+        I-->>P: Exception or invalid result
+        P-->>C: Propagate construction or validation error
+    end
+```
+
+The factory owns partially initialized resources until it successfully hands off
+a valid binding. Waiter cancellation does not revoke a successful handoff. Planner
+close joins construction before releasing resources. An integration that binds an
+adapter directly cannot also use a binding factory.
 
 This independent configuration prepares four records per logical step across two
 readers. The source contains twelve records, so the selected strict tail policy
@@ -301,10 +346,11 @@ wakeups and typed failures cross that boundary. Publishing an activation wakes
 all affected admission waiters. Starting after a checkpoint pause does not create
 a second source startup.
 
-Blocking capture uses the adapter I/O lane and compilation uses the process
-executor. Cancelling a caller's wait does not abandon an accepted operation. The
-session owner stops and joins progress, then awaits `planner.close()` to reject
-new work, join accepted operations and release executors. Failures stay visible.
+Scanning and its asynchronous waits use the dedicated adapter lane; compilation
+uses the process executor. Cancelling a caller's wait does not abandon accepted
+work. The session owner stops and joins progress, then calls `planner.close()`:
+reject new work and join accepted operations, close the adapter concurrently with
+shutting down the compiler pool, then close both execution lanes.
 Adapter/controller integration must separately validate bounded progress when
 metadata scans contain no new records.
 
@@ -315,6 +361,7 @@ sequenceDiagram
     participant P as Planner
     participant I as Adapter lane
     participant C as Compiler pool and<br/>lifecycle lane
+    participant R as Source adapter
     A->>P: Submit planning and await
     P->>I: Accepted scan
     opt Caller cancels its wait
@@ -326,18 +373,34 @@ sequenceDiagram
     A->>P: await close()
     P->>P: Reject new requests and join accepted operations
     I-->>P: Scan completes, remaining compilation and<br/>installation must finish
-    par Release adapter lane
-        P->>I: await close()
-        I-->>P: Thread joined
-    and Release compiler pool
+    par Release bound adapter
+        P->>I: call(adapter.close)
+        I->>R: close(), await an awaitable result
+        R-->>I: Completion or error
+        I-->>P: Adapter close outcome
+    and Shut down existing compiler pool
         P->>C: shutdown(wait=True)
-        C-->>P: Compiler processes joined
+        C-->>P: Compiler shutdown outcome
     end
-    P->>C: Close lifecycle lane
-    P-->>A: Return or propagate unobserved failures
+    par Close adapter lane
+        P->>I: await close()
+        I-->>P: Lane thread joined
+    and Close lifecycle lane
+        P->>C: await close()
+        C-->>P: Lane thread joined
+    end
+    P-->>A: Return or aggregate operation and close errors
 ```
 
-Repeated close waits for the same result; cancelling a close waiter does not interrupt resource release.
+A failed adapter close still proceeds to lane shutdown before errors are
+aggregated. Repeated close shares its result and closes the adapter once;
+cancelling a close waiter does not interrupt release. Operation errors or
+self-cancellation already observed by a caller are not reported again at close.
+Unobserved failures after waiter cancellation stay owned until close reports them.
+
+Supervised operations, such as construction or scanning, and their child tasks
+cannot close their planner. A close callback cannot recursively await the same
+close. These self-waits raise `RuntimeError`.
 
 ## Restore at the joint checkpoint
 

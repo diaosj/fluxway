@@ -248,11 +248,10 @@ alone owns leases, ACK frontiers and committed cuts. Driver activation checkpoin
 state is empty. Restore reconstructs plans
 and bindings before applying the logical committed cut.
 
-`IngestionLayoutPlanningComponent` owns descriptor construction and adapter scans
-on a dedicated `IOLane`, and pure compilation on a persistent spawn process pool.
-Accepted operations survive cancellation of their callers. Close rejects new work,
-joins accepted operations, then closes the adapter lane concurrently with joining
-the compiler pool on the lifecycle lane. It closes the lifecycle lane last.
+`IngestionLayoutPlanningComponent` manages the lifecycle of source bindings and adapters. Binding construction, data scanning, and resource disposal run on a dedicated `IOLane`, while pure compilation uses a persistent process pool. On shutdown, the planner rejects new requests, drains in-flight operations, shuts down the adapter and compiler pool concurrently, and reclaims lane resources.
+
+The planner and `IOLane` use `AsyncOperationSupervisor` and `AsyncCloseOnce` for concurrency safety: cancelling a caller's wait does not leak background tasks or resources, closure executes idempotently, and reentrant self-awaits are prevented from deadlocking. See [source coordination](source_coordination.md) for sequence details.
+
 Planner and ledger publication is installed in
 one owner-loop section without suspension; validation and installation costs still
 scale with window size. I/O threads isolate blocking calls but do not remove the

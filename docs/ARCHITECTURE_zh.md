@@ -159,7 +159,11 @@ flowchart LR
 
 适配器 `IngestionSourceAdapter` 按有界请求返回不可变的 `SourceScanResult`。控制器中的 `SourceProgressSupervisor` 负责事件驱动的扫描与激活发布。编译器先构建由 `SourceWorkKey(epoch, step, assignment_id)` 标识的规范任务，再按当前读取配额绑定为瞬态的 `WorkerLayoutDescriptor`。只有 `LogicalWorkLedger` 管理租约、确认前沿和已提交位置，驱动器不保存激活检查点状态。
 
-`IngestionLayoutPlanningComponent` 在独立的 `IOLane` 执行描述符构建和适配器扫描，在常驻的独立进程池执行纯编译。已接收操作不随调用方取消而丢弃。关闭时拒绝新请求，等待已接收操作结束，再并发关闭适配器通道和等待编译池退出，最后关闭生命周期通道。规划和账本发布在同一拥有者事件循环内完成，中间不挂起；其校验成本仍随窗口大小增加。输入输出线程隔离阻塞调用，不消除 Python 计算的 GIL 限制。
+`IngestionLayoutPlanningComponent` 统一管理来源绑定与适配器的生命周期。绑定构造、数据扫描和资源关闭均在专用 `IOLane` 中执行，纯编译使用常驻进程池。规划器关闭时拒绝新请求并等待已有任务落盘，随后并发释放适配器并退出编译池，最后彻底回收各通道。
+
+规划器与 `IOLane` 通过 `AsyncOperationSupervisor` 与 `AsyncCloseOnce` 保证并发安全：外部取消等待不会造成后台任务或资源泄漏，关闭逻辑保证幂等执行一次，且防止操作反向关闭拥有者导致的死锁。详情见[来源协调](source_coordination_zh.md)。
+
+规划和账本发布在同一拥有者事件循环内完成，中间不挂起；其校验成本仍随窗口大小增加。输入输出线程隔离阻塞调用，不消除 Python 计算的 GIL 限制。
 
 `SourceExecutionScope` 管理工作进程窗口安装、活跃步骤索引和瞬态授权。它按算子流水深度批量请求，只获取信用额度允许的完整步骤前缀。普通检查点继续使用当前作用域；恢复使用新的执行角色，随后才激活来源。确认通过有界异步队列提交，容量满时施加背压。
 
