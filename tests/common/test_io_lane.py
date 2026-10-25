@@ -105,6 +105,50 @@ async def test_cancelled_waiter_failure_is_reported_at_close():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [ValueError, asyncio.CancelledError])
+async def test_abandoned_failure_blocks_queued_write_before_capacity_transfer(
+    failure_type,
+):
+    owner = asyncio.get_running_loop()
+    entered = asyncio.Event()
+    release = Future()
+    mutations = []
+    lane = IOLane("test-failure-capacity-transfer", capacity=1)
+
+    async def failing_write():
+        owner.call_soon_threadsafe(entered.set)
+        await asyncio.wrap_future(release)
+        raise failure_type("unobserved write failure")
+
+    first = asyncio.create_task(lane.call(failing_write))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        second = asyncio.create_task(lane.call(mutations.append, "mutated"))
+        await asyncio.sleep(0)
+        assert not second.done()
+        release.set_result(None)
+        with pytest.raises(BaseExceptionGroup, match="unobserved") as caught:
+            await asyncio.wait_for(second, timeout=2)
+        assert len(caught.value.exceptions) == 1
+        assert isinstance(caught.value.exceptions[0], failure_type)
+        assert mutations == []
+        with pytest.raises(BaseExceptionGroup, match="unobserved"):
+            await asyncio.wait_for(lane.close(), timeout=2)
+        assert not lane._thread.is_alive()
+    finally:
+        if not release.done():
+            release.set_result(None)
+        await asyncio.gather(first, return_exceptions=True)
+        if second is not None:
+            await asyncio.gather(second, return_exceptions=True)
+        await asyncio.gather(lane.close(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_observed_failure_can_be_compensated_on_same_lane():
     lane = IOLane("test-storage-compensate", capacity=1)
 

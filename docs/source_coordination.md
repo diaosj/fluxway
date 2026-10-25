@@ -130,7 +130,10 @@ sequenceDiagram
 The factory owns partially initialized resources until it successfully hands off
 a valid binding. Waiter cancellation does not revoke a successful handoff. Planner
 close joins construction before releasing resources. An integration that binds an
-adapter directly cannot also use a binding factory.
+adapter directly cannot also use a binding factory. While a factory is running,
+`bind_source_scan()` raises `RuntimeError` before accepting a direct adapter;
+the rejected adapter remains owned by its caller. After construction,
+`bind_source_scan()` can configure scanning with the same factory-owned adapter.
 
 This independent configuration prepares four records per logical step across two
 readers. The source contains twelve records, so the selected strict tail policy
@@ -397,6 +400,9 @@ aggregated. Repeated close shares its result and closes the adapter once;
 cancelling a close waiter does not interrupt release. Operation errors or
 self-cancellation already observed by a caller are not reported again at close.
 Unobserved failures after waiter cancellation stay owned until close reports them.
+Joining an accepted operation waits for both execution and the caller's result
+observation or abandonment. I/O capacity becomes available after this accounting,
+so an abandoned failure rejects a queued write before it performs any mutation.
 
 Supervised operations, such as construction or scanning, and their child tasks
 cannot close their planner. A close callback cannot recursively await the same

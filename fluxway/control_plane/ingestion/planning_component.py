@@ -187,6 +187,7 @@ class IngestionLayoutPlanningComponent:
         self._source_adapter: IngestionSourceAdapter | None = None
         self._source_binding: SourceScanBinding | None = None
         self._source_binding_lock = asyncio.Lock()
+        self._source_binding_pending = False
         self._initial_cursor_factory: (
             Callable[
                 [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
@@ -241,17 +242,27 @@ class IngestionLayoutPlanningComponent:
 
         async def open_once() -> SourceScanBinding:
             async with self._source_binding_lock:
-                if self._source_binding is None:
+                with self._accept_lock:
+                    if self._source_binding is not None:
+                        return self._source_binding
                     if self._source_adapter is not None:
                         raise RuntimeError("source adapter is already bound directly")
+                    self._source_binding_pending = True
+                try:
                     binding = await self._adapter_lane.call(factory, **kwargs)
                     if not isinstance(binding, SourceScanBinding):
                         raise TypeError(
                             "source descriptor must return SourceScanBinding"
                         )
+                except BaseException:
+                    with self._accept_lock:
+                        self._source_binding_pending = False
+                    raise
+                with self._accept_lock:
                     self._source_binding = binding
                     self._source_adapter = binding.adapter
-                return self._source_binding
+                    self._source_binding_pending = False
+                return binding
 
         return await self._await_operation(open_once)
 
@@ -275,6 +286,8 @@ class IngestionLayoutPlanningComponent:
         resolved_tail = TailLayoutMode.from_value(tail_layout_mode)
         resolved_policy = AssignmentPolicy.from_value(assignment_policy)
         with self._accept_lock:
+            if self._source_binding_pending:
+                raise RuntimeError("source binding construction is in progress")
             if self._source_adapter is not None and self._source_adapter is not adapter:
                 raise ValueError("source scan adapter changed during planner lifetime")
             if (

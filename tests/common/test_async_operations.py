@@ -127,3 +127,71 @@ async def test_owner_preserves_native_async_concurrency_and_observed_errors():
     failures = await asyncio.gather(*callers, return_exceptions=True)
     assert [str(error) for error in failures] == ["0", "1"]
     assert await supervisor.drain() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+@pytest.mark.parametrize("failure_type", [None, ValueError, asyncio.CancelledError])
+async def test_concurrent_drain_waits_for_result_observation(
+    cancel_waiter, failure_type
+):
+    supervisor = AsyncOperationSupervisor()
+    completed = asyncio.Event()
+
+    async def operation():
+        completed.set()
+        if cancel_waiter:
+            asyncio.get_running_loop().call_soon(caller.cancel)
+        if failure_type is not None:
+            raise failure_type("completed failure")
+        return "completed"
+
+    async def drain_at_completion():
+        await completed.wait()
+        await asyncio.sleep(0)
+        return await supervisor.drain()
+
+    draining = asyncio.create_task(drain_at_completion())
+    caller = asyncio.create_task(supervisor.run(operation))
+    result, failures = await asyncio.wait_for(
+        asyncio.gather(caller, draining, return_exceptions=True), timeout=2
+    )
+    if cancel_waiter:
+        assert isinstance(result, asyncio.CancelledError)
+    elif failure_type is not None:
+        assert isinstance(result, failure_type)
+    else:
+        assert result == "completed"
+    if cancel_waiter and failure_type is not None:
+        assert len(failures) == 1
+        assert isinstance(failures[0], failure_type)
+    else:
+        assert failures == ()
+    assert await supervisor.drain() == failures
+
+
+@pytest.mark.asyncio
+async def test_cancelled_drain_does_not_cancel_owned_work_or_settlement():
+    supervisor = AsyncOperationSupervisor()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def operation():
+        entered.set()
+        await release.wait()
+        raise ValueError("late failure")
+
+    caller = asyncio.create_task(supervisor.run(operation))
+    await entered.wait()
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    draining = asyncio.create_task(supervisor.drain())
+    await asyncio.sleep(0)
+    draining.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await draining
+    release.set()
+    failures = await asyncio.wait_for(supervisor.drain(), timeout=2)
+    assert len(failures) == 1
+    assert isinstance(failures[0], ValueError)
+    assert str(failures[0]) == "late failure"

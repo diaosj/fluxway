@@ -966,6 +966,52 @@ async def test_close_joins_accepted_publication(source_layout) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [ValueError, asyncio.CancelledError])
+async def test_close_reports_failure_when_compile_completion_cancels_waiter(
+    source_layout, failure_type
+):
+    start_close = asyncio.Event()
+
+    class FailingPlanner(IngestionLayoutPlanningComponent):
+        async def _compile_prepared(self, request, *, epoch, start_position):
+            start_close.set()
+            asyncio.get_running_loop().call_soon(caller.cancel)
+            raise failure_type("unobserved compilation failure")
+
+    planner = FailingPlanner("compile-close-race")
+
+    async def close_at_completion():
+        await start_close.wait()
+        await planner.close()
+
+    closing = asyncio.create_task(close_at_completion())
+    request = source_layout(demands=(1,), cardinality=1).request
+    caller = asyncio.create_task(
+        planner.plan_and_publish(
+            LogicalWorkLedger(max_in_flight_steps=2),
+            request,
+            epoch=0,
+            start_position=0,
+        )
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(caller, timeout=2)
+        with pytest.raises(
+            BaseExceptionGroup, match="source planning close failed"
+        ) as first_close:
+            await asyncio.wait_for(closing, timeout=2)
+        assert len(first_close.value.exceptions) == 1
+        assert isinstance(first_close.value.exceptions[0], failure_type)
+        with pytest.raises(BaseExceptionGroup) as repeated_close:
+            await planner.close()
+        assert repeated_close.value is first_close.value
+    finally:
+        await asyncio.gather(caller, closing, return_exceptions=True)
+        await asyncio.gather(planner.close(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel_waiter", [False, True])
 async def test_close_settles_capture_and_publication(source_layout, cancel_waiter):
     compiled = source_layout(demands=(1,), cardinality=1)

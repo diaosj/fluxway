@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import threading
 from collections.abc import Awaitable
 
 import pytest
 
-from fluxway.common.ingestion import SourceBindingIdentity
-from fluxway.control_plane.ingestion import TailLayoutMode
+from fluxway.common.ingestion import SourceBindingIdentity, SourceScanBudget
+from fluxway.control_plane.ingestion import AssignmentPolicy, TailLayoutMode
 from fluxway.control_plane.ingestion.adapter import SourceScanBinding
 from fluxway.control_plane.ingestion.planning_component import (
     IngestionLayoutPlanningComponent,
@@ -135,3 +136,126 @@ async def test_close_failure_does_not_leave_the_adapter_lane_running():
         await component._adapter_lane.call(lambda: None)
     with pytest.raises(RuntimeError, match="closing"):
         await component.open_source_binding(lambda: binding(ResourceAdapter()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("foreign_thread", [False, True])
+@pytest.mark.parametrize("cancel_waiter", [False, True])
+async def test_direct_binding_rejected_during_factory_construction(
+    foreign_thread, cancel_waiter
+):
+    component = IngestionLayoutPlanningComponent("binding-admission")
+    factory_adapter, direct_adapter = ResourceAdapter(), ResourceAdapter()
+    entered, release = threading.Event(), threading.Event()
+
+    async def build():
+        entered.set()
+        await asyncio.to_thread(release.wait)
+        return binding(factory_adapter)
+
+    bind_direct = functools.partial(
+        component.bind_source_scan,
+        direct_adapter,
+        initial_cursor_factory=lambda: None,
+        budget=SourceScanBudget(1, 1),
+        tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
+        assignment_policy=AssignmentPolicy.default(),
+    )
+    opening = asyncio.create_task(component.open_source_binding(build))
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=3)
+        if cancel_waiter:
+            opening.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await opening
+        with pytest.raises(RuntimeError, match="binding construction"):
+            if foreign_thread:
+                await asyncio.to_thread(bind_direct)
+            else:
+                bind_direct()
+        release.set()
+        if not cancel_waiter:
+            created = await asyncio.wait_for(opening, timeout=3)
+            assert created.adapter is factory_adapter
+        await asyncio.wait_for(component.close(), timeout=3)
+        await component.close()
+        assert factory_adapter.closed == 1
+        assert direct_adapter.closed == 0
+    finally:
+        release.set()
+        await asyncio.gather(opening, return_exceptions=True)
+        await component.close()
+        direct_adapter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_binding", [False, True])
+async def test_failed_factory_releases_binding_reservation_for_next_request(
+    invalid_binding,
+):
+    component = IngestionLayoutPlanningComponent("binding-retry")
+    adapter = ResourceAdapter()
+    calls = 0
+
+    def build():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if invalid_binding:
+                return object()
+            raise ValueError("factory failed")
+        return binding(adapter)
+
+    try:
+        with pytest.raises(TypeError if invalid_binding else ValueError):
+            await component.open_source_binding(build)
+        created = await component.open_source_binding(build)
+        assert created.adapter is adapter
+        assert await component.open_source_binding(build) is created
+        assert calls == 2
+    finally:
+        await component.close()
+    assert adapter.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_factory_adapter_can_be_configured_for_scanning():
+    component = IngestionLayoutPlanningComponent("binding-configuration")
+    adapter = ResourceAdapter()
+    try:
+        created = await component.open_source_binding(lambda: binding(adapter))
+        for _ in range(2):
+            component.bind_source_scan(
+                adapter,
+                initial_cursor_factory=created.initial_cursor_factory,
+                budget=SourceScanBudget(1, 1),
+                tail_layout_mode=created.tail_layout_mode,
+                assignment_policy=created.assignment_policy,
+            )
+        assert await component.open_source_binding(lambda: binding(adapter)) is created
+    finally:
+        await component.close()
+    assert adapter.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_binding_rejects_factory_without_running_it():
+    component = IngestionLayoutPlanningComponent("direct-binding-owner")
+    adapter = ResourceAdapter()
+
+    def build():
+        raise AssertionError("a direct binding must reject factory construction")
+
+    try:
+        component.bind_source_scan(
+            adapter,
+            initial_cursor_factory=lambda: None,
+            budget=SourceScanBudget(1, 1),
+            tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
+            assignment_policy=AssignmentPolicy.default(),
+        )
+        with pytest.raises(RuntimeError, match="already bound directly"):
+            await component.open_source_binding(build)
+    finally:
+        await component.close()
+    assert adapter.closed == 1

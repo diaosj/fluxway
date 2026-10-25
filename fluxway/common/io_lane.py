@@ -64,26 +64,15 @@ class IOLane:
 
     async def call(self, operation: Callable[..., Any], /, *args, **kwargs) -> Any:
         self._bind_owner()
-        if not self._operations.accepting:
-            raise RuntimeError("I/O lane is closing")
-        self._operations.raise_unobserved()
-        await self._capacity.acquire()
-        if not self._operations.accepting:
-            self._capacity.release()
-            raise RuntimeError("I/O lane is closing")
-        try:
-            self._operations.raise_unobserved()
-        except BaseException:
-            self._capacity.release()
-            raise
 
         async def dispatch():
-            try:
-                return await self._dispatch(operation, args, kwargs)
-            finally:
-                self._capacity.release()
+            return await self._dispatch(operation, args, kwargs)
 
-        return await self._operations.run(dispatch)
+        return await self._operations.run_with_capacity(
+            self._capacity,
+            dispatch,
+            closing_message="I/O lane is closing",
+        )
 
     async def _dispatch(self, operation, args, kwargs):
         lane = await asyncio.shield(self._start())
