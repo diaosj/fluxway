@@ -3,8 +3,15 @@
 [英文版](user_profiler.md)
 
 Fluxway 会将整个算子调用记录为 `user_callable.execute`。
-对内部较小的耗时区域使用 `profiler.scope()`，对某个时刻的事实使用 `profiler.event()`。
+对内部较小的耗时区域使用 `profiler.scope()`，对特定时间点的瞬时事件使用 `profiler.event()`。
 不需要再给整个算子增加分析装饰器。
+
+![Perfetto 时间轴对比 Fluxway 不同 rank 的 lookup 耗时与下游等待](pictures/profiler_timeline.png)
+
+在同一时间轴上对比不同 rank，可以从生产者追踪延迟如何传递到消费者。
+这个[文档示例](pictures/README.md)中，embedding rank 1 在 step 1 的 lookup 更长，
+对应 trainer 的信箱等待（Mailbox wait）也随之延长。调用、传输、信箱和调度使用独立轨道，
+便于区分实际工作与等待。图中时间为示意数据。
 
 ## 添加作用域与标记
 
@@ -91,7 +98,7 @@ async def profile_job(
 没有共享存储时，应从控制器所在机器取回文件，不能检查调用方本地的同名路径。
 
 `skip_initial_steps` 排除最初若干执行步，`steady_state_only` 只保留稳定执行区间内的记录。
-如果过滤删除了全部记录，导出会报错。
+若过滤移除了全部记录，导出将抛出异常。
 采集使用固定大小的进程缓冲区，由 `buffer_bytes_per_process` 配置。
 默认启用严格的耗尽检查，容量不足时抛出 `ProfilerBufferExhausted`。
 时钟不确定度超过配置上限也会使采集失败，避免输出误导性的耗时。
@@ -107,10 +114,10 @@ sequenceDiagram
     A->>C: await execution.wait()
     C->>C: 进入 COMPLETING，停止检查点并关闭协调器
     C->>D: 并发请求性能快照
-    D->>W: 并发捕获各秩记录与时钟映射
+    D->>W: 并发捕获各 Rank 记录与时钟映射
     W-->>D: ProfilerSnapshot
     D-->>C: 全部 SPMD 快照
-    C->>D: 回收角色并释放资源
+    C->>D: 回收各 Actor 并释放资源
     D-->>C: 回收完成
     C->>C: 关闭来源规划器，合并控制器记录并解析符号
     C->>F: 应用过滤并同步写出 Perfetto 文件
@@ -131,18 +138,24 @@ Controller/<subsystem>/<leaf>
 ```
 
 `SPMDs` 和 `Controller` 是两个顶层所有者。
-展开某个进程编号即可查看计算、传输、信箱和调度活动。
-末尾的 `lane:<lane>` 将同一叶节点上重叠的切片分到不同轨道，同时保留原始持续时间。
-轨道分配是确定性的，数量等于该叶节点最大并发度所需的最少值，不会为每一步新建轨道。
+展开某个 Rank 即可查看计算、传输、信箱和调度活动。
+末尾的 `lane:<lane>` 将同一叶节点上重叠的切片分到不同泳道（Lane），同时保留原始持续时间。
+泳道分配是确定性的，数量等于该叶节点最大并发度所需的最少值，不会为每一步新建轨道（Track）。
 
 调度活动按职责分到 `scheduler/task`、`scheduler/queue`、`scheduler/step`
 和 `scheduler/loop`。检查点组件操作位于 `checkpoint/storage`，
-快照协调位于 `checkpoint/hook`。进程编号之下不会再重复插入 `worker` 层级。
+快照协调位于 `checkpoint/hook`。Rank 之下不会再重复插入 `worker` 层级。
 
 自定义作用域和标记位于 `compute/user_custom/<execution_mode>`。
-其中的 `execution_mode` 表示运行时调用模式，末尾的通道编号用于区分重叠切片。
+其中的 `execution_mode` 表示运行时调用模式，末尾的泳道编号用于区分重叠切片。
 每条记录关联外围调用的 `op_id`、`step`、`rank` 和 `execution_mode`。
 用户属性显示为可读的调试注解，内部的 `attrs_id` 不显示。
+
+![Perfetto 中选中的 user.embedding_lookup 作用域及其算子、执行步、rank 和应用属性](pictures/profiler_scope.png)
+
+选中自定义作用域，即可将耗时关联到 `op_id`、`step`、`rank`，以及 `table`、`count`
+等应用属性。应用细节与运行时活动放在一起，便于判断调用何时执行、时间花在哪里。
+该示例与[计算图配图](graph_visualization_zh.md)使用同一份编译图。
 
 ## 将事件对应到编译后的计算图
 

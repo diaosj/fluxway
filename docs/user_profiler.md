@@ -4,7 +4,15 @@
 
 Fluxway records the whole operator call as `user_callable.execute`. Add
 `profiler.scope()` for smaller timed regions and `profiler.event()` for facts at
-one instant. You do not need another decorator around the operator.
+one instant; no additional decorator is required around the operator.
+
+![Perfetto timeline comparing lookup durations and downstream waits across Fluxway ranks](pictures/profiler_timeline.png)
+
+Compare ranks on one time axis to follow a delay from producer to consumer.
+In this [documentation example](pictures/README.md), the longer lookup on
+embedding rank 1 at step 1 extends the corresponding trainer's mailbox wait.
+Separate call, transport, mailbox, and scheduler tracks help distinguish work
+from waiting. The timings are illustrative.
 
 ## Add a scope and a marker
 
@@ -158,6 +166,13 @@ runtime call mode, while the final lane number identifies overlapping trace
 slices. Each record is correlated with the surrounding call's `op_id`, `step`,
 `rank`, and `execution_mode`. User attributes appear as readable debug
 annotations; the internal `attrs_id` does not.
+
+![Selected user.embedding_lookup scope with operator, step, rank, and readable application attributes in Perfetto](pictures/profiler_scope.png)
+
+Select a custom scope to connect its duration to `op_id`, `step`, `rank`, and
+application attributes such as `table` and `count`. This keeps the application
+detail beside the runtime activity that explains when the call ran. The example
+uses the same compiled graph as the [graph screenshots](graph_visualization.md).
 
 ## Match events to the compiled graph
 

@@ -6,6 +6,14 @@ Fluxway exports a compiled graph for Google Model Explorer. Export does not run
 the graph, open a browser, or start a server. It writes a single
 `model_explorer.json` file; this file is for inspection, not job reconstruction.
 
+![Model Explorer dependency view showing parallel feature branches and the selected trainer operator](pictures/graph_dependencies.png)
+
+Follow `reader.read` through the `features.encode` and `embedding.lookup`
+branches into `trainer.forward`. Select an operator to inspect the compiled
+identity, ports, mesh, and concurrency policy. The screenshots use a larger
+[documentation example](pictures/README.md) than the minimal example below;
+its compiled symbols also identify operators in the [timeline](user_profiler.md).
+
 ## Install and export a complete example
 
 Install the optional viewer dependency:
@@ -153,6 +161,14 @@ Cross-step constraints do not alter the same-step dependency rank. The
 Box colors describe structural roles: green for a source, blue for a transform,
 amber for a sink, purple for a dependency-cycle member, and gray for an isolated
 operator. Model Explorer does not support dashed or dotted edge strokes.
+
+![Model Explorer potential-overlap view grouped by dependency rank and lane, with a cross-step phase overlay](pictures/graph_overlap.png)
+
+Here `encode` and `lookup` share a dependency rank, making the independent
+processing branches visually distinct. The trainer's compute and optimizer lanes expose its
+phase structure; the teal overlay links `update` to the next step's `forward`.
+Use this view to check where overlap is allowed, then inspect the trace to see
+whether it happened during execution.
 
 ## Inspect policies and correlate traces
 
