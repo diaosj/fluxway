@@ -12,7 +12,10 @@ from fluxway.common.ingestion.source_scan import (
     SourceScanBudget,
     SourceScanResult,
 )
-from fluxway.control_plane.ingestion.compiler import AssignmentPolicy
+from fluxway.control_plane.ingestion.compiler import (
+    AssignmentPolicy,
+    TailLayoutMode,
+)
 
 
 @runtime_checkable
@@ -40,7 +43,7 @@ class SourceScanBinding:
         [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
     ]
     topology: object
-    tail_layout_mode: object
+    tail_layout_mode: TailLayoutMode | str
     assignment_policy: AssignmentPolicy = field(
         default_factory=AssignmentPolicy.default
     )
@@ -52,6 +55,12 @@ class SourceScanBinding:
             raise TypeError("source binding requires SourceBindingIdentity")
         if not callable(self.initial_cursor_factory):
             raise TypeError("source binding requires an initial cursor factory")
+        if not isinstance(self.tail_layout_mode, TailLayoutMode):
+            object.__setattr__(
+                self,
+                "tail_layout_mode",
+                TailLayoutMode.from_value(self.tail_layout_mode),
+            )
         if not isinstance(self.assignment_policy, AssignmentPolicy):
             object.__setattr__(
                 self,

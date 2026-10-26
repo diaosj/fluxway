@@ -259,3 +259,21 @@ async def test_direct_binding_rejects_factory_without_running_it():
     finally:
         await component.close()
     assert adapter.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_binding_is_rejected_after_close():
+    component = IngestionLayoutPlanningComponent("direct-binding-after-close")
+    await component.close()
+
+    adapter = ResourceAdapter()
+    with pytest.raises(RuntimeError, match="source planning component is closing"):
+        component.bind_source_scan(
+            adapter,
+            initial_cursor_factory=lambda: None,
+            budget=SourceScanBudget(1, 1),
+            tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
+            assignment_policy=AssignmentPolicy.default(),
+        )
+    assert adapter.closed == 0
+    assert component._source_adapter is None

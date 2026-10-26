@@ -286,6 +286,7 @@ class IngestionLayoutPlanningComponent:
         resolved_tail = TailLayoutMode.from_value(tail_layout_mode)
         resolved_policy = AssignmentPolicy.from_value(assignment_policy)
         with self._accept_lock:
+            self._operations.ensure_admissible("source planning component is closing")
             if self._source_binding_pending:
                 raise RuntimeError("source binding construction is in progress")
             if self._source_adapter is not None and self._source_adapter is not adapter:
