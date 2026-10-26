@@ -6,11 +6,13 @@ import asyncio
 import functools
 import multiprocessing
 import threading
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar
 
+from fluxway.common.async_close import AsyncCloseOnce
+from fluxway.common.async_operations import AsyncOperationSupervisor
 from fluxway.common.ingestion import (
     LayoutUnitDescriptor,
     SourceLayoutActivation,
@@ -37,6 +39,7 @@ from fluxway.control_plane.checkpoint_transaction import (
 from fluxway.control_plane.components import ComponentState
 from fluxway.control_plane.ingestion.adapter import (
     IngestionSourceAdapter,
+    SourceScanBinding,
 )
 from fluxway.control_plane.ingestion.compiler import (
     AlgebraicLayoutCompiler,
@@ -182,9 +185,15 @@ class IngestionLayoutPlanningComponent:
         self._source_request: LayoutCompileRequest | None = None
         self._capture: _SourceCapture | None = None
         self._source_adapter: IngestionSourceAdapter | None = None
-        self._initial_cursor_factory: Callable[[], OpaqueSourceCursor | None] | None = (
-            None
-        )
+        self._source_binding: SourceScanBinding | None = None
+        self._source_binding_lock = asyncio.Lock()
+        self._source_binding_pending = False
+        self._initial_cursor_factory: (
+            Callable[
+                [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
+            ]
+            | None
+        ) = None
         self._binding_identity: SourceBindingIdentity | None = None
         self._source_budget: SourceScanBudget | None = None
         self._source_tail_layout: TailLayoutMode | None = None
@@ -201,10 +210,8 @@ class IngestionLayoutPlanningComponent:
             f"fluxway-source-lifecycle-{self.component_id}", capacity=1
         )
         self._compile_executor: ProcessPoolExecutor | None = None
-        self._closed = False
-        self._close_task: asyncio.Task[None] | None = None
-        self._operations: set[asyncio.Task[Any]] = set()
-        self._operation_failures: dict[asyncio.Task[Any], BaseException] = {}
+        self._close_once = AsyncCloseOnce(self._finish_close)
+        self._operations = AsyncOperationSupervisor()
         self._checkpoint_transactions = PreparedStateStore[dict[str, Any]]()
 
     @property
@@ -228,15 +235,81 @@ class IngestionLayoutPlanningComponent:
             )
         self._topology = topology
 
+    async def open_source_binding(
+        self, factory: Callable[..., Any], **kwargs: Any
+    ) -> SourceScanBinding:
+        """Own construction and cleanup from the first successful binding."""
+
+        async def open_once() -> SourceScanBinding:
+            async with self._source_binding_lock:
+                with self._accept_lock:
+                    if self._source_binding is not None:
+                        return self._source_binding
+                    if self._source_adapter is not None:
+                        raise RuntimeError("source adapter is already bound directly")
+                    self._source_binding_pending = True
+                try:
+                    binding = await self._adapter_lane.call(factory, **kwargs)
+                    if not isinstance(binding, SourceScanBinding):
+                        raise TypeError(
+                            "source descriptor must return SourceScanBinding"
+                        )
+                except BaseException:
+                    with self._accept_lock:
+                        self._source_binding_pending = False
+                    raise
+                with self._accept_lock:
+                    self._source_binding = binding
+                    self._source_adapter = binding.adapter
+                    self._source_binding_pending = False
+                return binding
+
+        return await self._await_operation(open_once)
+
     def bind_source_scan(
         self,
         adapter: IngestionSourceAdapter,
         *,
-        initial_cursor_factory: Callable[[], OpaqueSourceCursor | None],
+        initial_cursor_factory: Callable[
+            [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
+        ],
         budget: SourceScanBudget,
         tail_layout_mode: TailLayoutMode | str,
         assignment_policy: AssignmentPolicy,
     ) -> None:
+        """Bind and configure an ingestion source adapter for direct scanning.
+
+        Rejects external admission if the planning component is closing or closed,
+        preserving caller ownership and cleanup responsibility for the rejected adapter.
+        """
+        self._apply_source_scan_binding(
+            adapter,
+            initial_cursor_factory=initial_cursor_factory,
+            budget=budget,
+            tail_layout_mode=tail_layout_mode,
+            assignment_policy=assignment_policy,
+            _admitted=False,
+        )
+
+    def _apply_source_scan_binding(
+        self,
+        adapter: IngestionSourceAdapter,
+        *,
+        initial_cursor_factory: Callable[
+            [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
+        ],
+        budget: SourceScanBudget,
+        tail_layout_mode: TailLayoutMode | str,
+        assignment_policy: AssignmentPolicy,
+        _admitted: bool = True,
+    ) -> None:
+        """Apply and validate source scan binding parameters under lock.
+
+        Args:
+            _admitted: When True (default), the caller is already under supervisor
+                custody and the admission gate is skipped. External entry points
+                must pass False so the gate is checked atomically under the lock.
+        """
         if not isinstance(adapter, IngestionSourceAdapter):
             raise TypeError("source planning requires an ingestion source adapter")
         if not callable(initial_cursor_factory):
@@ -246,6 +319,12 @@ class IngestionLayoutPlanningComponent:
         resolved_tail = TailLayoutMode.from_value(tail_layout_mode)
         resolved_policy = AssignmentPolicy.from_value(assignment_policy)
         with self._accept_lock:
+            if not _admitted:
+                self._operations.ensure_admissible(
+                    "cannot bind source adapter: source planning component is closing"
+                )
+            if self._source_binding_pending:
+                raise RuntimeError("source binding construction is in progress")
             if self._source_adapter is not None and self._source_adapter is not adapter:
                 raise ValueError("source scan adapter changed during planner lifetime")
             if (
@@ -300,55 +379,22 @@ class IngestionLayoutPlanningComponent:
             )
         return self._compile_executor
 
-    def _submit_operation(
-        self, operation: Callable[[], Coroutine[Any, Any, _Result]]
-    ) -> asyncio.Task[_Result]:
-        if self._closed:
-            raise RuntimeError("layout planning component is closed")
-        task = asyncio.create_task(operation())
-        self._operations.add(task)
-        task.add_done_callback(self._operation_finished)
-        return task
-
-    def _operation_finished(self, task: asyncio.Task[Any]) -> None:
-        self._operations.discard(task)
-        if task.cancelled():
-            self._operation_failures[task] = asyncio.CancelledError()
-            return
-        error = task.exception()
-        if error is not None:
-            self._operation_failures[task] = error
-
     async def _await_operation(
         self, operation: Callable[[], Coroutine[Any, Any, _Result]]
     ) -> _Result:
-        task = self._submit_operation(operation)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
-            self._operation_failures.pop(task)
-            raise
+        return await self._operations.run(operation)
 
     async def close(self) -> None:
-        if self._close_task is None:
-            self._closed = True
-            self._close_task = asyncio.create_task(self._finish_close())
-            self._close_task.add_done_callback(self._observe_close)
-        await asyncio.shield(self._close_task)
-
-    @staticmethod
-    def _observe_close(task: asyncio.Task[None]) -> None:
-        if not task.cancelled():
-            task.exception()
+        self._operations.stop_accepting()
+        await self._close_once.close()
 
     async def _finish_close(self) -> None:
-        if self._operations:
-            await asyncio.gather(*tuple(self._operations), return_exceptions=True)
+        failures = list(await self._operations.drain())
         compile_executor = self._compile_executor
         self._compile_executor = None
-        closing = [self._adapter_lane.close()]
+        closing = []
+        if self._source_adapter is not None:
+            closing.append(self._adapter_lane.call(self._source_adapter.close))
         if compile_executor is not None:
             closing.append(
                 self._lifecycle_lane.call(
@@ -359,9 +405,12 @@ class IngestionLayoutPlanningComponent:
             )
         results = await asyncio.gather(*closing, return_exceptions=True)
         results.extend(
-            await asyncio.gather(self._lifecycle_lane.close(), return_exceptions=True)
+            await asyncio.gather(
+                self._adapter_lane.close(),
+                self._lifecycle_lane.close(),
+                return_exceptions=True,
+            )
         )
-        failures = list(self._operation_failures.values())
         failures.extend(
             result for result in results if isinstance(result, BaseException)
         )
@@ -837,7 +886,9 @@ class IngestionLayoutPlanningComponent:
     async def _plan_source_scan(
         self,
         adapter: IngestionSourceAdapter,
-        initial_cursor_factory: Callable[[], OpaqueSourceCursor | None],
+        initial_cursor_factory: Callable[
+            [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
+        ],
         ledger: LogicalWorkLedger,
         cursor: OpaqueSourceCursor | None,
         *,
@@ -850,7 +901,7 @@ class IngestionLayoutPlanningComponent:
         max_steps: int | None = None,
         max_descriptor_bytes: int | None = None,
     ) -> SourceLayoutActivation | None:
-        self.bind_source_scan(
+        self._apply_source_scan_binding(
             adapter,
             initial_cursor_factory=initial_cursor_factory,
             budget=budget,
@@ -886,8 +937,12 @@ class IngestionLayoutPlanningComponent:
                     "source initial cursor factory must return an opaque cursor"
                 )
             current_cursor = cursor
+            anchor = cursor
+            initial_cursor = cursor
         else:
             current_cursor = capture.cursor
+            anchor = capture.anchor
+            initial_cursor = capture.initial_cursor
         observations = () if capture is None else capture.observations
         identity = None if capture is None else capture.identity
         record_position = (
@@ -916,8 +971,8 @@ class IngestionLayoutPlanningComponent:
                 record_position += scan_result.records
             capture = _SourceCapture(
                 scan_result.next_cursor,
-                cursor if capture is None else capture.anchor,
-                cursor if capture is None else capture.initial_cursor,
+                anchor,
+                initial_cursor,
                 identity,
                 requested_mode,
                 record_position,
@@ -992,7 +1047,9 @@ class IngestionLayoutPlanningComponent:
     async def plan_source_scan(
         self,
         adapter: IngestionSourceAdapter,
-        initial_cursor_factory: Callable[[], OpaqueSourceCursor | None],
+        initial_cursor_factory: Callable[
+            [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
+        ],
         ledger: LogicalWorkLedger,
         cursor: OpaqueSourceCursor | None,
         *,

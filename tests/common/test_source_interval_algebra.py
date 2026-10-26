@@ -13,7 +13,7 @@ def _interval(start, count):
         cardinality_metric="rows",
         split_policy="SplittableSpan",
         locality_key="file",
-        physical_identity="file",
+        storage_locator="file",
         logical_start=start,
         opaque_token=b"original-source-range",
     )
@@ -28,7 +28,7 @@ def test_slice_composition_is_independent_of_window_boundaries(start):
             for count in range(1, size - offset + 1):
                 outer = original.slice(offset, count)
                 assert outer.opaque_token is original.opaque_token
-                assert outer.physical_identity == original.physical_identity
+                assert outer.storage_locator == original.storage_locator
                 for inner_offset in range(count):
                     for inner_count in range(1, count - inner_offset + 1):
                         assert outer.slice(inner_offset, inner_count) == original.slice(

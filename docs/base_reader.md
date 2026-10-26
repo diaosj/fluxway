@@ -13,7 +13,7 @@ routes data.
 Before each controlled read, the runtime validates a nonempty tuple of
 `SourceWorkItem` values for the current step. Source identity, schema and global
 batch size must agree, and duplicate intervals fail. Readers use the captured
-revision and physical locator, never a newly discovered latest revision.
+revision and storage locator, never a newly discovered latest revision.
 
 This CPU example supplies the context that the runtime normally injects. One
 reader owns two separate intervals of the same assignment. Constructing work
@@ -46,7 +46,7 @@ class FeatureReader(BaseReader):
                 revisions[
                     (
                         item.assignment.descriptor.revision_identity,
-                        item.assignment.descriptor.physical_identity,
+                        item.assignment.descriptor.storage_locator,
                     )
                 ][item.logical_start : item.logical_end]
                 for item in self.ctx.source_work_items
@@ -70,7 +70,7 @@ unit = LayoutUnitDescriptor(
     cardinality_metric="rows",
     split_policy="SplittableSpan",
     locality_key="part-0",
-    physical_identity="part-0",
+    storage_locator="part-0",
     logical_start=2,
     opaque_token=b"pinned-array",
 )
@@ -226,13 +226,51 @@ controlled execution the worker acquires leases, injects work items, calls the
 reader and submits lease acknowledgements through a bounded asynchronous queue.
 Applications do not manually acknowledge a whole descriptor for other workers.
 
+```mermaid
+sequenceDiagram
+    participant A as Async consumer
+    participant S as IngestionLayoutSession
+    participant T as Reader thread
+    participant R as IngestionReadSession
+    loop Until complete exhaustion
+        A->>S: await read()
+        S->>S: Acquire session async lock
+        S->>T: to_thread(next)
+        T->>R: Advance blocking interval iterator
+        R-->>T: SegmentReadChunk
+        T->>T: Validate actual cardinality and interval<br/>coverage
+        T-->>S: Batch or end of stream
+        alt Batch available
+            S-->>A: batch
+            A->>A: await consume(batch)
+        else All intervals exhausted with matching counts
+            S->>S: Create SourceLayoutCompletion
+            S-->>A: None
+        end
+    end
+    A->>S: await close()
+    S->>T: to_thread(stream.close)
+    T->>R: close()
+    S-->>A: Reader resources closed
+```
+
+Early exit or read failure produces no layout completion; count mismatches raise. Await
+consumption and close the session in `finally`. `close()` does not acknowledge a work
+lease or commit a checkpoint.
+
 ## Source registration and recovery
 
 Implement `IngestionSourceAdapter.scan_next(cursor, budget)` and pure
-`advance_cursor(cursor, records)`. A source descriptor supplies
-`build_source_scan_binding` and `build_component`. The controller creates and
-caches one binding for the session; it owns the reader topology, adapter, tail
-policy and initial opaque cursor. See the executable scanning example in
+`advance_cursor(cursor, records)`, plus `close()` even without external resources.
+A source descriptor supplies `build_source_scan_binding` and `build_component`.
+The Controller delegates binding creation and caching to the planner, retaining
+the reader topology, adapter, tail policy, and initial opaque cursor together.
+The planner owns adapter closure after successful binding, even if a caller stops
+waiting before the first scan. Construction, initial-cursor, scan, and close
+callbacks may return awaitables and run on the dedicated adapter lane; cursor
+advancement remains synchronous. The Worker's `IngestionReadSession.close()` is
+a separate synchronous read-session contract and does not close the control-side
+scan adapter. See executable scanning and lifecycle examples in
 [source coordination](source_coordination.md), and the
 [recommendation descriptor](../fluxway/example/recommendation/source_adapter.py)
 and [reader](../fluxway/example/recommendation/reader.py).

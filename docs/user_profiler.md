@@ -4,7 +4,15 @@
 
 Fluxway records the whole operator call as `user_callable.execute`. Add
 `profiler.scope()` for smaller timed regions and `profiler.event()` for facts at
-one instant. You do not need another decorator around the operator.
+one instant; no additional decorator is required around the operator.
+
+![Perfetto timeline comparing lookup durations and downstream waits across Fluxway ranks](pictures/profiler_timeline.png)
+
+Compare ranks on one time axis to follow a delay from producer to consumer.
+In this [documentation example](pictures/README.md), the longer lookup on
+embedding rank 1 at step 1 extends the corresponding trainer's mailbox wait.
+Separate call, transport, mailbox, and scheduler tracks help distinguish work
+from waiting. The timings are illustrative.
 
 ## Add a scope and a marker
 
@@ -104,6 +112,34 @@ insufficient capacity raises `ProfilerBufferExhausted`. Clock uncertainty beyond
 the configured limit also fails collection instead of presenting misleading
 timings.
 
+```mermaid
+sequenceDiagram
+    participant A as Application
+    participant C as Controller completion<br/>cleanup
+    participant D as Drivers
+    participant W as Worker recorders
+    participant F as Trace file
+    Note over C,W: Each process records events in a fixed buffer during execution
+    A->>C: await execution.wait()
+    C->>C: Enter COMPLETING, stop checkpointing and close<br/>checkpointer
+    C->>D: Request snapshots concurrently
+    D->>W: Capture rank records and clock mappings<br/>concurrently
+    W-->>D: ProfilerSnapshot
+    D-->>C: Snapshots from all SPMDs
+    C->>D: Reclaim actors and resources
+    D-->>C: Reclamation complete
+    C->>C: Close source planner, merge Controller records,<br/>resolve symbols
+    C->>F: Apply filters and write Perfetto file<br/>synchronously
+    F-->>C: File written
+    C->>C: Notify final outcome and publish terminal state
+    C-->>A: wait() returns successfully
+```
+
+This is automatic export on normal completion. Cancellation and failure cleanup do not
+automatically export a trace. Capture, reclamation, or write errors fail completion.
+Records show CPU queueing and invocation facts; device completion requires corresponding
+backend events.
+
 ## Read the trace
 
 Worker tracks follow this hierarchy:
@@ -130,6 +166,13 @@ runtime call mode, while the final lane number identifies overlapping trace
 slices. Each record is correlated with the surrounding call's `op_id`, `step`,
 `rank`, and `execution_mode`. User attributes appear as readable debug
 annotations; the internal `attrs_id` does not.
+
+![Selected user.embedding_lookup scope with operator, step, rank, and readable application attributes in Perfetto](pictures/profiler_scope.png)
+
+Select a custom scope to connect its duration to `op_id`, `step`, `rank`, and
+application attributes such as `table` and `count`. This keeps the application
+detail beside the runtime activity that explains when the call ran. The example
+uses the same compiled graph as the [graph screenshots](graph_visualization.md).
 
 ## Match events to the compiled graph
 

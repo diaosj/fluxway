@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 
+# pyrefly: ignore[missing-import]
 import msgpack
 import pytest
 
@@ -41,7 +42,7 @@ def encoded_descriptor(
 
 def segment(
     unit_id: str,
-    physical_identity: str,
+    storage_locator: str,
     locality_key: str,
     start: int,
     end: int,
@@ -51,7 +52,7 @@ def segment(
         "assignment_id": unit_id,
         "unit_id": unit_id,
         "revision_identity": "revision",
-        "physical_identity": physical_identity,
+        "storage_locator": storage_locator,
         "locality_key": locality_key,
         "cardinality_metric": "rows",
         "logical_start": start,
@@ -67,7 +68,7 @@ class RecordingReader:
     def read(self, request, *, batch_size):
         self.requests.append((request, batch_size))
         yield SegmentReadChunk(
-            f"{request.physical_identity}:{request.logical_start}:{request.logical_end}",
+            f"{request.storage_locator}:{request.logical_start}:{request.logical_end}",
             request.cardinality,
             11,
             object_opened=True,
@@ -97,7 +98,7 @@ def test_layout_reader_coalesces_adjacent_spans_and_reports_counters() -> None:
         _ = stream.metrics
     assert list(stream) == ["a.parquet:0:5", "b.parquet:0:1"]
     assert [
-        (request.physical_identity, request.locality_key, batch_size)
+        (request.storage_locator, request.locality_key, batch_size)
         for request, batch_size in reader.requests
     ] == [
         ("a.parquet", "node-0", 2),
@@ -179,7 +180,7 @@ def test_worker_layout_descriptor_is_the_single_wire_codec() -> None:
     descriptor = WorkerLayoutDescriptor.decode(encoded)
 
     assert descriptor.encode() == encoded
-    assert descriptor.segments[0].physical_identity == "a.parquet"
+    assert descriptor.segments[0].storage_locator == "a.parquet"
     assert WorkerLayoutDescriptor.FIELDS.isdisjoint(
         {"batch", "data", "tensor", "values"}
     )

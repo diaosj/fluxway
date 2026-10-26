@@ -32,7 +32,7 @@ def _nonnegative_integer(value: Any, name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class ScheduledSegmentRead:
-    physical_identity: str
+    storage_locator: str
     locality_key: str
     cardinality_metric: str
     logical_start: int
@@ -40,7 +40,7 @@ class ScheduledSegmentRead:
     segments: tuple[CompiledSegment, ...]
 
     def __post_init__(self) -> None:
-        _canonical_string(self.physical_identity, "scheduled read physical identity")
+        _canonical_string(self.storage_locator, "scheduled read storage locator")
         _canonical_string(self.locality_key, "scheduled read locality key")
         _canonical_string(self.cardinality_metric, "scheduled read cardinality metric")
         _nonnegative_integer(self.logical_start, "scheduled read logical start")
@@ -54,10 +54,8 @@ class ScheduledSegmentRead:
             raise ValueError("scheduled read logical interval must be non-empty")
         if any(segment.locality_key != self.locality_key for segment in segments):
             raise ValueError("scheduled read contains another locality key")
-        if any(
-            segment.physical_identity != self.physical_identity for segment in segments
-        ):
-            raise ValueError("scheduled read contains another physical identity")
+        if any(segment.storage_locator != self.storage_locator for segment in segments):
+            raise ValueError("scheduled read contains another storage locator")
         if any(
             segment.cardinality_metric != self.cardinality_metric
             for segment in segments
@@ -340,7 +338,7 @@ def _compile_schedule(
     for segment in segments[1:]:
         previous = grouped[-1][-1]
         if (
-            segment.physical_identity == previous.physical_identity
+            segment.storage_locator == previous.storage_locator
             and segment.locality_key == previous.locality_key
             and segment.cardinality_metric == previous.cardinality_metric
             and segment.logical_start == previous.logical_end
@@ -350,7 +348,7 @@ def _compile_schedule(
             grouped.append([segment])
     return tuple(
         ScheduledSegmentRead(
-            physical_identity=group[0].physical_identity,
+            storage_locator=group[0].storage_locator,
             locality_key=group[0].locality_key,
             cardinality_metric=group[0].cardinality_metric,
             logical_start=group[0].logical_start,

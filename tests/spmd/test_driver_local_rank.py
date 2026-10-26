@@ -96,9 +96,12 @@ class FakeWorker:
     def __init__(self, node_id):
         self.node_id = node_id
         self.setup_calls = []
+        self.find_free_port_calls = []
         self.get_node_id = _FakeAsyncRemoteCall(lambda: node_id)
         self.get_node_ip = _FakeAsyncRemoteCall(lambda: "127.0.0.1")
-        self.find_free_port = _FakeAsyncRemoteCall(lambda: 29500)
+        self.find_free_port = _FakeAsyncRemoteCall(
+            lambda host=None: self.find_free_port_calls.append(host) or 29500
+        )
         self.setup_and_start = _FakeSyncRemoteCall(
             lambda **kwargs: self.setup_calls.append(kwargs)
         )
@@ -152,3 +155,49 @@ async def test_start_workers_queries_node_ids_before_setup(monkeypatch):
             "rank0_address": "127.0.0.1:29500",
         }
     ]
+    assert fake_workers[0].find_free_port_calls == ["127.0.0.1"]
+
+
+def test_worker_find_free_port_real():
+    from fluxway.spmd.worker.worker import SPMDWorker
+
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+    worker = worker_cls.__new__(worker_cls)
+    port = worker.find_free_port(host="127.0.0.1")
+    assert isinstance(port, int)
+    assert 1024 <= port <= 65535
+
+
+def test_worker_find_free_port_candidate_iteration(monkeypatch):
+    import socket
+    from fluxway.spmd.worker.worker import SPMDWorker
+
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+    worker = worker_cls.__new__(worker_cls)
+
+    candidates = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 1)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 0)),
+    ]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: candidates)
+    port = worker.find_free_port(host="127.0.0.1")
+    assert isinstance(port, int)
+    assert 1024 <= port <= 65535
+
+
+def test_worker_find_free_port_all_fail_raises(monkeypatch):
+    import socket
+    from fluxway.spmd.worker.worker import SPMDWorker
+
+    cls = getattr(SPMDWorker, "__ray_metadata__", None)
+    worker_cls = cls.modified_class if cls else SPMDWorker
+    worker = worker_cls.__new__(worker_cls)
+
+    candidates = [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 1)),
+    ]
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **kw: candidates)
+    with pytest.raises(OSError):
+        worker.find_free_port(host="127.0.0.1")

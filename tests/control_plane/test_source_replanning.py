@@ -32,7 +32,7 @@ def _file_units(fragment_rows):
                     cardinality_metric="rows",
                     split_policy="SplittableSpan",
                     locality_key=identity,
-                    physical_identity=identity,
+                    storage_locator=identity,
                     logical_start=row,
                     opaque_token=identity,
                 )
@@ -61,10 +61,10 @@ def _global_records(compiled):
         for offset in range(unit.cardinality):
             position = assignment.global_start + offset
             assert position not in records
-            records[position] = (unit.physical_identity, unit.logical_start + offset)
+            records[position] = (unit.storage_locator, unit.logical_start + offset)
     assigned_rows = sorted(records.values())
     worker_rows = sorted(
-        (segment.physical_identity, row)
+        (segment.storage_locator, row)
         for layout in compiled.worker_layouts
         for segment in layout.segments
         for row in range(segment.logical_start, segment.logical_end)
@@ -133,7 +133,7 @@ def test_replanning_preserves_step_records_and_tail(
         if index >= consumed_steps * batch
     }
     assert [
-        (unit.physical_identity, row)
+        (unit.storage_locator, row)
         for unit in remaining
         for row in range(unit.logical_start, unit.logical_start + unit.cardinality)
     ] == [("file-3", 1), ("file-3", 2)]

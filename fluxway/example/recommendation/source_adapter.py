@@ -67,7 +67,7 @@ class RecommendationSourcePlanner:
                 cardinality_metric="samples",
                 split_policy="SplittableSpan",
                 locality_key="recommendation",
-                physical_identity=f"{self.source_identity}:{self.revision_id}",
+                storage_locator=f"{self.source_identity}:{self.revision_id}",
                 logical_start=start,
                 opaque_token=pack_metadata({"revision_id": self.revision_id}),
             ),
@@ -90,6 +90,9 @@ class RecommendationSourceAdapter(IngestionSourceAdapter):
     @property
     def source_identity(self) -> str:
         return self._planner.source_identity
+
+    def close(self) -> None:
+        """The deterministic planner has no external resources."""
 
     @property
     def revision_id(self) -> int:

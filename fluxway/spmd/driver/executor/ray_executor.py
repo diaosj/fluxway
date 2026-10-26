@@ -160,8 +160,14 @@ class RayWorkerExecutor(AbstractWorkerExecutor):
 
             max_retries = 5
             for attempt in range(max_retries):
-                rank0_port = await self._worker_handles[0].find_free_port.remote()
-                rank0_address = f"{rank0_ip}:{rank0_port}"
+                rank0_port = await self._worker_handles[0].find_free_port.remote(
+                    rank0_ip
+                )
+                rank0_address = (
+                    f"[{rank0_ip}]:{rank0_port}"
+                    if ":" in rank0_ip and not rank0_ip.startswith("[")
+                    else f"{rank0_ip}:{rank0_port}"
+                )
                 try:
                     await asyncio.gather(
                         *[

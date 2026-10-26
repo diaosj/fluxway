@@ -183,7 +183,7 @@ class WorkerLayoutDescriptor:
             "unit_id",
             "revision_identity",
             "locality_key",
-            "physical_identity",
+            "storage_locator",
             "cardinality_metric",
             "logical_start",
             "logical_end",

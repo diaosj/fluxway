@@ -252,14 +252,14 @@ class LogicalWorkLedger:
                     segment.unit_id,
                     segment.revision_identity,
                     segment.locality_key,
-                    segment.physical_identity,
+                    segment.storage_locator,
                     segment.cardinality_metric,
                     segment.opaque_token,
                 ) != (
                     descriptor.unit_id,
                     descriptor.revision_identity,
                     descriptor.locality_key,
-                    descriptor.physical_identity,
+                    descriptor.storage_locator,
                     descriptor.cardinality_metric,
                     descriptor.opaque_token,
                 ):

@@ -6,10 +6,16 @@ Fluxway 将编译后的计算图导出到 Google Model Explorer。
 导出不会运行计算图、打开浏览器或启动服务器，只生成一个 `model_explorer.json` 文件。
 该文件用于检查计算图，不能用来重建作业。
 
+![Model Explorer 依赖视图展示可并行的特征分支与选中的 trainer 算子](pictures/graph_dependencies.png)
+
+从 `reader.read` 沿 `features.encode` 与 `embedding.lookup` 两条分支，
+可以追踪到共同的消费者 `trainer.forward`。选中算子可检查编译标识、端口、设备网格和并发策略。
+配图使用比下方最小示例更完整的[文档示例](pictures/README.md)；
+同一份编译符号也用于标识[时间轴](user_profiler_zh.md)中的算子。
+
 ## 安装并导出完整示例
 
 安装可选的查看器依赖：
-
 
 ```bash
 python -m pip install "fluxway[visualization]"
@@ -18,7 +24,6 @@ python -m pip install "fluxway[visualization]"
 从仓库根目录运行下例。输出目录 `tmp/graph-example` 必须尚不存在。
 代码构建一条张量依赖和一条仅控制顺序的依赖，再检查导出的两个视图。
 不需要 Ray 集群或 GPU。
-
 
 ```python
 import json
@@ -84,8 +89,8 @@ print(bundle.resolve())
 传输编码、逻辑张量标识、函数标识、资源声明和 `AsyncPolicy`。
 它不会从 JSON 重建这些事实，运行时仍传输原生 Python 对象。
 
-目录已经存在时会抛出 `FileExistsError`。确实需要替换之前的 Fluxway 导出时，
-显式传入 `overwrite=True`。Fluxway 先检查该目录确实是导出包，再原子替换。
+目录已经存在时会抛出 `FileExistsError`。若需替换之前的 Fluxway 导出包，
+可显式传入 `overwrite=True`。Fluxway 先检查该目录确实是导出包，再原子替换。
 目录交换失败时会恢复原导出，并继续抛出异常。
 
 ## 本地查看与 SSH 访问
@@ -93,7 +98,6 @@ print(bundle.resolve())
 `view_graph(bundle)` 会启动 Model Explorer 服务器，并阻塞到服务器停止。
 没有桌面环境的机器可以使用下列函数，参数是已有导出目录。
 服务器仅监听本机回环地址，不打开浏览器。
-
 
 ```python
 from pathlib import Path
@@ -113,7 +117,6 @@ def serve_graph(bundle_directory: str | Path) -> None:
 在保存导出包的机器上调用 `serve_graph("tmp/graph-example")`。
 在自己的机器上，将平时使用的 SSH 目标作为下面函数的参数：
 
-
 ```bash
 forward_graph() {
     ssh -N -L 8080:127.0.0.1:8080 "$1"
@@ -123,7 +126,6 @@ forward_graph() {
 保持终端打开，然后访问 `http://127.0.0.1:8080`。两端的 8080 端口都需要可用。
 如果希望复制文件后直接查看，不保持远程服务器运行，可以使用下列函数。
 三个参数依次为 SSH 目标、远程导出目录的绝对路径和本地 JSON 输出路径；本地机器需要安装 Model Explorer。
-
 
 ```bash
 copy_and_view_graph() {
@@ -149,6 +151,12 @@ copy_and_view_graph() {
 方框颜色表示结构角色：绿色为源，蓝色为转换，琥珀色为终点，紫色为依赖环成员，灰色为孤立算子。
 Model Explorer 不支持虚线或点线边。
 
+![Model Explorer 潜在重叠视图按依赖层级和通道分组，并展示跨执行步阶段约束](pictures/graph_overlap.png)
+
+图中 `encode` 与 `lookup` 位于同一依赖层级，便于识别彼此独立的处理分支。
+trainer 的 compute 与 optimizer 通道展示阶段结构，青绿色覆盖边将 `update`
+关联到下一步的 `forward`。先用此视图检查哪些工作允许重叠，再通过执行轨迹确认实际是否发生重叠。
+
 ## 检查策略并关联执行轨迹
 
 SPMD 对应命名空间，算子对应节点。选中节点即可查看设备网格、资源范围、函数、端口、依赖层级和调度策略。
@@ -168,6 +176,8 @@ Model Explorer 可能折叠只含一个算子的命名空间；需要显示每�
 工作进程与导出共用 `compile_phase_schedule` 的语义。
 可以在 [Perfetto 执行轨迹](user_profiler_zh.md)中搜索相同的计算图、SPMD、算子和函数标识，
 对照调度规则与实际执行。
+
+静态视图仅表达潜在的重叠执行关系。实际调用、等待和关闭顺序见[算子执行时序](worker_process_operators_zh.md)；记录采集与文件写出顺序见[性能分析时序](user_profiler_zh.md)。`visualize_graph()` 同步写出静态文件，`view_graph()` 阻塞运行查看服务器，二者都不启动图执行。
 
 ## 理解重叠分组与规模边界
 
