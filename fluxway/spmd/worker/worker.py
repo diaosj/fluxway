@@ -1149,11 +1149,24 @@ class SPMDWorker:
 
         return ray.util.get_node_ip_address()
 
-    def find_free_port(self) -> int:
+    def find_free_port(self, host: str | None = None) -> int:
         """Find an available port on the current node."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("", 0))
-            return s.getsockname()[1]
+        target_host = host if host is not None else self.get_node_ip()
+        addr_info = socket.getaddrinfo(target_host, 0, type=socket.SOCK_STREAM)
+        if not addr_info:
+            raise OSError(f"Could not resolve address for host {target_host!r}")
+        last_err: OSError | None = None
+        for family, socktype, proto, _, sockaddr in addr_info:
+            try:
+                with socket.socket(family, socktype, proto) as s:
+                    s.bind(sockaddr)
+                    return s.getsockname()[1]
+            except OSError as e:
+                last_err = e
+                continue
+        if last_err is not None:
+            raise last_err
+        raise OSError(f"Failed to bind any resolved address for host {target_host!r}")
 
     def _worker_process_call_max_workers(self) -> int:
         max_depth = 1
