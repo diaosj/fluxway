@@ -11,7 +11,7 @@
 ## 扫描记录与定位消费前缀
 
 `IngestionSourceAdapter` 实现有界的 `scan_next(cursor, budget)` 和纯位置运算
-`advance_cursor(cursor, records)`，并提供资源释放方法 `close()`。适配器负责来源身份、修订选择、物理位置与位置编码。
+`advance_cursor(cursor, records)`，并提供资源释放方法 `close()`。适配器负责来源身份、修订选择、存储定位符（storage locator）与位置编码。
 Fluxway 不解析这些字节，也不替读取器发现另一个最新修订。
 扫描返回不可变的 `SourceScanResult`，包含有序区间与不透明位置。
 

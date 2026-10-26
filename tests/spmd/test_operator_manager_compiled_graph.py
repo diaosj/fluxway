@@ -425,7 +425,7 @@ def _source_work(*, step: int, global_start: int, schema: str = "schema"):
         cardinality_metric="samples",
         split_policy="AtomicItem",
         locality_key="source",
-        physical_identity="source",
+        storage_locator="source",
         logical_start=global_start,
         opaque_token=b"source-work",
     )

@@ -267,7 +267,10 @@ async def test_direct_binding_is_rejected_after_close():
     await component.close()
 
     adapter = ResourceAdapter()
-    with pytest.raises(RuntimeError, match="source planning component is closing"):
+    with pytest.raises(
+        RuntimeError,
+        match="cannot bind source adapter: source planning component is closing",
+    ):
         component.bind_source_scan(
             adapter,
             initial_cursor_factory=lambda: None,
@@ -277,3 +280,108 @@ async def test_direct_binding_is_rejected_after_close():
         )
     assert adapter.closed == 0
     assert component._source_adapter is None
+
+
+@pytest.mark.asyncio
+async def test_direct_binding_blocked_on_lock_is_rejected_after_close():
+    component = IngestionLayoutPlanningComponent("bind-blocked-during-close")
+    adapter = ResourceAdapter()
+
+    lock = component._accept_lock
+    lock.acquire()
+
+    bind_error = None
+    barrier = threading.Event()
+
+    def external_bind():
+        nonlocal bind_error
+        barrier.set()
+        try:
+            component.bind_source_scan(
+                adapter,
+                initial_cursor_factory=lambda: None,
+                budget=SourceScanBudget(1, 1),
+                tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
+                assignment_policy=AssignmentPolicy.default(),
+            )
+        except RuntimeError as e:
+            bind_error = e
+
+    t = threading.Thread(target=external_bind)
+    t.start()
+    barrier.wait()
+    await asyncio.sleep(0.02)
+
+    close_task = asyncio.create_task(component.close())
+    await asyncio.sleep(0.02)
+
+    lock.release()
+    t.join(timeout=2)
+    await close_task
+
+    assert bind_error is not None, "bind must be rejected after close"
+    assert "closing" in str(bind_error)
+    assert adapter.closed == 0
+    assert component._source_adapter is None
+
+
+@pytest.mark.asyncio
+async def test_admitted_scan_operation_completes_during_close():
+    component = IngestionLayoutPlanningComponent("admitted-scan-during-close")
+    adapter = ResourceAdapter()
+    entered = asyncio.Event()
+    continue_plan = asyncio.Event()
+
+    def cursor_factory():
+        return None
+
+    component.bind_source_scan(
+        adapter,
+        initial_cursor_factory=cursor_factory,
+        budget=SourceScanBudget(1, 1),
+        tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
+        assignment_policy=AssignmentPolicy.default(),
+    )
+
+    orig_internal_plan = component._plan_source_scan
+
+    async def hooked_internal_plan(*args, **kwargs):
+        entered.set()
+        await continue_plan.wait()
+        return await orig_internal_plan(*args, **kwargs)
+
+    component._plan_source_scan = hooked_internal_plan
+
+    scan_task = asyncio.create_task(
+        component._await_operation(
+            lambda: hooked_internal_plan(
+                adapter,
+                cursor_factory,
+                None,
+                None,
+                budget=SourceScanBudget(1, 1),
+                topology=None,
+                tail_layout_mode=TailLayoutMode.DISCARD_REMAINDER,
+                assignment_policy=AssignmentPolicy.default(),
+                epoch=0,
+                start_position=0,
+            )
+        )
+    )
+    await entered.wait()
+
+    # Caller cancels its wait on the scan operation
+    scan_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await scan_task
+
+    # Planner starts closing while the admitted scan task is in background custody
+    close_task = asyncio.create_task(component.close())
+    await asyncio.sleep(0.01)
+
+    # Let the admitted scan task resume and apply binding internally
+    continue_plan.set()
+
+    # Closing must safely wait for and drain the admitted task without raising BaseExceptionGroup
+    await close_task
+    assert adapter.closed == 1

@@ -29,7 +29,7 @@ class LayoutUnitDescriptor:
     cardinality_metric: str
     split_policy: SplitPolicy
     locality_key: str
-    physical_identity: str
+    storage_locator: str
     logical_start: int
     opaque_token: str | bytes
     work_kind: SourceWorkKind = SourceWorkKind.PHYSICAL
@@ -44,7 +44,7 @@ class LayoutUnitDescriptor:
         if self.split_policy == "AtomicItem" and self.cardinality != 1:
             raise ValueError("AtomicItem cardinality must be one")
         _id(self.locality_key, "layout unit locality key")
-        _id(self.physical_identity, "layout unit physical identity")
+        _id(self.storage_locator, "layout unit storage locator")
         _count(self.logical_start, "layout unit logical start")
         _opaque_token(self.opaque_token)
         if not isinstance(self.work_kind, SourceWorkKind):
@@ -63,7 +63,7 @@ class LayoutUnitDescriptor:
             unit_id=metadata_digest(
                 (
                     self.revision_identity,
-                    self.physical_identity,
+                    self.storage_locator,
                     self.cardinality_metric,
                     start,
                     start + count,
@@ -81,7 +81,7 @@ class LayoutUnitDescriptor:
         return CanonicalWorkInterval(
             source_identity=source_identity,
             revision_identity=self.revision_identity,
-            physical_identity=self.physical_identity,
+            storage_locator=self.storage_locator,
             cardinality_metric=self.cardinality_metric,
             logical_start=self.logical_start,
             logical_end=self.logical_start + self.cardinality,
@@ -114,7 +114,7 @@ def _count(value: int, name: str, *, positive: bool = False) -> int:
 class CanonicalWorkInterval:
     source_identity: str
     revision_identity: str
-    physical_identity: str
+    storage_locator: str
     cardinality_metric: str
     logical_start: int
     logical_end: int
@@ -122,7 +122,7 @@ class CanonicalWorkInterval:
     def __post_init__(self) -> None:
         _id(self.source_identity, "canonical interval source identity")
         _id(self.revision_identity, "canonical interval revision identity")
-        _id(self.physical_identity, "canonical interval physical identity")
+        _id(self.storage_locator, "canonical interval storage locator")
         _id(self.cardinality_metric, "canonical interval cardinality metric")
         _count(self.logical_start, "canonical interval logical start")
         _count(self.logical_end, "canonical interval logical end", positive=True)
@@ -134,7 +134,7 @@ class CanonicalWorkInterval:
         return (
             self.source_identity,
             self.revision_identity,
-            self.physical_identity,
+            self.storage_locator,
             self.cardinality_metric,
         )
 
@@ -452,7 +452,7 @@ class CompiledSegment:
     unit_id: str
     revision_identity: str
     locality_key: str
-    physical_identity: str
+    storage_locator: str
     cardinality_metric: str
     logical_start: int
     logical_end: int
@@ -465,7 +465,7 @@ class CompiledSegment:
         _id(self.unit_id, "compiled segment unit id")
         _id(self.revision_identity, "compiled segment revision identity")
         _id(self.locality_key, "compiled segment locality key")
-        _id(self.physical_identity, "compiled segment physical identity")
+        _id(self.storage_locator, "compiled segment storage locator")
         _id(self.cardinality_metric, "compiled segment cardinality metric")
         _count(self.logical_start, "compiled segment logical start")
         _count(self.logical_end, "compiled segment logical end", positive=True)
@@ -481,7 +481,7 @@ class CompiledSegment:
         return CanonicalWorkInterval(
             source_identity=source_identity,
             revision_identity=self.revision_identity,
-            physical_identity=self.physical_identity,
+            storage_locator=self.storage_locator,
             cardinality_metric=self.cardinality_metric,
             logical_start=self.logical_start,
             logical_end=self.logical_end,
@@ -494,7 +494,7 @@ class CompiledSegment:
             "unit_id": self.unit_id,
             "revision_identity": self.revision_identity,
             "locality_key": self.locality_key,
-            "physical_identity": self.physical_identity,
+            "storage_locator": self.storage_locator,
             "cardinality_metric": self.cardinality_metric,
             "logical_start": self.logical_start,
             "logical_end": self.logical_end,

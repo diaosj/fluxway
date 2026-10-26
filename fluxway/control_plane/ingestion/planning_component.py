@@ -277,6 +277,39 @@ class IngestionLayoutPlanningComponent:
         tail_layout_mode: TailLayoutMode | str,
         assignment_policy: AssignmentPolicy,
     ) -> None:
+        """Bind and configure an ingestion source adapter for direct scanning.
+
+        Rejects external admission if the planning component is closing or closed,
+        preserving caller ownership and cleanup responsibility for the rejected adapter.
+        """
+        self._apply_source_scan_binding(
+            adapter,
+            initial_cursor_factory=initial_cursor_factory,
+            budget=budget,
+            tail_layout_mode=tail_layout_mode,
+            assignment_policy=assignment_policy,
+            _admitted=False,
+        )
+
+    def _apply_source_scan_binding(
+        self,
+        adapter: IngestionSourceAdapter,
+        *,
+        initial_cursor_factory: Callable[
+            [], OpaqueSourceCursor | None | Awaitable[OpaqueSourceCursor | None]
+        ],
+        budget: SourceScanBudget,
+        tail_layout_mode: TailLayoutMode | str,
+        assignment_policy: AssignmentPolicy,
+        _admitted: bool = True,
+    ) -> None:
+        """Apply and validate source scan binding parameters under lock.
+
+        Args:
+            _admitted: When True (default), the caller is already under supervisor
+                custody and the admission gate is skipped. External entry points
+                must pass False so the gate is checked atomically under the lock.
+        """
         if not isinstance(adapter, IngestionSourceAdapter):
             raise TypeError("source planning requires an ingestion source adapter")
         if not callable(initial_cursor_factory):
@@ -286,7 +319,10 @@ class IngestionLayoutPlanningComponent:
         resolved_tail = TailLayoutMode.from_value(tail_layout_mode)
         resolved_policy = AssignmentPolicy.from_value(assignment_policy)
         with self._accept_lock:
-            self._operations.ensure_admissible("source planning component is closing")
+            if not _admitted:
+                self._operations.ensure_admissible(
+                    "cannot bind source adapter: source planning component is closing"
+                )
             if self._source_binding_pending:
                 raise RuntimeError("source binding construction is in progress")
             if self._source_adapter is not None and self._source_adapter is not adapter:
@@ -865,7 +901,7 @@ class IngestionLayoutPlanningComponent:
         max_steps: int | None = None,
         max_descriptor_bytes: int | None = None,
     ) -> SourceLayoutActivation | None:
-        self.bind_source_scan(
+        self._apply_source_scan_binding(
             adapter,
             initial_cursor_factory=initial_cursor_factory,
             budget=budget,

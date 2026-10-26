@@ -9,7 +9,7 @@
 ## 读取已分配的记录
 
 每次受控读取前，运行时检查当前训练步的 `SourceWorkItem` 非空元组。来源身份、结构和
-全局批次大小必须一致，重复区间直接报错。读取器使用任务中固定的修订和物理位置，
+全局批次大小必须一致，重复区间直接报错。读取器使用任务中固定的修订和存储定位符（storage locator），
 不能临时换成最新修订。
 
 下面的本地示例手动提供运行时通常会注入的上下文。一个读取器持有同一任务中两个
@@ -41,7 +41,7 @@ class FeatureReader(BaseReader):
                 revisions[
                     (
                         item.assignment.descriptor.revision_identity,
-                        item.assignment.descriptor.physical_identity,
+                        item.assignment.descriptor.storage_locator,
                     )
                 ][item.logical_start : item.logical_end]
                 for item in self.ctx.source_work_items
@@ -65,7 +65,7 @@ unit = LayoutUnitDescriptor(
     cardinality_metric="rows",
     split_policy="SplittableSpan",
     locality_key="part-0",
-    physical_identity="part-0",
+    storage_locator="part-0",
     logical_start=2,
     opaque_token=b"pinned-array",
 )

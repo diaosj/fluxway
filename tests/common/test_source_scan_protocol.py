@@ -32,7 +32,7 @@ def _unit() -> LayoutUnitDescriptor:
         cardinality_metric="rows",
         split_policy="SplittableSpan",
         locality_key="file-a",
-        physical_identity="file-a",
+        storage_locator="file-a",
         logical_start=0,
         opaque_token=b"range-token",
     )

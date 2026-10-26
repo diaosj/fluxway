@@ -8,7 +8,7 @@ or exactly-once external effects.
 
 ## Preserve physical coordinates
 
-`LayoutUnitDescriptor` fixes a revision, physical locator, cardinality metric,
+`LayoutUnitDescriptor` fixes a revision, storage locator, cardinality metric,
 interval and source-owned metadata. Splitting changes interval boundaries, not
 the original source encoding or physical row numbers. Composition must produce
 the same final descriptor regardless of the slicing path:
@@ -23,7 +23,7 @@ unit = LayoutUnitDescriptor(
     cardinality_metric="rows",
     split_policy="SplittableSpan",
     locality_key="file-0",
-    physical_identity="file-0",
+    storage_locator="file-0",
     logical_start=100,
     opaque_token=b"original-source-range",
 )
@@ -32,7 +32,7 @@ direct = unit.slice(3, 2)
 assert nested == direct
 assert (direct.logical_start, direct.cardinality) == (103, 2)
 assert direct.opaque_token is unit.opaque_token
-assert direct.physical_identity == "file-0"
+assert direct.storage_locator == "file-0"
 ```
 
 A reader resolves the assigned interval relative to the original encoded range.

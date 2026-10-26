@@ -13,7 +13,7 @@ routes data.
 Before each controlled read, the runtime validates a nonempty tuple of
 `SourceWorkItem` values for the current step. Source identity, schema and global
 batch size must agree, and duplicate intervals fail. Readers use the captured
-revision and physical locator, never a newly discovered latest revision.
+revision and storage locator, never a newly discovered latest revision.
 
 This CPU example supplies the context that the runtime normally injects. One
 reader owns two separate intervals of the same assignment. Constructing work
@@ -46,7 +46,7 @@ class FeatureReader(BaseReader):
                 revisions[
                     (
                         item.assignment.descriptor.revision_identity,
-                        item.assignment.descriptor.physical_identity,
+                        item.assignment.descriptor.storage_locator,
                     )
                 ][item.logical_start : item.logical_end]
                 for item in self.ctx.source_work_items
@@ -70,7 +70,7 @@ unit = LayoutUnitDescriptor(
     cardinality_metric="rows",
     split_policy="SplittableSpan",
     locality_key="part-0",
-    physical_identity="part-0",
+    storage_locator="part-0",
     logical_start=2,
     opaque_token=b"pinned-array",
 )

@@ -7,7 +7,7 @@
 
 ## 保持物理坐标
 
-`LayoutUnitDescriptor` 固定修订、物理位置、记录计量方式、区间和来源自身的编码。
+`LayoutUnitDescriptor` 固定修订、存储定位符（storage locator）、记录计量方式、区间和来源自身的编码。
 切分只改变区间边界，不改变原始来源编码或物理行号。无论经过几次切分，最终描述应相同：
 
 ```python
@@ -20,7 +20,7 @@ unit = LayoutUnitDescriptor(
     cardinality_metric="rows",
     split_policy="SplittableSpan",
     locality_key="file-0",
-    physical_identity="file-0",
+    storage_locator="file-0",
     logical_start=100,
     opaque_token=b"original-source-range",
 )
@@ -29,7 +29,7 @@ direct = unit.slice(3, 2)
 assert nested == direct
 assert (direct.logical_start, direct.cardinality) == (103, 2)
 assert direct.opaque_token is unit.opaque_token
-assert direct.physical_identity == "file-0"
+assert direct.storage_locator == "file-0"
 ```
 
 读取器相对原始编码区间解析任务。重新扫描或划分规划窗口不能重新编号已有物理区间。

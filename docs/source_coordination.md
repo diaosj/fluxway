@@ -15,7 +15,7 @@ source progress.
 `IngestionSourceAdapter` implements bounded `scan_next(cursor, budget)` and pure
 `advance_cursor(cursor, records)`, and provides `close()` for resource release.
 The adapter owns source identity, revision
-selection, physical locators and cursor encoding. Fluxway does not decode those
+selection, storage locators and cursor encoding. Fluxway does not decode those
 bytes or discover a different latest revision on the reader's behalf.
 Scans return immutable `SourceScanResult` values with ordered units and opaque
 cursors.

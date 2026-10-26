@@ -61,7 +61,7 @@ def test_padding_classification_is_explicit_and_survives_request_codec(rows):
         units=(
             replace(
                 source_request.units[0],
-                physical_identity="__VIRTUAL_PAD__",
+                storage_locator="__VIRTUAL_PAD__",
                 revision_identity=source_request.view_identity,
                 opaque_token="pad:virtual",
             ),

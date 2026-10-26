@@ -425,7 +425,7 @@ def test_virtual_pad_tail_mode_cannot_discard_remainder() -> None:
         cardinality_metric="rows",
         split_policy="SplittableSpan",
         locality_key="local",
-        physical_identity="__VIRTUAL_PAD__",
+        storage_locator="__VIRTUAL_PAD__",
         logical_start=0,
         opaque_token="pad:virtual",
         work_kind=SourceWorkKind.SYNTHETIC_PADDING,
@@ -472,7 +472,7 @@ def test_synthesize_padding_tail_mode_adds_virtual_tail() -> None:
         cardinality_metric="rows",
         split_policy="SplittableSpan",
         locality_key="local",
-        physical_identity="file.parquet",
+        storage_locator="file.parquet",
         logical_start=0,
         opaque_token="real",
     )
@@ -495,7 +495,7 @@ def test_synthesize_padding_tail_mode_adds_virtual_tail() -> None:
     assert compiled.discarded_cardinality == 0
     worker_segments = compiled.worker_layouts[0].segments
     assert len(worker_segments) == 2
-    assert worker_segments[0].physical_identity == "file.parquet"
+    assert worker_segments[0].storage_locator == "file.parquet"
     assert worker_segments[0].cardinality == 5
-    assert worker_segments[1].physical_identity == "__VIRTUAL_PAD__"
+    assert worker_segments[1].storage_locator == "__VIRTUAL_PAD__"
     assert worker_segments[1].cardinality == 3

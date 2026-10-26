@@ -87,9 +87,9 @@ class AssignmentPolicy:
         require_sequential_order: Ensure that canonical intervals are assigned in their
             deterministic, lexicographical sequence.
         affinity_contiguous_chunks: Prioritize assigning a new interval to a reader
-            that is currently stationed at the identical `physical_identity` (Owner-Affinity).
-        affinity_same_file: Constrain the dispersion of an identity by preferring
-            readers that have previously observed this `physical_identity` within the window.
+            that is currently stationed at the identical `storage_locator` (Owner-Affinity).
+        affinity_same_file: Constrain the dispersion of a locator by preferring
+            readers that have previously observed this `storage_locator` within the window.
         node_affinity_hint: Prefer readers on a deterministic or previously used
             physical node when attested reader node identities are supplied.
         allow_unit_splitting: Allow splitting an indivisible descriptor chunk
@@ -340,7 +340,7 @@ class _WorkerAllocationStrategy:
     def select_worker(
         self,
         available: list[str],
-        physical_identity: str,
+        storage_locator: str,
         owners: list[str],
     ) -> str:
         return min(
@@ -348,7 +348,7 @@ class _WorkerAllocationStrategy:
             key=lambda worker_id: _allocation_key(
                 self._policy,
                 worker_id,
-                physical_identity,
+                storage_locator,
                 self._previous_by_worker,
                 owners,
                 self._group_order,
@@ -356,7 +356,7 @@ class _WorkerAllocationStrategy:
         )
 
     def record_worker(
-        self, worker_id: str, physical_identity: str, owners: list[str]
+        self, worker_id: str, storage_locator: str, owners: list[str]
     ) -> None:
         if worker_id not in owners:
             owners.append(worker_id)
@@ -371,37 +371,37 @@ class _NodeAffinityAllocationStrategy(_WorkerAllocationStrategy):
         previous_by_worker: Mapping[str, str | None],
         group_order: Mapping[str, int],
         topology: _NodeAffinityTopology,
-        owner_nodes_by_physical: dict[str, set[str]],
-        preferred_node_by_physical: dict[tuple[str, tuple[str, ...]], str],
+        owner_nodes_by_locator: dict[str, set[str]],
+        preferred_node_by_locator: dict[tuple[str, tuple[str, ...]], str],
     ) -> None:
         super().__init__(policy, previous_by_worker, group_order)
         self._node_by_worker = topology.node_by_worker
         self._active_nodes = topology.active_nodes
         self._node_order = topology.node_order
-        self._owner_nodes_by_physical = owner_nodes_by_physical
-        self._preferred_node_by_physical = preferred_node_by_physical
+        self._owner_nodes_by_locator = owner_nodes_by_locator
+        self._preferred_node_by_locator = preferred_node_by_locator
 
     def select_worker(
         self,
         available: list[str],
-        physical_identity: str,
+        storage_locator: str,
         owners: list[str],
     ) -> str:
-        owner_nodes = self._owner_nodes_by_physical.setdefault(physical_identity, set())
-        preferred_key = (physical_identity, self._active_nodes)
-        preferred_node = self._preferred_node_by_physical.get(preferred_key)
+        owner_nodes = self._owner_nodes_by_locator.setdefault(storage_locator, set())
+        preferred_key = (storage_locator, self._active_nodes)
+        preferred_node = self._preferred_node_by_locator.get(preferred_key)
         if not owner_nodes and preferred_node is None:
-            digest = hashlib.sha256(physical_identity.encode("utf-8")).digest()
+            digest = hashlib.sha256(storage_locator.encode("utf-8")).digest()
             preferred_node = self._active_nodes[
                 int.from_bytes(digest[:8], "big") % len(self._active_nodes)
             ]
-            self._preferred_node_by_physical[preferred_key] = preferred_node
+            self._preferred_node_by_locator[preferred_key] = preferred_node
         return min(
             available,
             key=lambda worker_id: _node_affinity_allocation_key(
                 self._policy,
                 worker_id,
-                physical_identity,
+                storage_locator,
                 self._previous_by_worker,
                 owners,
                 self._group_order,
@@ -413,11 +413,11 @@ class _NodeAffinityAllocationStrategy(_WorkerAllocationStrategy):
         )
 
     def record_worker(
-        self, worker_id: str, physical_identity: str, owners: list[str]
+        self, worker_id: str, storage_locator: str, owners: list[str]
     ) -> None:
-        super().record_worker(worker_id, physical_identity, owners)
+        super().record_worker(worker_id, storage_locator, owners)
         node_id = self._node_by_worker[worker_id]
-        self._owner_nodes_by_physical.setdefault(physical_identity, set()).add(node_id)
+        self._owner_nodes_by_locator.setdefault(storage_locator, set()).add(node_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,11 +556,11 @@ class AlgebraicLayoutCompiler:
             group.worker_id: [] for group in request.topology.groups
         }
         policy = request.assignment_policy
-        owners_by_physical: dict[str, list[str]] = {}
-        owner_nodes_by_physical: dict[str, set[str]] | None = (
+        owners_by_locator: dict[str, list[str]] = {}
+        owner_nodes_by_locator: dict[str, set[str]] | None = (
             {} if policy.node_affinity_hint else None
         )
-        preferred_node_by_physical: dict[tuple[str, tuple[str, ...]], str] | None = (
+        preferred_node_by_locator: dict[tuple[str, tuple[str, ...]], str] | None = (
             {} if policy.node_affinity_hint else None
         )
         assignment_segment_counts: dict[str, int] = {}
@@ -598,7 +598,7 @@ class AlgebraicLayoutCompiler:
             }
             previous_by_worker = {
                 worker_id: (
-                    segments[worker_id][-1].physical_identity
+                    segments[worker_id][-1].storage_locator
                     if segments[worker_id]
                     else None
                 )
@@ -607,8 +607,8 @@ class AlgebraicLayoutCompiler:
             strategy: _WorkerAllocationStrategy
             if policy.node_affinity_hint:
                 assert (
-                    owner_nodes_by_physical is not None
-                    and preferred_node_by_physical is not None
+                    owner_nodes_by_locator is not None
+                    and preferred_node_by_locator is not None
                 )
                 topology = _resolve_node_affinity_topology(active_groups)
                 strategy = _NodeAffinityAllocationStrategy(
@@ -616,8 +616,8 @@ class AlgebraicLayoutCompiler:
                     previous_by_worker,
                     group_order,
                     topology,
-                    owner_nodes_by_physical,
-                    preferred_node_by_physical,
+                    owner_nodes_by_locator,
+                    preferred_node_by_locator,
                 )
             else:
                 strategy = _WorkerAllocationStrategy(
@@ -632,7 +632,7 @@ class AlgebraicLayoutCompiler:
             while index < len(step_assignments):
                 assignment = step_assignments[index]
                 descriptor = assignment.descriptor
-                owners = owners_by_physical.setdefault(descriptor.physical_identity, [])
+                owners = owners_by_locator.setdefault(descriptor.storage_locator, [])
                 available = [
                     worker_id
                     for worker_id, remaining in remaining_by_worker.items()
@@ -642,7 +642,7 @@ class AlgebraicLayoutCompiler:
                     raise RuntimeError("layout lowering exhausted active reader quota")
                 worker_id = select_worker(
                     available,
-                    descriptor.physical_identity,
+                    descriptor.storage_locator,
                     owners,
                 )
                 amount = min(
@@ -657,7 +657,7 @@ class AlgebraicLayoutCompiler:
                         unit_id=descriptor.unit_id,
                         revision_identity=descriptor.revision_identity,
                         locality_key=descriptor.locality_key,
-                        physical_identity=descriptor.physical_identity,
+                        storage_locator=descriptor.storage_locator,
                         cardinality_metric=descriptor.cardinality_metric,
                         logical_start=descriptor.logical_start + offset,
                         logical_end=descriptor.logical_start + offset + amount,
@@ -672,8 +672,8 @@ class AlgebraicLayoutCompiler:
                     and assignment_segment_counts[assignment.key.assignment_id] > 1
                 ):
                     raise ValueError("placement policy forbids splitting a source unit")
-                record_worker(worker_id, descriptor.physical_identity, owners)
-                previous_by_worker[worker_id] = descriptor.physical_identity
+                record_worker(worker_id, descriptor.storage_locator, owners)
+                previous_by_worker[worker_id] = descriptor.storage_locator
                 remaining_by_worker[worker_id] -= amount
                 offset += amount
                 if offset == descriptor.cardinality:
@@ -718,9 +718,9 @@ def _layout_cost(
     """Evaluate the physical quality of the resultant assignment.
 
     Computes a deterministic cost vector $C = (c_1, c_2, c_3, c_4)$ where:
-    - $c_1$: Distinct Entities. Sum of cardinality of unique owner sets for each physical identity.
-    - $c_2$: Transitions. Number of times a worker switches physical identities.
-    - $c_3$: Fragmentations. Number of discontinuous physical identity chunks.
+    - $c_1$: Distinct Entities. Sum of cardinality of unique owner sets for each storage locator.
+    - $c_2$: Transitions. Number of times a worker switches storage locators.
+    - $c_3$: Fragmentations. Number of discontinuous storage locator chunks.
     - $c_4$: Contiguous Cardinality. Aggregate volume of sequential logical observations.
     """
     entities: dict[str, set[str]] = {}
@@ -730,9 +730,9 @@ def _layout_cost(
     for layout in layouts:
         previous: CompiledSegment | None = None
         for segment in layout.segments:
-            entities.setdefault(segment.physical_identity, set()).add(layout.worker_id)
+            entities.setdefault(segment.storage_locator, set()).add(layout.worker_id)
             if previous is not None:
-                if segment.physical_identity != previous.physical_identity:
+                if segment.storage_locator != previous.storage_locator:
                     transitions += 1
                     fragmented += 1
                 elif segment.logical_start == previous.logical_end:
@@ -749,20 +749,20 @@ def _layout_cost(
 def _allocation_key(
     policy: AssignmentPolicy,
     worker_id: str,
-    physical_identity: str,
+    storage_locator: str,
     previous_by_worker: Mapping[str, str | None],
     owners: list[str],
     group_order: Mapping[str, int],
 ) -> tuple[int, ...]:
     """Derive the deterministic allocation lexicographic key for a target worker.
 
-    For a given physical identity chunk $P$, a candidate worker $w$ is scored
+    For a given storage locator chunk $P$, a candidate worker $w$ is scored
     using a lexicographical projection $K(w) = (k_1, k_2, k_3)$ where the components
     formalize Owner-Affinity and deterministic load distribution:
 
     1. Contiguous Prefix ($k_1 \\in \\{0, 1\\}$):
        $k_1 = 0 \\iff w.\\text{prev} = P$
-       Prioritize workers whose tail physical identity exactly matches $P$.
+       Prioritize workers whose tail storage locator exactly matches $P$.
     2. Owner Set Reunion ($k_2 \\in \\{0, 1\\} \\times \\mathbb{N}$):
        $k_{2,0} = 0 \\iff w \\in \\text{owners}(P)$
        $k_{2,1} = \\text{index}(w) \\text{ if } w \\in \\text{owners}(P) \\text{ else } |\\text{owners}(P)| + \\text{group\\_order}(w)$
@@ -775,7 +775,7 @@ def _allocation_key(
     """
     key: list[int] = []
     if policy.affinity_contiguous_chunks:
-        key.append(0 if previous_by_worker[worker_id] == physical_identity else 1)
+        key.append(0 if previous_by_worker[worker_id] == storage_locator else 1)
     if policy.affinity_same_file:
         key.append(0 if worker_id in owners else 1)
         key.append(
@@ -790,7 +790,7 @@ def _allocation_key(
 def _node_affinity_allocation_key(
     policy: AssignmentPolicy,
     worker_id: str,
-    physical_identity: str,
+    storage_locator: str,
     previous_by_worker: Mapping[str, str | None],
     owners: list[str],
     group_order: Mapping[str, int],
@@ -811,7 +811,7 @@ def _node_affinity_allocation_key(
         _allocation_key(
             policy,
             worker_id,
-            physical_identity,
+            storage_locator,
             previous_by_worker,
             owners,
             group_order,
@@ -875,7 +875,7 @@ def _request_from_dict(value: Any) -> LayoutCompileRequest:
             cardinality_metric=item["cardinality_metric"],
             split_policy=item["split_policy"],
             locality_key=item["locality_key"],
-            physical_identity=item["physical_identity"],
+            storage_locator=item["storage_locator"],
             logical_start=item["logical_start"],
             opaque_token=item["opaque_token"],
             work_kind=SourceWorkKind(item["work_kind"]),
